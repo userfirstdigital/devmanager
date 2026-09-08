@@ -77,6 +77,9 @@ pub fn action_for_client_request(request: &ClientRequest) -> Option<(ActionId, O
                     | crate::domain::cockpit::TaskCockpitQuery::ProviderSettings(_)
                     | crate::domain::cockpit::TaskCockpitQuery::RemoteAccess(_)
                     | crate::domain::cockpit::TaskCockpitQuery::OpenShellTerminal { .. }
+                    | crate::domain::cockpit::TaskCockpitQuery::OpenSshTerminal { .. }
+                    | crate::domain::cockpit::TaskCockpitQuery::ConfigUpsertSsh { .. }
+                    | crate::domain::cockpit::TaskCockpitQuery::ConfigArchiveSsh { .. }
                     | crate::domain::cockpit::TaskCockpitQuery::OpenBrowserSession { .. }
                     | crate::domain::cockpit::TaskCockpitQuery::BrowserNativeSession,
                 ) => {
@@ -566,6 +569,37 @@ mod tests {
                 query: Query::TaskCockpit(TaskCockpitQuery::RemoteAccess(setup)),
             });
             assert_eq!(action_for_client_request(&request), None);
+            assert_eq!(
+                SessionAuthorizer::paired_owner().authorize_request(&request),
+                PermissionDecision::Denied(PermissionDenyReason::UnknownAction)
+            );
+        }
+    }
+
+    #[test]
+    fn ssh_desktop_requests_are_never_connect_reads() {
+        for query in [
+            TaskCockpitQuery::OpenSshTerminal {
+                endpoint_id: "server".into(),
+                expected_task_revision: 1,
+            },
+            TaskCockpitQuery::ConfigUpsertSsh {
+                connection_id: None,
+                label: "Server".into(),
+                host: "localhost".into(),
+                port: 22,
+                username: "user".into(),
+            },
+            TaskCockpitQuery::ConfigArchiveSsh {
+                connection_id: "server".into(),
+            },
+        ] {
+            let request = ClientRequest::Query(QueryEnvelope {
+                request_id: RequestId::new(),
+                client_id: ClientId::new(),
+                task_id: None,
+                query: Query::TaskCockpit(query),
+            });
             assert_eq!(
                 SessionAuthorizer::paired_owner().authorize_request(&request),
                 PermissionDecision::Denied(PermissionDenyReason::UnknownAction)

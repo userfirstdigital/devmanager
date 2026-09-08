@@ -137,6 +137,8 @@ pub(crate) fn serve_task_cockpit_bounded(
     if matches!(
         dispatch.query,
         TaskCockpitQuery::ConfigCreateProject { .. }
+            | TaskCockpitQuery::ConfigUpsertSsh { .. }
+            | TaskCockpitQuery::ConfigArchiveSsh { .. }
             | TaskCockpitQuery::ConfigUpsertCommand { .. }
             | TaskCockpitQuery::ConfigArchiveCommand { .. }
             | TaskCockpitQuery::ConfigRunCommand { .. }
@@ -151,7 +153,9 @@ pub(crate) fn serve_task_cockpit_bounded(
     }
     if matches!(
         dispatch.query,
-        TaskCockpitQuery::OpenShellTerminal { .. } | TaskCockpitQuery::OpenBrowserSession { .. }
+        TaskCockpitQuery::OpenShellTerminal { .. }
+            | TaskCockpitQuery::OpenSshTerminal { .. }
+            | TaskCockpitQuery::OpenBrowserSession { .. }
     ) {
         // Opening a shell resolves a launch and writes a durable resource.
         // Only the exclusive host executor holds the authority to do either,
@@ -230,6 +234,8 @@ pub(crate) fn serve_task_cockpit_bounded(
         TaskCockpitQuery::ConfigSnapshot
         | TaskCockpitQuery::AgentConnection
         | TaskCockpitQuery::ConfigCreateProject { .. }
+        | TaskCockpitQuery::ConfigUpsertSsh { .. }
+        | TaskCockpitQuery::ConfigArchiveSsh { .. }
         | TaskCockpitQuery::ConfigUpsertCommand { .. }
         | TaskCockpitQuery::ConfigArchiveCommand { .. }
         | TaskCockpitQuery::ConfigRunCommand { .. }
@@ -237,6 +243,7 @@ pub(crate) fn serve_task_cockpit_bounded(
         | TaskCockpitQuery::ProviderSettings(_)
         | TaskCockpitQuery::RemoteAccess(_)
         | TaskCockpitQuery::OpenShellTerminal { .. }
+        | TaskCockpitQuery::OpenSshTerminal { .. }
         | TaskCockpitQuery::OpenBrowserSession { .. } => {
             unreachable!("config snapshot is handled before task-scoped lookup")
         }

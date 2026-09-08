@@ -670,6 +670,64 @@ mod workspace_security_tests {
     }
 
     #[test]
+    fn ssh_catalog_mutations_preserve_credentials_and_archive_without_removing_config() {
+        use crate::domain::TaskCockpitQuery;
+        let root = tempfile::tempdir().unwrap();
+        let path = root
+            .path()
+            .join("com.userfirst.devmanager-native-next-dev/config.json");
+        std::fs::create_dir(path.parent().unwrap()).unwrap();
+        let store = super::ConfigStore::open_test_fixture(path).unwrap();
+        let mut admission = super::HostWorkspaceAdmission::new(store, 1, 1).unwrap();
+        let query = TaskCockpitQuery::ConfigUpsertSsh {
+            connection_id: None,
+            label: "Server".into(),
+            host: "localhost".into(),
+            port: 2222,
+            username: "deploy".into(),
+        };
+        admission.apply_project_action(&query).unwrap();
+        let mut saved = admission.store.snapshot().config.ssh_connections[0].clone();
+        saved.auth = crate::config::Nullable::Value(crate::config::SshAuth {
+            mode: crate::config::SshAuthMode::Agent,
+            ..Default::default()
+        });
+        let revision = admission.store.snapshot().revision;
+        admission
+            .store
+            .execute(
+                revision,
+                crate::config::ConfigCommand::UpdateSsh {
+                    connection: saved.clone(),
+                },
+            )
+            .unwrap();
+        admission
+            .apply_project_action(&TaskCockpitQuery::ConfigUpsertSsh {
+                connection_id: Some(saved.id.clone()),
+                label: "Renamed".into(),
+                host: "example.test".into(),
+                port: 22,
+                username: "deploy".into(),
+            })
+            .unwrap();
+        let updated = &admission.store.snapshot().config.ssh_connections[0];
+        assert_eq!(updated.auth, saved.auth);
+        assert_eq!(updated.extra, saved.extra);
+        assert_eq!(updated.label, "Renamed");
+        admission
+            .apply_project_action(&TaskCockpitQuery::ConfigArchiveSsh {
+                connection_id: saved.id.clone(),
+            })
+            .unwrap();
+        assert!(admission
+            .redacted_ssh_endpoints()
+            .iter()
+            .all(|e| e.id != saved.id || e.archived));
+        assert_eq!(admission.store.snapshot().config.ssh_connections.len(), 1);
+    }
+
+    #[test]
     fn user_project_creation_persists_and_reissues_workspace_authority() {
         let root = tempfile::tempdir().unwrap();
         let project = root.path().join("project");
@@ -2670,6 +2728,52 @@ impl HostWorkspaceAdmission {
     fn apply_project_action(&mut self, query: &TaskCockpitQuery) -> Result<(), ConfigError> {
         let revision = self.store.snapshot().revision;
         match query {
+            TaskCockpitQuery::ConfigUpsertSsh {
+                connection_id,
+                label,
+                host,
+                port,
+                username,
+            } => {
+                let mut connection = if let Some(id) = connection_id {
+                    self.store
+                        .snapshot()
+                        .config
+                        .ssh_connections
+                        .iter()
+                        .find(|c| &c.id == id)
+                        .cloned()
+                        .ok_or_else(|| {
+                            ConfigError::new(
+                                ConfigErrorKind::Validation,
+                                "SSH connection is unavailable",
+                            )
+                        })?
+                } else {
+                    crate::config::SSHConnection {
+                        id: Uuid::new_v4().to_string(),
+                        ..Default::default()
+                    }
+                };
+                connection.label = label.trim().to_string();
+                connection.host = host.trim().to_string();
+                connection.username = username.trim().to_string();
+                connection.port = *port;
+                let command = if connection_id.is_some() {
+                    ConfigCommand::UpdateSsh { connection }
+                } else {
+                    ConfigCommand::CreateSsh { connection }
+                };
+                self.store.execute(revision, command)?;
+            }
+            TaskCockpitQuery::ConfigArchiveSsh { connection_id } => {
+                self.store.execute(
+                    revision,
+                    ConfigCommand::ArchiveSsh {
+                        connection_id: connection_id.clone(),
+                    },
+                )?;
+            }
             TaskCockpitQuery::ConfigUpsertCommand {
                 project_id,
                 folder_id,
@@ -2939,6 +3043,8 @@ pub struct HostRequestExecutor {
 /// One live plain shell terminal: the durable identity, the manager session
 /// behind it, and the sampling state the fact pump carries between ticks.
 struct ShellSessionLink {
+    ssh_key: Option<crate::ssh::RetainedKey>,
+    ssh_endpoint: Option<String>,
     task_id: TaskId,
     session_id: crate::terminal::protocol::TerminalSessionId,
     last_cwd: Option<PathBuf>,
@@ -4787,6 +4893,27 @@ impl HostRequestExecutor {
         request_id: RequestId,
         connection_id: Uuid,
     ) -> Result<(), QueryOutcome> {
+        self.open_interactive_terminal_request(
+            client_id,
+            task_id,
+            cwd,
+            expected_task_revision,
+            request_id,
+            connection_id,
+            None,
+        )
+    }
+
+    fn open_interactive_terminal_request(
+        &mut self,
+        client_id: ClientId,
+        task_id: Option<TaskId>,
+        cwd: Option<&str>,
+        expected_task_revision: u64,
+        request_id: RequestId,
+        connection_id: Uuid,
+        ssh_endpoint: Option<&str>,
+    ) -> Result<(), QueryOutcome> {
         let Some(task_id) = task_id else {
             return Err(shell_open_denied(
                 crate::domain::TaskCockpitDeniedReason::MissingTask,
@@ -4807,20 +4934,80 @@ impl HostRequestExecutor {
             }
         };
         let cwd = self.resolve_shell_terminal_cwd(task_id, cwd)?;
-        let (default_terminal, mac_profile, shell_integration_enabled) = self.terminal_settings();
-        let launch = match crate::terminal::session::resolve_plain_shell_launch(
-            Some(&default_terminal),
-            mac_profile.as_ref(),
-            shell_integration_enabled,
-            &cwd,
-        ) {
-            Ok(launch) => launch,
-            Err(reason) => {
-                return Err(shell_open_unavailable_named(
+        if let Some(endpoint) = ssh_endpoint {
+            let catalog = self
+                .config_admission
+                .as_ref()
+                .map(HostWorkspaceAdmission::redacted_ssh_endpoints)
+                .unwrap_or_default();
+            crate::ssh::accept_exact_endpoint(&catalog, endpoint).map_err(|_| {
+                shell_open_denied(crate::domain::TaskCockpitDeniedReason::Unauthorized)
+            })?;
+            if let Some(existing) = self.shell_sessions.iter().find_map(|(id, link)| {
+                (link.task_id == task_id
+                    && link.ssh_endpoint.as_deref() == Some(endpoint)
+                    && !link.exit_recorded)
+                    .then_some(*id)
+            }) {
+                return self.focus_open_ssh_terminal(
+                    client_id,
                     task_id,
-                    crate::domain::TaskCockpitUnavailableReason::TerminalUnavailable,
-                    reason,
-                ));
+                    existing,
+                    expected_task_revision,
+                    request_id,
+                    connection_id,
+                );
+            }
+        }
+        let mut ssh = if let Some(endpoint) = ssh_endpoint {
+            let admission = self.config_admission.as_ref().ok_or_else(|| {
+                shell_open_unavailable(
+                    crate::domain::TaskCockpitUnavailableReason::SshOperationUnsupported,
+                )
+            })?;
+            Some(
+                crate::ssh::prepare_interactive_terminal(
+                    &admission.store.snapshot().config,
+                    endpoint,
+                    &admission
+                        .store
+                        .path()
+                        .parent()
+                        .expect("config parent")
+                        .join("ssh-terminal-keys"),
+                )
+                .map_err(|reason| {
+                    shell_open_unavailable_named(
+                        task_id,
+                        crate::domain::TaskCockpitUnavailableReason::SshOperationUnsupported,
+                        reason,
+                    )
+                })?,
+            )
+        } else {
+            None
+        };
+        let (default_terminal, mac_profile, shell_integration_enabled) = self.terminal_settings();
+        let launch = if let Some(ssh) = &ssh {
+            crate::terminal::session::ResolvedShellLaunch {
+                program: ssh.program.clone(),
+                args: ssh.args.clone(),
+            }
+        } else {
+            match crate::terminal::session::resolve_plain_shell_launch(
+                Some(&default_terminal),
+                mac_profile.as_ref(),
+                shell_integration_enabled,
+                &cwd,
+            ) {
+                Ok(launch) => launch,
+                Err(reason) => {
+                    return Err(shell_open_unavailable_named(
+                        task_id,
+                        crate::domain::TaskCockpitUnavailableReason::TerminalUnavailable,
+                        reason,
+                    ));
+                }
             }
         };
         // The shell rides the Task's live runtime generation so teardown fences
@@ -4849,7 +5036,7 @@ impl HostRequestExecutor {
                     program: launch.program.clone(),
                     args: launch.args.clone(),
                 }),
-                title: None,
+                title: ssh.as_ref().map(|ssh| ssh.title.clone()),
             },
             now_ms,
         ) {
@@ -4912,7 +5099,73 @@ impl HostRequestExecutor {
         // refused on both wire lanes, so the accepted-request effect lane never
         // sees an open; a host-issued command has to start the process itself.
         self.open_shell_terminal_after_accept(task_id, resource_id);
+        if let Some(link) = self.shell_sessions.get_mut(&resource_id) {
+            link.ssh_key = ssh.as_mut().and_then(|ssh| ssh.key.take());
+            link.ssh_endpoint = ssh_endpoint.map(str::to_owned);
+        }
+        if ssh_endpoint.is_some() {
+            let revision = self
+                .bus
+                .task_snapshot(task_id)
+                .ok()
+                .flatten()
+                .map(|s| s.task.revision)
+                .ok_or_else(|| {
+                    shell_open_unavailable(
+                        crate::domain::TaskCockpitUnavailableReason::TerminalUnavailable,
+                    )
+                })?;
+            self.focus_open_ssh_terminal(
+                client_id,
+                task_id,
+                resource_id,
+                revision,
+                request_id,
+                connection_id,
+            )?;
+        }
         Ok(())
+    }
+
+    fn focus_open_ssh_terminal(
+        &mut self,
+        client_id: ClientId,
+        task_id: TaskId,
+        resource_id: ResourceId,
+        expected_revision: u64,
+        request_id: RequestId,
+        connection_id: Uuid,
+    ) -> Result<(), QueryOutcome> {
+        let snapshot = self
+            .bus
+            .task_snapshot(task_id)
+            .ok()
+            .flatten()
+            .ok_or_else(|| {
+                shell_open_denied(crate::domain::TaskCockpitDeniedReason::MissingTask)
+            })?;
+        let mut strip = snapshot.terminal_strip.clone();
+        strip.focused = Some(resource_id);
+        let envelope = CommandEnvelope {
+            command_id: crate::domain::CommandId::new(),
+            client_id,
+            task_id: Some(task_id),
+            issued_at_ms: unix_time_ms_u64() as i64,
+            expected_task_revision: Some(expected_revision),
+            command: Command::SetTerminalStrip(strip),
+        };
+        match self
+            .bus
+            .execute_host_authorized(envelope, None, request_id, connection_id)
+        {
+            Ok(CommandReceipt::Accepted { .. }) => {
+                self.fan_out_live_durable_events();
+                Ok(())
+            }
+            _ => Err(shell_open_denied(
+                crate::domain::TaskCockpitDeniedReason::StaleFence,
+            )),
+        }
     }
 
     /// Resolve the working directory one shell will start in.
@@ -5156,6 +5409,8 @@ impl HostRequestExecutor {
         self.shell_sessions.insert(
             resource_id,
             ShellSessionLink {
+                ssh_key: None,
+                ssh_endpoint: None,
                 task_id,
                 session_id,
                 last_cwd: None,
@@ -7222,7 +7477,10 @@ impl HostRequestExecutor {
                 if request.client_id != negotiated.client_id {
                     return Err(IpcError::Unauthorized);
                 }
-                if !negotiated.capabilities.contains(Capability::ProviderInput) {
+                if !negotiated
+                    .capabilities
+                    .contains(request.required_capability())
+                {
                     return Err(IpcError::UnsupportedCapability);
                 }
                 let input_id = request.input_id;
@@ -7544,6 +7802,41 @@ impl HostRequestExecutor {
                 // Opening a shell is a host-authority mutation admitted as a
                 // typed query. Serve it here, then answer with the Task's
                 // refreshed strip so one round trip both opens and shows it.
+                let query = if let TaskCockpitQuery::OpenSshTerminal {
+                    endpoint_id,
+                    expected_task_revision,
+                } = &query
+                {
+                    if !negotiated.capabilities.grants_task_cockpit()
+                        || envelope.client_id != negotiated.client_id
+                    {
+                        return Ok(QueryReply {
+                            request_id: envelope.request_id,
+                            outcome: QueryOutcome::Err(QueryError::Unauthorized),
+                        });
+                    }
+                    match self.open_interactive_terminal_request(
+                        envelope.client_id,
+                        envelope.task_id,
+                        None,
+                        *expected_task_revision,
+                        envelope.request_id,
+                        output_id
+                            .map(ConnectionOutputId::as_uuid)
+                            .unwrap_or(Uuid::nil()),
+                        Some(endpoint_id),
+                    ) {
+                        Ok(()) => TaskCockpitQuery::TaskTerminals,
+                        Err(outcome) => {
+                            return Ok(QueryReply {
+                                request_id: envelope.request_id,
+                                outcome,
+                            })
+                        }
+                    }
+                } else {
+                    query
+                };
                 let query = if let TaskCockpitQuery::OpenShellTerminal {
                     cwd,
                     expected_task_revision,
@@ -7645,6 +7938,8 @@ impl HostRequestExecutor {
                 if matches!(
                     &query,
                     TaskCockpitQuery::ConfigUpsertCommand { .. }
+                        | TaskCockpitQuery::ConfigUpsertSsh { .. }
+                        | TaskCockpitQuery::ConfigArchiveSsh { .. }
                         | TaskCockpitQuery::ConfigArchiveCommand { .. }
                         | TaskCockpitQuery::ConfigRunCommand { .. }
                 ) {
@@ -9527,7 +9822,7 @@ fn dispatch_authenticated_request_inner(
             if request.client_id != authenticated_client_id {
                 return Err(IpcError::Unauthorized);
             }
-            if !capabilities.contains(Capability::ProviderInput) {
+            if !capabilities.contains(request.required_capability()) {
                 return Err(IpcError::UnsupportedCapability);
             }
             // The compatibility executor has no host-owned TerminalService;
@@ -16238,6 +16533,8 @@ mod output_tests {
 
     fn shell_link_for_test() -> ShellSessionLink {
         ShellSessionLink {
+            ssh_key: None,
+            ssh_endpoint: None,
             task_id: TaskId::new(),
             session_id: crate::terminal::protocol::TerminalSessionId::new(),
             last_cwd: None,

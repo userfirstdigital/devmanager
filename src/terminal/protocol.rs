@@ -389,6 +389,14 @@ pub struct TerminalInputRequest {
 }
 
 impl TerminalInputRequest {
+    pub fn required_capability(&self) -> crate::protocol::Capability {
+        if self.context.is_plain_shell_fence() {
+            crate::protocol::Capability::TaskCockpit
+        } else {
+            crate::protocol::Capability::ProviderInput
+        }
+    }
+
     pub fn validate(&self) -> Result<(), TerminalError> {
         self.context.validate()?;
         if self.bytes.is_empty() || self.bytes.len() > MAX_INPUT_BYTES {

@@ -16,3 +16,7 @@ pub(crate) use supervisor::{
     ConfigCredentialResolver, SshAdmission, SshLifecycle, SshRuntimeAdapter, SshRuntimeError,
     SshRuntimeSnapshot, SshSupervisor, SshTaskIdentity,
 };
+
+mod terminal;
+pub(crate) use credentials::RetainedKey;
+pub(crate) use terminal::prepare_interactive_terminal;

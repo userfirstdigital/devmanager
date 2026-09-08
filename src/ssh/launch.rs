@@ -2078,7 +2078,7 @@ fn bounded_text(field: &'static str, value: &str, max: usize) -> Result<String, 
     Ok(value.to_string())
 }
 
-fn validate_host(value: &str) -> Result<String, SshLaunchError> {
+pub(super) fn validate_host(value: &str) -> Result<String, SshLaunchError> {
     let value = bounded_text("host", value, MAX_HOST_BYTES)?;
     if value.starts_with('-') || value.bytes().any(|byte| byte.is_ascii_whitespace()) {
         return Err(SshLaunchError::InvalidField("host"));
@@ -2086,7 +2086,7 @@ fn validate_host(value: &str) -> Result<String, SshLaunchError> {
     Ok(value)
 }
 
-fn validate_username(value: &str) -> Result<String, SshLaunchError> {
+pub(super) fn validate_username(value: &str) -> Result<String, SshLaunchError> {
     let value = bounded_text("username", value, MAX_USERNAME_BYTES)?;
     if value.starts_with('-') || value.bytes().any(|byte| byte.is_ascii_whitespace()) {
         return Err(SshLaunchError::InvalidField("username"));

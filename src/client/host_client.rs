@@ -429,7 +429,7 @@ impl HostClient {
         if !self
             .metadata
             .granted_capabilities()
-            .contains(Capability::ProviderInput)
+            .contains(request.required_capability())
         {
             return Err(IpcError::UnsupportedCapability);
         }

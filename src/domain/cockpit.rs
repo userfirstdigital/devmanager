@@ -383,6 +383,21 @@ pub enum TaskCockpitQuery {
         cwd: Option<String>,
         expected_task_revision: u64,
     },
+    /// Open an interactive SSH terminal using an exact saved host connection.
+    OpenSshTerminal {
+        endpoint_id: String,
+        expected_task_revision: u64,
+    },
+    ConfigUpsertSsh {
+        connection_id: Option<String>,
+        label: String,
+        host: String,
+        port: u16,
+        username: String,
+    },
+    ConfigArchiveSsh {
+        connection_id: String,
+    },
     WorkspaceStatus,
     /// Bounded path-redacted catalog of repositories for the exact Task/project.
     GitRepositories,
@@ -1159,6 +1174,8 @@ pub fn cockpit_surface(query: &TaskCockpitQuery) -> TaskCockpitSurface {
         TaskCockpitQuery::ConfigSnapshot
         | TaskCockpitQuery::AgentConnection
         | TaskCockpitQuery::ConfigCreateProject { .. }
+        | TaskCockpitQuery::ConfigUpsertSsh { .. }
+        | TaskCockpitQuery::ConfigArchiveSsh { .. }
         | TaskCockpitQuery::ConfigUpsertCommand { .. }
         | TaskCockpitQuery::ConfigArchiveCommand { .. }
         | TaskCockpitQuery::ConfigRunCommand { .. }
@@ -1181,7 +1198,8 @@ pub fn cockpit_surface(query: &TaskCockpitQuery) -> TaskCockpitSurface {
         | TaskCockpitQuery::TerminalResizeFor { .. }
         | TaskCockpitQuery::TerminalReadinessFor { .. }
         | TaskCockpitQuery::TaskTerminals
-        | TaskCockpitQuery::OpenShellTerminal { .. } => TaskCockpitSurface::Terminal,
+        | TaskCockpitQuery::OpenShellTerminal { .. }
+        | TaskCockpitQuery::OpenSshTerminal { .. } => TaskCockpitSurface::Terminal,
         TaskCockpitQuery::WorkspaceStatus => TaskCockpitSurface::Workspace,
         TaskCockpitQuery::GitRepositories
         | TaskCockpitQuery::GitStatus
@@ -1897,6 +1915,8 @@ impl TaskCockpitQuery {
             Self::ConfigSnapshot
                 | Self::AgentConnection
                 | Self::ConfigCreateProject { .. }
+                | Self::ConfigUpsertSsh { .. }
+                | Self::ConfigArchiveSsh { .. }
                 | Self::ConfigUpsertCommand { .. }
                 | Self::ConfigArchiveCommand { .. }
                 | Self::ConfigRunCommand { .. }

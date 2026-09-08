@@ -7,10 +7,13 @@
 //! `ClientModel`, while the task cockpit and terminal adapter consume that
 //! projection.
 
+#[path = "native_shell/ssh.rs"]
+mod ssh;
 #[path = "native_trusted_hosts.rs"]
 mod trusted_hosts;
 #[path = "native_trusted_hosts_view.rs"]
 mod trusted_hosts_view;
+
 use trusted_hosts_view::NativeTrustedHostsState;
 
 use std::cell::RefCell;
@@ -9802,16 +9805,31 @@ impl NativeInteraction {
         }
         let model = self.client_model.as_ref()?;
         let task = model.tasks().get(&request.context.task_id)?;
-        let agent = task.agents.get(&request.context.agent_session_id)?;
-        // The terminal action epoch belongs to the live provider/PTY
-        // correlation, while task.action_epoch fences durable task mutations.
-        // They legitimately diverge after restore. TerminalId, SessionId,
-        // resource/runtime generations, focus epoch, and the terminal action
-        // epoch are validated again by TerminalService at the host boundary.
-        if task.task.revision == 0 || agent.runtime_generation != request.context.runtime_generation
-        {
+        if task.task.revision == 0 {
             return None;
         }
+        let plain_shell = request.context.is_plain_shell_fence();
+        let capability = if plain_shell {
+            let resource = task.resources.get(&request.context.resource_id)?;
+            if resource.task_id != Some(request.context.task_id)
+                || resource.owner_kind != crate::domain::resource::OwnerKind::Task
+                || resource.resource_kind != crate::domain::resource::ResourceKind::Terminal
+                || !resource.recipe.is_plain_shell()
+                || resource.lifecycle != crate::domain::ResourceLifecycle::Active
+                || resource.runtime_generation != request.context.resource_generation
+            {
+                return None;
+            }
+            Some(Capability::TaskCockpit)
+        } else {
+            let agent = task.agents.get(&request.context.agent_session_id)?;
+            // Provider action epochs belong to the live PTY correlation, not
+            // the task mutation epoch. TerminalService checks the full fence.
+            if agent.runtime_generation != request.context.runtime_generation {
+                return None;
+            }
+            descriptor.required_capability
+        };
         let expected_task_revision = task.task.revision;
         let captured_task_action_epoch = task.task.action_epoch;
         let task_id = request.context.task_id;
@@ -9819,7 +9837,11 @@ impl NativeInteraction {
         let action_epoch = self.action_epoch;
         let event_request = ActionRequest::TaskCockpit {
             task_id,
-            query: TaskCockpitQuery::Terminal,
+            query: if plain_shell {
+                TerminalTarget::Resource(request.context.resource_id).screen_query()
+            } else {
+                TaskCockpitQuery::Terminal
+            },
         };
         let event = ActionEvent::new(
             event_request,
@@ -9844,7 +9866,7 @@ impl NativeInteraction {
             background_read: false,
             expected_task_revision: Some(expected_task_revision),
             captured_task_action_epoch: Some(captured_task_action_epoch),
-            capability: descriptor.required_capability,
+            capability,
             disabled_reason: None,
             event,
             command: NativeHostCommand::TerminalInput(request),
@@ -9943,7 +9965,11 @@ impl NativeInteraction {
         }
         let selected_task = self.selected_task();
         let request_task = match &request {
-            ActionRequest::TaskShow { task_id } => Some(*task_id),
+            ActionRequest::TaskShow { task_id }
+            | ActionRequest::TerminalOpenShell { task_id, .. }
+            | ActionRequest::TerminalClose { task_id, .. }
+            | ActionRequest::TerminalSetStrip { task_id, .. } => Some(*task_id),
+            ActionRequest::TerminalRename(arguments) => Some(arguments.task_id),
             ActionRequest::TaskRename(arguments) => Some(arguments.task_id),
             ActionRequest::TaskSettle { task_id } | ActionRequest::TaskReopen { task_id } => {
                 Some(*task_id)
@@ -11953,6 +11979,7 @@ pub struct NativeShell {
     last_window_persist: Option<Instant>,
     add_project: Option<AddProjectDraft>,
     settings_open: bool,
+    ssh_ui: ssh::SshUi,
     git_session: crate::git::native_client::NativeGitSession,
     pending_git_window: Option<HostTaskKey>,
     show_archived_tasks: bool,
@@ -12999,6 +13026,7 @@ impl NativeShell {
             last_window_persist: None,
             add_project: None,
             settings_open: false,
+            ssh_ui: ssh::SshUi::default(),
             git_session: crate::git::native_client::NativeGitSession::default(),
             pending_git_window: None,
             show_archived_tasks: false,
@@ -15810,7 +15838,7 @@ impl NativeShell {
         match command {
             NativeHostCommand::TaskCockpitQuery {
                 task_id,
-                query: TaskCockpitQuery::TaskTerminals,
+                query: TaskCockpitQuery::TaskTerminals | TaskCockpitQuery::OpenSshTerminal { .. },
                 ..
             } => Some(*task_id),
             NativeHostCommand::OpenShellTerminal { task_id, .. } => Some(*task_id),
@@ -16247,7 +16275,8 @@ impl NativeShell {
             .unwrap_or_default()
             .into_iter()
             .filter_map(|owner| {
-                if self.pane_view(&owner) != PaneView::Terminal
+                if (self.pane_view(&owner) != PaneView::Terminal
+                    && !self.ssh_terminal_is_visible(&owner))
                     || !self.task_surfaces.terminal_is_interactive(owner.clone())
                     || self.host_slot(&owner.host).is_none_or(|slot| {
                         slot.provider_setup_approvals.contains_key(&owner.task_id)
@@ -16340,7 +16369,8 @@ impl NativeShell {
                 .task_workspace
                 .as_ref()
                 .is_some_and(|workspace| workspace.contains_task(owner.clone()))
-                && self.pane_view(&owner) == PaneView::Terminal;
+                && (self.pane_view(&owner) == PaneView::Terminal
+                    || self.ssh_terminal_is_visible(&owner));
             if self.pending_terminal_echoes.contains_key(&key) {
                 if !visible {
                     self.pending_terminal_echoes.remove(&key);
@@ -17895,6 +17925,29 @@ impl NativeShell {
         if !self.outcome_admission_matches_live_for_host(host_id, &action) {
             return;
         }
+        // SSH writes settle by their exact owned request, even when their own
+        // durable resource publication advances the client projection first.
+        if host_id == &self.local_host_id()
+            && (self
+                .ssh_ui
+                .pending
+                .is_some_and(|(id, _)| native_request_id(&action.command) == Some(id))
+                || self
+                    .ssh_ui
+                    .disconnecting
+                    .as_ref()
+                    .is_some_and(|(id, _, _)| native_command_id(&action.command) == Some(*id)))
+        {
+            let epochs = self.local_slot().interaction.action_epochs();
+            if action.connection_epoch == epochs.connection_epoch
+                && action.resource_generation == epochs.resource_generation
+                && action.runtime_generation == epochs.runtime_generation
+                && action.client_epoch <= epochs.client_epoch
+            {
+                self.apply_action_outcome(outcome);
+            }
+            return;
+        }
         // Readiness belongs to the exact first-send lease, not the currently
         // visible dock query. Browser/terminal refreshes must not starve it by
         // advancing the UI epoch while its authenticated reply is in flight.
@@ -19146,6 +19199,7 @@ impl NativeShell {
     }
 
     fn apply_action_outcome(&mut self, outcome: NativeHostActionOutcome) {
+        self.settle_ssh_outcome(&outcome);
         if Self::task_cockpit_command_parts(&outcome.action().command).is_some_and(
             |(_, task, query)| {
                 Some(task) == self.local_slot().interaction.selected_task()
@@ -21768,7 +21822,8 @@ impl NativeShell {
         // the workspace, so a task reselected after a return to the idle canvas
         // opens on Conversation; one keypress puts it back on the terminal.
         let was_showing_terminal = self.local_slot_mut().cockpit.dock().showing_raw_terminal();
-        let show_terminal = self.pane_view(&owner) == PaneView::Terminal;
+        let show_terminal =
+            self.pane_view(&owner) == PaneView::Terminal || self.ssh_terminal_is_visible(&owner);
         let result = if show_terminal {
             self.local_slot_mut()
                 .cockpit
@@ -21804,6 +21859,9 @@ impl NativeShell {
     /// showing the terminal: a pane parked on Files stays on Files, because the
     /// dock's terminal presentation says nothing about a surface it does not own.
     fn note_terminal_presentation_on_pane(&mut self, owner: &HostTaskKey, raw: bool) {
+        if self.ssh_ui.side_owner.as_ref() == Some(owner) {
+            return;
+        }
         if raw {
             self.set_pane_view(owner, PaneView::Terminal);
         } else if self.pane_view(owner) == PaneView::Terminal {
@@ -33063,7 +33121,8 @@ impl NativeShell {
                 command_id,
             } => format!("Configuration server selected: {project_id}/{folder_id}/{command_id}"),
             ConfigSidebarActionRequest::SelectSsh { config_id } => {
-                format!("Remote connection selected: {config_id}")
+                self.open_ssh_connection(config_id);
+                "Opening SSH terminal…".into()
             }
             ConfigSidebarActionRequest::SelectProvider { provider } => {
                 format!("LLM provider selected: {}", provider.label())
@@ -45756,7 +45815,7 @@ impl NativeShell {
         }
         .into_iter()
         .filter(|key| {
-            if self.pane_view(key) != PaneView::Terminal {
+            if self.pane_view(key) != PaneView::Terminal && !self.ssh_terminal_is_visible(key) {
                 return false;
             }
             let target = self.focused_terminal_target(key).surface_target();
@@ -47432,6 +47491,7 @@ impl NativeShell {
                     viewport.into_any_element()
                 }
             })
+            .children((!board_rail).then(|| self.ssh_sidebar(tokens, cx)))
             .into_any_element();
         let sidebar = Self::reference_sidebar(tokens, board_width, inbox_panel);
         let top_bar = {
@@ -47447,12 +47507,11 @@ impl NativeShell {
             self.pane_rail(PaneEdge::Inbox, tokens, cx),
             self.pane_rail(PaneEdge::Dock, tokens, cx),
         );
-        let conversation = self.task_workspace_surface(
-            tokens,
-            Self::idle_conversation_photo_size(tokens, viewport, layout.clone(), board_width),
-            &board,
-            cx,
-        );
+        let workspace_size =
+            Self::idle_conversation_photo_size(tokens, viewport, layout.clone(), board_width);
+        let workspace_size = self.ssh_workspace_size(workspace_size);
+        let conversation = self.task_workspace_surface(tokens, workspace_size, &board, cx);
+        let conversation = self.with_ssh_panel(conversation, tokens, cx);
 
         // GPUI keeps one platform input handler per entity. The composer owns
         // the `NativeShell` registration, so root editors forward through a
@@ -47505,6 +47564,9 @@ impl NativeShell {
                 // Remote settings use InputState's own focus and text handler.
                 // Let it receive editing keys even if a terminal was armed
                 // before opening settings; only Escape belongs to the overlay.
+                if shell.ssh_ui.editor.is_some() {
+                    return;
+                }
                 if shell.settings_open && shell.settings_page == NativeSettingsPage::RemoteAccess {
                     if event.keystroke.key == "escape" {
                         shell.handle_settings_overlay_key(event, window, cx);
@@ -47544,10 +47606,11 @@ impl NativeShell {
                 if shell.composer_focus_handle.is_focused(window) {
                     return;
                 }
-                let center_terminal_visible = shell
-                    .selected_task_key
-                    .clone()
-                    .is_some_and(|owner| shell.pane_view(&owner) == PaneView::Terminal);
+                let center_terminal_visible =
+                    shell.selected_task_key.clone().is_some_and(|owner| {
+                        shell.pane_view(&owner) == PaneView::Terminal
+                            || shell.ssh_terminal_is_visible(&owner)
+                    });
                 if root_routes_key_to_terminal(
                     event.keystroke.key.as_str(),
                     shell.terminal_focus_handle.is_focused(window),
@@ -49250,6 +49313,7 @@ impl Render for NativeGitWindow {
 
 impl Render for NativeShell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.tick_ssh_requests();
         if let Some(owner) = self.pending_git_window.take() {
             if self.selected_task_key.as_ref() == Some(&owner) {
                 self.open_native_git_window(window, cx);
@@ -68664,6 +68728,157 @@ mod "
                     },
                 );
                 assert!(!shell.pending_terminal_requeries.contains_key(&key));
+            });
+            crate::ui::finish_headless_test(cx);
+        });
+    }
+
+    #[test]
+    fn ssh_terminal_mutations_capture_task_scoped_admission() {
+        let (model, task_id) = terminal_bound_client_model();
+        let resource_id = ResourceId::new();
+        let mut interaction = NativeInteraction::new(Some(task_id));
+        interaction.set_client_model(Some(Arc::new(model)));
+        for request in [
+            ActionRequest::TerminalOpenShell { task_id, cwd: None },
+            ActionRequest::TerminalClose {
+                task_id,
+                resource_id,
+            },
+            ActionRequest::TerminalRename(crate::client::action::TerminalRenameArguments {
+                task_id,
+                resource_id,
+                title: "Server".into(),
+            }),
+            ActionRequest::TerminalSetStrip {
+                task_id,
+                strip: crate::domain::terminal_facts::TaskTerminalStrip {
+                    order: vec![resource_id],
+                    focused: Some(resource_id),
+                },
+            },
+        ] {
+            let record = interaction.action(request).expect("terminal action");
+            assert_eq!(
+                record.task_id,
+                Some(task_id),
+                "host-global admission cannot send a task command"
+            );
+        }
+        assert!(interaction
+            .action(ActionRequest::TerminalClose {
+                task_id: TaskId::new(),
+                resource_id
+            })
+            .is_none());
+    }
+
+    #[test]
+    fn ssh_plain_terminal_input_uses_exact_resource_without_an_agent_fence() {
+        let (model, task_id, provider, shells) =
+            terminal_bound_client_model_with_shells_and_lifecycle(
+                crate::domain::TaskAttention::None,
+                ProviderKind::Codex,
+                None,
+                3,
+                crate::domain::task::TaskLifecycle::Open,
+                1,
+            );
+        let mut projection = provider_terminal_projection_for_test(&model, task_id, 1);
+        projection.resource_id = shells[0];
+        projection.agent_session_id = crate::domain::AgentSessionId::nil();
+        projection.runtime_generation = 0;
+        projection.action_epoch = 0;
+        projection.is_provider = false;
+        let request =
+            super::terminal_input_request(ClientId::new(), &projection, 1, b"yes\r".to_vec())
+                .unwrap();
+        let mut interaction = NativeInteraction::new(Some(task_id));
+        interaction.set_client_model(Some(Arc::new(model)));
+        let record = interaction
+            .terminal_input(request.clone())
+            .expect("plain shell accepts input without a provider fence");
+        assert_eq!(record.capability, Some(Capability::TaskCockpit));
+        assert!(
+            matches!(record.command, NativeHostCommand::TerminalInput(ref accepted) if accepted == &request)
+        );
+        let mut stale = request.clone();
+        stale.context.resource_generation += 1;
+        assert!(interaction.terminal_input(stale).is_none());
+        let mut foreign = request.clone();
+        foreign.context.resource_id = ResourceId::new();
+        assert!(interaction.terminal_input(foreign).is_none());
+        let mut provider_as_shell = request;
+        provider_as_shell.context.resource_id = provider;
+        assert!(interaction.terminal_input(provider_as_shell).is_none());
+    }
+
+    #[test]
+    fn ssh_panel_accepts_exact_open_after_projection_and_keeps_conversation_visible() {
+        if rerun_headless_shell_test_in_child("ui::native_shell::tests::ssh_panel_accepts_exact_open_after_projection_and_keeps_conversation_visible") { return; }
+        gpui::Application::headless().run(|cx| {
+            crate::ui::init(cx);
+            let (runtime, shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
+            with_test_shell_in_app(cx, runtime, |shell| {
+                shell.install_idle_conversation_photo_for_test();
+                let (model, task_id) = terminal_bound_client_model();
+                let model = Arc::new(model);
+                shell.apply_client_model(model.clone()).unwrap();
+                let owner = shell.local_task_key(task_id);
+                shell
+                    .select_fleet_task_key(owner.clone(), FleetSelectMode::Replace)
+                    .unwrap();
+                shared.lock().unwrap().accepted.clear();
+                shell.open_ssh_connection("saved-server".into());
+                shell.open_ssh_connection("saved-server".into());
+                let requests = shared
+                    .lock()
+                    .unwrap()
+                    .accepted
+                    .iter()
+                    .filter(|a| {
+                        matches!(
+                            a.command,
+                            NativeHostCommand::TaskCockpitQuery {
+                                query: TaskCockpitQuery::OpenSshTerminal { .. },
+                                ..
+                            }
+                        )
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    requests.len(),
+                    1,
+                    "duplicate connect while the owned request is pending"
+                );
+                let action = requests[0].clone();
+                shell
+                    .local_slot_mut()
+                    .interaction
+                    .set_client_model(Some(model.clone()));
+                let resource = ResourceId::new();
+                let provider =
+                    provider_terminal_projection_for_test(&model, task_id, 1).resource_id;
+                let strip = shell_strip_for_test(task_id, provider, &[resource], Some(resource));
+                shell.apply_epoch_fenced_action_outcome(NativeHostActionOutcome::Queried {
+                    action,
+                    detail: "SSH opened".into(),
+                    body: NativeHostQueryBody::TaskCockpit(
+                        crate::domain::TaskCockpitResult::TaskTerminals(strip),
+                    ),
+                });
+                assert!(shell.ssh_ui.pending.is_none());
+                assert_eq!(
+                    shell.ssh_ui.active.as_ref().map(|(_, _, id)| *id),
+                    Some(resource)
+                );
+                assert_eq!(shell.pane_view(&owner), PaneView::Conversation);
+                assert!(shell.ssh_terminal_is_visible(&owner));
+                let wide = shell.ssh_workspace_size(size(px(1200.0), px(800.0)));
+                assert_eq!(wide, size(px(596.0), px(800.0)));
+                let narrow = shell.ssh_workspace_size(size(px(700.0), px(800.0)));
+                assert_eq!(narrow, size(px(700.0), px(396.0)));
             });
             crate::ui::finish_headless_test(cx);
         });

@@ -5,11 +5,67 @@ launch platforms. macOS is outside the verified launch scope because no Mac
 test machine is available. This Linux machine cannot certify the Windows
 desktop or installer.
 Linux production packaging and a real signed 0.4.1 → 0.4.2 AppImage upgrade
-pass. The final native ext4 serial library suite passed: **4,180 passed, zero failed,
+pass. The latest serial Linux library suite passed: **4,188 passed, zero failed,
 22 ignored**. Exact-session identity checks, native contracts, the real WebKit
 engine, CLI/updater/package contracts, and the locked all-target compiler check
 are recorded below. Windows desktop and installer acceptance still require a
 Windows machine; public release promotion has not occurred.
+
+## Restored SSH list and task-side terminals
+
+Saved SSH connections are back in the sidebar with Add, Edit and Remove.
+Selecting a server opens its native terminal beside the selected local task's
+conversation; narrower windows stack the two panels. Hide keeps the connection
+running, reopening reuses it, and Disconnect waits for the host to retire the
+exact terminal before returning the conversation to full width. A selected
+local task supplies ownership, cleanup and workspace context. The implementation
+shares the existing managed PTY and native terminal renderer on Windows/Linux.
+
+The host resolves OpenSSH and the exact saved endpoint. Default OpenSSH keys,
+agent and configuration apply; saved private keys retain their existing secure
+materialization lifetime. Password and host-key prompts stay in the terminal.
+The editor preserves saved authentication fields, and Remove archives the
+saved row without stopping an open terminal. These host-local mutations are
+explicitly unavailable over Browser Connect.
+
+Live Linux acceptance used a private loopback SSH server and private keys/config.
+The actual native UI passed saved-list creation/edit/removal, host-key confirmation,
+public-key authentication, immediate physical keyboard input, Ctrl+U editing,
+drag selection copied through the desktop clipboard, wheel scrolling and return
+to the prompt, wide/stacked layouts, hide/reopen and exact disconnect. The SSH
+client PID and its durable running-process row were both gone after Disconnect.
+This pass also repaired shared terminal input incorrectly requiring an LLM agent
+and terminal controls accidentally capturing host-global rather than task-scoped
+admission. Production configuration hashes and the installed app identity stayed
+unchanged throughout isolated verification.
+
+Verification: the SSH group passed **96 tests**; the complete serial Linux
+library suite passed **4,188 tests, zero failed, 22 ignored**. The locked
+library/bin/test compiler check and changed-source formatting passed. All 21
+native UI contracts and 18 browser recipe integration tests passed. Private
+captures and process evidence are in `launch-evidence/ssh-restoration/`, including
+`input-visible.png`, `scroll-restored.png`, `narrow-stacked.png`,
+`edit-final.png`, and `disconnect-settled.png`. The lead-derived visual direction
+extends the existing native shell: the saved list stays below the task rail;
+the conversation and SSH share the available width with existing surface,
+text and border roles, and stack below 900 px of workspace width. Captures used
+1800×1000 and 1100×900 windows at 1×, the existing dark appearance, and the real
+GPUI/X11 renderer. These captures verify those states; independent design review
+and Windows interactive acceptance remain release-review work.
+
+The prior Windows candidate passed **4,297 library tests**. Its four browser
+recipe integration failures expected internal reasons in deliberately redacted
+public errors. The assertions now verify the typed internal reason separately
+from the unchanged redacted public surface. The new Windows CI run must still
+establish the final candidate result.
+
+The rebuilt AppImage was installed at
+`/home/robin/Applications/DevManager.AppImage` and visually inspected on the
+actual KDE desktop with both the SSH section and Git control present. Its
+SHA-256 is `8bc4b7cd741dd8a4804144ba13ad63feabdf1baa3fc00196d9503596cd5ee1f7`;
+process-to-window was 614 ms. The old windowless installed client, the desktop
+manager's restored client, and their exact host were joined before replacement.
+The new installed app remains open; configuration hashes are unchanged.
 
 ## Restored Git desktop window
 

@@ -765,7 +765,9 @@ pub const fn cockpit_query_action_id(query: &TaskCockpitQuery) -> &'static str {
         TaskCockpitQuery::ConfigSnapshot => ACTION_WORKSPACE_STATUS,
         TaskCockpitQuery::AgentConnection => ACTION_HOST_STATUS,
         TaskCockpitQuery::ConfigCreateProject { .. } => ACTION_CONFIG_CREATE_PROJECT,
-        TaskCockpitQuery::ConfigUpsertCommand { .. } => ACTION_CONFIG_UPSERT_COMMAND,
+        TaskCockpitQuery::ConfigUpsertCommand { .. }
+        | TaskCockpitQuery::ConfigUpsertSsh { .. }
+        | TaskCockpitQuery::ConfigArchiveSsh { .. } => ACTION_CONFIG_UPSERT_COMMAND,
         TaskCockpitQuery::ConfigArchiveCommand { .. } => ACTION_CONFIG_ARCHIVE_COMMAND,
         TaskCockpitQuery::ConfigRunCommand { .. } => ACTION_CONFIG_RUN_COMMAND,
         TaskCockpitQuery::ConfigCommandDetail { .. } => ACTION_CONFIG_COMMAND_DETAIL,
@@ -792,7 +794,9 @@ pub const fn cockpit_query_action_id(query: &TaskCockpitQuery) -> &'static str {
         | TaskCockpitQuery::TerminalResizeFor { .. }
         | TaskCockpitQuery::TerminalReadinessFor { .. }
         | TaskCockpitQuery::TaskTerminals => ACTION_TERMINAL_VIEW,
-        TaskCockpitQuery::OpenShellTerminal { .. } => ACTION_TERMINAL_OPEN_SHELL,
+        TaskCockpitQuery::OpenShellTerminal { .. } | TaskCockpitQuery::OpenSshTerminal { .. } => {
+            ACTION_TERMINAL_OPEN_SHELL
+        }
         TaskCockpitQuery::WorkspaceStatus => ACTION_WORKSPACE_STATUS,
         TaskCockpitQuery::GitRepositories => ACTION_GIT_REPOSITORIES,
         TaskCockpitQuery::GitStatus
