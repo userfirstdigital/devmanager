@@ -1076,7 +1076,10 @@ fn linux_delete_tombstone_replacement_fails_closed_without_clobbering_writer() {
 #[cfg(target_os = "linux")]
 #[test]
 fn linux_delete_source_is_rebound_before_handle_relative_detach() {
-    let source = include_str!("../src/workspace/files.rs");
+    let source = include_str!("../src/workspace/files.rs")
+        .split_once("fn delete_unix_if_identity(")
+        .expect("Linux delete implementation")
+        .1;
     let pause = source
         .find("test_pause(TEST_PAUSE_BEFORE_OLD_DETACH);")
         .expect("delete detach race pause exists");
@@ -1788,20 +1791,20 @@ fn secret_like_paths_are_classified_without_leaking_values_in_errors() {
     let entries = service.list(None, 8).expect("list secret-like fixture");
     assert_eq!(entries[0].secret, SecretClassification::SecretLike);
 
-    let current = service
+    let read_error = service
         .read(".env.local", ReadOptions::default())
-        .expect("read secret-like fixture");
-    let plan = service
+        .expect_err("ordinary content reads must reject secret-like files");
+    assert!(matches!(read_error, FileServiceError::SecretLikePath));
+    assert!(!read_error.to_string().contains("super-secret-value"));
+    let error = service
         .plan_write(
             ".env.local",
             b"replacement-secret-value".to_vec(),
-            ExpectedRevision::exact(current.revision),
+            ExpectedRevision::missing(),
         )
-        .expect("plan secret-like write");
-    fs::write(&target, b"API_TOKEN=changed-secret-value").expect("change secret-like fixture");
-    let error = service
-        .execute_write(plan)
-        .expect_err("stale plan must conflict");
+        .expect_err("an existing secret file must not be replaced by a missing expectation");
+    assert!(matches!(error, FileServiceError::Conflict { .. }));
+    assert_eq!(fs::read(&target).unwrap(), b"API_TOKEN=super-secret-value");
     let display = error.to_string();
     assert!(!display.contains("replacement-secret-value"));
     assert!(!display.contains("changed-secret-value"));
@@ -1867,7 +1870,10 @@ fn replacing_the_bound_root_with_a_reparse_target_fails_closed() {
             ExpectedRevision::missing(),
         )
         .is_err());
-    let _ = fs::remove_dir(&original);
+    #[cfg(unix)]
+    fs::remove_file(&original).expect("remove test root symlink");
+    #[cfg(windows)]
+    fs::remove_dir(&original).expect("remove test root junction");
     fs::rename(moved, original).expect("restore bound root after rejection");
 }
 
@@ -1903,7 +1909,10 @@ fn planned_write_rejects_a_reparse_swap_before_execution() {
         error,
         FileServiceError::ReparseRejected { .. } | FileServiceError::OutsideWorkspace { .. }
     ));
-    let _ = fs::remove_dir(&parent);
+    #[cfg(unix)]
+    fs::remove_file(&parent).expect("remove test parent symlink");
+    #[cfg(windows)]
+    fs::remove_dir(&parent).expect("remove test parent junction");
     fs::rename(moved, parent).expect("restore original parent");
     assert_eq!(fs::read(target).expect("read restored target"), b"inside");
 }
@@ -2372,15 +2381,20 @@ fn mutation_plans_and_results_have_redacted_debug_output() {
     assert!(!plan_debug.contains("<secret-like-path>"));
     assert!(!service_debug.contains(root_text.as_str()));
 
-    fs::write(temp.path().join(".env.local"), b"existing").expect("write secret target");
+    // Exercise delete-preview redaction using a readable ordinary path;
+    // secret-like contents are deliberately unavailable through read().
+    fs::write(temp.path().join("review-notes.txt"), b"existing").expect("write target");
     let revision = service
-        .read(".env.local", ReadOptions::default())
-        .expect("read secret target");
+        .read("review-notes.txt", ReadOptions::default())
+        .expect("read target");
     let preview = service
-        .plan_delete(".env.local", ExpectedRevision::exact(revision.revision))
-        .expect("plan secret delete");
+        .plan_delete(
+            "review-notes.txt",
+            ExpectedRevision::exact(revision.revision),
+        )
+        .expect("plan delete");
     let preview_debug = format!("{preview:?}");
-    assert!(!preview_debug.contains(".env.local"));
+    assert!(!preview_debug.contains("review-notes.txt"));
     assert!(!preview_debug.contains(root_text.as_str()));
     assert!(!preview_debug.contains("<secret-like-path>"));
 }

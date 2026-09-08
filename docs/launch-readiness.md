@@ -148,6 +148,25 @@ custody keys; the separately recorded real wallet acceptance remains applicable.
 Production config/remote hashes are unchanged and no owned build/test process
 remains. A live remote enrollment/Noise session is still a launch gate.
 
+### Linux file mutation flags
+
+Linux recovery now opens directory descriptors read-only, as required by
+`openat`/`renameat`/`unlinkat`; requesting `O_RDWR` on a directory had failed
+with `EISDIR`. Sibling temporary files now explicitly request `O_RDWR`, fixing
+writes failing with `EBADF`. Cleanup directories are created with private mode
+from the first syscall. The existing identity/CAS and recovery checks remain.
+
+The real host create/update/conflict regression passed, all **83 file-service
+integration tests passed**, and **261 workspace library tests passed** (one
+existing ignore). Coverage includes concurrent writes, permission preservation,
+root/parent replacement, exact cleanup ownership and deadline recovery. Fixed
+portable test cleanup of symlinks and aligned old fixtures with the existing
+secret-content read refusal; the production refusal was not relaxed. All-target
+check and formatting passed. Logs: `linux-production/files-{host,integration,
+workspace,check}.log`. This acceptance used workspaces on the same filesystem as
+the isolated temporary directory; cross-filesystem cleanup remains to be checked.
+Production config/remote hashes and installed-process baseline remain unchanged.
+
 ## Live desktop inspection
 
 The rebuilt native shell now launches with its real sibling host on this Linux

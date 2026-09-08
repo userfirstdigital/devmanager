@@ -5276,7 +5276,14 @@ fn open_nofollow(path: &Path, directory: bool, write: bool) -> io::Result<File> 
         ));
     }
     let mut options = fs::OpenOptions::new();
-    options.read(true).write(write);
+    options.read(true);
+    // Unix directory mutation is authorized by the retained directory fd and
+    // pathname permissions. Opening a directory O_RDWR fails with EISDIR;
+    // openat/renameat/unlinkat need its readable descriptor instead.
+    #[cfg(unix)]
+    options.write(write && !directory);
+    #[cfg(not(unix))]
+    options.write(write);
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt;
@@ -5795,7 +5802,8 @@ fn create_sibling_temp(
             use std::ffi::CString;
             use std::os::fd::{AsRawFd, FromRawFd};
             let name_c = CString::new(intent_name.as_str()).map_err(io::Error::other)?;
-            let flags = 0x40 | 0x80 | unix_o_cloexec() | unix_o_nofollow();
+            let flags =
+                libc::O_CREAT | libc::O_EXCL | libc::O_RDWR | unix_o_cloexec() | unix_o_nofollow();
             let fd = unsafe { unix_at::openat(_parent.as_raw_fd(), name_c.as_ptr(), flags, 0o600) };
             if fd < 0 {
                 let error = io::Error::last_os_error();
@@ -7623,25 +7631,16 @@ fn cleanup_authority(deadline: &OperationDeadline) -> io::Result<&'static Cleanu
     let suffix = encode_nonce(&random);
     let path = std::env::temp_dir().join(format!(".devmanager-file-cleanup-{suffix}"));
     check_deadline_io(deadline)?;
-    fs::create_dir(&path)?;
-    if let Err(error) = check_deadline_io(deadline) {
-        let _ = fs::remove_dir(&path);
-        return Err(error);
-    }
-    // Restrict the held directory to this user. This is deliberately outside
-    // every workspace. The private directory is only an exact-identity hold;
-    // a same-UID process that bypasses this boundary remains out of scope.
     {
-        use std::os::unix::fs::PermissionsExt;
-        if let Err(error) = fs::set_permissions(&path, fs::Permissions::from_mode(0o700)) {
-            let _ = fs::remove_dir(&path);
-            return Err(error);
-        }
+        use std::os::unix::fs::DirBuilderExt;
+        fs::DirBuilder::new().mode(0o700).create(&path)?;
     }
     if let Err(error) = check_deadline_io(deadline) {
         let _ = fs::remove_dir(&path);
         return Err(error);
     }
+    // This private directory retains exact identities outside the workspace.
+    // Same-UID processes bypassing the boundary remain out of scope.
     let handle = match open_nofollow(&path, true, true) {
         Ok(handle) => handle,
         Err(error) => {
