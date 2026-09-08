@@ -74,6 +74,14 @@ jobs:
           cargo test --locked --all-targets --target-dir "$env:CARGO_TARGET_DIR" -j 2 -- --test-threads=1 2>&1 | Tee-Object launch-evidence/tests.log
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
 
+      - name: Build desktop acceptance archive
+        shell: pwsh
+        run: |
+          cargo build --locked --bin devmanager --bin devmanager-host --target-dir "$env:CARGO_TARGET_DIR" -j 2
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          python packaging/assemble-launch-candidate.py
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+
       - name: Check for owned process residue
         if: always()
         shell: pwsh
@@ -97,3 +105,90 @@ jobs:
         with:
           name: windows-launch-verification
           path: launch-evidence/*.log
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        if: success()
+        with:
+          name: windows-desktop-candidate
+          path: dist/launch-candidates/*
+          if-no-files-found: error
+
+  linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: "1.94.0"
+          components: rustfmt
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install Linux desktop and test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential clang cmake pkg-config libssl-dev \
+            libasound2-dev libfontconfig-dev libglib2.0-dev libwayland-dev \
+            libx11-xcb-dev libxkbcommon-x11-dev libvulkan1 mesa-vulkan-drivers \
+            libzstd-dev dbus-user-session systemd-container lsof xvfb xauth
+          sudo loginctl enable-linger "$USER"
+          sudo systemctl start "user@$(id -u).service"
+          echo "XDG_RUNTIME_DIR=/run/user/$(id -u)" >> "$GITHUB_ENV"
+          echo "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus" >> "$GITHUB_ENV"
+
+      - name: Prepare isolated target and reviewed WASM inputs
+        run: |
+          python packaging/prepare-ci-checkout.py
+          mkdir -p launch-evidence
+          systemctl --user show-environment > /dev/null
+          test -f /sys/fs/cgroup/cgroup.controllers
+
+      - name: Check formatting and browser build
+        run: |
+          cargo fmt --all -- --check
+          npm --prefix web ci --no-audit --no-fund
+          npm --prefix web audit --audit-level=high
+          npm --prefix web test
+          npm --prefix web run build
+          GIT_OPTIONAL_LOCKS=0 git diff --exit-code -- web/bundle
+
+      - name: Compile all targets and verify library and desktop contracts
+        run: |
+          set -o pipefail
+          python packaging/assert-linux-process-clean.py
+          cargo check --locked --lib --bins --tests -j 2 2>&1 | tee launch-evidence/compiler.log
+          cargo build --locked --bin devmanager-process-test-helper -j 2 2>&1 | tee launch-evidence/process-helper.log
+          cargo test --locked --lib exact_resume_mismatch -j 2 -- --test-threads=1 2>&1 | tee launch-evidence/session-identity.log
+          xvfb-run -a cargo test --locked --test ui_native_shell -j 2 -- --test-threads=1 2>&1 | tee launch-evidence/native-contract.log
+          cargo test --locked --lib -j 2 -- --test-threads=1 2>&1 | tee launch-evidence/library.log
+          cargo test --locked --test file_service -j 2 -- --test-threads=1 2>&1 | tee launch-evidence/files.log
+
+      - name: Build desktop acceptance archive
+        run: |
+          cargo build --locked --bin devmanager --bin devmanager-host -j 2
+          python packaging/assemble-launch-candidate.py
+
+      - name: Check for owned process residue
+        if: always()
+        run: python packaging/assert-linux-process-clean.py
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        if: always()
+        with:
+          name: linux-launch-verification
+          path: launch-evidence/*.log
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        if: success()
+        with:
+          name: linux-desktop-candidate
+          path: dist/launch-candidates/*
+          if-no-files-found: error

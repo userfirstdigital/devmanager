@@ -4,7 +4,13 @@ Candidate branch: `codex/launch-ready-20260907`. Windows and Linux are required
 launch platforms. macOS is outside the verified launch scope because no Mac
 test machine is available. This Linux machine cannot certify the Windows
 desktop or installer.
-The candidate is not release-approved.
+The candidate is not release-approved. The latest complete Linux library run
+is green: **4,111 passed, zero failed, 20 ignored** on `d61142e4`. Native
+client/host integration (21 tests), exact-resume mismatch (four tests), file
+integration (83 tests), and all-target compiler checks passed. Real Windows
+desktop/install validation, Linux embedded-browser and package/update support,
+Cursor discovery, cross-filesystem file cleanup, historical stranded recovery
+receipts, and live remote enrollment still require acceptance.
 
 ## Implemented
 
@@ -192,6 +198,33 @@ and the all-target check passed (`linux-production/updater-platform-{fixtures,
 check}.log`). No production updater behavior changed. Real Linux package
 construction, paired binary names/staging and install/update acceptance remain
 separate gates; these state tests do not certify an installer.
+
+### Complete serial Linux verification, full6
+
+On `d61142e4`, helper build, four exact-resume mismatch checks and 21 native
+client/host contract checks passed before `cargo test --locked --lib --
+--test-threads=1`. The library run completed with **4,111 passed, zero failed,
+20 ignored**, in 232.61 seconds. No external `DEVMANAGER_PROFILE` was set and
+no other Rust build/test or isolated app was running. All owned compiler,
+harness and app processes were absent afterward; production config/remote
+hashes matched the baseline. Logs: `linux-production/full6-*.log`.
+
+### Windows and Linux candidate automation
+
+The candidate workflow now includes Ubuntu 24.04 with a systemd user session,
+cgroup v2, desktop dependencies, all-target compilation, serial library tests,
+and native/file integration checks. Both platforms build debug desktop archives
+containing only the two product binaries and explicit shipping resource roots,
+plus a source/hash manifest. Archive contents are checked against that allowlist
+and each recorded hash. No test harness, profile, conversation or evidence tree
+is included. Linux process cleanup auditing is scoped to the isolated target.
+
+The YAML, shell and Python scripts pass parsing checks. The remote CI jobs have
+not run here; Windows artifacts and acceptance still require an authenticated
+Windows-capable runner. Linux dependencies were checked against the GPUI
+upstream's [Linux build guidance](https://zed.dev/docs/development/linux) and
+[dependency script](https://github.com/zed-industries/zed/blob/main/script/linux).
+These are acceptance archives, not signed release installers.
 
 ## Live desktop inspection
 
