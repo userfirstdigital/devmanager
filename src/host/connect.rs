@@ -2040,6 +2040,7 @@ mod tests {
                     expected_task_revision: None,
                     command: Command::ArmUpdateInstall(ArmUpdateInstallIntent {
                         token_id: uuid::Uuid::nil(),
+                        stop_host_after_ack: false,
                     }),
                 }),
             )

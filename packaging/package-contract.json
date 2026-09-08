@@ -50,6 +50,17 @@
     "assets",
     "third_party/ghostty"
   ],
+  "linux": {
+    "platform": "linux-x86_64",
+    "format": "appimage",
+    "minimumDistribution": "Ubuntu 24.04 or compatible glibc 2.39+ desktop",
+    "desktop": "X11 or Wayland with XWayland",
+    "installLocation": "Executable AppImage in a directory owned by the current user",
+    "identityTrailer": "DEVMANAGER-AI-V1",
+    "runtime": ["GTK 3", "WebKitGTK 4.1", "GIO TLS modules", "GStreamer"],
+    "toolPins": "packaging/linux-appimage-tools.json",
+    "builder": "packaging/build-linux-appimage.py"
+  },
   "webview2": {
     "windowsExpectation": "Evergreen WebView2 Runtime required for wry/webview2-com browser surfaces",
     "dependencyCrates": [

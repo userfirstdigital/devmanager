@@ -779,10 +779,21 @@ impl AtomicInstallerBundle {
     ) -> Result<Self, String> {
         let client_build = client_build.into();
         let host_build = host_build.into();
+        let linux = proof.packager_target.starts_with("linux-");
         let bundle = Self {
             version: proof.version,
-            client_exe: "devmanager.exe".to_string(),
-            host_exe: "devmanager-host.exe".to_string(),
+            client_exe: if linux {
+                "devmanager"
+            } else {
+                "devmanager.exe"
+            }
+            .to_string(),
+            host_exe: if linux {
+                "devmanager-host"
+            } else {
+                "devmanager-host.exe"
+            }
+            .to_string(),
             client_build,
             host_build,
             protocol_major,
@@ -892,10 +903,28 @@ pub fn assert_atomic_installer_bundle(
     if !bundle.signature_verified_by_packager {
         return Err(AtomicBundleError::SignatureNotVerifiedByPackager);
     }
-    if bundle.client_exe != "devmanager.exe" {
+    let linux = bundle.packager_target.starts_with("linux-");
+    if linux && bundle.format != "appimage" {
+        return Err(AtomicBundleError::ProtocolMismatch {
+            detail: "Linux updates require a whole AppImage.".into(),
+        });
+    }
+    if bundle.client_exe
+        != if linux {
+            "devmanager"
+        } else {
+            "devmanager.exe"
+        }
+    {
         return Err(AtomicBundleError::MissingClientExe);
     }
-    if bundle.host_exe != "devmanager-host.exe" {
+    if bundle.host_exe
+        != if linux {
+            "devmanager-host"
+        } else {
+            "devmanager-host.exe"
+        }
+    {
         return Err(AtomicBundleError::MissingHostExe);
     }
     let client_version = extract_build_version(&bundle.client_build);
@@ -1159,7 +1188,7 @@ pub fn capture_preservation_checkpoint(
 pub struct HostUpdateHandoff {
     machine: UpdateHandoffMachine,
     admission: HostUpdateAdmission,
-    /// True after [`Self::begin_atomic_install`]; abort-to-ready is refused.
+    /// True after [`Self::seal_after_durable_stage`]; abort-to-ready is refused.
     install_irreversible: bool,
 }
 
@@ -1249,7 +1278,7 @@ impl HostUpdateHandoff {
     }
 
     /// Full pre-install gate: probe → refuse unsafe silent → expiring token → drain/confirm.
-    /// Remains abortable until [`Self::begin_atomic_install`].
+    /// Remains abortable until [`Self::seal_after_durable_stage`].
     pub fn run_pre_install_gate(
         &mut self,
         probe: &mut dyn ActiveResourceProbe,
@@ -1362,6 +1391,14 @@ impl HostUpdateHandoff {
                 expected: "pre-irreversible handoff",
                 observed: self.machine.phase().clone(),
             });
+        }
+        // The machine's Installing state also represents the reversible arm.
+        // Only this owner knows whether durable staging sealed it. Restore the
+        // pre-install state exclusively after the irreversible guard above.
+        if let UpdateHandoffPhase::Installing { token } = self.machine.phase() {
+            self.machine.phase = UpdateHandoffPhase::ReadyToInstall {
+                token: token.clone(),
+            };
         }
         self.machine.abort_pre_install()?;
         self.machine.return_to_ready_after_abort()?;

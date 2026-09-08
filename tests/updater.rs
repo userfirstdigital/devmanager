@@ -149,13 +149,8 @@ fn release_packaging_runs_independently_of_verify_but_stage_requires_verify() {
         "build must still wait for version preparation"
     );
     assert!(
-        stage_header.contains("needs: [verify, prepare, build]")
-            || stage_header.contains("needs: [prepare, build, verify]")
-            || stage_header.contains("needs: [build, verify, prepare]")
-            || stage_header.contains("needs: [verify, build, prepare]")
-            || stage_header.contains("needs: [prepare, verify, build]")
-            || stage_header.contains("needs: [build, prepare, verify]"),
-        "stage must require verify, prepare, and build together"
+        stage_header.contains("needs: [verify, prepare, build, build-linux]"),
+        "stage must require verification and every platform packaging job"
     );
     assert!(
         !publish_header.contains("needs:"),
@@ -260,7 +255,7 @@ fn release_latest_json_includes_protocol_hash_and_build_identity() {
         .nth(1)
         .and_then(|tail| tail.split("\n  publish:").next())
         .expect("stage job");
-    assert!(release_job.contains("\"minimum_protocol\": \"1.0\""));
+    assert!(release_job.contains("\"minimum_protocol\": f\"{contract['protocol']['major']}.{contract['protocol']['minor']}\""));
     assert!(release_job.contains("\"hash\": f\"sha256:{digest}\""));
     assert!(release_job.contains("\"client_build\": f\"devmanager/{version}\""));
     assert!(release_job.contains("\"host_build\": f\"devmanager-host/{version}\""));

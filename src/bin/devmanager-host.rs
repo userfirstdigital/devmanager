@@ -92,6 +92,10 @@ fn main() -> ExitCode {
     // settings point back to this executable. Relay subcommands must exit
     // before ctl parsing, HostLock acquisition, or server bootstrap.
     let args = std::env::args().skip(1).collect::<Vec<_>>();
+    if args.as_slice() == ["--package-identity"] {
+        println!("{}", devmanager::updater::shipping_package_metadata("host"));
+        return ExitCode::SUCCESS;
+    }
     if let Some(exit_code) =
         devmanager::ai::claude_hooks::run_hook_relay_subcommand(&args, std::io::stdin().lock())
     {
@@ -1187,12 +1191,19 @@ fn spawn_connection_task(
         // Duplex serve owns reader+writer halves until disconnect; abort/drain
         // of this JoinSet task reaps both halves with the connection lifecycle.
         let client_id = connection.client_id();
+        #[cfg(debug_assertions)]
         let matched_slow = slow_durable_reader_client_id == Some(client_id);
+        #[cfg(debug_assertions)]
         let result = if matched_slow {
             connection
                 .serve_duplex_for_test_slow_durable_reader(requests)
                 .await
         } else {
+            connection.serve_duplex(requests).await
+        };
+        #[cfg(not(debug_assertions))]
+        let result = {
+            let _ = slow_durable_reader_client_id;
             connection.serve_duplex(requests).await
         };
         if let Err(error) = result {
@@ -1471,12 +1482,19 @@ async fn serve_foreground_host(
 
 #[cfg(any(windows, target_os = "linux"))]
 fn installed_binaries_dir() -> Result<std::path::PathBuf, String> {
-    let exe = std::env::current_exe().map_err(|error| {
-        format!("unable to resolve host executable for update recovery: {error}")
-    })?;
-    exe.parent()
-        .map(Path::to_path_buf)
-        .ok_or_else(|| "host executable has no parent directory".to_string())
+    #[cfg(target_os = "linux")]
+    {
+        devmanager::updater::appimage::installed_recovery_directory()
+    }
+    #[cfg(windows)]
+    {
+        let exe = std::env::current_exe().map_err(|error| {
+            format!("unable to resolve host executable for update recovery: {error}")
+        })?;
+        exe.parent()
+            .map(Path::to_path_buf)
+            .ok_or_else(|| "host executable has no parent directory".to_string())
+    }
 }
 
 /// New production host startup: validate durable handoff marker against live
@@ -1488,6 +1506,8 @@ fn complete_update_handoff_recovery_if_present(
     server_build: &str,
     updater: &UpdaterService,
 ) -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    devmanager::updater::appimage::recover_running_image()?;
     let install_dir = installed_binaries_dir()?;
     let Some(marker) = read_update_handoff_recovery_marker(&install_dir)? else {
         return Ok(());
@@ -1501,7 +1521,11 @@ fn complete_update_handoff_recovery_if_present(
         PROTOCOL_MAJOR,
         PROTOCOL_MINOR,
         std::time::SystemTime::now(),
-        move || clear_update_handoff_recovery_marker(&install_dir_for_clear),
+        move || {
+            #[cfg(target_os = "linux")]
+            devmanager::updater::appimage::finalize_running_image(&install_dir_for_clear)?;
+            clear_update_handoff_recovery_marker(&install_dir_for_clear)
+        },
     )
 }
 

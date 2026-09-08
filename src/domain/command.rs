@@ -1402,6 +1402,8 @@ pub struct PrepareUpdateIntent {
     pub target_version: String,
     pub client_build: String,
     pub host_build: String,
+    /// Explicit install confirmation also authorizes uninspected worktrees
+    /// when the host has no agent or resource blockers. It does not drain them.
     pub allow_explicit_confirm_with_active: bool,
 }
 
@@ -1415,6 +1417,10 @@ pub struct ConfirmUpdateDrainIntent {
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct ArmUpdateInstallIntent {
     pub token_id: Uuid,
+    /// Retire the idle old host after its acknowledgement is physically written.
+    /// This does not permanently close the durable host admission journal.
+    #[serde(default)]
+    pub stop_host_after_ack: bool,
 }
 
 pub fn decide(

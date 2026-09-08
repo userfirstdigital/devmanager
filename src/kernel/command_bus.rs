@@ -811,6 +811,32 @@ impl CommandBus {
         Ok(closing)
     }
 
+    /// Update retirement may preserve Open admission only when there is no
+    /// remaining runtime or effect work. Read every check in one snapshot.
+    pub(crate) fn verify_idle_update_retirement(&self) -> Result<(), StoreError> {
+        let conn = self.store.open_query_connection()?;
+        let tx = conn.unchecked_transaction()?;
+        if host_admission_is_closing(&tx)? {
+            return Err(StoreError::Io(
+                "Host shutdown is already in progress.".into(),
+            ));
+        }
+        let inspection = inspect_host_quit_in_tx(&tx)?;
+        let pending: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM outbox WHERE state IN
+             ('pending', 'claimed', 'dispatching', 'reconcile_required', 'reconciling')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !inspection.agents.is_empty() || !inspection.resources.is_empty() || pending != 0 {
+            return Err(StoreError::Io(
+                "Close active sessions and wait for pending work before updating.".into(),
+            ));
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Advance exactly one host-cleanup unit under Closing admission.
     ///
     /// Resumes at the first absent fixed branch. TaskTeardowns may Progress by
@@ -2150,6 +2176,80 @@ mod terminal_and_provider_restart_tests {
         assert_eq!(intent.resource_id, provider_resource_id);
         assert_ne!(intent.resource_id, shell.id);
         assert_eq!(intent.agent_session_id, agent.id);
+    }
+
+    #[test]
+    fn archived_conversation_identity_is_not_a_host_quit_blocker() {
+        use crate::domain::agent::{AgentRole, AgentSessionFacts, AgentSessionLifecycle};
+        use crate::host::{ProcessEmptyTeardown, ProcessEmptyTeardownWorker};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kernel.sqlite3");
+        let mut bus = CommandBus::open(&path).unwrap();
+        let client = ClientId::new();
+        let (task, revision) = create_open_task(&mut bus, client);
+        let agent = AgentSessionId::new();
+        let revision = accepted_revision(
+            bus.execute_for_test(task_envelope(
+                client,
+                task,
+                revision,
+                Command::RegisterAgentSession {
+                    agent: AgentSessionFacts {
+                        id: agent,
+                        task_id: task,
+                        role: AgentRole::Primary,
+                        provider_kind: crate::providers::ProviderKind::Codex,
+                        provider_session_id: Some("archived-conversation".parse().unwrap()),
+                        lifecycle: AgentSessionLifecycle::Open,
+                        runtime_generation: 0,
+                        revision: 0,
+                    },
+                },
+            ))
+            .unwrap(),
+        );
+        assert_eq!(bus.inspect_host_quit().unwrap().agents.len(), 1);
+        let revision = accepted_revision(
+            bus.execute_for_test(task_envelope(
+                client,
+                task,
+                revision,
+                Command::BeginCloseTask,
+            ))
+            .unwrap(),
+        );
+        assert_eq!(bus.inspect_host_quit().unwrap().agents.len(), 1);
+        assert!(matches!(
+            ProcessEmptyTeardownWorker::run_once(&mut bus).unwrap(),
+            ProcessEmptyTeardown::Settled { .. }
+        ));
+        let inspection = bus.inspect_host_quit().unwrap();
+        assert!(inspection.agents.is_empty());
+        assert!(inspection.resources.is_empty());
+        drop(bus);
+        let mut bus = CommandBus::open(&path).unwrap();
+        assert_eq!(bus.inspect_host_quit().unwrap(), inspection);
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let (state, identity): (String, String) = conn
+            .query_row(
+                "SELECT lifecycle, provider_session_id FROM agent_sessions",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(state, "open");
+        assert_eq!(identity, "archived-conversation");
+        drop(conn);
+        accepted_revision(
+            bus.execute_for_test(task_envelope(
+                client,
+                task,
+                revision + 1,
+                Command::ReopenTask,
+            ))
+            .unwrap(),
+        );
+        assert_eq!(bus.inspect_host_quit().unwrap().agents.len(), 1);
     }
 
     fn accepted_revision(receipt: CommandReceipt) -> u64 {
@@ -12404,6 +12504,18 @@ fn inspect_host_quit_in_tx(conn: &Connection) -> Result<HostQuitInspection, Stor
             continue;
         }
         let task = load_task_row(conn, agent.task_id)?.ok_or(StoreError::Corruption)?;
+        // Archive retains the primary provider conversation identity for exact
+        // reopen. The completed teardown, not that retained Open identity,
+        // determines whether the session still blocks host retirement. Resource
+        // blockers are inspected independently below, even for archived tasks.
+        if matches!(
+            task.task.lifecycle,
+            TaskLifecycle::Archived | TaskLifecycle::Deleted
+        ) && agent.role == AgentRole::Primary
+            && agent.lifecycle == AgentSessionLifecycle::Open
+        {
+            continue;
+        }
         agents.push(HostQuitAgentBlocker {
             agent_session_id: agent.id,
             task_id: agent.task_id,

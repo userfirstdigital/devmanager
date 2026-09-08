@@ -7806,19 +7806,19 @@ fn cleanup_authority(deadline: &OperationDeadline) -> io::Result<&'static Cleanu
 fn discover_cleanup_authority(deadline: &OperationDeadline) -> io::Result<()> {
     check_deadline_io(deadline)?;
     let root = std::env::temp_dir();
+    scan_cleanup_authorities(&root, deadline)?;
+    let _ = cleanup_authority(deadline)?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn scan_cleanup_authorities(root: &Path, deadline: &OperationDeadline) -> io::Result<()> {
     check_deadline_io(deadline)?;
-    let entries = fs::read_dir(&root)?;
+    let entries = fs::read_dir(root)?;
     let mut scanned = 0_usize;
     let mut settled = 0_usize;
     for entry in entries {
         check_deadline_io(deadline)?;
-        scanned = scanned.saturating_add(1);
-        if scanned > MAX_SEARCH_ENTRIES {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                "cleanup authority scan exceeded bound",
-            ));
-        }
         let entry = match entry {
             Ok(entry) => entry,
             Err(_) => continue,
@@ -7839,6 +7839,17 @@ fn discover_cleanup_authority(deadline: &OperationDeadline) -> io::Result<()> {
         if !is_private_cleanup_authority(&authority)? {
             continue;
         }
+        // The system temp directory is shared with unrelated applications.
+        // Its ordinary entries must not exhaust our recovery-record budget.
+        // Every entry still consumes the same absolute deadline; only verified
+        // cleanup authorities and their children consume this count bound.
+        scanned = scanned.saturating_add(1);
+        if scanned > MAX_SEARCH_ENTRIES {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                "cleanup authority scan exceeded bound",
+            ));
+        }
         check_deadline_io(deadline)?;
         let children = match read_directory_from_handle(&authority, &path) {
             Ok(children) => children,
@@ -7854,8 +7865,39 @@ fn discover_cleanup_authority(deadline: &OperationDeadline) -> io::Result<()> {
         )?;
     }
     check_deadline_io(deadline)?;
-    let _ = cleanup_authority(deadline)?;
     Ok(())
+}
+
+#[cfg(all(test, target_os = "linux"))]
+#[test]
+fn cleanup_authority_scan_ignores_unrelated_entries_but_retains_bounds() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    for index in 0..=MAX_SEARCH_ENTRIES {
+        fs::write(root.path().join(format!("unrelated-{index}")), b"keep").unwrap();
+    }
+    scan_cleanup_authorities(root.path(), &OperationDeadline::new()).unwrap();
+    assert_eq!(fs::read(root.path().join("unrelated-0")).unwrap(), b"keep");
+    assert_eq!(
+        scan_cleanup_authorities(
+            root.path(),
+            &OperationDeadline::with_duration(Duration::ZERO)
+        )
+        .unwrap_err()
+        .kind(),
+        io::ErrorKind::TimedOut,
+    );
+    for index in 0..=MAX_SEARCH_ENTRIES {
+        let authority = root
+            .path()
+            .join(format!(".devmanager-file-cleanup-{index}"));
+        fs::create_dir(&authority).unwrap();
+        fs::set_permissions(&authority, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let error = scan_cleanup_authorities(root.path(), &OperationDeadline::new()).unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("cleanup authority scan exceeded bound"));
 }
 
 #[cfg(target_os = "linux")]

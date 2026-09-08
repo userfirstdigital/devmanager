@@ -5,7 +5,7 @@ use gtk::prelude::*;
 use javascriptcore::ValueExt;
 use std::io::Write;
 use webkit2gtk::{FileChooserRequestExt, PermissionRequestExt, WebViewExt};
-use wry::WebViewExtUnix;
+use wry::{WebViewBuilderExtUnix, WebViewExtUnix};
 
 // Each callback is admitted under the retained view before WebKit can own it.
 // Callbacks hold a weak registry reference, so they cannot keep the view alive.
@@ -17,9 +17,24 @@ struct PendingCall {
 
 pub(super) struct WebView {
     native: wry::WebView,
+    window: OwnedGtkWindow,
     calls: Rc<std::cell::RefCell<HashMap<u64, PendingCall>>>,
     next_call: Cell<u64>,
     upload: Rc<std::cell::RefCell<Option<NativeUpload>>>,
+}
+
+// A normal GTK realization owns and registers its GDK window. Wry's X11
+// foreign-window adapter replaces that registered window during realization;
+// its deferred close can later abort in gtk_widget_unregister_window.
+// Keep the actual GTK owner alive until WebKit drops, then destroy it on this
+// same GTK thread, including on failed builds.
+struct OwnedGtkWindow(gtk::Window);
+impl Drop for OwnedGtkWindow {
+    fn drop(&mut self) {
+        // SAFETY: this wrapper exclusively owns the native toplevel, and every
+        // WebKit child has already been dropped before this field is dropped.
+        unsafe { self.0.destroy() };
+    }
 }
 
 struct NativeUpload {
@@ -70,11 +85,63 @@ impl WebView {
     pub(super) fn show_at_bounds(&self, bounds: Rect) -> wry::Result<()> {
         // GTK ignores allocation of a hidden widget. Showing after allocating
         // can restore its natural content size and leave most of the dock black.
-        self.native.set_visible(true)?;
-        self.native.set_bounds(bounds)
+        self.set_visible(true)?;
+        self.set_bounds(bounds)
     }
 
-    pub(super) fn new(native: wry::WebView) -> Self {
+    pub(super) fn build_child(
+        builder: wry::WebViewBuilder<'_>,
+        parent: &impl raw_window_handle::HasWindowHandle,
+        bounds: Rect,
+    ) -> wry::Result<Self> {
+        let parent = match parent.window_handle()?.as_raw() {
+            raw_window_handle::RawWindowHandle::Xlib(parent) => parent.window,
+            _ => return Err(wry::Error::UnsupportedWindowHandle),
+        };
+        let window = OwnedGtkWindow(gtk::Window::new(gtk::WindowType::Toplevel));
+        window.0.set_decorated(false);
+        window.0.set_skip_taskbar_hint(true);
+        window.0.realize();
+        let container = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        window.0.add(&container);
+        let native = builder.build_gtk(&container)?;
+        let view = Self::new(native, window);
+        let child = child_hwnd_from_webview(&view).map_err(|_| wry::Error::X11DisplayNotFound)?;
+        let parent = BrowserWindowHandle::from_raw(parent)
+            .map_err(|_| wry::Error::UnsupportedWindowHandle)?;
+        super::super::linux_window::reparent(&child, &parent)
+            .map_err(|error| wry::Error::Io(std::io::Error::other(error)))?;
+        view.show_at_bounds(bounds)?;
+        view.set_visible(false)?;
+        Ok(view)
+    }
+
+    pub(super) fn set_visible(&self, visible: bool) -> wry::Result<()> {
+        if visible {
+            self.window.0.show_all();
+        } else {
+            self.window.0.hide();
+        }
+        self.native.set_visible(visible)
+    }
+
+    pub(super) fn set_bounds(&self, bounds: Rect) -> wry::Result<()> {
+        let scale = self.window.0.scale_factor() as f64;
+        let (x, y) = bounds.position.to_logical::<i32>(scale).into();
+        let (width, height): (i32, i32) = bounds.size.to_logical::<i32>(scale).into();
+        let window = self
+            .window
+            .0
+            .window()
+            .ok_or(wry::Error::X11DisplayNotFound)?;
+        window.move_resize(x, y, width.max(1), height.max(1));
+        self.window
+            .0
+            .size_allocate(&gtk::Allocation::new(0, 0, width.max(1), height.max(1)));
+        Ok(())
+    }
+
+    fn new(native: wry::WebView, window: OwnedGtkWindow) -> Self {
         let upload: Rc<std::cell::RefCell<Option<NativeUpload>>> = Rc::default();
         let slot = Rc::downgrade(&upload);
         native
@@ -107,6 +174,7 @@ impl WebView {
         });
         Self {
             native,
+            window,
             calls: Rc::default(),
             next_call: Cell::new(0),
             upload,
@@ -729,11 +797,19 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let parent = Parent::new();
         let mut context = WebContext::new(Some(temp.path().join("webkit")));
-        let native = WebViewBuilder::new_with_web_context(&mut context)
+        let builder = WebViewBuilder::new_with_web_context(&mut context)
             .with_html(r#"<!doctype html><title>Linux adapter acceptance</title><input type="file" multiple id="upload" data-devmanager-upload="live-upload"><p>WebKit native lifecycle</p><div style="background:rgb(16,185,129);width:160px;height:100px"></div>"#)
-            .with_bounds(Rect { position: PhysicalPosition::new(0, 0).into(), size: PhysicalSize::new(800, 600).into() })
-            .build_as_child(&parent).expect("real Wry child");
-        let view = WebView::new(native);
+            .with_bounds(Rect { position: PhysicalPosition::new(0, 0).into(), size: PhysicalSize::new(800, 600).into() });
+        let view = WebView::build_child(
+            builder,
+            &parent,
+            Rect {
+                position: PhysicalPosition::new(0, 0).into(),
+                size: PhysicalSize::new(800, 600).into(),
+            },
+        )
+        .expect("real GTK child");
+        view.set_visible(true).unwrap();
         let state = Arc::new(BrowserDocumentSecretState::default());
         let key = BrowserWorkspaceKey::new("linux-native-test", "conversation").unwrap();
         let (errors_tx, errors_rx) = std::sync::mpsc::channel();
@@ -854,8 +930,13 @@ mod tests {
             canceled_callback.set(true)
         });
         assert_eq!(view.calls.borrow().len(), 1);
+        let top = view.webview().toplevel().unwrap();
+        let destroyed = Rc::new(Cell::new(false));
+        let destroyed_callback = destroyed.clone();
+        top.connect_destroy(move |_| destroyed_callback.set(true));
         host.views.clear();
         until(|| canceled.get());
+        until(|| destroyed.get());
         assert!(!super::super::super::linux_window::is_window(&child).unwrap());
         destroy_host_owned_parking_hwnd(parking);
         assert!(!super::super::super::linux_window::is_window(&parking_handle).unwrap());

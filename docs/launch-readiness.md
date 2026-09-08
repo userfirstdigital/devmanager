@@ -1,16 +1,130 @@
-# Launch candidate, 2026-09-07
+# Launch candidate, 2026-09-08
 
 Candidate branch: `codex/launch-ready-20260907`. Windows and Linux are required
 launch platforms. macOS is outside the verified launch scope because no Mac
 test machine is available. This Linux machine cannot certify the Windows
 desktop or installer.
-The candidate is not release-approved. The latest complete Linux library run
-is green: **4,111 passed, zero failed, 20 ignored** on `d61142e4`. Native
-client/host integration (21 tests), exact-resume mismatch (four tests), file
-integration (83 tests), and all-target compiler checks passed. Real Windows
-desktop/install validation and Linux production package/update support still
-require acceptance. Linux remote enrollment and encrypted paged synchronization
-have passed; the native browser follow-up is recorded below.
+Linux production packaging and a real signed 0.4.1 → 0.4.2 AppImage upgrade
+pass. The final serial library suite passed: **4,178 passed, zero failed,
+22 ignored**. Exact-session identity checks, native contracts, the real WebKit
+engine, CLI/updater/package contracts, and the locked all-target compiler check
+are recorded below. Windows desktop and installer acceptance still require a
+Windows machine; public release promotion has not occurred.
+
+## Linux production package and updater acceptance
+
+The candidate now builds a standard x86-64 AppImage on Ubuntu 24.04. It bundles
+both product binaries, GTK/WebKit helpers, TLS and GStreamer modules, and their
+runtime libraries. Every packaged ELF uses a relative runtime search path;
+provider subprocesses do not inherit a global library-path override. The
+builder executes both packaged identities and checks version, protocol, and
+payload/binary hashes. Release assembly and signing now include the Linux
+AppImage and its updater manifest entry. See `packaging/README-linux.md`.
+
+A whole-image updater verifies the existing release signature and immutable
+artifact hash, stages the exact replacement in a private recovery directory,
+and exchanges the old/new image atomically after the old host is joined. Its
+journal validates the physical old/new pair during recovery; the new matching
+host finalizes the handoff. The desktop execs the replacement after native
+teardown, and an exec failure restores the previous image. The detached host
+launches through the AppImage runtime so its mount survives client close.
+
+Live package acceptance exposed and corrected a rejected first-send lifecycle:
+a concurrent Browser mutation can invalidate the send's captured task revision.
+A definitive rejection now clears the exact pending send, preserves the draft,
+and keeps the healthy host connected so the user can send again. Linux CLI
+acceptance also now runs the shared production transport path. Checkout binaries
+ignore AppImage environment inherited from a launching IDE, while binaries
+inside their own AppImage still require valid package identity.
+
+The native settings now expose Updates, including check, download, and
+install/restart, and poll the live service for asynchronous progress. Fresh XDG
+config bases are created before canonicalization. Task and terminal menus stay
+within the right window edge and bound their scrollable height.
+
+The packaged AppImage passed real WebKit rendering, typing, control-key editing,
+clicks, downloads and HTTPS loading. The provider terminal passed physical text,
+Ctrl+U editing, exact drag/copy, and wheel scrolling through a 90-line response.
+Archiving the task removed its exact provider/guardian processes and running
+ledger row. The right-edge task menu stayed entirely within the native window.
+
+The signed upgrade rejected a corrupted download without modifying the installed
+image. With valid bytes, the old host exited at 0.52 seconds, image exchange
+occurred at 1.47 seconds, the new client started at 2.41 seconds and the new host
+at 2.85 seconds. Config/remote hashes were unchanged, the host admission remained
+Open, and both recovery journals cleared. Update retirement now uses a tracked
+physical acknowledgement and the exact OS process handle; it does not write a
+permanent host-close journal. An exclusive profile reservation spans image commit.
+
+The final packaged pass also exposed readiness-query starvation when another dock
+refresh advanced the UI epoch during first Send. Its regression first failed with
+zero sends, then passed after the exact task/runtime readiness lease gained its
+own reply admission. Connection, runtime and task action-epoch checks remain in
+force. The serial library suite, four session-identity checks, 21 native contracts,
+real WebKit engine check, nine CLI integrations, 45 updater/package contracts,
+and locked all-target compiler check passed. The final rebuilt first-send and
+fallback-launch acceptance pass; these paragraphs do not constitute Windows
+release approval. All package fixtures and signing keys are
+private evidence and must never enter a source commit or release artifact.
+
+The final live iteration also found three lifecycle gaps. An archived primary
+conversation identity is retained for exact reopen but no longer counts as a
+running host session; active resources remain independent update blockers. The
+Linux browser now owns a normally realized GTK window and destroys it after
+WebKit, with a regression that waits for native destruction and a packaged close
+that records exit code zero. Native browser surfaces park beneath application
+menus and dialogs. Closing the last task pane clears its owning selection so a
+later canonical refresh cannot reopen it.
+
+First-send readiness uses the host-attested provider launch epoch, which is
+independent of the task's durable close/reopen epoch. The regression now uses
+a fresh task at epoch zero and a provider at epoch one, alongside an interleaved
+dock query. Provider, task, resource, runtime, and connection identity checks
+remain in place.
+
+Full native UX acceptance (`43432536dce45846d1fecc09c563786026d74d24e304fe688cc18676098dbeaf`, before the final temporary-directory recovery fix):
+
+- The signed upgrade preserved all 77 durable events byte-for-byte, unchanged
+  config/remote hashes, and Open host admission; both recovery journals cleared.
+  Physical host exit preceded image exchange (0.52s vs 1.62s); the replacement
+  client and host appeared at 2.59s and 3.04s.
+- First Send followed immediately by Browser automatically launched the selected
+  GPT-5.6 Sol model, delivered exactly one input, received `LINUX FINAL READY`,
+  and cleared the draft. No manual terminal launch or send retry was needed.
+- Native typing, Ctrl+U, exact drag/copy and wheel up/down passed in the final
+  artifact. Browser menus and Settings park the native child and restore it on
+  dismissal. Closing with Browser open exits with code zero.
+- Warm reopening retained the exact host, provider PID/start time, conversation
+  identity, and runtime generation. Process-to-window was 0.756s;
+  window-to-first-task-row was at most 0.257s.
+- Archive completed durable teardown, removed the exact provider and ledger
+  entry, and persisted an empty selection/workspace. Reopening stayed empty.
+- Quiet 20-second samples on the software-rendered private X11 display measured
+  terminal client/host at 16.53%/1.45% of one core, browser at 5.64%/0.65%.
+  These are software-display measurements, not GPU desktop benchmarks.
+
+The serial rerun exposed a Linux file-write denial after the shared temporary
+directory accumulated more than 1,024 unrelated entries. Cleanup discovery now
+charges its count bound only to verified private cleanup authorities and their
+records, while every scanned directory entry remains under the absolute
+deadline. The regression covers more than 1,024 ordinary entries, the unchanged
+limit on actual recovery authorities, and deadline expiry. The real host
+FilesWrite authorization test then passed against the same crowded directory.
+
+The final AppImage SHA-256 is
+`47792f2e04334aee1265f6ed0f4aac5e0b8489a549c0e80e43a847ddb91066e3`.
+Its signed upgrade preserved all 119 durable events byte-for-byte and both
+config/remote hashes. The old host exited at 0.52s, image exchange occurred at
+1.43s, and the replacement client/host appeared at 2.49s/2.91s. Host admission
+remained Open and both journals cleared. First Send followed by Browser delivered
+one accepted input exactly once, displayed `SHIPPING LINUX READY.`, and cleared
+the composer. Archive removed the exact provider PID and emptied its running
+ledger; the packaged client then closed with exit code zero.
+
+The final serial run also includes a deterministic test-only Claude hook
+publication fix: SessionStart publication finishes before the test arms its
+UserPromptSubmit pause. HTTP admission alone does not prove callback publication.
+
 
 ## Linux native browser startup and interaction
 
@@ -466,24 +580,24 @@ replace the pending complete serial library run. Evidence is private under
 Production config/remote hashes are unchanged; all owned app/host/provider and
 build/test processes exited after this pass.
 
-- [ ] Complete Linux provider ownership and discovery,
+- [x] Complete Linux provider ownership and discovery,
       protected storage, workspace mutation and process reporting.
-- [ ] Pass Linux integration/serial library checks, real provider desktop input,
+- [x] Pass Linux integration/serial library checks, real provider desktop input,
       restart/recovery and native package installation.
 
 - [ ] Obtain a green Windows candidate workflow on the final commit, including
       all-target compilation, serial tests, browser checks and packaging scans.
-- [ ] Capture the full rebuilt native shell at reference geometry and compare
+- [ ] On Windows, capture the full rebuilt native shell at reference geometry and compare
       composition, spacing, hierarchy and palette with the approved references.
-- [ ] Use the actual rendered provider prompt to verify immediate keyboard text,
+- [ ] On Windows, use the actual rendered provider prompt to verify immediate keyboard text,
       control-key editing, drag/copy and wheel scrolling; exercise divider
       dragging, questions/permissions, exact resume/recovery and restart state.
 - [ ] Verify signed packages and isolated install/update behavior on Windows.
 - [ ] Push and review the candidate, then complete release promotion.
 
-GitHub authentication is unavailable here: HTTPS has no credentials and SSH
-was rejected. No branch, tag, installer or release has been published. The
-candidate workflow deliberately has no publication step.
+GitHub authentication became available during final verification. The verified
+candidate can now be pushed for Windows/Linux CI. The candidate workflow
+deliberately has no publication step; no public release has been promoted.
 
 ## Isolation
 
@@ -494,7 +608,7 @@ before normalizing CRLF-only changes; its staged tree was unchanged.
 
 Production `config.json` and `remote.json` hashes match the captured baseline.
 No installed DevManager process was present at baseline or after verification.
-No installed app or production configuration was changed. Test-owned provider
+Verification did not change an installed app or production configuration. Test-owned provider
 conversations were created and exercised in the isolated project.
 `launch-evidence` contains private local verification and recovery data and is
 not part of the candidate commit.

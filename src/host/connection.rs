@@ -1913,6 +1913,7 @@ impl HostRequestHandle {
             Ok(crate::host::update::update_inspection_from_host_quit(
                 &inspection,
                 host_boot_id,
+                false,
             ))
         })
     }
@@ -2921,6 +2922,7 @@ pub struct HostRequestExecutor {
     outputs: HashMap<ConnectionOutputId, ConnectionOutputHandle>,
     /// Latest accepted ConfirmHostQuit receipt ack per output (for terminal drain).
     pending_quit_receipt_acks: HashMap<ConnectionOutputId, PendingQuitReceiptAck>,
+    pending_update_exit: Option<PendingQuitReceiptAck>,
     /// Exact PrepareUpdate replies retained for same-command retries after a
     /// client delivery failure or connection-epoch mismatch.
     prepared_update_replies: HashMap<crate::domain::id::CommandId, PreparedUpdateReply>,
@@ -3307,6 +3309,7 @@ impl HostRequestExecutor {
             test_semantic_journal: None,
             outputs: HashMap::with_capacity(MAX_SNAPSHOT_SESSIONS),
             pending_quit_receipt_acks: HashMap::with_capacity(MAX_SNAPSHOT_SESSIONS),
+            pending_update_exit: None,
             prepared_update_replies: HashMap::with_capacity(MAX_PREPARED_UPDATE_HANDOFFS),
             arm_tx: Some(arm_tx),
             workspace_coordinator: WorkspaceResourceCoordinator::new(),
@@ -3408,6 +3411,7 @@ impl HostRequestExecutor {
             test_semantic_journal: None,
             outputs: HashMap::with_capacity(MAX_SNAPSHOT_SESSIONS),
             pending_quit_receipt_acks: HashMap::with_capacity(MAX_SNAPSHOT_SESSIONS),
+            pending_update_exit: None,
             prepared_update_replies: HashMap::with_capacity(MAX_PREPARED_UPDATE_HANDOFFS),
             arm_tx: None,
             workspace_coordinator: WorkspaceResourceCoordinator::new(),
@@ -3574,6 +3578,9 @@ impl HostRequestExecutor {
                         );
                     }
                     let _ = job.reply.send(result);
+                    if let Some(pending) = self.pending_update_exit.take() {
+                        return self.retire_idle_host_for_update(pending).await;
+                    }
                 }
                 control = self.control_rx.recv(), if !self.control_closed => {
                     let Some(control) = control else {
@@ -3791,6 +3798,7 @@ impl HostRequestExecutor {
                     let mapped = crate::host::update::update_inspection_from_host_quit(
                         &inspection,
                         Uuid::nil(),
+                        allow_explicit_confirm_with_active,
                     );
                     let mut probe = crate::updater::FixedActiveResourceProbe { inspection: mapped };
                     self.update_gate
@@ -5776,6 +5784,54 @@ impl HostRequestExecutor {
         }
     }
 
+    async fn retire_idle_host_for_update(
+        &mut self,
+        pending: PendingQuitReceiptAck,
+    ) -> Result<HostExecutorOutcome, StoreError> {
+        // The single request lane has accepted the idle inspection and arm.
+        // Stop admission before awaiting anything that could admit more work.
+        self.quiesce_intake();
+        let (ack_tx, ack_rx) = oneshot::channel();
+        self.arm_tx
+            .as_ref()
+            .ok_or_else(|| StoreError::Io("missing update exit supervisor".into()))?
+            .send(PhysicalExitArmRequest {
+                operation_id: pending.operation_id,
+                action_epoch: 1,
+                ack: ack_tx,
+            })
+            .await
+            .map_err(|_| StoreError::Io("update exit arm rejected".into()))?;
+        ack_rx
+            .await
+            .map_err(|_| StoreError::Io("update exit arm dropped".into()))?;
+        let deadline = Instant::now() + QUIT_TERMINAL_ACK_TIMEOUT;
+        // No durable terminal is invented for an update. Finish admitted history
+        // and the install acknowledgement before disconnecting each output.
+        let mut fences = FuturesUnordered::new();
+        for entry in self.replay_registry.entries.values() {
+            if let Some(live) = &entry.live {
+                let stream = Arc::clone(&live.stream);
+                let target = live.last_admitted_sequence;
+                fences.push(async move {
+                    stream.wait_until_physically_written(target).await;
+                });
+            }
+        }
+        let _ = tokio::time::timeout(deadline.saturating_duration_since(Instant::now()), async {
+            let _ = pending.ack.wait().await;
+            while fences.next().await.is_some() {}
+        })
+        .await;
+        for output in self.outputs.values() {
+            output.request_shutdown();
+        }
+        Ok(HostExecutorOutcome::Intentional {
+            operation_id: pending.operation_id,
+            action_epoch: 1,
+        })
+    }
+
     async fn arm_and_complete_intentional_quit(
         &mut self,
         operation_id: OperationId,
@@ -6170,12 +6226,50 @@ impl HostRequestExecutor {
         output_id: Option<ConnectionOutputId>,
         routing: HostRequestCompletionRouting,
     ) -> Result<DuplexExecuteCompletion, IpcError> {
+        let retire_for_update = matches!(&request,
+            ClientRequest::Command(envelope)
+                if matches!(&envelope.command, Command::ArmUpdateInstall(intent) if intent.stop_host_after_ack));
+        if retire_for_update {
+            if self.arm_tx.is_none()
+                || output_id.and_then(|id| self.outputs.get(&id)).is_none()
+                || !matches!(
+                    routing,
+                    HostRequestCompletionRouting::ExecutorOwnsAcceptedHostQuitReceipt
+                )
+            {
+                return Err(IpcError::Unsupported);
+            }
+            self.bus
+                .verify_idle_update_retirement()
+                .map_err(map_store_error)?;
+        }
         let is_confirm_host_quit = matches!(
             &request,
             ClientRequest::Command(envelope)
                 if matches!(envelope.command, Command::ConfirmHostQuit(_))
         );
         let response = self.dispatch(negotiated, request, output_id)?;
+        if retire_for_update {
+            if let ServerMessage::CommandReceipt(CommandReceipt::Accepted {
+                operation_id, ..
+            }) = &response
+            {
+                let operation_id = *operation_id;
+                let output = self
+                    .outputs
+                    .get(&output_id.ok_or(IpcError::Unavailable)?)
+                    .ok_or(IpcError::Unavailable)?;
+                let ack = match output.try_enqueue_critical_tracked(response) {
+                    Ok(ack) => ack,
+                    Err(error) => {
+                        let _ = self.update_gate.abort_pre_install();
+                        return Err(error);
+                    }
+                };
+                self.pending_update_exit = Some(PendingQuitReceiptAck { operation_id, ack });
+                return Ok(DuplexExecuteCompletion::ExecutorAdmittedQuitReceipt { operation_id });
+            }
+        }
         if !matches!(
             routing,
             HostRequestCompletionRouting::ExecutorOwnsAcceptedHostQuitReceipt
@@ -8860,6 +8954,7 @@ impl HostRequestExecutor {
                 let mapped = crate::host::update::update_inspection_from_host_quit(
                     &inspection,
                     host_boot_id,
+                    intent.allow_explicit_confirm_with_active,
                 );
                 let mut probe = crate::updater::FixedActiveResourceProbe { inspection: mapped };
                 let token = self
@@ -14522,6 +14617,120 @@ mod output_tests {
             .expect("cursor continuation")
             .events
             .is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn update_retirement_waits_for_physical_ack_and_preserves_restartable_history() {
+        use super::HostExecutorOutcome;
+        use crate::domain::command::{ArmUpdateInstallIntent, CommandReceipt};
+        use crate::domain::id::CommandId;
+        use crate::kernel::CommandBus;
+        use crate::updater::{FixedActiveResourceProbe, UpdateResourceInspection};
+        use std::time::SystemTime;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("update-restart.db");
+        let mut bus = CommandBus::open(&path).unwrap();
+        let client = ClientId::new();
+        let task = create_task_for_conversation_wake(&mut bus, client);
+        let before = bus.task_snapshot(task).unwrap().unwrap();
+        let (requests, mut supervised) =
+            HostRequestExecutor::start_supervised_without_automatic_maintenance(bus);
+        let gate = requests.update_runtime_gate();
+        let mut probe = FixedActiveResourceProbe {
+            inspection: UpdateResourceInspection {
+                inspection_id: 1,
+                host_boot_id: Uuid::now_v7(),
+                active: vec![],
+                confirmable: true,
+            },
+        };
+        let token = gate
+            .prepare_update(
+                &mut probe,
+                "0.4.3",
+                "devmanager/0.4.3",
+                "devmanager-host/0.4.3",
+                SystemTime::now(),
+                true,
+            )
+            .unwrap();
+        gate.confirm_drain(token.token_id, SystemTime::now())
+            .unwrap();
+        let (out, mut ports) = ConnectionOutputHandle::new(4, 8, 1);
+        let reg = requests.register_output(out).await.unwrap();
+        let negotiated = host_shutdown_negotiated(client);
+        let arm_request = |token_id| {
+            ClientRequest::Command(CommandEnvelope {
+                command_id: CommandId::new(),
+                client_id: client,
+                task_id: None,
+                issued_at_ms: 1_725_000_000_000,
+                expected_task_revision: None,
+                command: Command::ArmUpdateInstall(ArmUpdateInstallIntent {
+                    token_id,
+                    stop_host_after_ack: true,
+                }),
+            })
+        };
+        assert!(
+            requests
+                .execute_for_duplex(negotiated.clone(), arm_request(token.token_id))
+                .await
+                .is_err(),
+            "a missing physical output cannot retire the host"
+        );
+        let handle = requests.with_output(reg.id());
+        assert!(
+            handle
+                .execute_for_duplex(negotiated.clone(), arm_request(Uuid::now_v7()))
+                .await
+                .is_err(),
+            "a foreign token cannot retire the host"
+        );
+        let completion = handle
+            .execute_for_duplex(negotiated, arm_request(token.token_id))
+            .await
+            .unwrap();
+        let DuplexExecuteCompletion::ExecutorAdmittedQuitReceipt { operation_id } = completion
+        else {
+            panic!("update ack must be owned by the physical writer");
+        };
+        let arm = supervised.arm_rx.recv().await.unwrap();
+        assert_eq!(arm.operation_id, operation_id);
+        assert!(!supervised.join.is_finished());
+        arm.ack.send(()).unwrap();
+        tokio::task::yield_now().await;
+        assert!(
+            !supervised.join.is_finished(),
+            "retirement waits for physical acknowledgement"
+        );
+        let outbound = ports.try_recv_prioritized().unwrap();
+        assert!(
+            matches!(outbound.message(), ServerMessage::CommandReceipt(CommandReceipt::Accepted { event_ids, .. }) if event_ids.is_empty())
+        );
+        outbound.after_successful_write();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), supervised.join)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap(),
+            HostExecutorOutcome::Intentional {
+                operation_id,
+                action_epoch: 1
+            }
+        );
+        drop(handle);
+        drop(reg);
+        drop(requests);
+        let bus = CommandBus::open(&path).unwrap();
+        assert!(!bus.host_admission_is_closing().unwrap());
+        assert!(matches!(
+            crate::host::HostCleanupWorker::restart_disposition(&bus).unwrap(),
+            crate::host::HostRestartDisposition::ServeResume
+        ));
+        assert_eq!(bus.task_snapshot(task).unwrap().unwrap(), before);
+        bus.verify_idle_update_retirement().unwrap();
     }
 
     #[tokio::test(flavor = "current_thread")]

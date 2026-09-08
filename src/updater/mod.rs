@@ -16,6 +16,8 @@ use std::sync::{
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+#[cfg(target_os = "linux")]
+pub mod appimage;
 pub mod handoff;
 pub mod replace;
 
@@ -174,6 +176,18 @@ pub enum PackageVersionSource {
     BinaryMetadata,
     /// Compile-time package metadata stamped into the binary.
     EmbeddedPackageMetadata,
+}
+
+/// Side-effect-free binary metadata used by package assembly before signing.
+pub fn shipping_package_metadata(role: &str) -> serde_json::Value {
+    serde_json::json!({
+        "role": role,
+        "version": env!("CARGO_PKG_VERSION"),
+        "client_build": env!("DEVMANAGER_SHIPPING_IDENTITY"),
+        "host_build": env!("DEVMANAGER_HOST_BUILD_IDENTITY"),
+        "protocol_major": crate::protocol::PROTOCOL_MAJOR,
+        "protocol_minor": crate::protocol::PROTOCOL_MINOR,
+    })
 }
 
 /// Why a remote candidate must not be admitted for download.
@@ -358,6 +372,8 @@ struct UpdaterInner {
     current_version: Version,
     config: Option<PackagerUpdaterConfig>,
     background_checks_started: AtomicBool,
+    process_must_exit: AtomicBool,
+    host_profile_root: Mutex<Option<std::path::PathBuf>>,
     state: RwLock<UpdaterState>,
     /// Shared host-owned FSM (bound from HostRequestHandle / tests).
     update_gate: Mutex<Option<Arc<HostUpdateRuntimeGate>>>,
@@ -500,6 +516,8 @@ impl UpdaterService {
                 current_version,
                 config,
                 background_checks_started: AtomicBool::new(false),
+                process_must_exit: AtomicBool::new(false),
+                host_profile_root: Mutex::new(None),
                 state: RwLock::new(UpdaterState {
                     snapshot,
                     pending_update: None,
@@ -514,6 +532,29 @@ impl UpdaterService {
                 live_protocol: Mutex::new(None),
             }),
         }
+    }
+
+    pub fn bind_host_profile_root(&self, root: &Path) {
+        *self
+            .inner
+            .host_profile_root
+            .lock()
+            .expect("new updater profile binding") = Some(root.to_path_buf());
+    }
+
+    pub fn capture_host_exit(
+        &self,
+        profile: &str,
+        boot_id: uuid::Uuid,
+    ) -> Result<crate::host::HostExitWait, String> {
+        let root = self
+            .inner
+            .host_profile_root
+            .lock()
+            .map_err(|_| "Host profile binding is unavailable.")?
+            .clone()
+            .ok_or("Host profile is not bound for update.")?;
+        crate::host::HostExitWait::capture(&root, profile, boot_id)
     }
 
     /// Bind the shared host-owned update FSM + timed IPC control + owned probe.
@@ -609,6 +650,12 @@ impl UpdaterService {
         gate.abort_pre_install()
             .map(|_| ())
             .map_err(|error| error.to_string())
+    }
+
+    /// Preserve the verified download when a fresh pre-install inspection
+    /// blocks the user's install request, before any handoff is prepared.
+    pub fn report_install_blocked(&self, detail: String) {
+        self.inner.restore_ready_snapshot(Some(detail));
     }
 
     /// Return the exact verified package identity used to request a host token.
@@ -824,42 +871,17 @@ impl UpdaterService {
             return Err(error);
         }
 
-        let install_dir = ready_update
-            .update
-            .extract_path
-            .clone()
-            .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| ready_update.update.extract_path.clone());
-        let staged_dir = install_dir.join(".devmanager-update-stage");
-        if let Err(error) = materialize_staged_binaries(
-            &staged_dir,
-            &ready_update.bytes,
-            &ready_update.package_identity,
-        ) {
-            let _ = self.abort_update_handoff();
-            self.inner.restore_ready_snapshot(Some(format!(
-                "Staging failed; ready update retained for retry: {error}"
-            )));
-            return Err(error);
-        }
-
-        let replacement = StagedBinaryReplacement::new(
-            &install_dir,
-            &staged_dir,
-            ready_update.package_identity.clone(),
-        );
-        if let Err(error) = replacement.validate_staged_payload() {
-            let _ = self.abort_update_handoff();
-            self.inner.restore_ready_snapshot(Some(error.to_string()));
-            return Err(error.to_string());
-        }
-        // Durable recoverable marker + backups before seal.
-        if let Err(error) = replacement.prepare_durable_backups() {
-            let _ = self.abort_update_handoff();
-            self.inner.restore_ready_snapshot(Some(error.to_string()));
-            return Err(error.to_string());
-        }
+        let mut replacement = match PreparedReplacement::prepare(&ready_update) {
+            Ok(replacement) => replacement,
+            Err(error) => {
+                let _ = self.abort_update_handoff();
+                self.inner.restore_ready_snapshot(Some(format!(
+                    "Staging failed; ready update retained for retry: {error}"
+                )));
+                return Err(error);
+            }
+        };
+        let install_dir = replacement.recovery_dir().to_path_buf();
         if drive_bound_host {
             let deadline = Instant::now() + UPDATE_IPC_DEADLINE;
             if let Ok(port) = self.inner.control_port.lock() {
@@ -901,9 +923,12 @@ impl UpdaterService {
         }
 
         let version = ready_update.update.version.clone();
-        match replacement.commit_after_durable_backups() {
+        match replacement.commit() {
             Ok(_) => {
                 let _ = self.inner.consume_ready_after_installer_launch();
+                self.inner
+                    .process_must_exit
+                    .store(true, AtomicOrdering::Release);
                 // Post-install host start/Hello is performed by the new process;
                 // old process must exit and must not assume continued execution.
                 Ok(InstallerLaunchOutcome {
@@ -913,7 +938,6 @@ impl UpdaterService {
                 })
             }
             Err(error) => {
-                let _ = replacement.recover_interrupted();
                 let _ = self.abort_update_handoff();
                 self.inner.restore_ready_snapshot(Some(format!(
                     "Staged replace failed; ready update retained when abortable: {error}"
@@ -953,6 +977,12 @@ impl UpdaterService {
         let token = self.prepare_update_install(options)?;
         self.launch_verified_installer(token.token_id)
             .map(|outcome| outcome.version)
+    }
+
+    /// A committed replacement requires native teardown even if the old host's
+    /// intentional disconnect fences its final UI action reply.
+    pub fn process_must_exit(&self) -> bool {
+        self.inner.process_must_exit.load(AtomicOrdering::Acquire)
     }
 
     pub fn snapshot(&self) -> UpdaterSnapshot {
@@ -1043,9 +1073,7 @@ impl UpdaterService {
                     }
                 }
                 Ok(None) => inner.finish_check_without_update(),
-                Err(error) => {
-                    inner.finish_check_error(check_plan, format!("Update check failed: {error}"))
-                }
+                Err(error) => inner.finish_check_error(check_plan, error),
             }
         });
         Ok(())
@@ -1106,6 +1134,98 @@ pub struct InstallerLaunchOutcome {
     pub process_must_exit: bool,
     /// New process must Hello the matching host and finish snapshot resync.
     pub require_host_hello_resync: bool,
+}
+
+enum ReplacementKind {
+    Binaries(StagedBinaryReplacement),
+    #[cfg(target_os = "linux")]
+    AppImage(appimage::AppImageReplacement),
+}
+
+struct PreparedReplacement {
+    kind: ReplacementKind,
+    committed: bool,
+}
+
+impl PreparedReplacement {
+    fn prepare(ready: &DownloadedUpdate) -> Result<Self, String> {
+        #[cfg(target_os = "linux")]
+        if ready.package_identity.format == "appimage" {
+            let image = appimage::running_image()?
+                .ok_or("Automatic Linux updates require the installed DevManager AppImage.")?;
+            if image != ready.update.extract_path {
+                return Err("The update target differs from the running AppImage.".into());
+            }
+            return Ok(Self {
+                kind: ReplacementKind::AppImage(appimage::AppImageReplacement::prepare(
+                    &image,
+                    &ready.bytes,
+                    &ready.package_identity,
+                )?),
+                committed: false,
+            });
+        }
+        let install_dir = ready
+            .update
+            .extract_path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| ready.update.extract_path.clone());
+        let staged_dir = install_dir.join(".devmanager-update-stage");
+        materialize_staged_binaries(&staged_dir, &ready.bytes, &ready.package_identity)?;
+        let replacement =
+            StagedBinaryReplacement::new(&install_dir, &staged_dir, ready.package_identity.clone());
+        replacement
+            .validate_staged_payload()
+            .map_err(|error| error.to_string())?;
+        replacement
+            .prepare_durable_backups()
+            .map_err(|error| error.to_string())?;
+        Ok(Self {
+            kind: ReplacementKind::Binaries(replacement),
+            committed: false,
+        })
+    }
+
+    fn recovery_dir(&self) -> &Path {
+        match &self.kind {
+            ReplacementKind::Binaries(replacement) => &replacement.install_dir,
+            #[cfg(target_os = "linux")]
+            ReplacementKind::AppImage(replacement) => replacement.recovery_dir(),
+        }
+    }
+
+    fn commit(&mut self) -> Result<(), String> {
+        match &self.kind {
+            ReplacementKind::Binaries(replacement) => replacement
+                .commit_after_durable_backups()
+                .map(|_| ())
+                .map_err(|error| error.to_string())?,
+            #[cfg(target_os = "linux")]
+            ReplacementKind::AppImage(replacement) => {
+                replacement.commit()?;
+                replacement.arm_restart()?;
+            }
+        }
+        self.committed = true;
+        Ok(())
+    }
+}
+
+impl Drop for PreparedReplacement {
+    fn drop(&mut self) {
+        if !self.committed {
+            match &self.kind {
+                ReplacementKind::Binaries(replacement) => {
+                    let _ = replacement.recover_interrupted();
+                }
+                #[cfg(target_os = "linux")]
+                ReplacementKind::AppImage(replacement) => {
+                    let _ = replacement.abort_prepared();
+                }
+            }
+        }
+    }
 }
 
 impl Default for UpdaterService {
@@ -1328,13 +1448,13 @@ impl UpdaterInner {
                 .lock()
                 .ok()
                 .and_then(|guard| guard.clone());
-            let host_build = match live_host {
-                Some(live) if live == pending.host_build => live,
+            match live_host {
+                Some(live) if live == format!("devmanager-host/{}", self.current_version) => {}
                 Some(live) => {
                     drop(state);
                     self.set_error(format!(
-                        "live Host Hello server_build `{live}` does not match release host_build `{}`",
-                        pending.host_build
+                        "live Host Hello server_build `{live}` does not match the running client version `{}`",
+                        self.current_version
                     ));
                     return;
                 }
@@ -1373,7 +1493,7 @@ impl UpdaterInner {
                 pending.protocol_major,
                 pending.protocol_minor,
                 pending.client_build.clone(),
-                host_build,
+                pending.host_build.clone(),
             ) {
                 Ok(identity) => identity,
                 Err(error) => {
@@ -1565,7 +1685,7 @@ pub fn is_remote_version_newer(
 ) -> Result<bool, String> {
     let current = parse_version(current_version)?;
     let remote = parse_version(remote_version)?;
-    Ok(remote > current)
+    Ok(remote.cmp_precedence(&current).is_gt())
 }
 
 /// Single semantic-version parser for installed and remote release identities.
@@ -1632,7 +1752,7 @@ pub fn evaluate_release_candidate(
     let remote = parse_version(&manifest.version)
         .map_err(|detail| UpdateRejection::InvalidRemoteVersion { detail })?;
 
-    match remote.cmp(&current.version) {
+    match remote.cmp_precedence(&current.version) {
         Ordering::Less => {
             return Err(UpdateRejection::Downgrade {
                 current: current.version.to_string(),
@@ -1747,10 +1867,10 @@ pub fn prefer_signed_manifest_over_stale_cache(
         .map_err(|detail| UpdateRejection::InvalidRemoteVersion { detail })?;
     let fresh_version = parse_version(&signed_fresh.version)
         .map_err(|detail| UpdateRejection::InvalidRemoteVersion { detail })?;
-    if fresh_version > cached_version {
+    if fresh_version.cmp_precedence(&cached_version).is_gt() {
         return Ok(signed_fresh.clone());
     }
-    if fresh_version == cached_version {
+    if fresh_version.cmp_precedence(&cached_version).is_eq() {
         return Ok(signed_fresh.clone());
     }
     Err(UpdateRejection::StaleCachedMetadata {
@@ -1828,7 +1948,8 @@ fn check_update_with_policy(
 ) -> Result<Option<PackagerUpdate>, String> {
     let config = apply_cache_busting_to_packager_config(config, policy)?;
 
-    let mut builder = UpdaterBuilder::new(current_version, config);
+    let mut builder = UpdaterBuilder::new(current_version, config)
+        .version_comparator(|current, remote| remote.version.cmp_precedence(&current).is_gt());
     for (key, value) in policy.header_pairs() {
         builder = builder
             .header(key, value)
@@ -2152,7 +2273,7 @@ fn split_config_list(value: Option<String>) -> Vec<String> {
 fn compare_versions(left: &str, right: &str) -> Result<Ordering, String> {
     let left = parse_version(left)?;
     let right = parse_version(right)?;
-    Ok(left.cmp(&right))
+    Ok(left.cmp_precedence(&right))
 }
 
 fn parse_version(value: &str) -> Result<Version, String> {
@@ -2284,6 +2405,8 @@ mod tests {
             current_version: Version::new(0, 2, 0),
             config: None,
             background_checks_started: AtomicBool::new(false),
+            process_must_exit: AtomicBool::new(false),
+            host_profile_root: Mutex::new(None),
             state: RwLock::new(UpdaterState {
                 snapshot: UpdaterSnapshot {
                     configured: true,
@@ -2327,9 +2450,42 @@ mod tests {
             client_build: format!("devmanager/{}", update.version),
             host_build: format!("devmanager-host/{}", update.version),
         };
-        *inner.live_host_build.lock().unwrap() = Some(admitted.host_build.clone());
+        *inner.live_host_build.lock().unwrap() =
+            Some(format!("devmanager-host/{}", inner.current_version));
         *inner.live_protocol.lock().unwrap() = Some((1, 0));
         inner.arm_pending_release_identity(&admitted).unwrap();
+    }
+
+    #[test]
+    fn downloaded_upgrade_binds_current_hello_separately_from_target_identity() {
+        let inner = test_inner();
+        let update = test_update("0.2.1", None);
+        arm_ready(&inner, &update, &[1, 2, 3]);
+        assert_eq!(
+            inner.live_host_build.lock().unwrap().as_deref(),
+            Some("devmanager-host/0.2.0")
+        );
+        inner.set_ready_to_install(update.clone(), vec![1, 2, 3]);
+        {
+            let state = inner.state.read().unwrap();
+            assert_eq!(state.snapshot.stage, UpdaterStage::ReadyToInstall);
+            assert_eq!(
+                state
+                    .ready_update
+                    .as_ref()
+                    .unwrap()
+                    .package_identity
+                    .host_build,
+                "devmanager-host/0.2.1"
+            );
+        }
+        arm_ready(&inner, &update, &[1, 2, 3]);
+        *inner.live_host_build.lock().unwrap() = Some("devmanager-host/0.2.1".into());
+        inner.set_ready_to_install(update, vec![1, 2, 3]);
+        assert_eq!(
+            inner.state.read().unwrap().snapshot.stage,
+            UpdaterStage::Error
+        );
     }
 
     #[test]

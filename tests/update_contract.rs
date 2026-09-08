@@ -512,7 +512,7 @@ fn owned_host_quit_probe_drains_confirms_and_aborts_before_irreversible() {
         worktrees: HostQuitWorktreeInspection::NotInspected,
         confirmable: true,
     };
-    let mapped = update_inspection_from_host_quit(&quit, boot);
+    let mapped = update_inspection_from_host_quit(&quit, boot, false);
     assert!(mapped.active.is_empty());
 
     let mut probe = owned_probe_from_quit_inspection(quit, boot);

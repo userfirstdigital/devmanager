@@ -1019,13 +1019,16 @@ impl BrowserNativeViewBuildJob {
                 bounds,
             );
             match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                builder.build_as_child(&parent_window)
-            })) {
-                Ok(Ok(webview)) => {
-                    #[cfg(target_os = "linux")]
-                    let webview = WebView::new(webview);
-                    Ok(webview)
+                #[cfg(target_os = "windows")]
+                {
+                    builder.build_as_child(&parent_window)
                 }
+                #[cfg(target_os = "linux")]
+                {
+                    WebView::build_child(builder, &parent_window, bounds)
+                }
+            })) {
+                Ok(Ok(webview)) => Ok(webview),
                 Ok(Err(error)) => Err(view_failure(error)),
                 Err(_payload) => Err(BrowserError::CrashedView {
                     message: "Wry panicked while creating a child WebView".to_string(),

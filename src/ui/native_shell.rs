@@ -796,7 +796,11 @@ fn first_send_terminal_runtime_live(
     terminal: &crate::domain::TaskTerminalProjection,
 ) -> bool {
     terminal.task_id == snapshot.task.id
+        && terminal.is_provider
         && snapshot.primary_agent_id == Some(terminal.agent_session_id)
+        // This is the host's provider-launch lease epoch, independently issued
+        // from the task's durable close/reopen epoch. The correlated host reply
+        // attests that lease; a fresh task may still have task.action_epoch=0.
         && terminal.action_epoch != 0
         && snapshot
             .agents
@@ -2448,8 +2452,12 @@ impl NativeHostBootstrap for ProcessNativeHostBootstrap {
                 message: "native host startup deadline expired before launch".to_string(),
             });
         }
-        let mut command = Command::new(&spec.executable);
-        command.args(spec.arguments());
+        #[cfg(target_os = "linux")]
+        let image = crate::updater::appimage::running_image()
+            .map_err(|message| NativeShellError::HostConnect { message })?;
+        #[cfg(not(target_os = "linux"))]
+        let image: Option<PathBuf> = None;
+        let mut command = native_host_launch_command(&spec, image.as_deref());
         sanitize_spawned_host_environment(&mut command);
         command.stdin(Stdio::null()).stdout(Stdio::null());
         if profile.is_production() {
@@ -2640,6 +2648,28 @@ fn spawn_durable_host_process(command: &mut Command) -> Result<Child, NativeShel
 #[cfg(not(windows))]
 fn spawn_durable_host_process(command: &mut Command) -> Result<Child, NativeShellError> {
     command.spawn().map_err(durable_host_launch_error)
+}
+
+/// A detached host owns its own AppImage runtime/mount. Launching the sibling
+/// directly would leave it alive after the client runtime unmounts its libraries.
+/// Parent-bound harness hosts share their client's bounded mount lifetime.
+fn native_host_launch_command(
+    spec: &NativeHostLaunchSpec,
+    verified_image: Option<&Path>,
+) -> Command {
+    if spec.child_ownership() == NativeHostChildOwnership::DetachOnClientClose {
+        if let Some(image) = verified_image {
+            let mut command = Command::new(image);
+            command.arg("--devmanager-host").args(spec.arguments());
+            for key in ["APPDIR", "APPIMAGE", "ARGV0", "OWD"] {
+                command.env_remove(key);
+            }
+            return command;
+        }
+    }
+    let mut command = Command::new(&spec.executable);
+    command.args(spec.arguments());
+    command
 }
 
 fn sanitize_spawned_host_environment(command: &mut Command) {
@@ -2904,6 +2934,9 @@ pub fn production_shell_profile() -> Result<IsolatedDevProfile, NativeShellError
     }
     let config_dir = dirs::config_dir().ok_or_else(|| NativeShellError::HostConnect {
         message: "unable to resolve config directory for production profile".to_string(),
+    })?;
+    std::fs::create_dir_all(&config_dir).map_err(|error| NativeShellError::HostConnect {
+        message: format!("unable to create config directory: {error}"),
     })?;
     let config_dir = config_dir
         .canonicalize()
@@ -3885,7 +3918,6 @@ pub struct NativeUpdateCommandIds {
     prepare: CommandId,
     confirm_drain: CommandId,
     arm_install: CommandId,
-    confirm_quit: CommandId,
 }
 
 impl NativeUpdateCommandIds {
@@ -3894,7 +3926,6 @@ impl NativeUpdateCommandIds {
             prepare: CommandId::new(),
             confirm_drain: CommandId::new(),
             arm_install: CommandId::new(),
-            confirm_quit: CommandId::new(),
         }
     }
 }
@@ -6381,19 +6412,30 @@ impl NativeHostClientRuntime {
         start_updater: bool,
     ) -> Result<Self, NativeShellError> {
         let updater = UpdaterService::new();
+        if owns_local_authority {
+            updater.bind_host_profile_root(profile.root());
+        }
         if start_updater && owns_local_authority {
             if let Ok(owned) = fleet.owner_metadata(&host_id) {
                 let meta = &owned.value;
+                #[cfg(target_os = "linux")]
+                let install_dir = Some(
+                    crate::updater::appimage::installed_recovery_directory()
+                        .map_err(|message| NativeShellError::HostConnect { message })?,
+                );
+                #[cfg(not(target_os = "linux"))]
                 let install_dir = std::env::current_exe()
                     .ok()
                     .and_then(|exe| exe.parent().map(Path::to_path_buf));
                 if let Some(install_dir) = install_dir.as_ref() {
-                    let _ = updater.observe_production_host_hello(
-                        meta.server_build(),
-                        meta.protocol_major(),
-                        meta.protocol_minor(),
-                        install_dir,
-                    );
+                    updater
+                        .observe_production_host_hello(
+                            meta.server_build(),
+                            meta.protocol_major(),
+                            meta.protocol_minor(),
+                            install_dir,
+                        )
+                        .map_err(|message| NativeShellError::HostConnect { message })?;
                 } else {
                     updater.bind_live_host_hello(
                         meta.server_build(),
@@ -8915,13 +8957,37 @@ async fn execute_native_update_install(
     let identity = updater
         .ready_update_identity()
         .map_err(IpcError::Security)?;
+    let inspection = fleet_inspect_host_quit(port)
+        .await?
+        .map_err(|error| IpcError::Security(format!("update inspection failed: {error:?}")))?;
+    if let Err(reason) = authorize_full_host_quit(&inspection, true) {
+        updater.report_install_blocked(format!(
+            "Update is ready. Close active task sessions before installing: {reason}"
+        ));
+        return Ok(NativeHostExecutionResult::Query {
+            detail: "Update waits for active sessions to close".into(),
+            body: NativeHostQueryBody::Updater(updater.snapshot()),
+        });
+    }
+    let HostId::LocalProfile(profile) = port.host() else {
+        return Err(IpcError::Unsupported);
+    };
+    let host_exit = updater
+        .capture_host_exit(
+            profile,
+            port.connection_metadata()
+                .host_boot_id()
+                .ok_or(IpcError::CorrelationMismatch)?,
+        )
+        .map_err(IpcError::Security)?;
+    let exit_deadline = Instant::now() + Duration::from_secs(60);
     let owned_token = port
         .prepare_update(
             ids.prepare,
             &identity.target_version,
             &identity.client_build,
             &identity.host_build,
-            false,
+            true,
         )
         .await
         .map_err(map_fleet_ipc)?;
@@ -8941,6 +9007,7 @@ async fn execute_native_update_install(
             ids.arm_install,
             DomainCommand::ArmUpdateInstall(ArmUpdateInstallIntent {
                 token_id: token.token_id,
+                stop_host_after_ack: true,
             }),
         ),
     ] {
@@ -8968,17 +9035,12 @@ async fn execute_native_update_install(
         }
     }
 
-    let inspection = fleet_inspect_host_quit(port)
-        .await?
-        .map_err(|error| IpcError::Security(format!("update host quit rejected: {error:?}")))?;
-    authorize_full_host_quit(&inspection, true).map_err(IpcError::Security)?;
-    let joined =
-        fleet_confirm_host_quit(port, ids.confirm_quit, inspection.inspection_id, true).await?;
-    if !matches!(joined, CommandReceipt::Accepted { command_id, .. } if command_id == ids.confirm_quit)
-    {
-        return Err(IpcError::CorrelationMismatch);
-    }
-
+    // The arm acknowledgement is physically delivered before the supervisor
+    // retires the idle old host. Join that exact process before image exchange.
+    let _host_profile_reservation = host_exit
+        .wait_until(exit_deadline)
+        .await
+        .map_err(IpcError::Security)?;
     let outcome = updater
         .launch_verified_installer_after_host_join(token.token_id)
         .map_err(IpcError::Security)?;
@@ -8989,7 +9051,7 @@ async fn execute_native_update_install(
     }
     Ok(NativeHostExecutionResult::Query {
         detail: bounded_host_error(format!(
-            "Installer for {} launched; exiting old process",
+            "Update {} installed; restarting DevManager",
             outcome.version
         )),
         body: NativeHostQueryBody::UpdaterInstalled(updater.snapshot()),
@@ -12027,6 +12089,7 @@ enum NativeSettingsPage {
     Appearance,
     Providers,
     RemoteAccess,
+    Updates,
 }
 
 #[derive(Default)]
@@ -16515,17 +16578,18 @@ impl NativeShell {
     }
 
     fn sync_top_bar_from_updater(&mut self) -> bool {
-        let snapshot = self.updater_snapshot.clone().or_else(|| {
-            self.local_slot_mut()
-                .host_runtime
-                .as_ref()
-                .and_then(|runtime| match runtime {
-                    NativeHostRuntimeAttachment::Client(runtime) => {
-                        Some(runtime.updater().snapshot())
-                    }
-                    NativeHostRuntimeAttachment::Injected(_) => None,
-                })
-        });
+        // Check/download work advances asynchronously after its command reply.
+        // Read the live service on each tick so a cached Checking snapshot cannot
+        // permanently hide completion, progress, or signature failures.
+        let snapshot = self
+            .local_slot()
+            .host_runtime
+            .as_ref()
+            .and_then(|runtime| match runtime {
+                NativeHostRuntimeAttachment::Client(runtime) => Some(runtime.updater().snapshot()),
+                NativeHostRuntimeAttachment::Injected(_) => None,
+            })
+            .or_else(|| self.updater_snapshot.clone());
         let Some(snapshot) = snapshot else {
             return false;
         };
@@ -17817,6 +17881,54 @@ impl NativeShell {
         let action = outcome.action().clone();
         if !self.outcome_admission_matches_live_for_host(host_id, &action) {
             return;
+        }
+        // Readiness belongs to the exact first-send lease, not the currently
+        // visible dock query. Browser/terminal refreshes must not starve it by
+        // advancing the UI epoch while its authenticated reply is in flight.
+        if let Some((request_id, task_id, query)) =
+            Self::task_cockpit_command_parts(&action.command)
+        {
+            let owned = matches!(
+                query,
+                TaskCockpitQuery::Terminal | TaskCockpitQuery::TerminalReadiness
+            ) && self
+                .host_slot(host_id)
+                .and_then(|slot| slot.pending_draft_first_send.as_ref())
+                .is_some_and(|pending| {
+                    pending.owner.host == *host_id
+                        && pending.task_id == task_id
+                        && pending.readiness_request_id == Some(request_id)
+                });
+            if owned {
+                let live = self.host_slot(host_id).is_some_and(|slot| {
+                    let epochs = slot.interaction.action_epochs();
+                    slot.pending_draft_first_send
+                        .as_ref()
+                        .is_some_and(|pending| {
+                            action.connection_epoch == pending.connection_epoch
+                                && action.resource_generation == pending.resource_generation
+                                && action.runtime_generation == pending.runtime_generation
+                                && pending.connection_epoch == epochs.connection_epoch
+                                && pending.resource_generation == epochs.resource_generation
+                                && pending.runtime_generation == epochs.runtime_generation
+                                && action.client_epoch <= epochs.client_epoch
+                        })
+                });
+                if live {
+                    if host_id == &self.local_host_id() {
+                        self.apply_action_outcome(outcome);
+                    } else {
+                        self.apply_action_outcome_for_host(host_id, outcome);
+                    }
+                } else {
+                    self.cancel_pending_draft_first_send_for_host(
+                        host_id,
+                        "The connection changed during provider startup. Your draft was kept.",
+                    );
+                    self.discard_native_query_action_for_owner(host_id, &action);
+                }
+                return;
+            }
         }
         if host_id == &self.local_host_id() {
             if let NativeHostCommand::ProviderInput {
@@ -19140,6 +19252,56 @@ impl NativeShell {
                         self.acknowledge_settled_command_receipt(&action, &receipt);
                         return;
                     }
+                    if let NativeHostCommand::ProviderInput {
+                        command_id,
+                        arguments,
+                        ..
+                    } = &action.command
+                    {
+                        let owns_submission = self
+                            .pending_composer_submissions
+                            .get(command_id)
+                            .is_some_and(|submission| {
+                                submission.key.task_id.host == local
+                                    && submission.key.task_id.task_id == arguments.task_id
+                                    && submission.key.agent_session_id == arguments.agent_session_id
+                            });
+                        if owns_submission {
+                            let message = if matches!(
+                                code,
+                                crate::domain::command::RejectionCode::RevisionConflict
+                            ) {
+                                "The task changed before your message was sent. Your draft is kept; try Send again.".to_string()
+                            } else {
+                                format!("Message was not sent ({code:?}). Your draft is kept.")
+                            };
+                            self.settle_composer_submission_for_owner(
+                                &local,
+                                &action,
+                                false,
+                                Some(message),
+                            );
+                            self.local_slot_mut()
+                                .pending_host_actions
+                                .retain(|pending| {
+                                    native_command_id(&pending.command) != Some(*command_id)
+                                });
+                            if self
+                                .local_slot()
+                                .retained_action_overflow
+                                .as_ref()
+                                .is_some_and(|pending| {
+                                    native_command_id(&pending.command) == Some(*command_id)
+                                })
+                            {
+                                self.local_slot_mut().retained_action_overflow = None;
+                            }
+                            // A definitive rejection settles this command. Replaying its ID
+                            // cannot succeed, and it does not mean the transport disconnected.
+                            self.acknowledge_settled_command_receipt(&action, &receipt);
+                            return;
+                        }
+                    }
                     let retained = self.retain_pending_host_action(action.clone());
                     self.set_execution_failure(
                         &action,
@@ -19485,6 +19647,12 @@ impl NativeShell {
 
     fn controller_tick(&mut self, max: usize) -> bool {
         self.controller_ticks = self.controller_ticks.saturating_add(1);
+        if self.local_slot().host_runtime.as_ref().is_some_and(|runtime| {
+            matches!(runtime, NativeHostRuntimeAttachment::Client(runtime) if runtime.updater().process_must_exit())
+        }) {
+            self.exit_after_update = true;
+            return true;
+        }
         let now = Instant::now();
         if self.settings_open
             && self.settings_page == NativeSettingsPage::RemoteAccess
@@ -27594,9 +27762,16 @@ impl NativeShell {
                             div()
                                 .id("pane-menu")
                                 .absolute()
-                                .left(menu.position.x)
+                                .left(px(f32::from(menu.position.x).clamp(
+                                    0.0,
+                                    (f32::from(viewport.width) - PANE_MENU_WIDTH - 8.0).max(0.0),
+                                )))
                                 .top(menu.position.y + px(4.0))
                                 .w(px(PANE_MENU_WIDTH))
+                                .max_h(px(
+                                    (f32::from(viewport.height - menu.position.y) - 12.0).max(0.0)
+                                ))
+                                .overflow_y_scroll()
                                 .flex()
                                 .flex_col()
                                 .py(px(tokens.density.spacing.xs))
@@ -30642,9 +30817,14 @@ impl NativeShell {
                         .child(
                             overlay_chrome::overlay_surface("native-terminal-chip-menu", tokens)
                                 .absolute()
-                                .left(menu.position.x)
+                                .left(px(f32::from(menu.position.x)
+                                    .clamp(0.0, (f32::from(viewport.width) - 208.0).max(0.0))))
                                 .top(menu.position.y + px(overlay_chrome::OVERLAY_ANCHOR_DROP))
                                 .w(px(200.0))
+                                .max_h(px(
+                                    (f32::from(viewport.height - menu.position.y) - 12.0).max(0.0)
+                                ))
+                                .overflow_y_scroll()
                                 .child(overlay_chrome::section_label(label, tokens))
                                 .children(rows),
                         ),
@@ -33317,6 +33497,12 @@ impl NativeShell {
             self.cache_current_composer_draft();
             self.clear_composer_binding();
             self.composer_owner = None;
+            // Closing the last pane must clear the owning interaction too.
+            // Otherwise its next canonical projection restores that stale
+            // selection and persists an archived task as an open pane.
+            if let Some(slot) = self.host_slot_mut(&key.host) {
+                slot.interaction.sync_selected_task(None);
+            }
         }
         // Conservatively cancel multistep follow-ups whose immutable owner is
         // no longer focused — never silently send to the new focus.
@@ -34921,11 +35107,24 @@ impl NativeShell {
                 let mut async_cx = cx.clone();
                 async move {
                     let picked = match rx.await {
-                        Ok(Ok(Some(mut paths))) => paths.pop(),
-                        _ => None,
+                        Ok(Ok(paths)) => Ok(paths.and_then(|mut paths| paths.pop())),
+                        Ok(Err(error)) => Err(format!("Could not open the folder picker: {error}")),
+                        Err(_) => {
+                            Err("The folder picker closed without returning a result.".to_string())
+                        }
                     };
-                    let Some(path) = picked else {
-                        return;
+                    let path = match picked {
+                        Ok(Some(path)) => path,
+                        Ok(None) => return,
+                        Err(message) => {
+                            let _ = this.update(&mut async_cx, |shell, cx| {
+                                if let Some(draft) = shell.add_project.as_mut() {
+                                    draft.error = Some(bounded_host_error(message));
+                                    cx.notify();
+                                }
+                            });
+                            return;
+                        }
                     };
                     let _ = this.update(&mut async_cx, |shell, cx| {
                         shell.apply_picked_project_folder(path);
@@ -41486,6 +41685,82 @@ impl NativeShell {
         content.into_any_element()
     }
 
+    fn render_update_settings_content(
+        &self,
+        tokens: crate::ui::tokens::ThemeTokens,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let snapshot = self.updater_snapshot.as_ref();
+        let connected = matches!(
+            self.local_slot().host_state,
+            NativeHostState::Connected { .. }
+        );
+        let enabled = connected
+            && snapshot.is_some_and(|snapshot| snapshot.configured && !snapshot.is_busy());
+        let stage = snapshot.map(|snapshot| &snapshot.stage);
+        let detail = snapshot
+            .map(|snapshot| snapshot.detail.clone())
+            .unwrap_or_else(|| "Connecting to update service…".into());
+        let mut content = div()
+            .flex()
+            .flex_col()
+            .gap(px(tokens.density.spacing.md))
+            .child(overlay_chrome::heading(
+                format!("DevManager {}", env!("CARGO_PKG_VERSION")),
+                tokens,
+            ))
+            .child(
+                div()
+                    .text_size(px(tokens.density.typography.body))
+                    .text_color(tokens.text.secondary.to_gpui())
+                    .child(detail),
+            );
+        let mut actions = div().flex().gap(px(tokens.density.spacing.sm));
+        for (id, label, action, allowed) in [
+            (
+                "native-update-check",
+                "Check for updates",
+                UpdaterAction::Check,
+                enabled,
+            ),
+            (
+                "native-update-download",
+                "Download update",
+                UpdaterAction::Download,
+                enabled && matches!(stage, Some(UpdaterStage::UpdateAvailable)),
+            ),
+            (
+                "native-update-install",
+                "Install and restart",
+                UpdaterAction::Install,
+                enabled && matches!(stage, Some(UpdaterStage::ReadyToInstall)),
+            ),
+        ] {
+            actions = actions.child(Button::new(id).label(label).disabled(!allowed).on_click(
+                cx.listener(move |shell, _: &ClickEvent, _window, cx| {
+                    cx.stop_propagation();
+                    shell.dispatch_action(ActionRequest::Updater(action));
+                    cx.notify();
+                }),
+            ));
+        }
+        content = content.child(actions);
+        if let Some(notes) = snapshot
+            .and_then(|snapshot| snapshot.release_notes.as_ref())
+            .filter(|notes| !notes.is_empty())
+        {
+            content = content.child(
+                div()
+                    .id("native-update-notes")
+                    .max_h(px(240.0))
+                    .overflow_y_scroll()
+                    .text_size(px(tokens.density.typography.body))
+                    .child(notes.clone()),
+            );
+        }
+        content.into_any_element()
+    }
+
     fn render_settings_overlay(
         &self,
         tokens: crate::ui::tokens::ThemeTokens,
@@ -41496,6 +41771,7 @@ impl NativeShell {
             NativeSettingsPage::Appearance => self.render_appearance_settings_content(tokens, cx),
             NativeSettingsPage::Providers => self.render_provider_settings_content(tokens, cx),
             NativeSettingsPage::RemoteAccess => self.render_remote_settings_content(tokens, cx),
+            NativeSettingsPage::Updates => self.render_update_settings_content(tokens, cx),
         };
         deferred(
             anchored()
@@ -41601,6 +41877,32 @@ impl NativeShell {
                                                             shell.cancel_theme_editor();
                                                         }
                                                         shell.open_remote_settings(window, cx);
+                                                        cx.notify();
+                                                    },
+                                                )),
+                                        )
+                                        .child(
+                                            Button::new("native-settings-updates")
+                                                .label("Updates")
+                                                .when(
+                                                    self.settings_page
+                                                        == NativeSettingsPage::Updates,
+                                                    |button| button.primary(),
+                                                )
+                                                .when(
+                                                    self.settings_page
+                                                        != NativeSettingsPage::Updates,
+                                                    |button| button.ghost(),
+                                                )
+                                                .on_click(cx.listener(
+                                                    |shell, _: &ClickEvent, _window, cx| {
+                                                        cx.stop_propagation();
+                                                        shell.settings_page =
+                                                            NativeSettingsPage::Updates;
+                                                        if shell.theme_editor.is_some() {
+                                                            shell.cancel_theme_editor();
+                                                        }
+                                                        shell.sync_top_bar_from_updater();
                                                         cx.notify();
                                                     },
                                                 )),
@@ -43585,12 +43887,43 @@ impl NativeShell {
         );
     }
 
+    fn native_browser_occluded(&self) -> bool {
+        let keyboard = self.local_slot().interaction.keyboard_state();
+        self.add_project.is_some()
+            || self.new_task.is_some()
+            || self.rename_task.is_some()
+            || self.delete_task.is_some()
+            || self.settings_open
+            || matches!(
+                self.header_commit.phase,
+                HeaderCommitPhase::Preview { .. }
+                    | HeaderCommitPhase::Confirming { .. }
+                    | HeaderCommitPhase::Success { .. }
+                    | HeaderCommitPhase::Error(_)
+                    | HeaderCommitPhase::LoadingStatus
+            )
+            || !matches!(self.project_actions.mode, ProjectActionMenuMode::Closed)
+            || self.project_scope_menu.open()
+            || self.terminal_chip_menu.is_some()
+            || self.board_menu.is_some()
+            || self.pane_menu.is_some()
+            || self.task_search.open()
+            || keyboard.task_switcher_open
+            || keyboard.palette_open
+            || self.composer_selector.is_some()
+            || self
+                .trigger_menu
+                .as_ref()
+                .is_some_and(|menu| !menu.suggestions.is_empty())
+    }
+
     fn reconcile_browser_dock_lifecycle(&mut self, window: Option<&Window>) {
         // A native WebView is an HWND-backed surface above GPUI. It must be
         // parked while the center terminal owns the canvas (or while a remote
         // owner is selected); otherwise a late attach/resize can cover the
         // terminal and intercept every click and keystroke.
-        let browser_tab_active = !self.selected_owner_is_remote()
+        let browser_tab_active = !self.native_browser_occluded()
+            && !self.selected_owner_is_remote()
             && self
                 .selected_task_key
                 .as_ref()
@@ -44043,6 +44376,10 @@ impl NativeShell {
     }
 
     fn pump_pending_browser_commands(&mut self, window: &Window) {
+        if self.native_browser_occluded() {
+            self.reconcile_browser_dock_lifecycle(Some(window));
+            return;
+        }
         // A native browser surface lives above GPUI. Commands captured for a
         // previously visible Browser dock must not be replayed after the user
         // changes owner, collapses the dock, or switches the center canvas to
@@ -50492,7 +50829,7 @@ pub(crate) mod tests {
             resource_id: resource.id,
             runtime_generation: snapshot.agents[&agent_id].runtime_generation,
             resource_generation: resource.runtime_generation,
-            action_epoch: 1,
+            action_epoch: snapshot.task.action_epoch,
             focus_epoch: crate::terminal::protocol::FocusEpoch::initial(),
             accepted_input_sequence: 0,
             accepts_input_without_conversation_id: true,
@@ -50515,7 +50852,12 @@ pub(crate) mod tests {
         terminal.agent_session_id = agent_id;
         terminal.action_epoch = 0;
         assert!(!super::first_send_terminal_ready(snapshot, &terminal));
-        terminal.action_epoch = 1;
+        terminal.action_epoch = snapshot.task.action_epoch + 1;
+        assert!(super::first_send_terminal_ready(snapshot, &terminal));
+        terminal.is_provider = false;
+        assert!(!super::first_send_terminal_ready(snapshot, &terminal));
+        terminal.is_provider = true;
+        terminal.action_epoch = snapshot.task.action_epoch;
         terminal.text_lines = vec!["Do you trust the contents of this directory?".into()];
         terminal.accepts_input_without_conversation_id = false;
         assert!(
@@ -52948,6 +53290,7 @@ mod "
                             NativeSettingsPage::Appearance,
                             NativeSettingsPage::Providers,
                             NativeSettingsPage::RemoteAccess,
+                            NativeSettingsPage::Updates,
                         ] {
                             shell.settings_page = page;
                             drop(shell.render_settings_overlay(tokens, viewport, cx));
@@ -54418,6 +54761,93 @@ mod "
             Some("Connected"),
             "a live runtime must replace a stale recovery error with its current connection state"
         );
+    }
+
+    #[test]
+    fn rejected_composer_send_keeps_draft_and_allows_fresh_send() {
+        if rerun_headless_shell_test_in_child(
+            "ui::native_shell::tests::rejected_composer_send_keeps_draft_and_allows_fresh_send",
+        ) {
+            return;
+        }
+        let _guard = HEADLESS_SHELL_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap();
+        let (runtime, shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
+        gpui::Application::headless().run(move |cx| {
+            crate::ui::init(cx);
+            with_test_shell_in_app(cx, runtime, |shell| {
+                shell.install_idle_conversation_photo_for_test();
+                let (model, task_id) = terminal_bound_client_model();
+                shell.apply_client_model(Arc::new(model)).unwrap();
+                let host = shell.local_host_id();
+                shell
+                    .select_fleet_task_key(
+                        HostTaskKey::new(host.clone(), task_id),
+                        FleetSelectMode::Replace,
+                    )
+                    .unwrap();
+                let focus = shell.local_slot().interaction.current_focus_epoch();
+                shell
+                    .composer
+                    .as_mut()
+                    .unwrap()
+                    .replace_draft("keep this first message", focus)
+                    .unwrap();
+                shell.activate_composer_control(ComposerControl::SendNow);
+                let action = shared
+                    .lock()
+                    .unwrap()
+                    .accepted
+                    .iter()
+                    .find(|a| matches!(a.command, NativeHostCommand::ProviderInput { .. }))
+                    .unwrap()
+                    .clone();
+                let command_id = native_command_id(&action.command).unwrap();
+                assert!(shell.pending_composer_submissions.contains_key(&command_id));
+                // A newer projection/panel gesture must not strand the older send receipt.
+                let (new_model, _) = terminal_bound_client_model_at_epoch(4);
+                shell.apply_client_model(Arc::new(new_model)).unwrap();
+                shell.apply_epoch_fenced_action_outcome_for_host(
+                    &host,
+                    NativeHostActionOutcome::Accepted {
+                        action,
+                        receipt: crate::domain::command::CommandReceipt::Rejected {
+                            command_id,
+                            code: crate::domain::command::RejectionCode::RevisionConflict,
+                            current_revision: Some(10),
+                            resolution: None,
+                        },
+                    },
+                );
+                assert!(!shell.pending_composer_submissions.contains_key(&command_id));
+                assert!(shell.composer.as_ref().unwrap().pending_intent().is_none());
+                assert!(matches!(
+                    shell.local_slot().host_state,
+                    NativeHostState::Connected { .. }
+                ));
+                assert!(shell
+                    .local_slot()
+                    .composer_error
+                    .as_deref()
+                    .unwrap()
+                    .contains("draft is kept"));
+                shell.activate_composer_control(ComposerControl::SendNow);
+                let accepted = shared.lock().unwrap().accepted.clone();
+                let sends: Vec<_> = accepted
+                    .iter()
+                    .filter(|a| matches!(a.command, NativeHostCommand::ProviderInput { .. }))
+                    .collect();
+                assert_eq!(
+                    sends.len(),
+                    2,
+                    "the preserved draft must allow another Send"
+                );
+                assert_ne!(native_command_id(&sends[1].command), Some(command_id));
+            });
+            crate::ui::finish_headless_test(cx);
+        });
     }
 
     #[test]
@@ -57348,6 +57778,29 @@ mod "
             0,
             "remote owner must admit independently of a saturated local lane"
         );
+    }
+
+    #[test]
+    fn appimage_detached_host_owns_mount_and_keeps_native_arguments() {
+        let spec = super::NativeHostLaunchSpec {
+            executable: PathBuf::from("/mounted/usr/bin/devmanager-host"),
+            mode: super::NativeHostLaunchMode::Production,
+        };
+        let image = std::path::Path::new("/home/user/Apps/DevManager release.AppImage");
+        let command = super::native_host_launch_command(&spec, Some(image));
+        assert_eq!(command.get_program(), image.as_os_str());
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            vec!["--devmanager-host", "--foreground"]
+        );
+        for key in ["APPDIR", "APPIMAGE", "ARGV0", "OWD"] {
+            assert!(command
+                .get_envs()
+                .any(|(name, value)| name == key && value.is_none()));
+        }
+        let direct = super::native_host_launch_command(&spec, None);
+        assert_eq!(direct.get_program(), spec.executable.as_os_str());
+        assert_eq!(direct.get_args().collect::<Vec<_>>(), vec!["--foreground"]);
     }
 
     #[cfg(unix)]
@@ -63979,6 +64432,44 @@ mod "
     }
 
     #[test]
+    fn closed_last_pane_stays_closed_after_canonical_refresh() {
+        if rerun_headless_shell_test_in_child(
+            "ui::native_shell::tests::closed_last_pane_stays_closed_after_canonical_refresh",
+        ) {
+            return;
+        }
+        gpui::Application::headless().run(move |cx| {
+            crate::ui::init(cx);
+            let (runtime, _) = TestRuntime::new(true, NativeHostActionResult::Queued);
+            with_test_shell_in_app(cx, runtime, |shell| {
+                shell.install_idle_conversation_photo_for_test();
+                let (model, ids) = open_tasks_client_model(1);
+                let model = Arc::new(model);
+                shell.apply_client_model(model.clone()).unwrap();
+                let key = shell.local_task_key(ids[0]);
+                shell
+                    .select_fleet_task_key(key.clone(), FleetSelectMode::Replace)
+                    .unwrap();
+                shell.close_task_pane(&key);
+                shell.apply_client_model(model).unwrap();
+                assert!(shell.selected_task_key.is_none());
+                assert!(shell.layout.selected_task.is_none());
+                assert!(shell.layout.task_workspace.is_none());
+                assert!(shell.local_slot().interaction.selected_task().is_none());
+                assert!(!shell.native_browser_occluded());
+                shell.open_pane_menu(key, gpui::point(gpui::px(100.0), gpui::px(100.0)));
+                assert!(shell.native_browser_occluded());
+                shell.pane_menu = None;
+                shell.settings_open = true;
+                assert!(shell.native_browser_occluded());
+                shell.settings_open = false;
+                assert!(!shell.native_browser_occluded());
+            });
+            crate::ui::finish_headless_test(cx);
+        });
+    }
+
+    #[test]
     fn panel_menu_pins_and_swaps_the_captured_owner() {
         use crate::ui::panel::PanelMenuItem;
         use crate::ui::task_workspace::{Axis, Viewport};
@@ -67854,7 +68345,7 @@ mod "
                         crate::domain::task::TaskAttention::None,
                         ProviderKind::Codex,
                         None,
-                        1,
+                        0,
                     );
                 let draft_model = Arc::new(draft_model);
                 let snapshot = draft_model.task(task_id).expect("task");
@@ -67927,6 +68418,22 @@ mod "
                     })
                     .cloned()
                     .expect("probe");
+                // A panel refresh can advance the UI query epoch while the
+                // exact first-send readiness lease is still outstanding.
+                shell
+                    .dispatch_action_recorded_for_owner(
+                        &remote_host,
+                        ActionRequest::TaskCockpit {
+                            task_id,
+                            query: TaskCockpitQuery::Terminal,
+                        },
+                    )
+                    .expect("interleaved panel refresh");
+                assert!(!shell
+                    .host_slot(&remote_host)
+                    .unwrap()
+                    .interaction
+                    .accepts_action_outcome_record(&probe));
                 shell.apply_epoch_fenced_action_outcome_for_host(
                     &remote_host,
                     NativeHostActionOutcome::Queried {

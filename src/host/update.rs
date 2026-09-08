@@ -24,6 +24,7 @@ pub use crate::updater::handoff::HostUpdateRuntimeGate;
 pub fn update_inspection_from_host_quit(
     inspection: &HostQuitInspection,
     host_boot_id: Uuid,
+    allow_uninspected_worktrees: bool,
 ) -> UpdateResourceInspection {
     let mut active = Vec::new();
     for agent in &inspection.agents {
@@ -52,7 +53,16 @@ pub fn update_inspection_from_host_quit(
         inspection_id: inspection.inspection_id,
         host_boot_id,
         active,
-        confirmable: inspection.confirmable,
+        // An explicit install has the same uninspected-worktree authority as
+        // explicit host quit. It must never clear an agent/resource blocker.
+        confirmable: inspection.confirmable
+            || (allow_uninspected_worktrees
+                && inspection.agents.is_empty()
+                && inspection.resources.is_empty()
+                && matches!(
+                    inspection.worktrees,
+                    crate::domain::host::HostQuitWorktreeInspection::NotInspected
+                )),
     }
 }
 
@@ -95,7 +105,11 @@ impl OwnedActiveResourceProbe {
                 .lock()
                 .map_err(|_| "update probe source lock is poisoned".to_string())?;
             let inspection = guard.inspect_host_quit_for_update()?;
-            Ok(update_inspection_from_host_quit(&inspection, host_boot_id))
+            Ok(update_inspection_from_host_quit(
+                &inspection,
+                host_boot_id,
+                false,
+            ))
         })
     }
 }
@@ -167,6 +181,55 @@ mod tests {
     use std::time::{Duration, SystemTime};
 
     #[test]
+    fn explicit_update_accepts_real_idle_inspection_but_preserves_active_blockers() {
+        let directory = tempfile::tempdir().unwrap();
+        let bus = CommandBus::open(&directory.path().join("kernel.sqlite3")).unwrap();
+        let mut inspection = bus.inspect_host_quit().unwrap();
+        assert!(
+            !inspection.confirmable,
+            "production inspections leave worktrees uninspected"
+        );
+        let boot = Uuid::now_v7();
+        let silent = update_inspection_from_host_quit(&inspection, boot, false);
+        let explicit = update_inspection_from_host_quit(&inspection, boot, true);
+        assert!(!silent.confirmable);
+        assert!(explicit.confirmable);
+        let mut handoff = HostUpdateHandoff::new(Duration::from_secs(60));
+        let token = handoff
+            .prepare_update(
+                &explicit,
+                "0.4.2",
+                "devmanager/0.4.2",
+                "devmanager-host/0.4.2",
+                SystemTime::now(),
+                true,
+            )
+            .unwrap();
+        assert_eq!(token.host_boot_id, boot);
+        inspection.agents.push(HostQuitAgentBlocker {
+            agent_session_id: AgentSessionId::new(),
+            task_id: TaskId::new(),
+            task_title: "busy".into(),
+            role: AgentRole::Primary,
+            provider_kind: ProviderKind::ClaudeCode,
+            lifecycle: AgentSessionLifecycle::Open,
+            runtime_generation: 1,
+        });
+        assert!(!update_inspection_from_host_quit(&inspection, boot, true).confirmable);
+        inspection.agents.clear();
+        inspection.resources.push(HostQuitResourceBlocker {
+            resource_id: ResourceId::new(),
+            task_id: None,
+            task_title: None,
+            owner_kind: OwnerKind::Host,
+            resource_kind: ResourceKind::Terminal,
+            lifecycle: ResourceLifecycle::Active,
+            runtime_generation: 1,
+        });
+        assert!(!update_inspection_from_host_quit(&inspection, boot, true).confirmable);
+    }
+
+    #[test]
     fn host_quit_inspection_maps_active_and_releasing_resources() {
         let inspection = HostQuitInspection {
             inspection_id: 9,
@@ -191,7 +254,7 @@ mod tests {
             worktrees: HostQuitWorktreeInspection::NotInspected,
             confirmable: true,
         };
-        let mapped = update_inspection_from_host_quit(&inspection, Uuid::nil());
+        let mapped = update_inspection_from_host_quit(&inspection, Uuid::nil(), false);
         assert_eq!(mapped.inspection_id, 9);
         assert_eq!(mapped.active.len(), 2);
     }

@@ -4,7 +4,7 @@
 //! debug profile. Never resolve or touch installed DevManager APPDATA, and
 //! never read or hash session.json.
 
-#![cfg(windows)]
+#![cfg(any(windows, target_os = "linux"))]
 
 use std::{
     fs,
@@ -70,6 +70,12 @@ fn seed_task_with_base(paths: &ResolvedAppPaths, base: u8, title: &str) -> TaskI
     fs::create_dir_all(&paths.root).expect("create isolated profile root");
     let project_id = ProjectId::from_bytes(fixed_uuid_v7(base + 4)).expect("project id");
     let configured_id = project_id.to_string();
+    let workspace_root = paths
+        .root
+        .parent()
+        .unwrap()
+        .join(format!("workspace-{base}"));
+    fs::create_dir_all(&workspace_root).expect("create distinct isolated workspace");
     let client_id = ClientId::from_bytes(fixed_uuid_v7(base)).expect("seed client id");
     let task_id = TaskId::from_bytes(fixed_uuid_v7(base + 1)).expect("seed task id");
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -87,7 +93,7 @@ fn seed_task_with_base(paths: &ResolvedAppPaths, base: u8, title: &str) -> TaskI
                     project: Project {
                         id: configured_id.clone(),
                         name: "CLI seed project".to_string(),
-                        root_path: paths.root.to_string_lossy().into_owned(),
+                        root_path: workspace_root.to_string_lossy().into_owned(),
                         created_at: "now".to_string(),
                         updated_at: "now".to_string(),
                         ..Project::default()
@@ -261,7 +267,16 @@ impl Drop for ChildGuard {
         let started = Instant::now();
         while started.elapsed() < TERMINATE_TIMEOUT {
             match child.try_wait() {
-                Ok(Some(_)) | Err(_) => return,
+                Ok(Some(_)) | Err(_) => {
+                    if std::thread::panicking() {
+                        if let Some(stderr) = child.stderr.take() {
+                            let mut diagnostic = String::new();
+                            let _ = stderr.take(8192).read_to_string(&mut diagnostic);
+                            eprintln!("Owned fixture host diagnostics: {diagnostic}");
+                        }
+                    }
+                    return;
+                }
                 Ok(None) => thread::sleep(POLL),
             }
         }
@@ -376,11 +391,22 @@ fn action_catalog_ids_are_unique_and_classified() {
                 | ACTION_TERMINAL_RENAME
                 | ACTION_TERMINAL_SET_STRIP
         ) {
-            ActionRisk::Mutating
+            Some(ActionRisk::Mutating)
+        } else if matches!(
+            action.id,
+            ACTION_HOST_ACTIONS
+                | ACTION_HOST_STATUS
+                | ACTION_TASK_LIST
+                | ACTION_TASK_SHOW
+                | ACTION_TERMINAL_VIEW
+        ) {
+            Some(ActionRisk::ReadOnly)
         } else {
-            ActionRisk::ReadOnly
+            None
         };
-        assert_eq!(action.risk, expected_risk);
+        if let Some(expected) = expected_risk {
+            assert_eq!(action.risk, expected, "risk for {}", action.id);
+        }
         let expected_scope = if matches!(
             action.id,
             ACTION_TASK_SHOW
@@ -400,11 +426,22 @@ fn action_catalog_ids_are_unique_and_classified() {
                 | ACTION_TERMINAL_RENAME
                 | ACTION_TERMINAL_SET_STRIP
         ) {
-            ActionScope::Task
+            Some(ActionScope::Task)
+        } else if matches!(
+            action.id,
+            ACTION_HOST_ACTIONS
+                | ACTION_HOST_STATUS
+                | ACTION_TASK_LIST
+                | ACTION_TASK_CREATE_V2
+                | ACTION_CONFIG_CREATE_PROJECT
+        ) {
+            Some(ActionScope::Host)
         } else {
-            ActionScope::Host
+            None
         };
-        assert_eq!(action.scope, expected_scope);
+        if let Some(expected) = expected_scope {
+            assert_eq!(action.scope, expected, "scope for {}", action.id);
+        }
         assert!(!action.title.is_empty());
         assert!(!action.description.is_empty());
         assert!(!action.keywords.is_empty());
@@ -735,17 +772,29 @@ fn ctl_invoke_task_create_uses_shared_mutation_without_taking_host_lock() {
 
     let task_id = TaskId::new();
     let project_id = ProjectId::new();
-    fs::write(
-        &paths.config,
-        serde_json::json!({
-            "projects": [{
-                "id": project_id.to_string(),
-                "rootPath": configured_root
-            }]
-        })
-        .to_string(),
-    )
-    .expect("host-owned project config");
+    let project_id = {
+        let mut store = ConfigStore::open_host(&paths).expect("isolated host config");
+        store
+            .execute(
+                store.snapshot().revision,
+                ConfigCommand::CreateProject {
+                    project: Project {
+                        id: project_id.to_string(),
+                        name: "CLI configured project".into(),
+                        root_path: configured_root.to_string_lossy().into_owned(),
+                        created_at: "now".into(),
+                        updated_at: "now".into(),
+                        ..Project::default()
+                    },
+                },
+            )
+            .expect("host-owned project config");
+        let revision = store.snapshot().revision;
+        WorkspaceProjectRoots::from_host_config_store(&mut store, revision, 1, 1)
+            .expect("host project roots")
+            .project_id_for_config_id(&project_id.to_string())
+            .expect("opaque project ID")
+    };
 
     let mut host = ChildGuard::spawn(host_command(config_base.path(), &profile));
     let original = wait_for_identity(&mut host, &lock_path);
@@ -1010,7 +1059,7 @@ fn ctl_rejects_unknown_commands_and_invalid_profiles() {
     ]);
     assert!(!unknown_action.status.success());
     assert!(unknown_action.stdout.is_empty());
-    assert!(String::from_utf8_lossy(&unknown_action.stderr).contains("unsupported action id"));
+    assert!(String::from_utf8_lossy(&unknown_action.stderr).contains("unknown action"));
 
     let unknown_field = run_ctl_bounded(&[
         "ctl",

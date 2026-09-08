@@ -43,7 +43,7 @@ pub use ipc::{
     pipe_endpoint_for_named_profile, profile_fingerprint_for_named_profile, AcceptHelloConfig,
     AcceptedHello, HelloListener, HostConnection, IpcError,
 };
-pub use lock::{HostIdentity, HostLock, HostLockError, HOST_EXIT_ALREADY_RUNNING};
+pub use lock::{HostExitWait, HostIdentity, HostLock, HostLockError, HOST_EXIT_ALREADY_RUNNING};
 pub use organization_runtime::{
     OrganizationEvidenceMetadata, OrganizationIpcCommand, OrganizationIpcQuery,
     OrganizationIpcReply, OrganizationPromptView, OrganizationRefreshReply, OrganizationRuntime,

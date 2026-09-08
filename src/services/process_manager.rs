@@ -14916,12 +14916,22 @@ mod tests {
             .registration
             .clone();
         let endpoint = manager.claude_hook_endpoint().unwrap();
+        let (startup_tx, startup_rx) = std::sync::mpsc::channel();
+        manager.set_remote_session_handler(Some(Arc::new(move |event| {
+            if matches!(event, RemoteSessionEvent::ClaudeSemantic { .. }) {
+                let _ = startup_tx.send(());
+            }
+        })));
         ureq::post(&endpoint)
             .header("x-devmanager-claude-nonce", &registration.nonce)
             .send(
                 br#"{"hook_event_name":"SessionStart","session_id":"provider-admitted","source":"startup"}"#,
             )
             .unwrap();
+        // HTTP admission precedes callback publication. Drain SessionStart
+        // before arming the gate for UserPromptSubmit, or the test can pause
+        // the startup event and let cleanup retire the still-queued prompt.
+        startup_rx.recv_timeout(Duration::from_secs(2)).unwrap();
 
         let publication_gate = Arc::new((Mutex::new((false, false)), Condvar::new()));
         let hook_gate = publication_gate.clone();

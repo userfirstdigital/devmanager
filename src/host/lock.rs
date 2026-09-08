@@ -118,6 +118,278 @@ fn validate_profile(profile: &str) -> Result<String, HostLockError> {
     }
 }
 
+/// A wait-only OS handle to the exact host generation named by authenticated
+/// Hello and its profile metadata. Metadata never grants signal/kill authority.
+#[derive(Debug)]
+pub struct HostExitWait {
+    profile_root: PathBuf,
+    #[cfg(target_os = "linux")]
+    process: std::os::fd::OwnedFd,
+    #[cfg(windows)]
+    process: std::os::windows::io::OwnedHandle,
+}
+
+impl HostExitWait {
+    pub fn capture(profile_root: &Path, profile: &str, boot_id: Uuid) -> Result<Self, String> {
+        let mut options = fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        }
+        let mut file = options
+            .open(lock_path(profile_root))
+            .map_err(|e| e.to_string())?;
+        let metadata = file.metadata().map_err(|e| e.to_string())?;
+        if !metadata.is_file() {
+            return Err("Host identity is not a regular file.".into());
+        }
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if metadata.uid() != unsafe { libc::geteuid() }
+                || metadata.nlink() != 1
+                || metadata.mode() & 0o022 != 0
+            {
+                return Err("Host identity ownership changed.".into());
+            }
+        }
+        let identity = read_identity_from_file(&mut file).ok_or("Host identity is unavailable.")?;
+        if boot_id.is_nil()
+            || identity.boot_id != boot_id
+            || identity.profile != profile
+            || identity.pid == 0
+        {
+            return Err("Host process identity does not match authenticated Hello.".into());
+        }
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::FromRawFd;
+            let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, identity.pid, 0) };
+            if fd < 0 {
+                return Err(std::io::Error::last_os_error().to_string());
+            }
+            let process = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd as i32) };
+            let ticks = crate::services::platform_service::capture_process_creation_time_100ns(
+                identity.pid,
+            );
+            let exe =
+                fs::read_link(format!("/proc/{}/exe", identity.pid)).map_err(|e| e.to_string())?;
+            if ticks != Some(identity.process_creation_filetime_ticks)
+                || exe != identity.executable_path
+            {
+                return Err("Host process generation changed before update.".into());
+            }
+            let wait = Self {
+                process,
+                profile_root: profile_root.to_path_buf(),
+            };
+            if wait.has_exited()? {
+                return Err("Host exited before update preparation.".into());
+            }
+            return Ok(wait);
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::FromRawHandle;
+            use windows::Win32::System::Threading::{
+                OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+            };
+            let handle = unsafe {
+                OpenProcess(
+                    PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+                    false,
+                    identity.pid,
+                )
+            }
+            .map_err(|e| e.to_string())?;
+            let process = unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(handle.0) };
+            if process_creation_ticks(handle).map_err(|e| e.to_string())?
+                != identity.process_creation_filetime_ticks
+                || process_image_path(handle).map_err(|e| e.to_string())?
+                    != identity
+                        .executable_path
+                        .canonicalize()
+                        .map_err(|e| e.to_string())?
+            {
+                return Err("Host process generation changed before update.".into());
+            }
+            let wait = Self {
+                process,
+                profile_root: profile_root.to_path_buf(),
+            };
+            if wait.has_exited()? {
+                return Err("Host exited before update preparation.".into());
+            }
+            return Ok(wait);
+        }
+        #[cfg(not(any(windows, target_os = "linux")))]
+        Err("Host exit verification is unsupported on this platform.".into())
+    }
+
+    pub fn has_exited(&self) -> Result<bool, String> {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd;
+            let mut descriptor = libc::pollfd {
+                fd: self.process.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let result = unsafe { libc::poll(&mut descriptor, 1, 0) };
+            if result < 0 {
+                return Err(std::io::Error::last_os_error().to_string());
+            }
+            if descriptor.revents & (libc::POLLERR | libc::POLLNVAL) != 0 {
+                return Err("Host exit handle failed.".into());
+            }
+            return Ok(descriptor.revents & (libc::POLLIN | libc::POLLHUP) != 0);
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawHandle;
+            use windows::Win32::{
+                Foundation::{HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT},
+                System::Threading::WaitForSingleObject,
+            };
+            return match unsafe { WaitForSingleObject(HANDLE(self.process.as_raw_handle()), 0) } {
+                WAIT_OBJECT_0 => Ok(true),
+                WAIT_TIMEOUT => Ok(false),
+                _ => Err(std::io::Error::last_os_error().to_string()),
+            };
+        }
+        #[cfg(not(any(windows, target_os = "linux")))]
+        Err("Host exit verification is unsupported on this platform.".into())
+    }
+
+    pub async fn wait_until(&self, deadline: std::time::Instant) -> Result<HostUpdateLock, String> {
+        loop {
+            if self.has_exited()? {
+                return HostUpdateLock::acquire(&self.profile_root);
+            }
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(
+                    "The old host has not exited; the installed image was preserved.".into(),
+                );
+            }
+            tokio::time::sleep(remaining.min(std::time::Duration::from_millis(20))).await;
+        }
+    }
+}
+
+/// Holds the existing profile lock without rewriting diagnostic identity while
+/// the installer commits. A competing host cannot start from the old image.
+#[derive(Debug)]
+pub struct HostUpdateLock {
+    _file: File,
+}
+
+impl HostUpdateLock {
+    fn acquire(root: &Path) -> Result<Self, String> {
+        let mut options = fs::OpenOptions::new();
+        options.read(true).write(true);
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            options.share_mode(windows::Win32::Storage::FileSystem::FILE_SHARE_READ.0);
+        }
+        let file = options
+            .open(lock_path(root))
+            .map_err(|error| format!("Host profile was reacquired before update: {error}"))?;
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::{fd::AsRawFd, unix::fs::MetadataExt};
+            let metadata = file.metadata().map_err(|e| e.to_string())?;
+            if !metadata.is_file()
+                || metadata.nlink() != 1
+                || metadata.uid() != unsafe { libc::geteuid() }
+                || metadata.mode() & 0o022 != 0
+            {
+                return Err("Host profile lock ownership changed before update.".into());
+            }
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+                return Err(
+                    "Another host acquired the profile before update; image preserved.".into(),
+                );
+            }
+        }
+        Ok(Self { _file: file })
+    }
+}
+
+#[cfg(all(test, any(windows, target_os = "linux")))]
+mod exit_wait_tests {
+    use super::*;
+
+    #[test]
+    fn host_exit_wait_requires_the_authenticated_live_generation() {
+        let directory = tempfile::tempdir().unwrap();
+        let lock = HostLock::acquire(directory.path(), "exitidentity").unwrap();
+        assert!(HostExitWait::capture(directory.path(), "exitidentity", Uuid::now_v7()).is_err());
+        let wait = HostExitWait::capture(directory.path(), "exitidentity", lock.identity().boot_id)
+            .unwrap();
+        assert!(!wait.has_exited().unwrap());
+        assert!(
+            HostExitWait::capture(directory.path(), "foreign", lock.identity().boot_id).is_err()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn host_exit_wait_waits_for_physical_exit_and_reserves_profile_until_commit() {
+        struct Child(std::process::Child);
+        impl Drop for Child {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let mut child = Child(
+            std::process::Command::new("/usr/bin/sleep")
+                .arg("1")
+                .spawn()
+                .unwrap(),
+        );
+        let identity = HostIdentity {
+            pid: child.0.id(),
+            process_creation_filetime_ticks:
+                crate::services::platform_service::capture_process_creation_time_100ns(child.0.id())
+                    .unwrap(),
+            executable_path: fs::read_link(format!("/proc/{}/exe", child.0.id())).unwrap(),
+            profile: "exitwait".into(),
+            protocol_major: PROTOCOL_MAJOR,
+            boot_id: Uuid::now_v7(),
+        };
+        let bytes = serde_json::to_vec(&identity).unwrap();
+        fs::write(lock_path(directory.path()), &bytes).unwrap();
+        let wait = HostExitWait::capture(directory.path(), "exitwait", identity.boot_id).unwrap();
+        assert!(wait
+            .wait_until(std::time::Instant::now() + std::time::Duration::from_millis(1))
+            .await
+            .is_err());
+        let reservation = wait
+            .wait_until(std::time::Instant::now() + std::time::Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert!(child.0.try_wait().unwrap().is_some());
+        assert!(matches!(
+            HostLock::acquire(directory.path(), "exitwait"),
+            Err(HostLockError::AlreadyRunning { .. })
+        ));
+        assert_eq!(fs::read(lock_path(directory.path())).unwrap(), bytes);
+        drop(reservation);
+        assert!(HostLock::acquire(directory.path(), "exitwait").is_ok());
+    }
+}
+
 fn lock_path(profile_root: &Path) -> PathBuf {
     profile_root.join(LOCK_FILE_NAME)
 }

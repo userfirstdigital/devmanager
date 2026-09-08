@@ -352,17 +352,21 @@ where
 }
 
 fn validate_ctl_profile(raw: &str) -> Result<String, CliError> {
+    validate_ctl_profile_for_build(raw, cfg!(debug_assertions))
+}
+
+fn validate_ctl_profile_for_build(raw: &str, debug_build: bool) -> Result<String, CliError> {
     if raw.is_empty() {
         return Err(CliError::new("profile must be nonempty"));
     }
-    if raw.eq_ignore_ascii_case("production") {
+    if debug_build && raw.eq_ignore_ascii_case("production") {
         return Err(CliError::new(
             "reserved production profile is forbidden for debug ctl commands",
         ));
     }
     match crate::config::paths::AppProfile::named(raw) {
         Ok(crate::config::paths::AppProfile::Named(name)) => {
-            if name == "production" {
+            if debug_build && name == "production" {
                 return Err(CliError::new(
                     "reserved production profile is forbidden for debug ctl commands",
                 ));
@@ -699,13 +703,13 @@ pub fn run_ctl(command: CtlCommand) -> Result<(), CliError> {
 }
 
 fn status_json_document(profile: &str) -> Result<String, CliError> {
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "linux")))]
     {
         let _ = profile;
-        return Err(CliError::new("ctl status requires Windows"));
+        return Err(CliError::new("ctl status requires Windows or Linux"));
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -715,7 +719,7 @@ fn status_json_document(profile: &str) -> Result<String, CliError> {
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 async fn status_json_document_async(profile: &str) -> Result<String, CliError> {
     let client = connect_profile_client(profile, ClientId::new(), CapabilitySet::empty()).await?;
 
@@ -735,13 +739,13 @@ async fn status_json_document_async(profile: &str) -> Result<String, CliError> {
 }
 
 fn tasks_json_document(profile: &str) -> Result<String, CliError> {
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "linux")))]
     {
         let _ = profile;
-        return Err(CliError::new("ctl tasks requires Windows"));
+        return Err(CliError::new("ctl tasks requires Windows or Linux"));
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -751,7 +755,7 @@ fn tasks_json_document(profile: &str) -> Result<String, CliError> {
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 async fn tasks_json_document_async(profile: &str) -> Result<String, CliError> {
     let mut client = connect_profile_client(
         profile,
@@ -776,7 +780,7 @@ async fn tasks_json_document_async(profile: &str) -> Result<String, CliError> {
     result
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 async fn assemble_task_list(
     client: &mut HostClient,
     profile: &str,
@@ -894,14 +898,14 @@ async fn assemble_task_list(
 }
 
 fn task_show_json_document(profile: &str, task_id: TaskId) -> Result<String, CliError> {
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "linux")))]
     {
         let _ = profile;
         let _ = task_id;
-        return Err(CliError::new("ctl task-show requires Windows"));
+        return Err(CliError::new("ctl task-show requires Windows or Linux"));
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -911,7 +915,7 @@ fn task_show_json_document(profile: &str, task_id: TaskId) -> Result<String, Cli
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 async fn task_show_json_document_async(profile: &str, task_id: TaskId) -> Result<String, CliError> {
     let mut client =
         connect_profile_client(profile, ClientId::new(), CapabilitySet::empty()).await?;
@@ -987,13 +991,13 @@ fn invoke_json_document(
                     "task creation requires expected-task-revision to be absent",
                 ));
             }
-            #[cfg(not(windows))]
+            #[cfg(not(any(windows, target_os = "linux")))]
             {
                 let _ = profile;
                 let _ = arguments_json;
-                return Err(CliError::new("ctl invoke requires Windows"));
+                return Err(CliError::new("ctl invoke requires Windows or Linux"));
             }
-            #[cfg(windows)]
+            #[cfg(any(windows, target_os = "linux"))]
             {
                 let runtime = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
@@ -1011,14 +1015,14 @@ fn invoke_json_document(
             let Some(expected_task_revision) = expected_task_revision else {
                 return Err(CliError::new("task.rename requires expected-task-revision"));
             };
-            #[cfg(not(windows))]
+            #[cfg(not(any(windows, target_os = "linux")))]
             {
                 let _ = profile;
                 let _ = arguments_json;
                 let _ = expected_task_revision;
-                return Err(CliError::new("ctl invoke requires Windows"));
+                return Err(CliError::new("ctl invoke requires Windows or Linux"));
             }
-            #[cfg(windows)]
+            #[cfg(any(windows, target_os = "linux"))]
             {
                 let runtime = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
@@ -1047,14 +1051,14 @@ fn invoke_json_document(
                     "{action_id} requires expected-task-revision"
                 )));
             };
-            #[cfg(not(windows))]
+            #[cfg(not(any(windows, target_os = "linux")))]
             {
                 let _ = profile;
                 let _ = arguments_json;
                 let _ = expected_task_revision;
-                return Err(CliError::new("ctl invoke requires Windows"));
+                return Err(CliError::new("ctl invoke requires Windows or Linux"));
             }
-            #[cfg(windows)]
+            #[cfg(any(windows, target_os = "linux"))]
             {
                 let runtime = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
@@ -1071,13 +1075,13 @@ fn invoke_json_document(
             }
         }
         ACTION_SERVICE_START | ACTION_SERVICE_STOP | ACTION_SERVICE_RESTART => {
-            #[cfg(not(windows))]
+            #[cfg(not(any(windows, target_os = "linux")))]
             {
                 let _ = profile;
                 let _ = arguments_json;
-                return Err(CliError::new("ctl invoke requires Windows"));
+                return Err(CliError::new("ctl invoke requires Windows or Linux"));
             }
-            #[cfg(windows)]
+            #[cfg(any(windows, target_os = "linux"))]
             {
                 let runtime = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
@@ -1101,7 +1105,7 @@ fn invoke_json_document(
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 async fn service_control_invoke_async(
     profile: &str,
     action_id: &str,
@@ -1153,7 +1157,7 @@ async fn service_control_invoke_async(
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 async fn task_create_invoke_async(
     profile: &str,
     action_id: &str,
@@ -1202,7 +1206,7 @@ fn task_create_requested_capabilities(args: &TaskCreateV2Arguments) -> Capabilit
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 async fn task_rename_invoke_async(
     profile: &str,
     arguments_json: &str,
@@ -1244,7 +1248,7 @@ async fn task_rename_invoke_async(
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 async fn provider_input_invoke_async(
     profile: &str,
     action_id: &str,
@@ -1352,7 +1356,7 @@ fn provider_input_delivery_from_operation_state(
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 async fn wait_for_provider_input_delivery(
     client: &mut HostClient,
     operation_id: OperationId,
@@ -1420,7 +1424,7 @@ fn unix_epoch_ms() -> Result<i64, CliError> {
         .map_err(|_| CliError::new("system clock milliseconds exceed supported range"))
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 async fn execute_command_with_reconnect(
     client: &mut HostClient,
     envelope: CommandEnvelope,
@@ -1458,7 +1462,7 @@ async fn execute_command_with_reconnect(
     )))
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 async fn reconnect_before_deadline(
     client: &mut HostClient,
     deadline: tokio::time::Instant,
@@ -1495,7 +1499,7 @@ fn command_replay_timeout_error(action_id: &str) -> CliError {
     ))
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 async fn connect_profile_client(
     profile: &str,
     client_id: ClientId,
@@ -1726,6 +1730,21 @@ mod tests {
                 arguments_json: arguments.to_string(),
                 expected_task_revision: Some(1),
             }
+        );
+    }
+
+    #[test]
+    fn shipping_ctl_accepts_production_while_debug_ctl_remains_isolated() {
+        use super::validate_ctl_profile_for_build;
+        assert_eq!(
+            validate_ctl_profile_for_build("Production", false).unwrap(),
+            "production"
+        );
+        assert!(validate_ctl_profile_for_build("Production", true).is_err());
+        assert!(validate_ctl_profile_for_build("../production", false).is_err());
+        assert_eq!(
+            validate_ctl_profile_for_build("Alpha_1", true).unwrap(),
+            "alpha_1"
         );
     }
 

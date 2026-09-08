@@ -10,6 +10,13 @@ fn main() -> ExitCode {
     // Sole product desktop entry: one native GPUI client plus durable host.
     // Hook relays and debug-only --ui-preview run before the product shell.
     let args = std::env::args_os().skip(1).collect::<Vec<_>>();
+    if args.len() == 1 && args[0] == "--package-identity" {
+        println!(
+            "{}",
+            devmanager::updater::shipping_package_metadata("client")
+        );
+        return ExitCode::SUCCESS;
+    }
     // Provider relay arguments are textual; preserve native OS paths for the
     // debug workspace entry instead of panicking on a non-UTF-8 Linux path.
     if let Some(text_args) = args
@@ -44,7 +51,13 @@ fn main() -> ExitCode {
     {
         return run_ui_preview(args);
     }
-    run_product_shell(args)
+    let outcome = run_product_shell(args);
+    #[cfg(target_os = "linux")]
+    if let Err(error) = devmanager::updater::appimage::restart_after_native_shutdown() {
+        eprintln!("{error}");
+        return ExitCode::from(2);
+    }
+    outcome
 }
 
 fn run_product_shell(args: Vec<std::ffi::OsString>) -> ExitCode {

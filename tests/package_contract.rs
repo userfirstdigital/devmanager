@@ -415,8 +415,8 @@ fn package_docs_and_workflows_describe_one_product_two_binaries_without_next_ide
         "draft verification must not keep the stale 11-asset hard-coded expectation"
     );
     assert!(
-        release.contains("14 uniquely named platform") && release.contains("plus latest.json"),
-        "staging must document the 14 platform artifacts + latest.json emit contract"
+        release.contains("16 uniquely named platform") && release.contains("plus latest.json"),
+        "staging must document the 16 platform artifacts + latest.json emit contract"
     );
 
     let notices = read(&repo_root().join("THIRD_PARTY_NOTICES.md"));
