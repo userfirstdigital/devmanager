@@ -486,6 +486,17 @@ fn stale_reference_scan_keeps_forbidden_patterns_and_exact_path_token_safety_con
         ("src/updater/handoff.rs", &["session.json"][..]),
         ("tests/prompt_ui.rs", &["session.json"][..]),
         ("tests/update_contract.rs", &["session.json"][..]),
+        ("tests/prompt_library_smoke.rs", &["session.json"][..]),
+        (
+            "docs/final-release-verification-matrix.md",
+            &["session.json", "devmanager-next"][..],
+        ),
+        ("docs/prompts.md", &["session.json"][..]),
+        ("docs/providers.md", &["session.json"][..]),
+        (
+            "scripts/native-next/Invoke-FinalReleaseGate.ps1",
+            &["session.json", "devmanager-next"][..],
+        ),
         (
             "scripts/native-next/Invoke-CutoverAudit.ps1",
             &["session.json", "devmanager-next"][..],

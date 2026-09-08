@@ -57,7 +57,12 @@
     "desktop": "X11 or Wayland with XWayland",
     "installLocation": "Executable AppImage in a directory owned by the current user",
     "identityTrailer": "DEVMANAGER-AI-V1",
-    "runtime": ["GTK 3", "WebKitGTK 4.1", "GIO TLS modules", "GStreamer"],
+    "runtime": [
+      "GTK 3",
+      "WebKitGTK 4.1",
+      "GIO TLS modules",
+      "GStreamer"
+    ],
     "toolPins": "packaging/linux-appimage-tools.json",
     "builder": "packaging/build-linux-appimage.py"
   },
@@ -126,22 +131,73 @@
       "requiredOnlyIfLocked": true
     },
     "selectedCrypto": [
-      { "name": "rustls", "version": "0.23.37", "direct": true },
-      { "name": "ring", "version": "0.17.14", "direct": true },
-      { "name": "rcgen", "version": "0.13.2", "direct": true },
-      { "name": "sha2", "version": "0.10.9", "direct": true },
-      { "name": "hmac", "version": "0.12.1", "direct": true },
-      { "name": "zeroize", "version": "1.8.2", "direct": true },
-      { "name": "web-push-native", "version": "0.4.0", "direct": true },
-      { "name": "getrandom", "version": "0.3.4", "direct": true },
-      { "name": "base64", "version": "0.22.1", "direct": true }
+      {
+        "name": "rustls",
+        "version": "0.23.37",
+        "direct": true
+      },
+      {
+        "name": "ring",
+        "version": "0.17.14",
+        "direct": true
+      },
+      {
+        "name": "rcgen",
+        "version": "0.13.2",
+        "direct": true
+      },
+      {
+        "name": "sha2",
+        "version": "0.10.9",
+        "direct": true
+      },
+      {
+        "name": "hmac",
+        "version": "0.12.1",
+        "direct": true
+      },
+      {
+        "name": "zeroize",
+        "version": "1.8.2",
+        "direct": true
+      },
+      {
+        "name": "web-push-native",
+        "version": "0.4.0",
+        "direct": true
+      },
+      {
+        "name": "getrandom",
+        "version": "0.3.4",
+        "direct": true
+      },
+      {
+        "name": "base64",
+        "version": "0.22.1",
+        "direct": true
+      }
     ],
     "requiredDirect": [
-      { "name": "gpui", "version": "0.2.2" },
-      { "name": "gpui-component", "version": "0.5.1" },
-      { "name": "rusqlite", "version": "0.39.0" },
-      { "name": "secret-service", "version": "5.2.0" },
-      { "name": "zbus", "version": "5.14.0" }
+      {
+        "name": "gpui",
+        "version": "0.2.2"
+      },
+      {
+        "name": "gpui-component",
+        "version": "0.5.1"
+      },
+      {
+        "name": "rusqlite",
+        "version": "0.39.0"
+      },
+      {
+        "name": "secret-service",
+        "version": "5.2.0"
+      },
+      {
+        "name": "zbus",
+        "version": "5.14.0"
+      }
     ]
   },
   "staleReferenceScan": {
@@ -168,23 +224,69 @@
     "intentionalSafetyReferences": [
       {
         "path": "src/updater/handoff.rs",
-        "tokens": ["session.json"],
+        "tokens": [
+          "session.json"
+        ],
         "reason": "protected/ignored user-state contract"
       },
       {
         "path": "tests/prompt_ui.rs",
-        "tokens": ["session.json"],
+        "tokens": [
+          "session.json"
+        ],
         "reason": "explicit preservation/ignore contract"
       },
       {
         "path": "tests/update_contract.rs",
-        "tokens": ["session.json"],
+        "tokens": [
+          "session.json"
+        ],
         "reason": "explicit preservation/ignore contract"
       },
       {
         "path": "scripts/native-next/Invoke-CutoverAudit.ps1",
-        "tokens": ["session.json", "devmanager-next"],
+        "tokens": [
+          "session.json",
+          "devmanager-next"
+        ],
         "reason": "protected-file and forbidden-legacy negative checks"
+      },
+      {
+        "path": "tests/prompt_library_smoke.rs",
+        "tokens": [
+          "session.json"
+        ],
+        "reason": "documents the production-profile files excluded from isolated smoke verification"
+      },
+      {
+        "path": "docs/final-release-verification-matrix.md",
+        "tokens": [
+          "session.json",
+          "devmanager-next"
+        ],
+        "reason": "documents protected user state and the current isolated verification directory"
+      },
+      {
+        "path": "docs/prompts.md",
+        "tokens": [
+          "session.json"
+        ],
+        "reason": "documents the production-profile files that prompt tests must never read"
+      },
+      {
+        "path": "docs/providers.md",
+        "tokens": [
+          "session.json"
+        ],
+        "reason": "documents the production-profile files that provider tests must never access"
+      },
+      {
+        "path": "scripts/native-next/Invoke-FinalReleaseGate.ps1",
+        "tokens": [
+          "session.json",
+          "devmanager-next"
+        ],
+        "reason": "enforces isolated verification paths and preserves installed-app session state"
       }
     ]
   },
