@@ -23,7 +23,7 @@ pub enum BrowserHoldSettleError {
     Hold(BrowserIntegrationHold),
 }
 
-/// Public grant without a live Windows observation cannot mint a token.
+/// Public grant without a live native observation cannot mint a token.
 /// The production path is [`grant_browser_service_settler_for_live_surface`].
 pub fn grant_browser_service_settler(
     granted: CapabilitySet,
@@ -38,13 +38,13 @@ pub fn grant_browser_service_settler(
     Err(BrowserIntegrationHold::WebViewSurfaceAbsent)
 }
 
-/// Issue unforgeable 8.3 authority only after a live Windows child HWND /
+/// Issue unforgeable 8.3 authority only after a live native child window /
 /// controller / parent observation. Copied descriptors and synthetic maps
 /// cannot mint authority.
 pub fn browser_service_authority_for_live_surface(
     proof: &BrowserHostOwnedSurfaceProof,
 ) -> Result<BrowserServiceAuthority, BrowserIntegrationHold> {
-    if !proof.is_live_windows_observation() {
+    if !proof.is_live_verified() {
         return Err(BrowserIntegrationHold::WebViewSurfaceAbsent);
     }
     let descriptor = proof.descriptor();
@@ -58,7 +58,7 @@ pub fn browser_service_authority_for_live_surface(
 }
 
 /// Production token grant after hello `BrowserProjection`, host authority, exact
-/// hold identity, and a live Windows host-owned surface observation.
+/// hold identity, and a live native host-owned surface observation.
 pub fn grant_browser_service_settler_for_live_surface(
     granted: CapabilitySet,
     authority: &BrowserServiceAuthority,
@@ -70,7 +70,7 @@ pub fn grant_browser_service_settler_for_live_surface(
             BrowserIntegrationHold::HostCapabilityUngranted,
         ));
     }
-    if !proof.is_live_windows_observation() {
+    if !proof.is_live_verified() {
         return Err(BrowserHoldSettleError::Hold(
             BrowserIntegrationHold::WebViewSurfaceAbsent,
         ));
@@ -154,7 +154,7 @@ fn settle_accepted_browser_hold_gated(
             BrowserIntegrationHold::WebViewSurfaceAbsent,
         ));
     };
-    if !proof.is_live_windows_observation() {
+    if !proof.is_live_verified() {
         return Err(BrowserHoldSettleError::Hold(
             BrowserIntegrationHold::WebViewSurfaceAbsent,
         ));

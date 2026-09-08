@@ -109,6 +109,14 @@ windows = { version = "=0.61.3", features = [
 libc = "0.2.183"
 
 [target.'cfg(target_os = "linux")'.dependencies]
+raw-window-handle = "0.6"
+wry = { version = "=0.55.1", default-features = false, features = ["devtools", "protocol", "os-webview", "x11"] }
+gtk = "=0.18.2"
+cairo-rs = { version = "=0.18.5", features = ["png"] }
+gdkx11 = "0.18"
+javascriptcore-rs = "=1.1.2"
+webkit2gtk = { version = "=2.0.2", features = ["v2_40"] }
+x11rb = "=0.13.2"
 ring = "=0.17.14"
 secret-service = { version = "=5.2.0", features = ["rt-async-io-crypto-rust"] }
 zbus = { version = "=5.14.0", default-features = false, features = ["async-io"] }
@@ -150,3 +158,6 @@ main = true
 [[package.metadata.packager.binaries]]
 path = "devmanager-host"
 main = false
+
+[patch.crates-io]
+gpui = { path = "third_party/gpui" }

@@ -149,8 +149,14 @@ fn browser_session_normalization_preserves_only_ai_workspaces() {
 fn browser_enabled_uses_the_platform_default_for_legacy_settings() {
     let legacy: Settings = serde_json::from_str("{}").expect("legacy settings");
 
-    assert_eq!(Settings::default().browser_enabled, cfg!(windows));
-    assert_eq!(legacy.browser_enabled, cfg!(windows));
+    assert_eq!(
+        Settings::default().browser_enabled,
+        cfg!(any(windows, target_os = "linux"))
+    );
+    assert_eq!(
+        legacy.browser_enabled,
+        cfg!(any(windows, target_os = "linux"))
+    );
 }
 
 #[test]

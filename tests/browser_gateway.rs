@@ -1539,27 +1539,28 @@ async fn real_rmcp_client_lists_the_browser_tools_with_exact_bound_schemas() {
             .iter()
             .map(|tool| tool.name.as_ref())
             .collect::<Vec<_>>();
-        assert_eq!(
-            names,
-            vec![
-                "browser_act",
-                "browser_annotations",
-                "browser_cdp",
-                "browser_console",
-                "browser_downloads",
-                "browser_navigate",
-                "browser_network",
-                "browser_performance",
-                "browser_recording",
-                "browser_screenshot",
-                "browser_snapshot",
-                "browser_status",
-                "browser_tabs",
-                "browser_upload",
-                "browser_wait",
-                "browser_workflow",
-            ]
-        );
+        let mut expected = vec![
+            "browser_act",
+            "browser_annotations",
+            "browser_cdp",
+            "browser_console",
+            "browser_downloads",
+            "browser_navigate",
+            "browser_network",
+            "browser_performance",
+            "browser_recording",
+            "browser_screenshot",
+            "browser_snapshot",
+            "browser_status",
+            "browser_tabs",
+            "browser_upload",
+            "browser_wait",
+            "browser_workflow",
+        ];
+        if cfg!(target_os = "linux") {
+            expected.retain(|name| *name != "browser_cdp");
+        }
+        assert_eq!(names, expected);
         assert!(listed.tools.iter().all(|tool| {
             let required = tool
                 .input_schema
@@ -2721,7 +2722,7 @@ async fn browser_recording_resource_failure_is_typed_path_free_and_retains_revie
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn real_rmcp_client_routes_all_ten_automation_groups_with_compact_results() {
+async fn real_rmcp_client_routes_supported_automation_groups_with_compact_results() {
     let config_dir = unique_gateway_config_dir("automation-tools");
     let project_root = config_dir.join("project-root");
     std::fs::create_dir_all(&project_root).expect("create automation project root");
@@ -2845,8 +2846,15 @@ async fn real_rmcp_client_routes_all_ten_automation_groups_with_compact_results(
                 .call_tool(
                     CallToolRequestParams::new(tool_name).with_arguments(arguments(tool_arguments)),
                 )
-                .await
-                .unwrap_or_else(|error| panic!("call {tool_name}: {error}"));
+                .await;
+            if cfg!(target_os = "linux") && tool_name == "browser_cdp" {
+                assert!(
+                    result.is_err(),
+                    "WebKit must not advertise or accept Chromium-only CDP calls"
+                );
+                continue;
+            }
+            let result = result.unwrap_or_else(|error| panic!("call {tool_name}: {error}"));
             assert_eq!(result.is_error, Some(false), "{tool_name}");
             let structured = result
                 .structured_content

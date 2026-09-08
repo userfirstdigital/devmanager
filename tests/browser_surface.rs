@@ -99,9 +99,9 @@ fn attach(
 fn protocol_descriptor(task_id: TaskId) -> ProtocolDescriptor {
     let json = serde_json::json!({
         "identity": {
-            "task_id": task_id,
-            "context_id": BrowserContextId::new(),
-            "resource_id": ResourceId::new(),
+            "taskId": task_id,
+            "contextId": BrowserContextId::new(),
+            "resourceId": ResourceId::new(),
         },
         "childHwnd": "hwnd:4096",
         "hostProcess": {
@@ -637,7 +637,14 @@ fn contract_fixture_server_source_never_launches_webview_or_installed_app() {
     assert!(source.contains("MAX_REQUEST_LINE_BYTES"));
     assert!(source.contains("MAX_HEADER_BYTES"));
     assert!(source.contains("MAX_BODY_BYTES"));
-    assert!(!source.to_ascii_lowercase().contains("webview2"));
+    // Documentation names the engines this fixture must never launch.
+    let code = source
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!code.to_ascii_lowercase().contains("webview2"));
+    assert!(!code.contains("Command::new"));
     assert!(!source.contains("Start-Process"));
     assert!(!source.contains("claude"));
     assert!(!source.contains("codex"));
@@ -651,7 +658,7 @@ fn contract_surface_proof_script_exists_and_stays_local() {
     ))
     .expect("surface proof script");
     assert!(script.contains("Set-StrictMode"));
-    assert!(script.contains("-Stage"));
+    assert!(script.contains("[string]$Stage"));
     assert!(script.contains("Red"));
     assert!(script.contains("Green"));
     assert!(script.contains("OutputDir"));
@@ -660,7 +667,9 @@ fn contract_surface_proof_script_exists_and_stays_local() {
     assert!(script.contains("HostRecovery"));
     assert!(script.contains("CARGO_TARGET_DIR"));
     assert!(script.contains("DEVMANAGER_PROFILE"));
-    assert!(!script.contains("Start-Process"));
+    assert!(script.contains("Assert-BrowserSurfaceProofDoesNotLaunchHosts"));
+    assert!(script.contains("Parser]::ParseFile"));
+    assert!(script.contains("if ($name -eq 'Start-Process')"));
     assert!(!script
         .to_ascii_lowercase()
         .contains("com.userfirst.devmanager"));

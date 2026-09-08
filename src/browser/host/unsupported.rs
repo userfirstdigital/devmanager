@@ -1,6 +1,6 @@
-#[cfg(any(not(target_os = "windows"), test))]
+#[cfg(any(not(any(target_os = "windows", target_os = "linux")), test))]
 use super::super::BrowserCommandRequest;
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
 use super::super::{
     apply_browser_workflow_review_mutation, browser_workflow_review_projection,
     discard_browser_workflow_review, preview_browser_workflow_review, save_browser_workflow_review,
@@ -15,14 +15,14 @@ use super::super::{
     validate_direct_repair_preview_command, validate_direct_secret_command, BrowserCommand,
     BrowserError, BrowserHostStatus, BrowserResponse,
 };
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
 use super::{
     BrowserAppExitDisposition, BrowserHostState, BrowserNativeWindowLifetime,
     BrowserWorkspaceSnapshot,
 };
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
 use crate::browser::BrowserAttachmentProjection;
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
 use std::{
     marker::PhantomData,
     path::{Path, PathBuf},
@@ -53,7 +53,7 @@ fn bounded_platform(platform: String) -> String {
 }
 
 pub fn unsupported_platform_error(platform: impl Into<String>) -> BrowserError {
-    // Locator failures can only be produced by the Windows host action boundary.
+    // Locator failures can only be produced by the native host action boundary.
     // Unsupported hosts must remain unavailable without attempting locator resolution.
     BrowserError::UnavailablePlatform {
         platform: bounded_platform(platform.into()),
@@ -103,7 +103,7 @@ pub(crate) fn unsupported_validated_command_response(
     }
 }
 
-#[cfg(any(not(target_os = "windows"), test))]
+#[cfg(any(not(any(target_os = "windows", target_os = "linux")), test))]
 pub(crate) fn unsupported_request_response(
     platform: impl Into<String>,
     request: &BrowserCommandRequest,
@@ -118,7 +118,7 @@ pub(crate) fn unsupported_request_response(
     unsupported_validated_command_response(platform, request.command().clone())
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
 pub struct BrowserWebViewHost {
     status: BrowserHostStatus,
     #[allow(dead_code)]
@@ -129,7 +129,7 @@ pub struct BrowserWebViewHost {
     _main_thread_only: PhantomData<Rc<()>>,
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
 impl BrowserWebViewHost {
     pub fn new(app_config_dir: impl AsRef<Path>) -> Self {
         let app_config_dir = app_config_dir.as_ref().to_path_buf();

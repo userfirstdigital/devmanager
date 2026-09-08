@@ -405,7 +405,7 @@ impl BrowserNativeShellController {
     }
 
     pub fn for_current_platform() -> Self {
-        if cfg!(target_os = "windows") {
+        if cfg!(any(target_os = "windows", target_os = "linux")) {
             Self::supported()
         } else {
             Self::unsupported()

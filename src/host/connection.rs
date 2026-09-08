@@ -8046,7 +8046,10 @@ impl HostRequestExecutor {
             }
         };
         let page = match super::cockpit::serve_conversation(
-            &dispatch, task_id, after_sequence, page_limits,
+            &dispatch,
+            task_id,
+            after_sequence,
+            page_limits,
         ) {
             QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Conversation(page))) => {
                 page

@@ -4357,18 +4357,17 @@ where
     if !same_path(&canonical, path) {
         return Err("repository graph path canonical identity changed".to_string());
     }
-    let identity = if is_file
-        && absence_policy == OptionalMutableAbsencePolicy::AllowApprovedIndexGone
-    {
-        stable_file_identity_with_index_retry(path, false, deadline, true, true, true, true)?
-    } else if is_file {
-        deadline.map_or_else(
-            || data_file_identity(path),
-            |deadline| data_file_identity_with_deadline(path, deadline),
-        )?
-    } else {
-        mutable_directory_identity_with_deadline(path, deadline)?
-    };
+    let identity =
+        if is_file && absence_policy == OptionalMutableAbsencePolicy::AllowApprovedIndexGone {
+            stable_file_identity_with_index_retry(path, false, deadline, true, true, true, true)?
+        } else if is_file {
+            deadline.map_or_else(
+                || data_file_identity(path),
+                |deadline| data_file_identity_with_deadline(path, deadline),
+            )?
+        } else {
+            mutable_directory_identity_with_deadline(path, deadline)?
+        };
     Ok(Some(identity))
 }
 

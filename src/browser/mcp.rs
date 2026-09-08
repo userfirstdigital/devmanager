@@ -484,7 +484,15 @@ impl BrowserMcpServer {
                 workflow,
                 surface_binding,
             }),
-            tool_router: Self::tool_router(),
+            tool_router: {
+                #[allow(unused_mut)]
+                let mut router = Self::tool_router();
+                // WebKit supports the ordinary browser tools through native
+                // adapters. Chromium's raw DevTools protocol is engine-specific.
+                #[cfg(target_os = "linux")]
+                router.remove_route("browser_cdp");
+                router
+            },
         }
     }
 

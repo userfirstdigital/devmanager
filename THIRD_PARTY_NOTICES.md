@@ -3,7 +3,7 @@
 ## gpui 0.2.2 and gpui-component 0.5.1
 
 - Sources: `https://crates.io/crates/gpui/0.2.2` and `https://crates.io/crates/gpui-component/0.5.1`
-- Declared in `Cargo.toml` as `gpui = "0.2.2"` and `gpui-component = "=0.5.1"`; resolved checksums are in `Cargo.lock`
+- Declared in `Cargo.toml` as `gpui = "0.2.2"` and `gpui-component = "=0.5.1"`. GPUI is patched from the exact published crate in `third_party/gpui` to implement retained X11 raw handles and explicit X11 application selection; provenance and the patch scope are in `third_party/gpui/UPSTREAM.md`. Registry dependency checksums remain in `Cargo.lock`.
 - These crates provide the native desktop UI shell packaged as `devmanager.exe`
 - Detailed `gpui-component` provenance remains in the section below
 

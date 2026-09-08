@@ -1381,7 +1381,7 @@ pub fn run_live_cli(args: Vec<OsString>, policy: &PreviewPathPolicy) -> Result<(
     let root = preview.root();
     let errors = Rc::new(RefCell::new(None));
     let errors_for_app = errors.clone();
-    gpui::Application::new()
+    crate::ui::desktop_application()
         .with_assets(AppAssets::new())
         .run(move |cx| {
             crate::ui::init(cx);

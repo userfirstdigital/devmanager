@@ -138,6 +138,7 @@ jobs:
           sudo apt-get install -y build-essential clang cmake pkg-config libssl-dev \
             libasound2-dev libfontconfig-dev libglib2.0-dev libwayland-dev \
             libx11-xcb-dev libxkbcommon-x11-dev libvulkan1 mesa-vulkan-drivers \
+            libgtk-3-dev libwebkit2gtk-4.1-dev xwayland \
             libzstd-dev dbus-user-session systemd-container lsof xvfb xauth
           sudo loginctl enable-linger "$USER"
           sudo systemctl start "user@$(id -u).service"
@@ -168,6 +169,7 @@ jobs:
           cargo build --locked --bin devmanager-process-test-helper -j 2 2>&1 | tee launch-evidence/process-helper.log
           cargo test --locked --lib exact_resume_mismatch -j 2 -- --test-threads=1 2>&1 | tee launch-evidence/session-identity.log
           xvfb-run -a cargo test --locked --test ui_native_shell -j 2 -- --test-threads=1 2>&1 | tee launch-evidence/native-contract.log
+          GDK_BACKEND=x11 xvfb-run -a cargo test --locked --lib linux_webkit_native_lifecycle -j 2 -- --ignored --test-threads=1 2>&1 | tee launch-evidence/linux-browser-engine.log
           cargo test --locked --lib -j 2 -- --test-threads=1 2>&1 | tee launch-evidence/library.log
           cargo test --locked --test file_service -j 2 -- --test-threads=1 2>&1 | tee launch-evidence/files.log
 

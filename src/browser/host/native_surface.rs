@@ -1,6 +1,6 @@
 //! Host-owned native surface backend for the single BrowserWebViewHost owner.
 //!
-//! Production mutations must succeed only after live Win32/Wry observation.
+//! Production mutations must succeed only after live platform/Wry observation.
 //! Synthetic HWND maps exist only under `cfg(test)` and cannot mint proof.
 
 use super::{
@@ -11,8 +11,8 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 /// Opaque proof that a host-owned surface was observed live. A copied
-/// descriptor is not authority. Only the Windows host observation path may
-/// mark [`HostSurfaceObservation::LiveWindows`].
+/// descriptor is not authority. Only a platform host observation path may
+/// mark the proof as live.
 ///
 /// ```compile_fail
 /// use devmanager::browser::BrowserHostOwnedSurfaceProof;
@@ -28,6 +28,8 @@ pub struct BrowserHostOwnedSurfaceProof {
 enum HostSurfaceObservation {
     Unverified,
     LiveWindows,
+    #[cfg(target_os = "linux")]
+    LiveLinux,
 }
 
 impl BrowserHostOwnedSurfaceProof {
@@ -54,7 +56,20 @@ impl BrowserHostOwnedSurfaceProof {
     }
 
     pub fn is_live_verified(&self) -> bool {
-        self.is_live_windows_observation()
+        match self.observation {
+            HostSurfaceObservation::LiveWindows => true,
+            #[cfg(target_os = "linux")]
+            HostSurfaceObservation::LiveLinux => true,
+            HostSurfaceObservation::Unverified => false,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn from_linux_child_observation(descriptor: BrowserSurfaceDescriptor) -> Self {
+        Self {
+            descriptor,
+            observation: HostSurfaceObservation::LiveLinux,
+        }
     }
 }
 
@@ -357,7 +372,7 @@ impl HostOwnedNativeSurfaceBackend {
         Ok(())
     }
 
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
     fn win32_require_live(_handle: &BrowserWindowHandle) -> Result<(), String> {
         Err(HostOwnedSurfaceBindError::LiveWindowRequired.to_string())
     }
@@ -373,7 +388,7 @@ impl HostOwnedNativeSurfaceBackend {
         Ok(unsafe { IsWindow(Some(hwnd)).as_bool() })
     }
 
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
     fn win32_is_window(_handle: &BrowserWindowHandle) -> Result<bool, String> {
         Err(HostOwnedSurfaceBindError::LiveWindowRequired.to_string())
     }
@@ -395,7 +410,7 @@ impl HostOwnedNativeSurfaceBackend {
         Ok(())
     }
 
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
     fn win32_reparent(
         _child: &BrowserWindowHandle,
         _parent: &BrowserWindowHandle,
@@ -427,7 +442,7 @@ impl HostOwnedNativeSurfaceBackend {
         Ok(())
     }
 
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
     fn win32_set_bounds(
         _child: &BrowserWindowHandle,
         _bounds: BrowserPhysicalBounds,
@@ -450,7 +465,7 @@ impl HostOwnedNativeSurfaceBackend {
         Ok(())
     }
 
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
     fn win32_set_focus(_child: &BrowserWindowHandle, _focused: bool) -> Result<(), String> {
         Err(HostOwnedSurfaceBindError::Win32Mutation.to_string())
     }
@@ -468,12 +483,45 @@ impl HostOwnedNativeSurfaceBackend {
         Ok(parent.0 as usize as u64 == expected_parent.raw_value())
     }
 
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
     fn win32_parent_matches(
         _child: &BrowserWindowHandle,
         _expected_parent: &BrowserWindowHandle,
     ) -> Result<bool, String> {
         Err(HostOwnedSurfaceBindError::Win32Mutation.to_string())
+    }
+    #[cfg(target_os = "linux")]
+    fn win32_require_live(handle: &BrowserWindowHandle) -> Result<(), String> {
+        super::linux_window::require_live(handle)
+    }
+    #[cfg(target_os = "linux")]
+    fn win32_is_window(handle: &BrowserWindowHandle) -> Result<bool, String> {
+        super::linux_window::is_window(handle)
+    }
+    #[cfg(target_os = "linux")]
+    fn win32_reparent(
+        child: &BrowserWindowHandle,
+        parent: &BrowserWindowHandle,
+    ) -> Result<(), String> {
+        super::linux_window::reparent(child, parent)
+    }
+    #[cfg(target_os = "linux")]
+    fn win32_set_bounds(
+        child: &BrowserWindowHandle,
+        bounds: BrowserPhysicalBounds,
+    ) -> Result<(), String> {
+        super::linux_window::set_bounds(child, bounds)
+    }
+    #[cfg(target_os = "linux")]
+    fn win32_set_focus(child: &BrowserWindowHandle, focused: bool) -> Result<(), String> {
+        super::linux_window::set_focus(child, focused)
+    }
+    #[cfg(target_os = "linux")]
+    fn win32_parent_matches(
+        child: &BrowserWindowHandle,
+        parent: &BrowserWindowHandle,
+    ) -> Result<bool, String> {
+        Ok(super::linux_window::parent(child)? == parent.raw_value())
     }
 }
 

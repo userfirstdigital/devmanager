@@ -43419,17 +43419,22 @@ impl NativeShell {
                 attached,
                 parent_hwnd: self.browser_parent_hwnd.or_else(|| {
                     window.and_then(|window| {
-                        #[cfg(target_os = "windows")]
+                        #[cfg(any(target_os = "windows", target_os = "linux"))]
                         {
                             use raw_window_handle::{HasWindowHandle, RawWindowHandle};
                             raw_window_handle::HasWindowHandle::window_handle(window)
                                 .ok()
                                 .and_then(|handle| match handle.as_raw() {
+                                    #[cfg(target_os = "windows")]
                                     RawWindowHandle::Win32(win) => Some(win.hwnd.get() as u64),
+                                    #[cfg(target_os = "linux")]
+                                    RawWindowHandle::Xlib(win) => Some(win.window),
+                                    #[cfg(target_os = "linux")]
+                                    RawWindowHandle::Xcb(win) => Some(u64::from(win.window.get())),
                                     _ => None,
                                 })
                         }
-                        #[cfg(not(target_os = "windows"))]
+                        #[cfg(not(any(target_os = "windows", target_os = "linux")))]
                         {
                             let _ = window;
                             None
@@ -43619,19 +43624,27 @@ impl NativeShell {
     }
 
     fn capture_browser_parent_hwnd(&mut self, window: &Window) {
-        #[cfg(target_os = "windows")]
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
         {
             use raw_window_handle::{HasWindowHandle, RawWindowHandle};
             if let Ok(handle) = raw_window_handle::HasWindowHandle::window_handle(window) {
-                if let RawWindowHandle::Win32(win) = handle.as_raw() {
-                    let hwnd = win.hwnd.get() as u64;
+                let hwnd = match handle.as_raw() {
+                    #[cfg(target_os = "windows")]
+                    RawWindowHandle::Win32(win) => Some(win.hwnd.get() as u64),
+                    #[cfg(target_os = "linux")]
+                    RawWindowHandle::Xlib(win) => Some(win.window),
+                    #[cfg(target_os = "linux")]
+                    RawWindowHandle::Xcb(win) => Some(u64::from(win.window.get())),
+                    _ => None,
+                };
+                if let Some(hwnd) = hwnd {
                     if hwnd != 0 {
                         self.browser_parent_hwnd = Some(hwnd);
                     }
                 }
             }
         }
-        #[cfg(not(target_os = "windows"))]
+        #[cfg(not(any(target_os = "windows", target_os = "linux")))]
         {
             let _ = window;
         }
@@ -46641,12 +46654,7 @@ impl NativeShell {
         );
         let conversation = self.task_workspace_surface(
             tokens,
-            Self::idle_conversation_photo_size(
-                tokens,
-                viewport,
-                layout.clone(),
-                board_width,
-            ),
+            Self::idle_conversation_photo_size(tokens, viewport, layout.clone(), board_width),
             &board,
             cx,
         );
@@ -46702,9 +46710,7 @@ impl NativeShell {
                 // Remote settings use InputState's own focus and text handler.
                 // Let it receive editing keys even if a terminal was armed
                 // before opening settings; only Escape belongs to the overlay.
-                if shell.settings_open
-                    && shell.settings_page == NativeSettingsPage::RemoteAccess
-                {
+                if shell.settings_open && shell.settings_page == NativeSettingsPage::RemoteAccess {
                     if event.keystroke.key == "escape" {
                         shell.handle_settings_overlay_key(event, window, cx);
                         cx.stop_propagation();
@@ -48621,7 +48627,7 @@ fn launch_native_shell(
     // use, so a dev profile can never reopen on top of the installed app.
     let stored_layout = WorkspaceLayoutStore::at_profile_root(profile.root()).load();
     let window_title = profile.window_title();
-    Application::new()
+    crate::ui::desktop_application()
         .with_assets(AppAssets::new())
         .run(move |cx| {
             crate::ui::init(cx);

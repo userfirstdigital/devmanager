@@ -162,7 +162,7 @@ impl Default for Settings {
             terminal_mouse_override: false,
             terminal_read_only: false,
             github_token: None,
-            browser_enabled: cfg!(windows),
+            browser_enabled: cfg!(any(windows, target_os = "linux")),
         }
     }
 }

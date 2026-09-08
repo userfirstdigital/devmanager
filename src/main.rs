@@ -35,6 +35,9 @@ fn main() -> ExitCode {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    devmanager::ui::prepare_native_platform();
+
     if args
         .iter()
         .any(|argument| argument == "--ui-preview" || argument == "--ui-preview-live")

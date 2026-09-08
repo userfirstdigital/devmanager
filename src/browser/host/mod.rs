@@ -15,6 +15,11 @@ use crate::protocol::{
     BrowserWindowHandle, MAX_BROWSER_CLIENT_SEQUENCE,
 };
 mod initialization;
+#[cfg(target_os = "linux")]
+#[path = "windows.rs"]
+mod linux;
+#[cfg(target_os = "linux")]
+mod linux_window;
 mod native_surface;
 mod unsupported;
 #[cfg(target_os = "windows")]
@@ -26,6 +31,8 @@ pub use native_surface::{
     HostOwnedSurfaceBindError, LegacyMcpTaskSurfaceBlocker,
 };
 
+#[cfg(target_os = "linux")]
+pub use linux::BrowserWebViewHost;
 use serde::{Deserialize, Serialize};
 use std::cell::Cell;
 use std::collections::{BTreeSet, HashMap, VecDeque};
@@ -34,7 +41,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
 pub use unsupported::BrowserWebViewHost;
 pub use unsupported::{
     unsupported_command_response, unsupported_host_status, unsupported_platform_error,

@@ -583,3 +583,22 @@ the live five-task/38-fact state without pairing again. No session error remaine
 Private evidence: `linux-production/remote-pages-live-result.json` and
 `remote-pages-*.log`. Exact app/host and Rust processes were joined; production
 configuration hashes remained unchanged.
+
+### Linux embedded-browser runtime
+
+The Linux backend uses WebKitGTK 4.1 through GTK 3 and a retained X11 child
+window. Wayland desktops use XWayland; provider processes retain the user's
+original desktop environment. Build dependencies include `libgtk-3-dev` and
+`libwebkit2gtk-4.1-dev` (Ubuntu names), and a Wayland runtime needs XWayland.
+The pinned GPUI crate has a narrow vendored patch for its previously unimplemented
+X11 raw handles and explicit X11 application selection.
+
+The real GTK harness passed asynchronous JavaScript, native file upload with
+exact content verification, screenshot pixel validation, child reparenting and
+parking, and cancellation during teardown. Chromium-only raw CDP is omitted
+from the Linux tool list; the typed automation and capture adapters use WebKit.
+Resource storage now retains a directory descriptor and rejects directory/lock
+replacement, including replacement during an artifact write.
+
+This is engine acceptance. The native task Browser pane still needs its durable
+session startup wiring before complete desktop browser acceptance.

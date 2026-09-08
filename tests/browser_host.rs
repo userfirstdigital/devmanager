@@ -3857,8 +3857,9 @@ fn windows_secret_lifecycle_uses_native_navigation_identity_and_success_args() {
     assert!(source.contains("args.IsErrorPage(&mut is_error_page)"));
     assert!(source.contains("add_NavigationCompleted"));
     assert!(source.contains("args.IsSuccess(&mut is_success)"));
-    assert!(source.contains("document_secret_state.content_loading("));
-    assert!(source.contains("document_secret_state.navigation_completed("));
+    let compact = source.split_whitespace().collect::<String>();
+    assert!(compact.contains("content_document_secret_state.content_loading("));
+    assert!(compact.contains("document_secret_state.navigation_completed("));
 }
 
 #[test]
@@ -4187,7 +4188,7 @@ fn windows_host_profile_state_and_clear_plan_use_the_retained_canonical_root() {
     let source = include_str!("../src/browser/host/windows.rs");
     let constructor = source.find("fn with_status(").unwrap();
     let clear = source.find("fn clear_project_profile(").unwrap();
-    assert!(source[constructor..clear].contains("BrowserHostState::new(state_app_config_dir)"));
+    assert!(source[constructor..clear].contains("BrowserHostState::new(&state_app_config_dir)"));
     let clear_body = &source[clear..];
     let retained = clear_body.find("self.trusted_app_config_dir").unwrap();
     let layout = clear_body
@@ -4233,6 +4234,7 @@ fn verified_resource_store_rejects_an_intermediate_resources_reparse() {
     remove_directory_redirect(&redirected_resources);
 }
 
+#[cfg(windows)]
 #[test]
 fn verified_resource_store_root_lock_blocks_post_open_swap_and_store_remains_usable() {
     let temp = TestDir::new("resource-root-swap");
@@ -4259,6 +4261,49 @@ fn verified_resource_store_root_lock_blocks_post_open_swap_and_store_remains_usa
         )
         .is_ok());
     assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_verified_resource_store_rejects_replaced_root_and_does_not_write_outside() {
+    let temp = TestDir::new("linux-resource-root-swap");
+    let trusted = temp.path().join("trusted-config");
+    let store = BrowserResourceStore::open_verified(
+        &trusted,
+        "project-a",
+        BrowserResourceLimits::default(),
+    )
+    .unwrap();
+    let root = store.root().to_path_buf();
+    let retired = root.with_extension("retired");
+    std::fs::rename(&root, &retired).unwrap();
+    std::fs::create_dir(&root).unwrap();
+    assert!(store
+        .put(
+            &workspace("project-a", "conversation-a"),
+            BrowserResourceKind::ConsoleLog,
+            "text/plain",
+            b"must remain private",
+            false
+        )
+        .is_err());
+    assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+    std::fs::remove_dir(&root).unwrap();
+    let outside = temp.path().join("outside");
+    std::fs::create_dir(&outside).unwrap();
+    std::os::unix::fs::symlink(&outside, &root).unwrap();
+    assert!(store
+        .put(
+            &workspace("project-a", "conversation-a"),
+            BrowserResourceKind::ConsoleLog,
+            "text/plain",
+            b"must remain private",
+            false
+        )
+        .is_err());
+    drop(store);
+    assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
+    std::fs::remove_file(&root).unwrap();
 }
 
 #[test]

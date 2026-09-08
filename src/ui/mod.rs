@@ -106,3 +106,40 @@ pub fn finish_headless_test(cx: &mut App) {
     })
     .detach();
 }
+
+/// Initialize GTK on the process main thread before host/provider threads start.
+/// The backend override exists only during GTK initialization; launched tools
+/// retain the user's original Wayland/X11 environment.
+#[cfg(target_os = "linux")]
+pub fn prepare_native_platform() {
+    if !std::env::var_os("DISPLAY").is_some_and(|display| !display.is_empty())
+        || gtk::is_initialized()
+    {
+        return;
+    }
+    struct RestoreBackend(Option<std::ffi::OsString>);
+    impl Drop for RestoreBackend {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(value) => std::env::set_var("GDK_BACKEND", value),
+                None => std::env::remove_var("GDK_BACKEND"),
+            }
+        }
+    }
+    let _restore = RestoreBackend(std::env::var_os("GDK_BACKEND"));
+    std::env::set_var("GDK_BACKEND", "x11");
+    gtk::gdk::set_allowed_backends("x11");
+    let _ = gtk::init();
+}
+
+/// The native browser is an X11 child, so use XWayland when it is available.
+/// Headless and non-Linux launches keep GPUI's ordinary platform selection.
+pub(crate) fn desktop_application() -> gpui::Application {
+    #[cfg(target_os = "linux")]
+    if std::env::var_os("ZED_HEADLESS").is_none()
+        && std::env::var_os("DISPLAY").is_some_and(|display| !display.is_empty())
+    {
+        return gpui::Application::new_x11().expect("initialize native X11 application");
+    }
+    gpui::Application::new()
+}

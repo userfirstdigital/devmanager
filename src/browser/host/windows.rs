@@ -1,3 +1,5 @@
+//! Shared Wry task-browser runtime. Platform adapters own native windows and engine callbacks.
+
 use super::{
     acknowledge_attachment_projection_and_reconcile_pins, browser_user_input_initialization_script,
     require_completed_wry_task_identity, validate_browser_url, BrowserAppExitDisposition,
@@ -57,8 +59,7 @@ use crate::protocol::{
 use base64::Engine as _;
 use gpui::{ForegroundExecutor, Task};
 use raw_window_handle::{
-    HandleError, HasWindowHandle, RawWindowHandle, Win32WindowHandle,
-    WindowHandle as BorrowedWindowHandle,
+    HandleError, HasWindowHandle, RawWindowHandle, WindowHandle as BorrowedWindowHandle,
 };
 use rfd::{MessageButtons, MessageDialog, MessageDialogResult, MessageLevel};
 use serde::Deserialize;
@@ -72,6 +73,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+#[cfg(target_os = "windows")]
 use webview2_com::Microsoft::Web::WebView2::Win32::{
     COREWEBVIEW2_PERMISSION_KIND, COREWEBVIEW2_PERMISSION_KIND_CAMERA,
     COREWEBVIEW2_PERMISSION_KIND_CLIPBOARD_READ, COREWEBVIEW2_PERMISSION_KIND_FILE_READ_WRITE,
@@ -79,17 +81,23 @@ use webview2_com::Microsoft::Web::WebView2::Win32::{
     COREWEBVIEW2_PERMISSION_KIND_NOTIFICATIONS, COREWEBVIEW2_PERMISSION_STATE_ALLOW,
     COREWEBVIEW2_PERMISSION_STATE_DENY,
 };
+#[cfg(target_os = "windows")]
 use webview2_com::{
     CallDevToolsProtocolMethodCompletedHandler, ContentLoadingEventHandler,
     NavigationCompletedEventHandler, PermissionRequestedEventHandler,
 };
+#[cfg(target_os = "windows")]
 use windows::core::{BOOL, HSTRING};
 use wry::dpi::{LogicalPosition, LogicalSize};
-use wry::{
-    MemoryUsageLevel, NewWindowResponse, PageLoadEvent, Rect, WebContext, WebView, WebViewBuilder,
-    WebViewExtWindows,
-};
+#[cfg(target_os = "windows")]
+use wry::{MemoryUsageLevel, WebView, WebViewExtWindows};
+use wry::{NewWindowResponse, PageLoadEvent, Rect, WebContext, WebViewBuilder};
 use zeroize::{Zeroize, Zeroizing};
+#[cfg(target_os = "linux")]
+#[path = "linux_webview.rs"]
+mod linux_webview;
+#[cfg(target_os = "linux")]
+use linux_webview::*;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct BrowserViewKey {
@@ -835,7 +843,7 @@ struct BrowserProjectRuntime {
 }
 
 struct BrowserParentWindowLease {
-    handle: Win32WindowHandle,
+    handle: RawWindowHandle,
     window_lease: BrowserNativeWindowBuildLease,
 }
 
@@ -848,12 +856,20 @@ impl BrowserParentWindowLease {
             HasWindowHandle::window_handle(window).map_err(|_| BrowserError::CrashedView {
                 message: "browser parent window handle is unavailable".to_string(),
             })?;
-        let RawWindowHandle::Win32(handle) = handle.as_raw() else {
-            return Err(BrowserError::CrashedView {
-                message: "GPUI did not expose a Win32 parent window handle".to_string(),
-            });
+        let handle = handle.as_raw();
+        // XCB and Xlib use the same server-side XID. Wry accepts an Xlib
+        // window handle; retain GPUI's exact lifetime lease across this conversion.
+        #[cfg(target_os = "linux")]
+        let handle = match handle {
+            RawWindowHandle::Xcb(xcb) => RawWindowHandle::Xlib(
+                raw_window_handle::XlibWindowHandle::new(u64::from(xcb.window.get())),
+            ),
+            handle => handle,
         };
-        let window_identity = handle.hwnd.get();
+        let window_identity =
+            native_parent_window_identity(handle).ok_or_else(|| BrowserError::CrashedView {
+                message: "embedded browser requires a supported native parent window".to_string(),
+            })?;
         let generation =
             lifetime
                 .bind_window(window_identity)
@@ -884,7 +900,7 @@ impl HasWindowHandle for BrowserParentWindowLease {
         // SAFETY: this non-cloneable wrapper owns a native-window lease acquired with this exact
         // HWND. DevManager closes admission before teardown and defers window destruction until
         // every queued, executing, and completed-but-unpumped wrapper has been dropped.
-        Ok(unsafe { BorrowedWindowHandle::borrow_raw(RawWindowHandle::Win32(self.handle)) })
+        Ok(unsafe { BorrowedWindowHandle::borrow_raw(self.handle) })
     }
 }
 
@@ -1005,7 +1021,11 @@ impl BrowserNativeViewBuildJob {
             match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 builder.build_as_child(&parent_window)
             })) {
-                Ok(Ok(webview)) => Ok(webview),
+                Ok(Ok(webview)) => {
+                    #[cfg(target_os = "linux")]
+                    let webview = WebView::new(webview);
+                    Ok(webview)
+                }
                 Ok(Err(error)) => Err(view_failure(error)),
                 Err(_payload) => Err(BrowserError::CrashedView {
                     message: "Wry panicked while creating a child WebView".to_string(),
@@ -1021,6 +1041,7 @@ impl BrowserNativeViewBuildJob {
                     tab_id,
                 )?;
                 webview.set_visible(false).map_err(view_failure)?;
+                #[cfg(target_os = "windows")]
                 webview
                     .set_memory_usage_level(MemoryUsageLevel::Low)
                     .map_err(view_failure)?;
@@ -1124,7 +1145,7 @@ struct BrowserNativeViewTeardown {
 impl BrowserWebViewHost {
     pub fn new(app_config_dir: impl AsRef<Path>) -> Self {
         let app_config_dir = absolute_path(app_config_dir.as_ref());
-        let mut status = match wry::webview_version() {
+        let mut status = match initialize_webview_runtime() {
             Ok(version) => BrowserHostStatus {
                 available: true,
                 platform: std::env::consts::OS.to_string(),
@@ -1135,7 +1156,7 @@ impl BrowserWebViewHost {
                 available: false,
                 platform: std::env::consts::OS.to_string(),
                 version: None,
-                diagnostic: Some("WebView2 runtime is unavailable".to_string()),
+                diagnostic: Some("Embedded browser runtime is unavailable".to_string()),
             },
         };
         let trusted_app_config_dir = if status.available {
@@ -1375,7 +1396,10 @@ impl BrowserWebViewHost {
         if observed_child != descriptor.child_hwnd {
             return Err(BrowserNativeViewError::LiveWryObservationUnavailable);
         }
-        Ok(super::BrowserHostOwnedSurfaceProof::from_windows_child_observation(descriptor))
+        #[cfg(target_os = "windows")]
+        return Ok(super::BrowserHostOwnedSurfaceProof::from_windows_child_observation(descriptor));
+        #[cfg(target_os = "linux")]
+        return Ok(super::BrowserHostOwnedSurfaceProof::from_linux_child_observation(descriptor));
     }
 
     /// Settle one accepted durable browser HOLD from the exact live native
@@ -1884,6 +1908,7 @@ impl BrowserWebViewHost {
         found.ok_or(BrowserNativeViewError::MissingView)
     }
 
+    #[cfg(target_os = "windows")]
     fn reparent_wry_view(
         webview: &WebView,
         destination: &BrowserWindowHandle,
@@ -2520,6 +2545,13 @@ impl BrowserWebViewHost {
     }
 
     pub fn pump_async_completions(&mut self, window: &gpui::Window) {
+        #[cfg(target_os = "linux")]
+        {
+            for view in self.views.values() {
+                view.expire_async_calls();
+            }
+            pump_linux_webview_events();
+        }
         self.finish_native_view_build_task_teardown();
         self.finish_native_view_teardown();
         self.pump_native_view_build_completions(window);
@@ -2535,6 +2567,13 @@ impl BrowserWebViewHost {
     }
 
     pub(crate) fn finish_native_window_teardown_cleanup(&mut self) {
+        #[cfg(target_os = "linux")]
+        {
+            for view in self.views.values() {
+                view.expire_async_calls();
+            }
+            pump_linux_webview_events();
+        }
         self.finish_native_view_build_task_teardown();
         self.finish_native_view_teardown();
         self.drop_native_view_build_completions();
@@ -2869,6 +2908,10 @@ impl BrowserWebViewHost {
     }
 
     fn cancel_target_operations(&mut self, target: BrowserOperationTarget) {
+        #[cfg(target_os = "linux")]
+        if let Ok(view) = self.view(&target.workspace_key, &target.tab_id) {
+            view.cancel_upload();
+        }
         let active_repair_request = self.active_requests.get(&target).is_some_and(|active| {
             matches!(
                 active.phase,
@@ -3673,7 +3716,7 @@ impl BrowserWebViewHost {
             }})()"#
         );
         self.view(&target.workspace_key, &target.tab_id)?
-            .evaluate_script_with_callback(&script, move |result| {
+            .evaluate_browser_script_with_callback(&script, move |result| {
                 let _ = sender.send(BrowserAsyncCompletion {
                     target: callback_target.clone(),
                     operation_id: callback_operation_id.clone(),
@@ -3710,7 +3753,7 @@ impl BrowserWebViewHost {
             }})()"#
         );
         self.view(&target.workspace_key, &target.tab_id)?
-            .evaluate_script_with_callback(&script, move |result| {
+            .evaluate_browser_script_with_callback(&script, move |result| {
                 let _ = sender.send(BrowserAsyncCompletion {
                     target: callback_target.clone(),
                     operation_id: callback_operation_id.clone(),
@@ -3747,7 +3790,7 @@ impl BrowserWebViewHost {
             }})()"#
         );
         self.view(&target.workspace_key, &target.tab_id)?
-            .evaluate_script_with_callback(&script, move |result| {
+            .evaluate_browser_script_with_callback(&script, move |result| {
                 let _ = sender.send(BrowserAsyncCompletion {
                     target: callback_target.clone(),
                     operation_id: callback_operation_id.clone(),
@@ -3782,7 +3825,7 @@ impl BrowserWebViewHost {
             }})()"#
         );
         self.view(&target.workspace_key, &target.tab_id)?
-            .evaluate_script_with_callback(&script, move |result| {
+            .evaluate_browser_script_with_callback(&script, move |result| {
                 let _ = sender.send(BrowserAsyncCompletion {
                     target: callback_target.clone(),
                     operation_id: callback_operation_id.clone(),
@@ -3800,6 +3843,7 @@ impl BrowserWebViewHost {
             .map_err(view_failure)
     }
 
+    #[cfg(target_os = "windows")]
     fn start_cdp(
         &self,
         target: &BrowserOperationTarget,
@@ -3881,28 +3925,45 @@ impl BrowserWebViewHost {
                 candidate,
             },
         );
-        let method = HSTRING::from("Page.captureScreenshot");
-        let params = HSTRING::from(json!({"format": "png", "fromSurface": true}).to_string());
-        let sender = self.annotation_sender.clone();
-        let callback_route = route.clone();
-        let callback_capture_id = capture_id.clone();
-        let handler =
-            CallDevToolsProtocolMethodCompletedHandler::create(Box::new(move |status, result| {
-                let result = status
-                    .map(|()| result)
-                    .map_err(|_| "browser annotation callback failed".to_string());
+        #[cfg(target_os = "windows")]
+        let started = {
+            let method = HSTRING::from("Page.captureScreenshot");
+            let params = HSTRING::from(json!({"format": "png", "fromSurface": true}).to_string());
+            let sender = self.annotation_sender.clone();
+            let callback_route = route.clone();
+            let callback_capture_id = capture_id.clone();
+            let handler = CallDevToolsProtocolMethodCompletedHandler::create(Box::new(
+                move |status, result| {
+                    let result = status
+                        .map(|()| result)
+                        .map_err(|_| "browser annotation callback failed".to_string());
+                    let _ = sender.send(BrowserAnnotationCompletion {
+                        route: callback_route.clone(),
+                        capture_id: callback_capture_id.clone(),
+                        result,
+                    });
+                    Ok(())
+                },
+            ));
+            unsafe {
+                self.view(workspace_key, tab_id)?
+                    .webview()
+                    .CallDevToolsProtocolMethod(&method, &params, &handler)
+                    .map_err(view_failure)
+            }
+        };
+        #[cfg(target_os = "linux")]
+        let started = {
+            let sender = self.annotation_sender.clone();
+            let callback_route = route.clone();
+            let callback_capture_id = capture_id.clone();
+            capture_linux_webview(self.view(workspace_key, tab_id)?, false, move |result| {
                 let _ = sender.send(BrowserAnnotationCompletion {
-                    route: callback_route.clone(),
-                    capture_id: callback_capture_id.clone(),
+                    route: callback_route,
+                    capture_id: callback_capture_id,
                     result,
                 });
-                Ok(())
-            }));
-        let started = unsafe {
-            self.view(workspace_key, tab_id)?
-                .webview()
-                .CallDevToolsProtocolMethod(&method, &params, &handler)
-                .map_err(view_failure)
+            })
         };
         if let Err(error) = started {
             self.annotation_captures.remove(&route);
@@ -5233,7 +5294,7 @@ impl BrowserWebViewHost {
             ));
             let accepted = self
                 .view(&target.workspace_key, &target.tab_id)?
-                .evaluate_script_with_callback(&script, move |result| {
+                .evaluate_browser_script_with_callback(&script, move |result| {
                     if callback_exposure.finish().is_err() {
                         callback_exposure.mark_failed();
                     }
@@ -5708,16 +5769,43 @@ impl BrowserWebViewHost {
             );
             return;
         }
-        let selector = format!("[data-devmanager-upload=\"{token}\"]");
-        let params = json!({
-            "expression": format!("document.querySelector({})", serde_json::to_string(&selector).unwrap()),
-            "returnByValue": false,
-        });
-        active.phase = BrowserAsyncPhase::UploadRuntime { paths, token };
-        if let Err(error) = self.start_cdp(&target, &operation_id, "Runtime.evaluate", &params) {
-            self.finish_queued_request(window, target, operation_id, active.request, Err(error));
-        } else {
-            self.active_requests.insert(target, active);
+        #[cfg(target_os = "linux")]
+        {
+            let result = self.start_linux_upload(&target, &operation_id, &token, &paths);
+            active.phase = BrowserAsyncPhase::UploadSet { paths, token };
+            if let Err(error) = result {
+                self.finish_queued_request(
+                    window,
+                    target,
+                    operation_id,
+                    active.request,
+                    Err(error),
+                );
+            } else {
+                self.active_requests.insert(target, active);
+            }
+            return;
+        }
+        #[cfg(target_os = "windows")]
+        {
+            let selector = format!("[data-devmanager-upload=\"{token}\"]");
+            let params = json!({
+                "expression": format!("document.querySelector({})", serde_json::to_string(&selector).unwrap()),
+                "returnByValue": false,
+            });
+            active.phase = BrowserAsyncPhase::UploadRuntime { paths, token };
+            if let Err(error) = self.start_cdp(&target, &operation_id, "Runtime.evaluate", &params)
+            {
+                self.finish_queued_request(
+                    window,
+                    target,
+                    operation_id,
+                    active.request,
+                    Err(error),
+                );
+            } else {
+                self.active_requests.insert(target, active);
+            }
         }
     }
 
@@ -7041,7 +7129,7 @@ impl BrowserWebViewHost {
                     .status
                     .diagnostic
                     .clone()
-                    .unwrap_or_else(|| "WebView2 runtime is unavailable".to_string()),
+                    .unwrap_or_else(|| "Embedded browser runtime is unavailable".to_string()),
             })
         }
     }
@@ -7160,7 +7248,10 @@ impl BrowserWebViewHost {
             })?;
         let parent_window =
             BrowserParentWindowLease::from_gpui(window, &self.native_window_lifetime)?;
-        self.ensure_host_parking_hwnd(parent_window.handle.hwnd.get())?;
+        self.ensure_host_parking_hwnd(
+            native_parent_window_identity(parent_window.handle)
+                .ok_or_else(native_shell_missing_view)?,
+        )?;
         let url = validate_browser_url(url)?;
         let retained_trust_root = self.verified_trusted_app_config_dir()?.to_path_buf();
         let (trusted_app_config_dir, layout) =
@@ -7562,6 +7653,7 @@ impl BrowserWebViewHost {
             let Some(view) = self.views.get(&view_key(&plan.workspace_key, &plan.tab_id)) else {
                 continue;
             };
+            #[cfg(target_os = "windows")]
             let result = if plan.visible {
                 view.set_bounds(wry_bounds(self.bounds))
                     .and_then(|_| view.set_memory_usage_level(MemoryUsageLevel::Normal))
@@ -7569,6 +7661,13 @@ impl BrowserWebViewHost {
             } else {
                 view.set_visible(false)
                     .and_then(|_| view.set_memory_usage_level(MemoryUsageLevel::Low))
+            };
+            #[cfg(target_os = "linux")]
+            let result = if plan.visible {
+                view.set_bounds(wry_bounds(self.bounds))
+                    .and_then(|_| view.set_visible(true))
+            } else {
+                view.set_visible(false)
             };
             if result.is_err() {
                 let message = "could not update WebView visibility".to_string();
@@ -7791,6 +7890,7 @@ fn random_locator_failure_ticket() -> Result<String, BrowserError> {
     Ok(ticket)
 }
 
+#[cfg(target_os = "windows")]
 fn attach_document_lifecycle_handlers(
     webview: &WebView,
     document_secret_state: Arc<BrowserDocumentSecretState>,
@@ -7846,6 +7946,7 @@ fn attach_document_lifecycle_handlers(
     Ok(())
 }
 
+#[cfg(target_os = "windows")]
 fn attach_permission_handler(
     webview: &WebView,
     event_sender: Sender<BrowserHostEvent>,
@@ -7910,6 +8011,7 @@ fn attach_permission_handler(
     }
 }
 
+#[cfg(target_os = "windows")]
 fn permission_name(kind: COREWEBVIEW2_PERMISSION_KIND) -> &'static str {
     match kind {
         COREWEBVIEW2_PERMISSION_KIND_CAMERA => "camera",
@@ -8684,6 +8786,7 @@ fn current_host_process_identity() -> Result<BrowserHostProcessIdentity, Browser
     .map_err(|_| BrowserNativeViewError::LiveWryObservationUnavailable)
 }
 
+#[cfg(target_os = "windows")]
 fn current_process_creation_time_100ns() -> Option<u64> {
     use windows::Win32::Foundation::FILETIME;
     use windows::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
@@ -8705,6 +8808,7 @@ fn current_process_creation_time_100ns() -> Option<u64> {
     (value != 0).then_some(value)
 }
 
+#[cfg(target_os = "windows")]
 unsafe extern "system" fn parking_window_proc(
     hwnd: windows::Win32::Foundation::HWND,
     msg: u32,
@@ -8714,7 +8818,9 @@ unsafe extern "system" fn parking_window_proc(
     windows::Win32::UI::WindowsAndMessaging::DefWindowProcW(hwnd, msg, wparam, lparam)
 }
 
+#[cfg(target_os = "windows")]
 fn create_host_owned_parking_hwnd(gpui_window_identity: isize) -> Result<u64, ()> {
+    #[cfg(target_os = "windows")]
     use windows::core::w;
     use windows::Win32::Foundation::{HINSTANCE, HWND};
     use windows::Win32::UI::WindowsAndMessaging::{
@@ -8763,6 +8869,7 @@ fn create_host_owned_parking_hwnd(gpui_window_identity: isize) -> Result<u64, ()
     }
 }
 
+#[cfg(target_os = "windows")]
 fn destroy_host_owned_parking_hwnd(raw: u64) {
     use windows::Win32::Foundation::HWND;
     use windows::Win32::UI::WindowsAndMessaging::{DestroyWindow, IsWindow};
@@ -8774,6 +8881,7 @@ fn destroy_host_owned_parking_hwnd(raw: u64) {
     }
 }
 
+#[cfg(target_os = "windows")]
 fn child_hwnd_from_webview(
     webview: &WebView,
 ) -> Result<BrowserWindowHandle, BrowserNativeViewError> {
@@ -10796,5 +10904,41 @@ mod secret_document_state_tests {
             conservative_tainted_document_risk(BrowserRisk::Normal, false),
             BrowserRisk::Normal
         );
+    }
+}
+
+fn native_parent_window_identity(handle: RawWindowHandle) -> Option<isize> {
+    match handle {
+        #[cfg(target_os = "windows")]
+        RawWindowHandle::Win32(handle) => Some(handle.hwnd.get()),
+        #[cfg(target_os = "linux")]
+        RawWindowHandle::Xlib(handle) => isize::try_from(handle.window).ok().filter(|id| *id != 0),
+        #[cfg(target_os = "linux")]
+        RawWindowHandle::Xcb(handle) => isize::try_from(handle.window.get()).ok(),
+        _ => None,
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn initialize_webview_runtime() -> Result<String, ()> {
+    wry::webview_version().map_err(|_| ())
+}
+
+#[cfg(target_os = "windows")]
+trait BrowserScriptEvaluation {
+    fn evaluate_browser_script_with_callback(
+        &self,
+        script: &str,
+        callback: impl Fn(String) + Send + 'static,
+    ) -> wry::Result<()>;
+}
+#[cfg(target_os = "windows")]
+impl BrowserScriptEvaluation for WebView {
+    fn evaluate_browser_script_with_callback(
+        &self,
+        script: &str,
+        callback: impl Fn(String) + Send + 'static,
+    ) -> wry::Result<()> {
+        self.evaluate_script_with_callback(script, callback)
     }
 }
