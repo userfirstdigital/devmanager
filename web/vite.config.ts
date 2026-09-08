@@ -161,6 +161,16 @@ export default defineConfig({
         ],
       },
       injectManifest: {
+        // Filesystem glob order differs on Windows. Keep the embedded service
+        // worker byte-identical across the supported build platforms.
+        manifestTransforms: [
+          (entries) => ({
+            manifest: [...entries].sort((left, right) =>
+              left.url < right.url ? -1 : left.url > right.url ? 1 : 0,
+            ),
+            warnings: [],
+          }),
+        ],
         globPatterns: [
           "index.html",
           "assets/**/*.{js,css,woff,woff2}",
