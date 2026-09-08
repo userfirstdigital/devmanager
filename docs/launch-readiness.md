@@ -549,3 +549,16 @@ That defect still needs correction before multi-page conversation acceptance.
 Private evidence: `linux-production/remote-*`. Owned app, host, guardian,
 automation and Rust processes were joined; production configuration hashes did
 not change.
+
+
+### Linux index replacement race
+
+Stage/Unstage in an unborn repository intermittently failed because a Linux
+metadata lookup observed Git's replaced index inode with zero links. Exact
+Stage in-flight index validation now retries that observation up to three
+milliseconds before reading bytes. Hard links, missing paths, persistent
+unlinking, other graph files, and strict post-transition validation retain their
+rejection behavior. Deterministic metadata tests cover these boundaries; eight
+consecutive real Stage/Unstage/Commit runs passed. The broader Git library suite
+passed 128 tests and both Git integration suites passed (five tests total).
+The host cockpit suite passed all 38 tests, including the original failing flow.

@@ -1640,14 +1640,36 @@ fn stable_file_identity(
     digest_content: bool,
     validate_path_components: bool,
 ) -> Result<FileIdentity, String> {
+    stable_file_identity_with_index_retry(
+        path,
+        require_native_image,
+        deadline,
+        reject_hard_links,
+        digest_content,
+        validate_path_components,
+        false,
+    )
+}
+
+fn stable_file_identity_with_index_retry(
+    path: &Path,
+    require_native_image: bool,
+    deadline: Option<OperationDeadline>,
+    reject_hard_links: bool,
+    digest_content: bool,
+    validate_path_components: bool,
+    retry_unlinked_index: bool,
+) -> Result<FileIdentity, String> {
     if deadline.is_some_and(OperationDeadline::is_expired) {
         return Err("Git executable identity exceeded the operation deadline".to_string());
     }
     if validate_path_components {
         reject_reparse_components(path)?;
     }
-    let metadata = fs::symlink_metadata(path)
-        .map_err(|_| "Git executable metadata is unavailable".to_string())?;
+    let metadata = graph_metadata_with_index_retry(path, deadline, retry_unlinked_index, |path| {
+        fs::symlink_metadata(path)
+    })
+    .map_err(|_| "Git executable metadata is unavailable".to_string())?;
     if !metadata.is_file() {
         return Err("Git executable is not a regular file".to_string());
     }
@@ -1720,6 +1742,41 @@ fn stable_file_identity(
     {
         Ok(FileIdentity { content_digest })
     }
+}
+
+/// Linux stat can observe the old index inode after Git's atomic rename has
+/// unlinked it. Retry only this zero-link observation in the admitted Stage
+/// window, before reading any bytes. Hard links and all strict reads retain
+/// their existing rejection; the post-transition proof is always strict.
+fn graph_metadata_with_index_retry<F>(
+    path: &Path,
+    deadline: Option<OperationDeadline>,
+    retry_unlinked_index: bool,
+    mut stat: F,
+) -> io::Result<fs::Metadata>
+where
+    F: FnMut(&Path) -> io::Result<fs::Metadata>,
+{
+    for attempt in 0..4 {
+        if deadline.is_some_and(OperationDeadline::is_expired) {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "index metadata deadline",
+            ));
+        }
+        let metadata = stat(path)?;
+        #[cfg(unix)]
+        if retry_unlinked_index && metadata.is_file() && metadata.nlink() == 0 && attempt < 3 {
+            // Let the admitted Git child finish the rename before taking the
+            // next stat. Four immediate polls can all hit the same window.
+            std::thread::sleep(Duration::from_millis(1));
+            continue;
+        }
+        #[cfg(not(unix))]
+        let _ = (retry_unlinked_index, attempt);
+        return Ok(metadata);
+    }
+    unreachable!("the final metadata observation is returned")
 }
 
 fn directory_identity(path: &Path) -> Result<FileIdentity, String> {
@@ -3541,7 +3598,20 @@ impl RepositoryGraph {
             } else {
                 None
             };
-            let identity = if node.is_file {
+            let identity = if node.is_file
+                && optional_mutable_absence_policy_for_revalidate(
+                    transition,
+                    true,
+                    &node.path,
+                    &self.git_dir,
+                    update_baseline,
+                    full_content,
+                ) == OptionalMutableAbsencePolicy::AllowApprovedIndexGone
+            {
+                stable_file_identity_with_index_retry(
+                    &node.path, false, deadline, true, true, true, true,
+                )?
+            } else if node.is_file {
                 deadline.map_or_else(
                     || data_file_identity(&node.path),
                     |deadline| data_file_identity_with_deadline(&node.path, deadline),
@@ -4287,7 +4357,11 @@ where
     if !same_path(&canonical, path) {
         return Err("repository graph path canonical identity changed".to_string());
     }
-    let identity = if is_file {
+    let identity = if is_file
+        && absence_policy == OptionalMutableAbsencePolicy::AllowApprovedIndexGone
+    {
+        stable_file_identity_with_index_retry(path, false, deadline, true, true, true, true)?
+    } else if is_file {
         deadline.map_or_else(
             || data_file_identity(path),
             |deadline| data_file_identity_with_deadline(path, deadline),
@@ -11896,6 +11970,69 @@ mod tests {
         .map(|_| ())
         .expect_err("post-transition/strict index race must fail closed");
         assert!(post.contains("cannot be canonicalized"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn index_metadata_retries_only_unlinked_inflight_observations_with_a_bound() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index");
+        fs::write(&path, b"old").unwrap();
+        let old = fs::File::open(&path).unwrap();
+        fs::remove_file(&path).unwrap();
+        let unlinked = old.metadata().unwrap();
+        assert_eq!(unlinked.nlink(), 0);
+        fs::write(&path, b"new").unwrap();
+        let replacement = fs::symlink_metadata(&path).unwrap();
+        for (allow, expected_calls, expected_links) in [(false, 1, 0), (true, 2, 1)] {
+            let mut calls = 0;
+            let observed = graph_metadata_with_index_retry(&path, None, allow, |_| {
+                calls += 1;
+                Ok(if calls == 1 {
+                    unlinked.clone()
+                } else {
+                    replacement.clone()
+                })
+            })
+            .unwrap();
+            assert_eq!(calls, expected_calls);
+            assert_eq!(observed.nlink(), expected_links);
+        }
+        let mut calls = 0;
+        let observed = graph_metadata_with_index_retry(&path, None, true, |_| {
+            calls += 1;
+            Ok(unlinked.clone())
+        })
+        .unwrap();
+        assert_eq!(calls, 4);
+        assert_eq!(
+            observed.nlink(),
+            0,
+            "persistent unlink must still be rejected"
+        );
+        fs::hard_link(&path, dir.path().join("alias")).unwrap();
+        let mut calls = 0;
+        let observed = graph_metadata_with_index_retry(&path, None, true, |path| {
+            calls += 1;
+            fs::symlink_metadata(path)
+        })
+        .unwrap();
+        assert_eq!(calls, 1, "hard links are never retried");
+        assert_eq!(observed.nlink(), 2);
+        assert!(
+            stable_file_identity_with_index_retry(&path, false, None, true, true, true, true)
+                .map(|_| ())
+                .unwrap_err()
+                .contains("hard-link")
+        );
+        assert!(
+            graph_metadata_with_index_retry(&path, None, true, |_| {
+                Err(io::Error::from(io::ErrorKind::NotFound))
+            })
+            .is_err(),
+            "a missing path must not become a synthetic identity"
+        );
     }
 
     #[test]
