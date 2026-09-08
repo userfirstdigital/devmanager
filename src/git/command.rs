@@ -2103,7 +2103,9 @@ impl TrustedExecutable {
             }
             let canonical = fs::canonicalize(&candidate)
                 .map_err(|_| "Git executable cannot be canonicalized".to_string())?;
-            if !same_path(&canonical, &candidate) {
+            if !same_path(&canonical, &candidate)
+                && !is_linux_merged_usr_git_alias(&candidate, &canonical)
+            {
                 return Err("Git PATH candidate is a symlink or junction".to_string());
             }
             if !is_explicitly_trusted_git_path(&canonical) {
@@ -2275,6 +2277,36 @@ impl TrustedExecutable {
                 command_path: self.path.clone().into_os_string(),
             })
         }
+    }
+}
+
+// Merged-/usr distributions expose the same native Git through system-owned
+// directory aliases. Resolve only these exact aliases, then bind and verify the
+// canonical executable as usual; an arbitrary PATH symlink grants no authority.
+fn is_linux_merged_usr_git_alias(candidate: &Path, canonical: &Path) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if canonical != Path::new("/usr/bin/git")
+            || !matches!(
+                candidate.to_str(),
+                Some("/bin/git" | "/sbin/git" | "/usr/sbin/git")
+            )
+        {
+            return false;
+        }
+        candidate.ancestors().skip(1).all(|ancestor| {
+            fs::symlink_metadata(ancestor).is_ok_and(|metadata| {
+                metadata.uid() == 0
+                    && (metadata.file_type().is_symlink()
+                        || (metadata.is_dir() && metadata.mode() & 0o022 == 0))
+            })
+        })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (candidate, canonical);
+        false
     }
 }
 
@@ -10758,6 +10790,33 @@ mod tests {
                 "unexpected resolver error: {error}"
             );
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn merged_usr_git_path_deduplicates_system_alias_and_rejects_user_alias() {
+        let native = Path::new("/usr/bin/git");
+        if fs::canonicalize("/bin/git").ok().as_deref() != Some(native) {
+            return; // This distribution does not use the merged-/usr layout.
+        }
+        let path = env::join_paths(["/usr/bin", "/bin"]).expect("system PATH");
+        let executable = TrustedExecutable::resolve_from_path(&path).expect("merged usr Git");
+        assert_eq!(executable.path, native);
+        executable.verify().expect("canonical executable identity");
+        let alias_only =
+            TrustedExecutable::resolve_from_path(OsStr::new("/bin")).expect("system alias alone");
+        assert!(alias_only.identity == executable.identity);
+
+        let fixture = tempfile::tempdir().expect("user PATH fixture");
+        std::os::unix::fs::symlink("/usr/bin", fixture.path().join("bin"))
+            .expect("user-controlled directory alias");
+        assert!(
+            TrustedExecutable::resolve_from_path(fixture.path().join("bin").as_os_str()).is_err()
+        );
+        assert!(!is_linux_merged_usr_git_alias(
+            Path::new("/bin/git"),
+            Path::new("/tmp/git")
+        ));
     }
 
     #[cfg(windows)]

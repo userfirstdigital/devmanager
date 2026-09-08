@@ -106,6 +106,29 @@ cancellation-owned sockets, and used the read-only issuer in that fixture.
 Linux probes now use the separately tested descendant supervisor above. This does not convert the earlier
 full-suite result into a green run.
 
+### Latest serial Linux run and Git follow-up
+
+The September 7 `full5` run on `9d2620b1` completed with **4,041 passed,
+59 failed, 20 ignored**. The process helper was built first; four correlated
+session mismatch tests and all 21 native client/host integration tests passed
+before the serial library suite. No external profile or concurrent Rust build
+was used. All owned test/build processes exited, and production config/remote
+hashes stayed unchanged.
+
+The Git failure cluster was the resolver rejecting the standard merged-/usr
+`/bin/git` alias to `/usr/bin/git`. The follow-up accepts only exact system-owned
+Linux aliases, retains canonical executable verification, and still rejects
+user-controlled directory aliases. All **127 Git tests passed**, including
+stage/unstage/commit and replacement/authority regressions. The host cockpit
+suite passed **37 of 38**; only the existing Linux file-write authorization
+failure remained. The all-target compiler check passed. Logs:
+`linux-production/git-alias-{green,host,check}.log`.
+
+This focused result does not replace a fresh complete green run. Remote trust,
+file mutation, browser repair retention and Windows installer inspection remain
+in the latest failure list. The previous port-forward failures did not recur
+in `full5`; their deadline sensitivity still warrants review.
+
 ## Live desktop inspection
 
 The rebuilt native shell now launches with its real sibling host on this Linux
