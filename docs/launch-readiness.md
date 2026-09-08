@@ -11,6 +11,30 @@ engine, CLI/updater/package contracts, and the locked all-target compiler check
 are recorded below. Windows desktop and installer acceptance still require a
 Windows machine; public release promotion has not occurred.
 
+## KDE desktop first paint
+
+Direct compositor screenshots reproduced a mapped but blank DevManager window
+on KDE/XWayland. An Expose event alone restored the complete interface. XCB can
+consume socket readiness while buffering Map/Expose events during synchronous
+startup replies; the event loop now drains that queue before its initial wait
+and after callbacks that can perform more synchronous X11 requests. It adds no
+polling timer and does not change KDE or window-manager settings.
+
+The rebuilt production AppImage painted without clicks, focus requests, or
+synthetic Expose events in two launches: process-to-window was 565 ms in both;
+window-to-content was 51 ms and 42 ms. Two debug launches with saved task rows
+also painted without input (119 ms and 50 ms after mapping). The final installed
+image SHA-256 is
+`6022341130ac588991aa260b34be9c06b7e05ce4588e61e00c02bf98eeb2c966`.
+Its full KDE desktop capture was visually inspected. The earlier AppImage
+`024dce9f77f03639e9bbb39506ade2855288fd0446ceec4d52e651fe2acfe154`
+passed the ext4 provider, terminal, Git, browser, archive and signed-update
+acceptance; the final image adds the X11 event-queue correction.
+After that correction, the serial native ext4 library suite passed again
+(4,180 passed, zero failed, 22 ignored), along with all 21 native contracts,
+the real WebKit lifecycle and `cargo check --locked --lib --bins --tests`.
+The installed client used 0.4% of one CPU in a ten-second idle sample.
+
 ## ext4 and cleanup follow-up
 
 Native ext4 verification exposed directory link counts changing during normal

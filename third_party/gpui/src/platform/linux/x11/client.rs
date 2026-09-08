@@ -1604,7 +1604,17 @@ impl LinuxClient for X11Client {
             return;
         };
 
-        event_loop.run(None, &mut self.clone(), |_| {}).log_err();
+        // Synchronous XCB replies during window creation can consume socket
+        // readiness while leaving Map/Expose events in XCB's internal queue.
+        // Drain those events before sleeping, and again after callbacks that
+        // may perform more synchronous X11 requests.
+        let xcb_connection = self.0.borrow().xcb_connection.clone();
+        self.process_x11_events(&xcb_connection).log_err();
+        event_loop
+            .run(None, &mut self.clone(), |client| {
+                client.process_x11_events(&xcb_connection).log_err();
+            })
+            .log_err();
     }
 
     fn active_window(&self) -> Option<AnyWindowHandle> {
