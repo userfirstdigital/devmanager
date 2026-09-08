@@ -2561,14 +2561,18 @@ fn teardown_257th_distinct_cleanup_starts_and_settles_after_256_completions() {
         let ticket = indexed_ticket(index);
         admission.allow(&ticket);
         effects.install(&ticket, BranchScript::cooperative_zero(&ticket));
-        reports.push(
-            runtime().block_on(
-                coordinator
-                    .request(ticket)
-                    .expect("every distinct cleanup remains admissible")
-                    .wait(),
-            ),
+        let report = runtime().block_on(
+            coordinator
+                .request(ticket)
+                .expect("every distinct cleanup remains admissible")
+                .wait(),
         );
+        assert_eq!(
+            report.outcome(),
+            TeardownOutcome::Closed,
+            "cleanup {index}: {report:?}"
+        );
+        reports.push(report);
     }
 
     assert_eq!(reports.len(), 257);

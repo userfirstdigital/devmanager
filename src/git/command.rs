@@ -12791,7 +12791,12 @@ if ($PipeHold) {
     [IO.File]::WriteAllText($ChildPidFile, [string]$child.Id)
     exit 0
 }
-$child = Start-Process -WindowStyle Hidden -FilePath cmd.exe -ArgumentList @('/c','ping.exe -n 30 127.0.0.1 > nul') -PassThru
+$startInfo = [Diagnostics.ProcessStartInfo]::new()
+$startInfo.FileName = 'cmd.exe'
+$startInfo.Arguments = '/c ping.exe -n 30 127.0.0.1 > nul'
+$startInfo.UseShellExecute = $false
+$startInfo.CreateNoWindow = $true
+$child = [Diagnostics.Process]::Start($startInfo)
 [IO.File]::WriteAllText($ChildPidFile, [string]$child.Id)
 [Console]::Out.WriteLine('parent')
 [Console]::Error.WriteLine('parent-error')

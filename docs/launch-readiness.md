@@ -622,11 +622,17 @@ build/test processes exited after this pass.
 The candidate is pushed in [draft PR #2](https://github.com/userfirstdigital/devmanager/pull/2).
 Its checks track Windows/Linux compilation, serial tests and candidate archives.
 Both platforms passed browser bundle parity and Windows passed package-reference
-and dependency-provenance scans. Windows Rust CI is still running at this recording. Linux CI compiled all
-targets, then reproduced four CLI fixture failures because its default `/tmp`
-ancestor is writable by other users. CI now gives tests a private temporary
-directory beneath its isolated target; the same nine CLI tests pass with that
-setup. Consult the PR checks for the final run result. The separate web workflow
+and dependency-provenance scans. Windows all-target compilation passed. The first serial Windows library run
+reported **4,277 passed, 17 failed, 12 ignored**. The failure list includes
+short-path aliases in the runner's default temporary directory, CRLF-sensitive
+source assertions, and process-lifecycle fixtures. CI now uses a canonical
+Windows temporary directory, Rust source checks out with LF, and the Windows
+process fixture launches its child directly without shell activation. The
+257-cleanup regression now reports the exact failing cleanup for any remaining
+failure; it passes locally. These corrections still require a green Windows
+rerun. Linux CI's four initial CLI failures reproduced under shared `/tmp`;
+all nine tests pass using the new private temporary directory. Consult the PR
+checks for the final platform results. The separate web workflow
 now restores the reviewed WASM inputs and installs the native dependencies needed
 by its embedded-asset tests. Neither workflow publishes a public release.
 

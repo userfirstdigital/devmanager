@@ -80,10 +80,16 @@ jobs:
           cargo build --locked --bin devmanager-process-test-helper --target-dir "$env:CARGO_TARGET_DIR" -j 2 2>&1 | Tee-Object launch-evidence/process-helper.log
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
 
-      - name: Run Windows tests serially
+      - name: Run Windows library tests serially
         shell: pwsh
         run: |
-          cargo test --locked --all-targets --target-dir "$env:CARGO_TARGET_DIR" -j 2 -- --test-threads=1 2>&1 | Tee-Object launch-evidence/tests.log
+          cargo test --locked --lib --target-dir "$env:CARGO_TARGET_DIR" -j 2 -- --test-threads=1 2>&1 | Tee-Object launch-evidence/library.log
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+
+      - name: Run Windows integration and binary tests serially
+        shell: pwsh
+        run: |
+          cargo test --locked --bins --examples --test '*' --target-dir "$env:CARGO_TARGET_DIR" -j 2 -- --test-threads=1 2>&1 | Tee-Object launch-evidence/tests.log
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
 
       - name: Build desktop acceptance archive

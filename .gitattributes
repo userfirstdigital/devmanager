@@ -6,3 +6,6 @@ web/index.html text eol=lf
 
 # Browser fixture payloads are asserted byte-for-byte on every platform.
 tests/fixtures/browser-site/** text eol=lf
+
+# Source-contract assertions must see the same Rust text on every platform.
+*.rs text eol=lf
