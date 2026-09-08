@@ -68,7 +68,7 @@ pub use update::{
 /// organization and service-supervisor capabilities are appended at runtime.
 /// Keep the desktop client's requested set covered by this base before adding
 /// a native query path.
-pub const NATIVE_HOST_BASE_CAPABILITIES: [crate::protocol::Capability; 12] = [
+pub const NATIVE_HOST_BASE_CAPABILITIES: [crate::protocol::Capability; 13] = [
     crate::protocol::Capability::PagedSnapshots,
     crate::protocol::Capability::EventReplay,
     crate::protocol::Capability::OperationSettlement,
@@ -79,6 +79,7 @@ pub const NATIVE_HOST_BASE_CAPABILITIES: [crate::protocol::Capability; 12] = [
     crate::protocol::Capability::UpdateHandoff,
     crate::protocol::Capability::ProviderInput,
     crate::protocol::Capability::TaskCockpit,
+    crate::protocol::Capability::BrowserProjection,
     crate::protocol::Capability::SemanticConversation,
     crate::protocol::Capability::SemanticSubagents,
 ];

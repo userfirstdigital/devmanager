@@ -418,12 +418,14 @@ fn native_shell_keeps_the_reference_workspace_and_independent_compact_panel_cont
     assert!(source.contains("native-shell-sidebar-search"));
     assert!(source.contains("native-shell-sidebar-project-scope"));
     assert!(source.contains("native-shell-workspace-column"));
-    assert!(source.contains("native-shell-workspace-topbar"));
-    assert!(source.contains("native-shell-center-mode-switch"));
+    assert!(source.contains("native-shell-workspace-grid"));
+    assert!(!source.contains("native-shell-workspace-topbar"));
+    assert!(source.contains("native-panel-tab-"));
+    assert!(!source.contains("native-shell-center-mode-switch"));
     assert!(source.contains("native-task-center-conversation"));
     assert!(source.contains("native-task-center-terminal"));
     assert!(source.contains("native-shell-context-dock-toggle"));
-    assert!(source.contains("crate::icons::PANEL_RIGHT"));
+    assert!(source.contains("fn select_pane_view_for"));
     assert!(!source.contains("native-shell-compact-terminal-toggle"));
     assert!(!source.contains(".child(canvas_switch)"));
 }
@@ -498,7 +500,11 @@ fn preview_validation_rejects_existing_sensitive_output() {
     assert!(matches!(error, PreviewError::OutputAlreadyExists { .. }));
 
     let production_fixture = write_fixture(&policy, "production.json", FIXTURE_JSON);
+    #[cfg(windows)]
     let production = Path::new(r"C:\Users\micro\AppData\Roaming\DevManager\config.json");
+    #[cfg(not(windows))]
+    let production =
+        Path::new("/home/devmanager-test/.config/com.userfirst.devmanager/config.json");
     let error = PreviewRequest::validate(production_fixture, production, &policy)
         .expect_err("production config path must fail");
     assert!(matches!(error, PreviewError::SensitivePath { .. }));
@@ -790,6 +796,7 @@ fn inbox_resource_item(
         ResourceKind::Terminal => (ResourceRecipe::terminal(80, 24), ResourceLifecycle::Active),
         ResourceKind::BrowserContext => (
             ResourceRecipe::Browser {
+                context_id: None,
                 start_url: "https://example.test".into(),
             },
             ResourceLifecycle::Active,

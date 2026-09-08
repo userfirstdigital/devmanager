@@ -772,7 +772,9 @@ pub const fn cockpit_query_action_id(query: &TaskCockpitQuery) -> &'static str {
         TaskCockpitQuery::ProviderSettings(_) | TaskCockpitQuery::RemoteAccess(_) => {
             ACTION_HOST_STATUS
         }
-        TaskCockpitQuery::BrowserProcessSession => ACTION_BROWSER_NATIVE,
+        TaskCockpitQuery::BrowserProcessSession
+        | TaskCockpitQuery::BrowserNativeSession
+        | TaskCockpitQuery::OpenBrowserSession { .. } => ACTION_BROWSER_NATIVE,
         TaskCockpitQuery::Conversation { .. }
         | TaskCockpitQuery::OpenConversationSubscription { .. }
         | TaskCockpitQuery::ReleaseConversationSubscription { .. }

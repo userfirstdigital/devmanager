@@ -245,6 +245,7 @@ impl CommandBus {
                 // the authenticated host may choose those, so a client-built
                 // OpenShellTerminal never reaches the store: the host rebuilds
                 // the recipe and re-executes it under its own authority.
+                | Command::OpenTaskBrowser(_)
                 | Command::OpenShellTerminal(_)
         ) {
             return Err(StoreError::HostAuthorityRequired);
@@ -2237,6 +2238,98 @@ mod terminal_and_provider_restart_tests {
             1_725_000_000_100,
         )
         .expect("plain shell facts")
+    }
+
+    #[test]
+    fn native_browser_open_is_host_only_atomic_and_survives_projection_rebuild() {
+        use crate::domain::id::{BrowserContextId, BrowserRequestId, BrowserTabId};
+        use crate::domain::native_browser::{
+            NativeBrowserSessionProjection, OpenTaskBrowserIntent,
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let mut bus = CommandBus::open(&directory.path().join("browser.sqlite")).unwrap();
+        let client = ClientId::new();
+        let (task, revision) = create_open_task(&mut bus, client);
+        let agent =
+            AgentSessionFacts::new(task, AgentRole::Primary, ProviderKind::Codex, None).unwrap();
+        let revision = accepted_revision(host_execute(
+            &mut bus,
+            task_envelope(
+                client,
+                task,
+                revision,
+                Command::RegisterAgentSession {
+                    agent: agent.clone(),
+                },
+            ),
+        ));
+        let revision = accepted_revision(host_execute(
+            &mut bus,
+            task_envelope(
+                client,
+                task,
+                revision,
+                Command::SetPrimaryAgent {
+                    agent_session_id: agent.id,
+                },
+            ),
+        ));
+        let mut resource = ResourceFacts::new(
+            Some(task),
+            OwnerKind::Task,
+            ResourceKind::BrowserContext,
+            ResourceRecipe::Browser {
+                start_url: "about:blank".into(),
+                context_id: Some(BrowserContextId::new()),
+            },
+            100,
+        )
+        .unwrap();
+        resource.runtime_generation = 1;
+        let command = task_envelope(
+            client,
+            task,
+            revision,
+            Command::OpenTaskBrowser(OpenTaskBrowserIntent {
+                agent_session_id: agent.id,
+                resource: resource.clone(),
+                tab_id: BrowserTabId::new(),
+                create_request_id: BrowserRequestId::new(),
+                open_request_id: BrowserRequestId::new(),
+            }),
+        );
+        assert!(matches!(
+            bus.execute(command.clone()),
+            Err(StoreError::HostAuthorityRequired)
+        ));
+        assert!(NativeBrowserSessionProjection::from_snapshot(
+            &bus.task_snapshot(task).unwrap().unwrap()
+        )
+        .unwrap()
+        .is_none());
+        let request_id = RequestId::new();
+        let connection_id = Uuid::now_v7();
+        let receipt = bus
+            .execute_host_authorized(command.clone(), None, request_id, connection_id)
+            .unwrap();
+        assert!(
+            matches!(receipt, CommandReceipt::Accepted { .. }),
+            "{receipt:?}"
+        );
+        let opened = bus.task_snapshot(task).unwrap().unwrap();
+        let session = NativeBrowserSessionProjection::from_snapshot(&opened)
+            .unwrap()
+            .unwrap();
+        assert_eq!(session.resource_id, resource.id);
+        assert_eq!(opened.agents[&agent.id].provider_session_id, None);
+        assert_eq!(
+            bus.execute_host_authorized(command, None, request_id, connection_id)
+                .unwrap(),
+            receipt,
+            "exact command retry must not duplicate context or resource"
+        );
+        bus.store.rebuild_projections().unwrap();
+        assert_eq!(bus.task_snapshot(task).unwrap().unwrap(), opened);
     }
 
     #[test]

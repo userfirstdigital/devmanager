@@ -1686,6 +1686,7 @@ pub(crate) fn apply_event(
                     "browser.fact embedded task_id disagrees with DomainEvent.task_id".into(),
                 ));
             }
+            bump_task_revision(tx, shadow, task_id, event)?;
         }
         Event::TerminalRenamed { resource_id, title } => {
             let task_id = require_task_id(event)?;

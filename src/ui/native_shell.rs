@@ -164,7 +164,7 @@ use crate::ui::task_cockpit::timeline::{PreviewConversationMessage, PreviewPlanS
 use crate::ui::task_cockpit::{
     action_is_current, one_fresh_quota_observations, panel_button_shell, panel_caption,
     panel_empty_state, panel_list_row, panel_row_shell, project_services_from_task_projection,
-    project_services_panel, render_panel_action, render_panel_frame, render_task_browser_dock,
+    project_services_panel, render_panel_action, render_panel_frame,
     update_observation_from_snapshot, ArtifactsPanelProjection, ChangesPanelProjection,
     ConfigSidebarActionRequest, ConfigSidebarProjection, ConfigSidebarUnavailableReason,
     FilesPanelProjection, Inbox, InboxPresentationWidth, InboxRenderModel, PanelAction,
@@ -1975,6 +1975,7 @@ impl IsolatedDevProfile {
                 Capability::PromptProjection,
                 Capability::ProviderInput,
                 Capability::TaskCockpit,
+                Capability::BrowserProjection,
                 Capability::SemanticConversation,
                 Capability::SemanticSubagents,
                 Capability::ExplicitDetach,
@@ -11997,8 +11998,12 @@ pub struct NativeShell {
     browser_inbox: Option<BrowserCommandInbox>,
     browser_gateway: Option<BrowserGatewayHandle>,
     browser_registration: Option<BrowserGatewayRegistration>,
+    browser_native_session: Option<crate::domain::native_browser::NativeBrowserSessionProjection>,
+    browser_session_request: Option<NativeActionRecord>,
+    browser_pump: Option<gpui::Task<()>>,
     browser_address_draft: String,
     browser_address_focused: bool,
+    browser_loading: bool,
     browser_address_select_all: bool,
     pending_browser_commands: std::collections::VecDeque<(BrowserWorkspaceKey, BrowserCommand)>,
     composer_file_candidates: Vec<TriggerSuggestion>,
@@ -12174,6 +12179,9 @@ struct PaneDrag {
 
 impl Drop for NativeShell {
     fn drop(&mut self) {
+        drop(self.browser_pump.take());
+        let _ = self.browser_host.begin_native_window_teardown();
+        self.browser_host.finish_native_window_teardown_cleanup();
         self.trusted_hosts.shutdown_pending();
         self.cache_current_composer_draft();
         self.flush_composer_drafts_if_due(true);
@@ -12819,7 +12827,9 @@ impl NativeShell {
                 }
                 #[cfg(not(test))]
                 {
-                    BrowserWebViewHost::new(&browser_profile_root)
+                    let mut host = BrowserWebViewHost::new(&browser_profile_root);
+                    host.attach_foreground_executor(cx.foreground_executor().clone());
+                    host
                 }
             },
             prompt_library,
@@ -12973,8 +12983,12 @@ impl NativeShell {
             browser_inbox: Some(browser_bridge_init.1),
             browser_gateway: None,
             browser_registration: None,
+            browser_native_session: None,
+            browser_session_request: None,
+            browser_pump: None,
             browser_address_draft: String::new(),
             browser_address_focused: false,
+            browser_loading: false,
             browser_address_select_all: false,
             pending_browser_commands: std::collections::VecDeque::new(),
             composer_file_candidates: Vec::new(),
@@ -15305,10 +15319,50 @@ impl NativeShell {
 
     fn forward_browser_host_events(&mut self) {
         for event in self.browser_host.drain_events() {
-            let _ = self
-                .local_slot_mut()
+            if self
+                .local_slot()
                 .cockpit
-                .forward_browser_host_event(&event);
+                .forward_browser_host_event(&event)
+                .is_none()
+            {
+                continue;
+            }
+            match event {
+                crate::browser::BrowserHostEvent::PageLoad { state, .. } => {
+                    self.browser_loading = state == crate::browser::BrowserPageLoadState::Started;
+                    if state == crate::browser::BrowserPageLoadState::Failed {
+                        self.browser_dock_diagnostic = Some(
+                            "Could not load this page. Check the address and connection, then reload.".into(),
+                        );
+                    }
+                }
+                crate::browser::BrowserHostEvent::UserInput { .. } => {
+                    self.browser_address_focused = false;
+                    self.browser_address_select_all = false;
+                }
+                crate::browser::BrowserHostEvent::Download { state, .. } => {
+                    use crate::browser::BrowserDownloadState;
+                    self.browser_dock_diagnostic = Some(
+                        match state {
+                            BrowserDownloadState::Started => "Downloading…",
+                            BrowserDownloadState::Completed { successful: true } => {
+                                "Download complete"
+                            }
+                            BrowserDownloadState::Completed { successful: false } => {
+                                "Download failed. Try again."
+                            }
+                        }
+                        .into(),
+                    );
+                }
+                crate::browser::BrowserHostEvent::Diagnostic { level, message, .. } => {
+                    if level == crate::browser::BrowserDiagnosticLevel::Error {
+                        self.browser_loading = false;
+                    }
+                    self.browser_dock_diagnostic = Some(message.chars().take(256).collect());
+                }
+                _ => {}
+            }
         }
     }
 
@@ -15570,9 +15624,12 @@ impl NativeShell {
                         }
                     }
                 }
-                if let crate::domain::TaskCockpitResult::BrowserProcessSession(projection) = &result
+                if let crate::domain::TaskCockpitResult::BrowserNativeSession {
+                    session,
+                    workspace_root,
+                } = &result
                 {
-                    self.apply_browser_process_session(projection);
+                    self.apply_browser_native_session(session, workspace_root);
                 }
                 if let crate::domain::TaskCockpitResult::Services(services) = &result {
                     self.local_slot_mut().services_projection =
@@ -15785,6 +15842,15 @@ impl NativeShell {
             .state(owner.clone())
             .is_some_and(|state| state.terminal_query_in_flight());
         let active_tool = self.local_slot_mut().cockpit.active_tool();
+        if active_tool == CockpitDockTool::Browser
+            && self.browser_session_request.as_ref().is_some_and(|record| {
+                self.local_slot()
+                    .interaction
+                    .accepts_action_outcome_record(record)
+            })
+        {
+            return;
+        }
         if matches!(active_tool, CockpitDockTool::Terminal) {
             // The Terminal tool becoming visible is the first half of the
             // strip cadence. The strip is a different surface from the screen,
@@ -15827,7 +15893,7 @@ impl NativeShell {
                 Some(crate::client::action::ACTION_BROWSER_NATIVE),
                 vec![ActionRequest::TaskCockpit {
                     task_id,
-                    query: TaskCockpitQuery::BrowserProcessSession,
+                    query: TaskCockpitQuery::BrowserNativeSession,
                 }],
             ),
             CockpitDockTool::Terminal => (
@@ -17726,6 +17792,13 @@ impl NativeShell {
         host_id: &HostId,
         outcome: NativeHostActionOutcome,
     ) {
+        if host_id == &self.local_host_id()
+            && self.browser_session_request.as_ref().is_some_and(|record| {
+                native_request_id(&record.command) == native_request_id(&outcome.action().command)
+            })
+        {
+            self.browser_session_request = None;
+        }
         let request_key = native_request_id(&outcome.action().command).map(request_trace_key);
         if let Some(key) = request_key {
             self.startup_trace.note_request_replied(key);
@@ -18948,6 +19021,39 @@ impl NativeShell {
     }
 
     fn apply_action_outcome(&mut self, outcome: NativeHostActionOutcome) {
+        if Self::task_cockpit_command_parts(&outcome.action().command).is_some_and(
+            |(_, task, query)| {
+                Some(task) == self.local_slot().interaction.selected_task()
+                    && matches!(query, TaskCockpitQuery::OpenBrowserSession { .. })
+            },
+        ) {
+            let failure = match &outcome {
+                NativeHostActionOutcome::Failed { error, .. }
+                | NativeHostActionOutcome::Uncertain { error, .. } => Some(error.clone()),
+                NativeHostActionOutcome::Queried {
+                    body:
+                        NativeHostQueryBody::TaskCockpit(crate::domain::TaskCockpitResult::Denied {
+                            reason,
+                            detail,
+                            ..
+                        }),
+                    ..
+                } => Some(cockpit_reason_line(reason, detail.as_deref())),
+                NativeHostActionOutcome::Queried {
+                    body:
+                        NativeHostQueryBody::TaskCockpit(
+                            crate::domain::TaskCockpitResult::Unavailable {
+                                reason, detail, ..
+                            },
+                        ),
+                    ..
+                } => Some(cockpit_reason_line(reason, detail.as_deref())),
+                _ => None,
+            };
+            if let Some(message) = failure {
+                self.browser_dock_diagnostic = Some(format!("Could not open browser: {message}"));
+            }
+        }
         match outcome {
             NativeHostActionOutcome::Accepted { action, receipt } => {
                 let action_id = action.id;
@@ -20153,6 +20259,51 @@ impl NativeShell {
         });
         self.appearance_subscription = Some(appearance);
         self.bounds_subscription = Some(bounds);
+        if self.browser_pump.is_none() {
+            let timer = cx.background_executor().clone();
+            self.browser_pump = Some(cx.spawn_in(window, async move |shell, cx| {
+                let mut delay = Duration::from_millis(100);
+                loop {
+                    timer.timer(delay).await;
+                    let Ok(next) = shell.update_in(cx, |shell, window, cx| {
+                        if shell.browser_native_session.is_none() {
+                            return Duration::from_millis(100);
+                        }
+                        let before = shell.selected_browser_dock_model();
+                        let diagnostic = shell.browser_dock_diagnostic.clone();
+                        shell.browser_host.pump_async_completions(window);
+                        // Provider/MCP requests must settle through the real host,
+                        // never disappear merely because no chrome was clicked.
+                        for _ in 0..16 {
+                            let request = shell
+                                .browser_inbox
+                                .as_mut()
+                                .and_then(|inbox| inbox.try_recv());
+                            let Some(request) = request else {
+                                break;
+                            };
+                            let _ = shell.browser_host.handle_request(window, request);
+                        }
+                        shell.pump_pending_browser_commands(window);
+                        shell.forward_browser_host_events();
+                        shell.reconcile_browser_dock_lifecycle(Some(window));
+                        if before != shell.selected_browser_dock_model()
+                            || diagnostic != shell.browser_dock_diagnostic
+                        {
+                            cx.notify();
+                        }
+                        if shell.local_slot().cockpit.active_tool() == CockpitDockTool::Browser {
+                            Duration::from_millis(16)
+                        } else {
+                            Duration::from_millis(100)
+                        }
+                    }) else {
+                        break;
+                    };
+                    delay = next;
+                }
+            }));
+        }
     }
 
     /// Everything the shell does when GPUI reports the window moved or
@@ -26858,6 +27009,17 @@ impl NativeShell {
     /// the typed dock panels are fed by host queries that the tool selection
     /// is what asks for. This runs the same admission the dock's own tabs ran.
     fn select_pane_view_for(&mut self, owner: &HostTaskKey, view: PaneView) {
+        // A tab gesture owns its panel immediately. Updating only workspace
+        // focus leaves the host interaction on the previous task until a later
+        // controller tick, so the first click's query is correctly refused.
+        if self.selected_task_key.as_ref() != Some(owner) {
+            if self
+                .select_fleet_task_key(owner.clone(), FleetSelectMode::Replace)
+                .is_err()
+            {
+                return;
+            }
+        }
         self.set_pane_view(owner, view);
         if view == PaneView::Terminal {
             // A deliberate tab selection may attach/resume its exact provider.
@@ -26893,6 +27055,7 @@ impl NativeShell {
                     let _ = self.dispatch_action(ActionRequest::HostActions);
                     self.refresh_selected_cockpit_surfaces();
                 }
+                CockpitDockTool::Browser => self.open_task_browser_for(owner),
                 CockpitDockTool::Changes | CockpitDockTool::Files => {
                     self.refresh_selected_cockpit_surfaces();
                 }
@@ -31014,6 +31177,8 @@ impl NativeShell {
                         if matches!(tool, DockTool::Services) {
                             let _ = self.dispatch_action(ActionRequest::HostActions);
                             self.refresh_selected_cockpit_surfaces();
+                        } else if matches!(tool, DockTool::Browser) {
+                            self.open_task_browser_for(&owner);
                         } else if matches!(tool, DockTool::Changes | DockTool::Files) {
                             self.refresh_selected_cockpit_surfaces();
                         } else if matches!(tool, DockTool::Review) {
@@ -31176,41 +31341,37 @@ impl NativeShell {
     }
 
     fn selected_browser_dock_model(&self) -> Option<TaskBrowserDockModel> {
-        let task_id = self.local_slot().interaction.selected_task()?;
+        let task = self.local_slot().interaction.selected_task()?;
         let model = self.local_slot().client_model.as_ref()?;
-        let view = model.browser_dock_view(task_id)?;
-        let tab_labels = (0..view.tab_count)
-            .take(32)
-            .map(|index| format!("Browser tab {}", index + 1))
-            .collect();
+        let title = model.task(task)?.task.title.clone();
+        let key = self.browser_workspace_key();
+        let workspace = key
+            .as_ref()
+            .and_then(|key| self.browser_host.workspace_snapshot(key));
+        let selected = workspace.and_then(|workspace| {
+            workspace
+                .tabs
+                .iter()
+                .find(|tab| Some(&tab.id) == workspace.selected_tab_id.as_ref())
+        });
         Some(TaskBrowserDockModel {
-            task_title: view.title.clone(),
-            address: view.shareable_url.unwrap_or_default(),
-            title: view.title,
+            task_title: title,
+            address: selected.map(|tab| tab.url.clone()).unwrap_or_default(),
+            title: selected
+                .map(|tab| tab.title.clone())
+                .filter(|title| !title.is_empty())
+                .unwrap_or_else(|| "New tab".into()),
             security: BrowserSecurityState::Unknown,
-            loading: false,
+            loading: self.browser_loading,
             error: None,
             progress: None,
-            tab_labels,
-            selected_tab: None,
-            diagnostic: Some(format!(
-                "{} browser tab(s) · context={} · resource={} · agent={} · generation={}",
-                view.tab_count,
-                view.context_id
-                    .map(|id| id.to_string())
-                    .unwrap_or_else(|| "unbound".to_string()),
-                view.resource_id
-                    .map(|id| id.to_string())
-                    .unwrap_or_else(|| "unbound".to_string()),
-                view.agent_session_id
-                    .map(|id| id.to_string())
-                    .unwrap_or_else(|| "unbound".to_string()),
-                view.generation
-                    .map(|generation| generation.to_string())
-                    .unwrap_or_else(|| "unbound".to_string()),
-            )),
+            tab_labels: workspace
+                .map(|workspace| workspace.tabs.iter().map(|tab| tab.title.clone()).collect())
+                .unwrap_or_default(),
+            selected_tab: selected.map(|tab| tab.title.clone()),
+            diagnostic: None,
             approval: None,
-            artifact_count: model.artifact_summaries().len(),
+            artifact_count: 0,
         })
     }
 
@@ -32108,8 +32269,28 @@ impl NativeShell {
                 if let Some(diagnostic) = self.browser_dock_diagnostic.clone() {
                     model.diagnostic = Some(diagnostic);
                 }
-                let address = self.browser_address_draft.clone();
-                let chrome = render_task_browser_dock(model, tokens).into_any_element();
+                let address = if self.browser_address_focused {
+                    self.browser_address_draft.clone()
+                } else if model.address == "about:blank" {
+                    String::new()
+                } else {
+                    model.address.clone()
+                };
+                let message = model.diagnostic.clone().unwrap_or_else(|| {
+                    if model.loading {
+                        "Loading…".into()
+                    } else {
+                        model.title.clone()
+                    }
+                });
+                let chrome = div()
+                    .flex_none()
+                    .px(px(8.0))
+                    .py(px(3.0))
+                    .text_size(px(11.0))
+                    .text_color(tokens.text.muted.to_gpui())
+                    .child(message);
+                let browser_ready = self.browser_dock_identity().is_some();
                 let shell_for_bounds = shell_entity.clone();
                 let shell_for_back = shell_entity.clone();
                 let shell_for_forward = shell_entity.clone();
@@ -32123,76 +32304,69 @@ impl NativeShell {
                     .gap(px(6.0))
                     .p(px(6.0))
                     .child(
-                        div()
-                            .id("native-browser-back")
-                            .px(px(8.0))
-                            .py(px(4.0))
-                            .rounded(px(4.0))
-                            .cursor_pointer()
-                            .child("Back")
-                            .on_mouse_down(MouseButton::Left, move |_event, window, app| {
-                                let Some(shell_for_back) = shell_for_back.as_ref() else {
-                                    return;
-                                };
-                                let _ = shell_for_back.update(app, |shell, cx| {
-                                    cx.stop_propagation();
-                                    shell.dispatch_browser_chrome_command(BrowserCommand::Back {
-                                        tab_id: "conversation".into(),
-                                    });
-                                    shell.pump_pending_browser_commands(window);
-                                    cx.notify();
+                        crate::ui::components::button::native_toolbar_button(
+                            "native-browser-back",
+                            "Back",
+                            browser_ready,
+                        )
+                        .on_click(move |_event, window, app| {
+                            let Some(shell_for_back) = shell_for_back.as_ref() else {
+                                return;
+                            };
+                            let _ = shell_for_back.update(app, |shell, cx| {
+                                cx.stop_propagation();
+                                shell.dispatch_browser_chrome_command(BrowserCommand::Back {
+                                    tab_id: shell.selected_browser_tab_id(),
                                 });
-                            }),
+                                shell.pump_pending_browser_commands(window);
+                                cx.notify();
+                            });
+                        }),
                     )
                     .child(
-                        div()
-                            .id("native-browser-forward")
-                            .px(px(8.0))
-                            .py(px(4.0))
-                            .rounded(px(4.0))
-                            .cursor_pointer()
-                            .child("Forward")
-                            .on_mouse_down(MouseButton::Left, move |_event, window, app| {
-                                let Some(shell_for_forward) = shell_for_forward.as_ref() else {
-                                    return;
-                                };
-                                let _ = shell_for_forward.update(app, |shell, cx| {
-                                    cx.stop_propagation();
-                                    shell.dispatch_browser_chrome_command(
-                                        BrowserCommand::Forward {
-                                            tab_id: "conversation".into(),
-                                        },
-                                    );
-                                    shell.pump_pending_browser_commands(window);
-                                    cx.notify();
+                        crate::ui::components::button::native_toolbar_button(
+                            "native-browser-forward",
+                            "Forward",
+                            browser_ready,
+                        )
+                        .on_click(move |_event, window, app| {
+                            let Some(shell_for_forward) = shell_for_forward.as_ref() else {
+                                return;
+                            };
+                            let _ = shell_for_forward.update(app, |shell, cx| {
+                                cx.stop_propagation();
+                                shell.dispatch_browser_chrome_command(BrowserCommand::Forward {
+                                    tab_id: shell.selected_browser_tab_id(),
                                 });
-                            }),
+                                shell.pump_pending_browser_commands(window);
+                                cx.notify();
+                            });
+                        }),
                     )
                     .child(
-                        div()
-                            .id("native-browser-reload")
-                            .px(px(8.0))
-                            .py(px(4.0))
-                            .rounded(px(4.0))
-                            .cursor_pointer()
-                            .child("Reload")
-                            .on_mouse_down(MouseButton::Left, move |_event, window, app| {
-                                let Some(shell_for_reload) = shell_for_reload.as_ref() else {
-                                    return;
-                                };
-                                let _ = shell_for_reload.update(app, |shell, cx| {
-                                    cx.stop_propagation();
-                                    shell.dispatch_browser_chrome_command(BrowserCommand::Reload {
-                                        tab_id: "conversation".into(),
-                                    });
-                                    shell.pump_pending_browser_commands(window);
-                                    cx.notify();
+                        crate::ui::components::button::native_toolbar_button(
+                            "native-browser-reload",
+                            "Reload",
+                            browser_ready,
+                        )
+                        .on_click(move |_event, window, app| {
+                            let Some(shell_for_reload) = shell_for_reload.as_ref() else {
+                                return;
+                            };
+                            let _ = shell_for_reload.update(app, |shell, cx| {
+                                cx.stop_propagation();
+                                shell.dispatch_browser_chrome_command(BrowserCommand::Reload {
+                                    tab_id: shell.selected_browser_tab_id(),
                                 });
-                            }),
+                                shell.pump_pending_browser_commands(window);
+                                cx.notify();
+                            });
+                        }),
                     )
                     .child(
                         div()
                             .id("native-browser-address")
+                            .track_focus(&self.root_editor_focus_handle)
                             .relative()
                             .flex_1()
                             .px(px(8.0))
@@ -32211,6 +32385,13 @@ impl NativeShell {
                                 };
                                 let _ = shell_for_address.update(app, |shell, cx| {
                                     cx.stop_propagation();
+                                    if !shell.browser_address_focused {
+                                        shell.browser_address_draft = shell
+                                            .selected_browser_dock_model()
+                                            .map(|model| model.address)
+                                            .filter(|url| url != "about:blank")
+                                            .unwrap_or_default();
+                                    }
                                     shell.browser_address_focused = true;
                                     shell.browser_address_select_all = true;
                                     shell.root_editor_focus_handle.focus(window);
@@ -32219,32 +32400,30 @@ impl NativeShell {
                             }),
                     )
                     .child(
-                        div()
-                            .id("native-browser-go")
-                            .px(px(8.0))
-                            .py(px(4.0))
-                            .rounded(px(4.0))
-                            .cursor_pointer()
-                            .child("Go")
-                            .on_mouse_down(MouseButton::Left, move |_event, window, app| {
-                                let Some(shell_for_go) = shell_for_go.as_ref() else {
-                                    return;
-                                };
-                                let _ = shell_for_go.update(app, |shell, cx| {
-                                    cx.stop_propagation();
-                                    let url = shell.browser_address_draft.clone();
-                                    if !url.trim().is_empty() {
-                                        shell.dispatch_browser_chrome_command(
-                                            BrowserCommand::Navigate {
-                                                tab_id: "conversation".into(),
-                                                url,
-                                            },
-                                        );
-                                        shell.pump_pending_browser_commands(window);
-                                    }
-                                    cx.notify();
-                                });
-                            }),
+                        crate::ui::components::button::native_toolbar_button(
+                            "native-browser-go",
+                            "Go",
+                            browser_ready,
+                        )
+                        .on_click(move |_event, window, app| {
+                            let Some(shell_for_go) = shell_for_go.as_ref() else {
+                                return;
+                            };
+                            let _ = shell_for_go.update(app, |shell, cx| {
+                                cx.stop_propagation();
+                                let url = shell.browser_address_draft.clone();
+                                if !url.trim().is_empty() {
+                                    shell.dispatch_browser_chrome_command(
+                                        BrowserCommand::Navigate {
+                                            tab_id: shell.selected_browser_tab_id(),
+                                            url,
+                                        },
+                                    );
+                                    shell.pump_pending_browser_commands(window);
+                                }
+                                cx.notify();
+                            });
+                        }),
                     );
                 div()
                     .id("native-shell-browser-page")
@@ -32260,32 +32439,48 @@ impl NativeShell {
                             .id("native-shell-browser-pixels")
                             .w_full()
                             .flex_1()
-                            .min_h(px(120.0))
+                            .min_h(px(0.0))
                             .bg(tokens.surfaces.sunken.to_gpui())
-                            .child(canvas(
-                                move |bounds, window, app| {
-                                    let Some(shell_for_bounds) = shell_for_bounds.as_ref() else {
-                                        return;
-                                    };
-                                    let _ = shell_for_bounds.update(app, |shell, cx| {
-                                        let next = crate::browser::BrowserBounds {
-                                            x: f32::from(bounds.origin.x) as i32,
-                                            y: f32::from(bounds.origin.y) as i32,
-                                            width: f32::from(bounds.size.width) as i32,
-                                            height: f32::from(bounds.size.height) as i32,
+                            .child(
+                                canvas(
+                                    move |bounds, window, app| {
+                                        let Some(shell_for_bounds) = shell_for_bounds.as_ref()
+                                        else {
+                                            return;
                                         };
-                                        if shell.browser_page_bounds != Some(next) {
-                                            shell.browser_page_bounds = Some(next);
-                                            // Bounds-only reconcile keeps retained HWND;
-                                            // window observers refresh HWND + pending commands.
-                                            shell.reconcile_browser_dock_lifecycle(None);
-                                        }
-                                        shell.pump_pending_browser_commands(window);
-                                        cx.notify();
-                                    });
-                                },
-                                |_bounds, _path, _window, _app| {},
-                            )),
+                                        let _ = shell_for_bounds.update(app, |shell, cx| {
+                                            let next = crate::browser::BrowserBounds {
+                                                x: (f32::from(bounds.origin.x)
+                                                    * window.scale_factor())
+                                                .round()
+                                                    as i32,
+                                                y: (f32::from(bounds.origin.y)
+                                                    * window.scale_factor())
+                                                .round()
+                                                    as i32,
+                                                width: (f32::from(bounds.size.width)
+                                                    * window.scale_factor())
+                                                .round()
+                                                    as i32,
+                                                height: (f32::from(bounds.size.height)
+                                                    * window.scale_factor())
+                                                .round()
+                                                    as i32,
+                                            };
+                                            if shell.browser_page_bounds != Some(next) {
+                                                shell.browser_page_bounds = Some(next);
+                                                // Bounds-only reconcile keeps retained HWND;
+                                                // window observers refresh HWND + pending commands.
+                                            }
+                                            shell.reconcile_browser_dock_lifecycle(Some(window));
+                                            shell.pump_pending_browser_commands(window);
+                                            let _ = cx;
+                                        });
+                                    },
+                                    |_bounds, _path, _window, _app| {},
+                                )
+                                .size_full(),
+                            ),
                     )
                     .into_any_element()
             }
@@ -37654,17 +37849,17 @@ impl NativeShell {
             "native-task-commit" => self.begin_header_commit(),
             "native-browser-back" => {
                 self.dispatch_browser_chrome_command(BrowserCommand::Back {
-                    tab_id: "conversation".into(),
+                    tab_id: self.selected_browser_tab_id(),
                 });
             }
             "native-browser-forward" => {
                 self.dispatch_browser_chrome_command(BrowserCommand::Forward {
-                    tab_id: "conversation".into(),
+                    tab_id: self.selected_browser_tab_id(),
                 });
             }
             "native-browser-reload" => {
                 self.dispatch_browser_chrome_command(BrowserCommand::Reload {
-                    tab_id: "conversation".into(),
+                    tab_id: self.selected_browser_tab_id(),
                 });
             }
             "native-browser-address" => {
@@ -37675,7 +37870,7 @@ impl NativeShell {
                 let url = self.browser_address_draft.trim().to_string();
                 if !url.is_empty() {
                     self.dispatch_browser_chrome_command(BrowserCommand::Navigate {
-                        tab_id: "conversation".into(),
+                        tab_id: self.selected_browser_tab_id(),
                         url,
                     });
                 }
@@ -43396,7 +43591,10 @@ impl NativeShell {
         // owner is selected); otherwise a late attach/resize can cover the
         // terminal and intercept every click and keystroke.
         let browser_tab_active = !self.selected_owner_is_remote()
-            && !self.owner_showing_raw_terminal()
+            && self
+                .selected_task_key
+                .as_ref()
+                .is_some_and(|owner| self.pane_view(owner) == PaneView::Browser)
             && self.local_slot_mut().cockpit.active_tool() == CockpitDockTool::Browser;
         // With the right dock retired, "the browser surface is on screen" is a
         // question about the panels. Reading `dock_collapsed` here would keep
@@ -43404,12 +43602,28 @@ impl NativeShell {
         let dock_expanded =
             !self.layout.dock_collapsed || self.workspace_shows_view(PaneView::Browser);
         let host_available = self.browser_host.status().available;
+        let identity = self.browser_dock_identity();
+        let wrong_binding =
+            self.local_slot()
+                .cockpit
+                .browser_projection()
+                .is_some_and(|projection| {
+                    identity.as_ref().is_none_or(|identity| {
+                        projection.identity() != identity.to_native_identity()
+                    })
+                });
+        if wrong_binding {
+            if let Ok(command) = self.local_slot_mut().cockpit.detach_browser_native() {
+                if self.apply_browser_native_command(&command).is_err() {
+                    return;
+                }
+            }
+        }
         let attached = self
             .local_slot_mut()
             .cockpit
             .browser_projection()
             .is_some_and(|projection| projection.attached());
-        let identity = self.browser_dock_identity();
         let plan = plan_browser_dock(
             identity.as_ref(),
             BrowserDockSurfaceState {
@@ -43446,7 +43660,12 @@ impl NativeShell {
         );
         match plan {
             BrowserDockPlan::ShowDiagnostic(error) => {
-                self.browser_dock_diagnostic = Some(error.message().to_string());
+                // Keep the exact request failure visible while no session exists.
+                if error != BrowserDockLifecycleError::IdentityIncomplete
+                    || self.browser_dock_diagnostic.is_none()
+                {
+                    self.browser_dock_diagnostic = Some(error.message().to_string());
+                }
             }
             BrowserDockPlan::Park => {
                 if let Ok(command) = self.local_slot_mut().cockpit.detach_browser_native() {
@@ -43460,11 +43679,7 @@ impl NativeShell {
                 bounds,
             } => {
                 self.browser_dock_diagnostic = None;
-                let workspace_key = crate::browser::BrowserWorkspaceKey::new(
-                    identity.task_id.to_string(),
-                    "conversation",
-                );
-                let Ok(workspace_key) = workspace_key else {
+                let Some(workspace_key) = self.browser_workspace_key() else {
                     self.browser_dock_diagnostic = Some(
                         BrowserDockLifecycleError::IdentityIncomplete
                             .message()
@@ -43475,17 +43690,71 @@ impl NativeShell {
                 let gateway = crate::browser::BrowserGatewayBindingRef::new(
                     identity.process_session_id.clone(),
                 );
-                if self.local_slot_mut().cockpit.browser_projection().is_none() {
-                    // Ensure/open the route before bind so registrar identity can settle.
-                    self.dispatch_browser_chrome_command(BrowserCommand::Ensure {
-                        snapshot: BrowserWorkspaceSnapshot::default(),
-                    });
-                    let _ = self.local_slot_mut().cockpit.bind_browser_native(
+                if self.local_slot().cockpit.browser_projection().is_none() {
+                    let Ok(lease) = self.local_slot_mut().cockpit.bind_browser_native(
                         identity.to_native_identity(),
-                        workspace_key,
-                        gateway,
+                        workspace_key.clone(),
+                        gateway.clone(),
                         bounds,
-                    );
+                    ) else {
+                        return;
+                    };
+                    let command = BrowserNativeHostCommand::BindGateway {
+                        lease,
+                        identity: identity.to_native_identity(),
+                        workspace_key: workspace_key.clone(),
+                        gateway,
+                    };
+                    if let Err(error) = self.apply_browser_native_command(&command) {
+                        self.browser_dock_diagnostic = Some(error.to_string());
+                        return;
+                    }
+                }
+                // Register the actual Wry child before attaching the native lease.
+                // A projection or a queued Ensure is not evidence of a live surface.
+                #[cfg(any(target_os = "windows", target_os = "linux"))]
+                let needs_view = self
+                    .browser_host
+                    .native_view(&identity.to_native_identity().protocol_surface())
+                    .is_none();
+                #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+                let needs_view = true;
+                if needs_view {
+                    let Some(window) = window else {
+                        return;
+                    };
+                    let Some(session) = self.browser_native_session.as_ref() else {
+                        return;
+                    };
+                    if let Err(error) = self.browser_host.set_bounds(bounds) {
+                        self.browser_dock_diagnostic = Some(error.to_string());
+                        return;
+                    }
+                    if let Err(error) = self.browser_host.handle_command(
+                        window,
+                        &workspace_key,
+                        BrowserCommand::Ensure {
+                            snapshot: Self::browser_initial_snapshot(session),
+                        },
+                    ) {
+                        self.browser_dock_diagnostic = Some(error.to_string());
+                        return;
+                    }
+                }
+                #[cfg(any(target_os = "windows", target_os = "linux"))]
+                if self
+                    .browser_host
+                    .native_view(&identity.to_native_identity().protocol_surface())
+                    .is_none()
+                {
+                    self.browser_dock_diagnostic =
+                        Some(match self.browser_host.last_task_surface_bind_blocker() {
+                            Some(_) => {
+                                "Could not display the browser. Switch panels and try again.".into()
+                            }
+                            None => "Opening browser…".into(),
+                        });
+                    return;
                 }
                 if let Ok(destination) =
                     crate::browser::BrowserNativeDestination::from_raw(parent_hwnd)
@@ -43495,11 +43764,23 @@ impl NativeShell {
                         .cockpit
                         .attach_browser_native(destination, bounds)
                     {
-                        let _ = self.apply_browser_native_command(&command);
+                        if let Err(error) = self.apply_browser_native_command(&command) {
+                            self.local_slot_mut().cockpit.browser_native_attach_failed();
+                            self.browser_dock_diagnostic = Some(error.to_string());
+                        }
                     }
                 }
             }
             BrowserDockPlan::Resize { bounds } => {
+                if self
+                    .local_slot()
+                    .cockpit
+                    .browser_projection()
+                    .is_some_and(|projection| projection.bounds() == bounds)
+                {
+                    return;
+                }
+
                 if let Ok(command) = self.local_slot_mut().cockpit.resize_browser_native(bounds) {
                     let _ = self.apply_browser_native_command(&command);
                 }
@@ -43513,88 +43794,173 @@ impl NativeShell {
         }
     }
 
-    fn browser_dock_identity(&self) -> Option<BrowserDockIdentity> {
-        let task_id = self.local_slot().interaction.selected_task()?;
-        let view = self
+    fn open_task_browser_for(&mut self, owner: &HostTaskKey) {
+        if owner.host != self.local_host_id() {
+            return;
+        }
+        if self.browser_session_request.as_ref().is_some_and(|record| {
+            self.local_slot()
+                .interaction
+                .accepts_action_outcome_record(record)
+        }) {
+            return;
+        }
+        let Some(revision) = self
             .local_slot()
             .client_model
-            .as_ref()?
-            .browser_dock_view(task_id)?;
-        let agent_session_id = view.agent_session_id?;
-        let context_id = view.context_id?;
-        let resource_id = view.resource_id?;
-        let workspace_key = BrowserWorkspaceKey::new(task_id.to_string(), "conversation").ok()?;
-        // Prefer an already-bound projection, else the registrar (pre-bind).
-        // Never synthesize a process session id.
-        let process_session_id = self
-            .local_slot()
-            .cockpit
-            .browser_projection()
-            .map(|projection| projection.gateway().process_session_id().to_string())
-            .filter(|value| !value.trim().is_empty())
-            .or_else(|| {
-                registered_process_session_id(
-                    self.browser_gateway
-                        .as_ref()
-                        .map(|gateway| gateway.registrar())
-                        .as_ref(),
-                    &workspace_key,
-                )
-            })?;
+            .as_ref()
+            .and_then(|model| model.task(owner.task_id))
+            .map(|snapshot| snapshot.task.revision)
+        else {
+            return;
+        };
+        match self.dispatch_action_recorded_for_owner(
+            &owner.host,
+            ActionRequest::TaskCockpit {
+                task_id: owner.task_id,
+                query: TaskCockpitQuery::OpenBrowserSession {
+                    expected_task_revision: revision,
+                },
+            },
+        ) {
+            Ok(record) => {
+                self.browser_session_request = Some(record);
+                self.browser_dock_diagnostic = Some("Opening browser…".into());
+            }
+            Err(error) => {
+                self.browser_dock_diagnostic = Some(error.message);
+            }
+        }
+    }
+
+    fn browser_workspace_key(&self) -> Option<BrowserWorkspaceKey> {
+        let session = self.browser_native_session.as_ref()?;
+        if Some(session.task_id) != self.local_slot().interaction.selected_task() {
+            return None;
+        }
+        BrowserWorkspaceKey::new(session.task_id.to_string(), session.tab_id.to_string()).ok()
+    }
+
+    fn browser_initial_snapshot(
+        session: &crate::domain::native_browser::NativeBrowserSessionProjection,
+    ) -> BrowserWorkspaceSnapshot {
+        BrowserWorkspaceSnapshot {
+            pane_open: true,
+            selected_tab_id: Some(session.tab_id.to_string()),
+            tabs: vec![crate::browser::BrowserTabSnapshot {
+                id: session.tab_id.to_string(),
+                title: "New tab".into(),
+                url: session.start_url.clone(),
+                viewport: crate::browser::BrowserViewport::default(),
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn browser_dock_identity(&self) -> Option<BrowserDockIdentity> {
+        let task_id = self.local_slot().interaction.selected_task()?;
+        let session = self.browser_native_session.as_ref()?;
+        let canonical =
+            crate::domain::native_browser::NativeBrowserSessionProjection::from_snapshot(
+                self.local_slot().client_model.as_ref()?.task(task_id)?,
+            )
+            .ok()??;
+        if canonical.task_id != session.task_id
+            || canonical.context_id != session.context_id
+            || canonical.resource_id != session.resource_id
+            || canonical.agent_session_id != session.agent_session_id
+            || canonical.generation != session.generation
+            || canonical.tab_id != session.tab_id
+        {
+            return None;
+        }
+        let workspace = self.browser_workspace_key()?;
+        let process_session_id = registered_process_session_id(
+            self.browser_gateway
+                .as_ref()
+                .map(|gateway| gateway.registrar())
+                .as_ref(),
+            &workspace,
+        )?;
+        if process_session_id != session.routing_key() {
+            return None;
+        }
         Some(BrowserDockIdentity {
             task_id,
-            agent_session_id,
-            context_id,
-            resource_id,
+            agent_session_id: session.agent_session_id,
+            context_id: session.context_id,
+            resource_id: session.resource_id,
             process_session_id,
         })
     }
 
-    fn apply_browser_process_session(
+    fn apply_browser_native_session(
         &mut self,
-        projection: &crate::domain::BrowserProcessSessionProjection,
+        session: &crate::domain::native_browser::NativeBrowserSessionProjection,
+        workspace_root: &Path,
     ) {
-        if self.local_slot_mut().interaction.selected_task() != Some(projection.task_id) {
+        if self.local_slot().interaction.selected_task() != Some(session.task_id) {
             return;
+        }
+        if self.browser_native_session.as_ref() == Some(session)
+            && self.browser_registration.is_some()
+        {
+            if self.browser_dock_diagnostic.as_deref() == Some("Opening browser…") {
+                self.browser_dock_diagnostic = None;
+            }
+            return;
+        }
+        if self.local_slot().cockpit.browser_projection().is_some() {
+            if let Ok(command) = self.local_slot_mut().cockpit.detach_browser_native() {
+                if self.apply_browser_native_command(&command).is_err() {
+                    return;
+                }
+            }
         }
         let Some(gateway) = self.browser_gateway.as_ref() else {
-            self.browser_dock_diagnostic = Some("Browser gateway is unavailable.".into());
+            self.browser_dock_diagnostic = Some("Browser is unavailable. Try again.".into());
             return;
         };
-        let Ok(workspace_key) =
-            BrowserWorkspaceKey::new(projection.task_id.to_string(), "conversation")
-        else {
-            self.browser_dock_diagnostic = Some("Browser workspace key is invalid.".into());
-            return;
-        };
-        if self
-            .browser_registration
-            .as_ref()
-            .is_some_and(|registration| {
-                registration.process_session_id() == projection.process_session_id
-                    && registration.workspace_key() == &workspace_key
-            })
-        {
-            return;
-        }
         if let Some(registration) = self.browser_registration.take() {
             gateway.registrar().revoke(&registration);
         }
-        match gateway.registrar().register(
-            projection.process_session_id.clone(),
-            workspace_key,
-            BrowserWorkspaceSnapshot::default(),
+        self.browser_native_session = None;
+        match gateway.registrar().register_native_session(
+            session,
+            Self::browser_initial_snapshot(session),
+            workspace_root,
         ) {
             Ok(registration) => {
                 self.browser_registration = Some(registration);
+                self.browser_native_session = Some(session.clone());
+                self.browser_loading = false;
+                self.browser_address_focused = false;
+                self.browser_address_select_all = false;
+                self.browser_address_draft = if session.start_url == "about:blank" {
+                    String::new()
+                } else {
+                    session.start_url.clone()
+                };
                 self.browser_dock_diagnostic = None;
                 self.reconcile_browser_dock_lifecycle(None);
             }
             Err(error) => {
-                self.browser_dock_diagnostic =
-                    Some(format!("Browser gateway registration failed: {error}"));
+                self.browser_dock_diagnostic = Some(format!("Could not open browser: {error}"))
             }
         }
+    }
+
+    fn selected_browser_tab_id(&self) -> String {
+        self.browser_workspace_key()
+            .as_ref()
+            .and_then(|key| self.browser_host.workspace_snapshot(key))
+            .and_then(|workspace| workspace.selected_tab_id.clone())
+            .or_else(|| {
+                self.browser_native_session
+                    .as_ref()
+                    .map(|session| session.tab_id.to_string())
+            })
+            .unwrap_or_default()
     }
 
     fn reconcile_native_browser_gateway(&mut self) {
@@ -43602,7 +43968,8 @@ impl NativeShell {
             return;
         }
         if !self.browser_host.status().available {
-            self.browser_dock_diagnostic = Some("BrowserWebViewHost is unavailable.".into());
+            self.browser_dock_diagnostic =
+                Some("The browser is unavailable on this display.".into());
             return;
         }
         let app_config_dir = self.profile.root().to_path_buf();
@@ -43651,6 +44018,9 @@ impl NativeShell {
     }
 
     fn dispatch_browser_chrome_command(&mut self, command: BrowserCommand) {
+        self.browser_address_focused = false;
+        self.browser_address_select_all = false;
+        self.browser_dock_diagnostic = None;
         if self.selected_owner_is_remote() {
             if let Some(key) = self.selected_task_key.clone() {
                 if let Some(slot) = self.host_slot_mut(&key.host) {
@@ -43664,8 +44034,7 @@ impl NativeShell {
                 Some("Select a task before controlling the browser.".into());
             return;
         };
-        let Ok(workspace_key) = BrowserWorkspaceKey::new(task_id.to_string(), "conversation")
-        else {
+        let Some(workspace_key) = self.browser_workspace_key() else {
             self.browser_dock_diagnostic = Some("Browser workspace key is invalid.".into());
             return;
         };
@@ -43680,8 +44049,11 @@ impl NativeShell {
         // Terminal. Dropping them is intentional: browser chrome commands are
         // ephemeral UI intent, not durable host actions.
         let browser_surface_active = !self.selected_owner_is_remote()
-            && !self.owner_showing_raw_terminal()
-            && !self.layout.dock_collapsed
+            && self
+                .selected_task_key
+                .as_ref()
+                .is_some_and(|owner| self.pane_view(owner) == PaneView::Browser)
+            && (!self.layout.dock_collapsed || self.workspace_shows_view(PaneView::Browser))
             && self.local_slot().cockpit.active_tool() == CockpitDockTool::Browser
             && self.selected_task_key.as_ref().is_some_and(|owner| {
                 owner.host == self.local_host_id()
@@ -43716,11 +44088,6 @@ impl NativeShell {
             if let Err(error) = result {
                 self.browser_dock_diagnostic = Some(error.to_string());
             }
-        }
-        while let Some(inbox) = self.browser_inbox.as_mut() {
-            let Some(_request) = inbox.try_recv() else {
-                break;
-            };
         }
         self.forward_browser_host_events();
     }
@@ -44202,7 +44569,7 @@ impl NativeShell {
                     let url = self.browser_address_draft.trim().to_string();
                     if !url.is_empty() {
                         self.dispatch_browser_chrome_command(BrowserCommand::Navigate {
-                            tab_id: "conversation".into(),
+                            tab_id: self.selected_browser_tab_id(),
                             url,
                         });
                         self.pump_pending_browser_commands(window);
@@ -72640,6 +73007,230 @@ mod "
             .interaction
             .navigation_mouse_down(task_id, &list);
         shell.sync_cockpit_follow();
+    }
+
+    fn native_browser_model_for_test(
+        mut model: crate::client::ClientModel,
+        task: TaskId,
+    ) -> (
+        crate::client::ClientModel,
+        crate::domain::native_browser::NativeBrowserSessionProjection,
+    ) {
+        use crate::domain::id::{BrowserContextId, BrowserRequestId, BrowserTabId};
+        use crate::domain::native_browser::{
+            NativeBrowserSessionProjection, OpenTaskBrowserIntent,
+        };
+        use crate::domain::{
+            Command, CommandEnvelope, DomainEvent, EventId, OwnerKind, ResourceFacts, ResourceKind,
+            ResourceRecipe,
+        };
+        let snapshot = model.task(task).unwrap();
+        let mut resource = ResourceFacts::new(
+            Some(task),
+            OwnerKind::Task,
+            ResourceKind::BrowserContext,
+            ResourceRecipe::Browser {
+                start_url: "about:blank".into(),
+                context_id: Some(BrowserContextId::new()),
+            },
+            100,
+        )
+        .unwrap();
+        resource.runtime_generation = 1;
+        let envelope = CommandEnvelope {
+            command_id: CommandId::new(),
+            client_id: crate::domain::ClientId::new(),
+            task_id: Some(task),
+            expected_task_revision: Some(snapshot.task.revision),
+            issued_at_ms: 100,
+            command: Command::OpenTaskBrowser(OpenTaskBrowserIntent {
+                agent_session_id: snapshot.primary_agent_id.unwrap(),
+                resource,
+                tab_id: BrowserTabId::new(),
+                create_request_id: BrowserRequestId::new(),
+                open_request_id: BrowserRequestId::new(),
+            }),
+        };
+        let events = crate::domain::decide(Some(snapshot), &envelope).unwrap();
+        for payload in events {
+            let revision =
+                model.task(task).unwrap().task.revision + u64::from(payload.is_task_mutation());
+            model
+                .apply_event(&DomainEvent {
+                    id: EventId::new(),
+                    task_id: Some(task),
+                    sequence: model.last_applied_sequence() + 1,
+                    task_revision: Some(revision),
+                    occurred_at_ms: 100,
+                    payload,
+                })
+                .unwrap();
+        }
+        let session = NativeBrowserSessionProjection::from_snapshot(model.task(task).unwrap())
+            .unwrap()
+            .unwrap();
+        (model, session)
+    }
+
+    #[test]
+    fn native_browser_panel_gesture_selects_its_exact_owner_before_open() {
+        if rerun_headless_shell_test_in_child("ui::native_shell::tests::native_browser_panel_gesture_selects_its_exact_owner_before_open") { return; }
+        gpui::Application::headless().run(move |cx| {
+            crate::ui::init(cx);
+            let (runtime, _) = TestRuntime::new(true, NativeHostActionResult::Queued);
+            with_test_shell_in_app(cx, runtime, |shell| {
+                let (model, first, second) = two_task_terminal_bound_client_model();
+                prepare_local_task_shell(shell, Arc::new(model), first);
+                let second_owner = shell.local_task_key(second);
+                shell.select_pane_view_for(&second_owner, PaneView::Browser);
+                assert_eq!(shell.selected_task_key.as_ref(), Some(&second_owner));
+                assert_eq!(shell.local_slot().interaction.selected_task(), Some(second));
+                let record = shell
+                    .browser_session_request
+                    .as_ref()
+                    .expect("first tab gesture must queue the exact browser open");
+                assert!(
+                    matches!(record.command, NativeHostCommand::TaskCockpitQuery {
+                    task_id, query: TaskCockpitQuery::OpenBrowserSession { .. }, ..
+                } if task_id == second)
+                );
+                assert!(shell
+                    .local_slot()
+                    .interaction
+                    .accepts_action_outcome_record(record));
+            });
+            crate::ui::finish_headless_test(cx);
+        });
+    }
+
+    #[test]
+    fn native_browser_open_receipt_and_projection_are_fenced_in_both_orders() {
+        if rerun_headless_shell_test_in_child("ui::native_shell::tests::native_browser_open_receipt_and_projection_are_fenced_in_both_orders") { return; }
+        gpui::Application::headless().run(move |cx| {
+            crate::ui::init(cx);
+            for projection_first in [false, true] {
+                let (runtime, _) = TestRuntime::new(true, NativeHostActionResult::Queued);
+                with_test_shell_in_app(cx, runtime, |shell| {
+                    let (model, task) = terminal_bound_client_model();
+                    let (opened, session) = native_browser_model_for_test(model.clone(), task);
+                    prepare_local_task_shell(shell, Arc::new(model), task);
+                    shell.browser_gateway = Some(
+                        crate::browser::BrowserGatewayHandle::start_with_app_config_dir(
+                            shell.browser_bridge.clone(),
+                            shell.profile.root(),
+                        )
+                        .unwrap(),
+                    );
+                    let owner = shell.local_task_key(task);
+                    shell.open_task_browser_for(&owner);
+                    let record = shell.browser_session_request.clone().expect("open queued");
+                    shell.open_task_browser_for(&owner);
+                    assert_eq!(
+                        super::native_request_id(
+                            &shell.browser_session_request.as_ref().unwrap().command
+                        ),
+                        super::native_request_id(&record.command)
+                    );
+                    if projection_first {
+                        shell.apply_client_model(Arc::new(opened.clone())).unwrap();
+                    }
+                    shell.apply_epoch_fenced_action_outcome(NativeHostActionOutcome::Queried {
+                        action: record,
+                        detail: "browser opened".into(),
+                        body: NativeHostQueryBody::TaskCockpit(
+                            crate::domain::TaskCockpitResult::BrowserNativeSession {
+                                session: session.clone(),
+                                workspace_root: shell.profile.root().to_path_buf(),
+                            },
+                        ),
+                    });
+                    assert!(shell.browser_session_request.is_none());
+                    assert_eq!(shell.browser_native_session.as_ref(), Some(&session));
+                    if !projection_first {
+                        assert!(
+                            shell.browser_dock_identity().is_none(),
+                            "receipt alone must not grant native authority"
+                        );
+                        shell.apply_client_model(Arc::new(opened)).unwrap();
+                    }
+                    assert!(shell.browser_dock_identity().is_some());
+                    assert!(
+                        shell.local_slot().cockpit.browser_projection().is_none(),
+                        "headless receipt cannot prove native pixels"
+                    );
+                });
+            }
+            crate::ui::finish_headless_test(cx);
+        });
+    }
+
+    #[test]
+    fn native_browser_late_or_replaced_open_cannot_publish_a_session() {
+        if rerun_headless_shell_test_in_child("ui::native_shell::tests::native_browser_late_or_replaced_open_cannot_publish_a_session") { return; }
+        gpui::Application::headless().run(move |cx| {
+            crate::ui::init(cx);
+            let (runtime, _) = TestRuntime::new(true, NativeHostActionResult::Queued);
+            with_test_shell_in_app(cx, runtime, |shell| {
+                let (model, task) = terminal_bound_client_model();
+                let (_, session) = native_browser_model_for_test(model.clone(), task);
+                prepare_local_task_shell(shell, Arc::new(model), task);
+                shell.browser_gateway = Some(
+                    crate::browser::BrowserGatewayHandle::start_with_app_config_dir(
+                        shell.browser_bridge.clone(),
+                        shell.profile.root(),
+                    )
+                    .unwrap(),
+                );
+                let owner = shell.local_task_key(task);
+                shell.open_task_browser_for(&owner);
+                let old = shell.browser_session_request.clone().unwrap();
+                // A new input handler cancels the old continuation. A subsequent
+                // browser gesture has a different exact request identity.
+                shell
+                    .local_slot_mut()
+                    .interaction
+                    .action(ActionRequest::HostStatus)
+                    .unwrap();
+                shell.open_task_browser_for(&owner);
+                let replacement = shell.browser_session_request.clone().unwrap();
+                assert_ne!(
+                    super::native_request_id(&old.command),
+                    super::native_request_id(&replacement.command)
+                );
+                shell.apply_epoch_fenced_action_outcome(NativeHostActionOutcome::Queried {
+                    action: old,
+                    detail: "late".into(),
+                    body: NativeHostQueryBody::TaskCockpit(
+                        crate::domain::TaskCockpitResult::BrowserNativeSession {
+                            session,
+                            workspace_root: shell.profile.root().to_path_buf(),
+                        },
+                    ),
+                });
+                assert!(shell.browser_native_session.is_none());
+                assert_eq!(
+                    super::native_request_id(
+                        &shell.browser_session_request.as_ref().unwrap().command
+                    ),
+                    super::native_request_id(&replacement.command)
+                );
+                shell
+                    .local_slot_mut()
+                    .interaction
+                    .sync_host_epochs(NativeHostRuntimeEpochs {
+                        connection_epoch: replacement.connection_epoch + 1,
+                        resource_generation: replacement.resource_generation,
+                        runtime_generation: replacement.runtime_generation,
+                    });
+                shell.apply_epoch_fenced_action_outcome(NativeHostActionOutcome::Failed {
+                    action: replacement,
+                    error: "connection replaced".into(),
+                });
+                assert!(shell.browser_session_request.is_none());
+                assert!(shell.browser_registration.is_none());
+            });
+            crate::ui::finish_headless_test(cx);
+        });
     }
 
     #[test]

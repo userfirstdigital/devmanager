@@ -2412,9 +2412,11 @@ pub fn apply(
             if fact.task_id() != snap.task.id {
                 return Err(ApplyError::OwnershipConflict);
             }
+            let next_revision = require_next_revision(&snap, event)?;
             snap.browser
                 .apply_facts(std::slice::from_ref(fact))
                 .map_err(apply_browser_error)?;
+            snap.task.revision = next_revision;
             Ok(snap)
         }
         Event::OperationAccepted(_fact) => {

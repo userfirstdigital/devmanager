@@ -1106,7 +1106,7 @@ impl PreviewApplication {
             {
                 Ok(root) => root,
                 Err(_error) => {
-                    cx.quit();
+                    crate::ui::finish_headless_test(cx);
                     return;
                 }
             };
@@ -1123,7 +1123,7 @@ impl PreviewApplication {
                 native_shell_instantiated,
                 production_host_started: false,
             });
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
 
         let result = report

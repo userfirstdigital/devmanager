@@ -90,6 +90,164 @@ fn create_intent(task: TaskId) -> CreateTaskIntent {
     }
 }
 
+fn native_browser_fixture() -> (
+    TaskSnapshot,
+    devmanager::domain::native_browser::OpenTaskBrowserIntent,
+) {
+    use devmanager::domain::id::{BrowserContextId, BrowserRequestId, BrowserTabId};
+    use devmanager::domain::native_browser::OpenTaskBrowserIntent;
+    let task = TaskId::new();
+    let mut snapshot = create_task(None, task, 1, 0x21);
+    let agent = AgentSessionFacts {
+        id: AgentSessionId::new(),
+        task_id: task,
+        role: AgentRole::Primary,
+        provider_kind: ProviderKind::Codex,
+        provider_session_id: None,
+        lifecycle: AgentSessionLifecycle::Open,
+        runtime_generation: 0,
+        revision: 0,
+    };
+    snapshot.primary_agent_id = Some(agent.id);
+    snapshot.agents.insert(agent.id, agent.clone());
+    let mut resource = ResourceFacts::new(
+        Some(task),
+        OwnerKind::Task,
+        ResourceKind::BrowserContext,
+        ResourceRecipe::Browser {
+            start_url: "about:blank".into(),
+            context_id: Some(BrowserContextId::new()),
+        },
+        100,
+    )
+    .unwrap();
+    resource.runtime_generation = 1;
+    (
+        snapshot,
+        OpenTaskBrowserIntent {
+            agent_session_id: agent.id,
+            resource,
+            tab_id: BrowserTabId::new(),
+            create_request_id: BrowserRequestId::new(),
+            open_request_id: BrowserRequestId::new(),
+        },
+    )
+}
+
+#[test]
+fn native_browser_opens_without_a_provider_process_and_replays_exact_identity() {
+    use devmanager::domain::native_browser::NativeBrowserSessionProjection;
+    let (snapshot, intent) = native_browser_fixture();
+    let command = envelope(
+        CommandId::new(),
+        Some(snapshot.task.id),
+        Some(snapshot.task.revision),
+        Command::OpenTaskBrowser(intent.clone()),
+    );
+    let events = decide(Some(&snapshot), &command).unwrap();
+    assert!(matches!(
+        events.last(),
+        Some(Event::ResourceRegistered { .. })
+    ));
+    let opened = apply_decided(Some(snapshot.clone()), &command, 2, 0x30, 100).unwrap();
+    let session = NativeBrowserSessionProjection::from_snapshot(&opened)
+        .unwrap()
+        .unwrap();
+    assert_eq!(session.resource_id, intent.resource.id);
+    assert_eq!(session.tab_id, intent.tab_id);
+    assert_eq!(session.generation, 1);
+    assert_eq!(session.start_url, "about:blank");
+    assert_eq!(
+        opened.agents, snapshot.agents,
+        "opening browser must not start or reidentify a provider"
+    );
+    assert_eq!(opened.resources.len(), 1);
+    assert_eq!(opened.browser.identity_snapshot().contexts.len(), 1);
+    let replayed = apply_decided(Some(snapshot), &command, 2, 0x30, 100).unwrap();
+    assert_eq!(replayed, opened);
+    let duplicate = CommandEnvelope {
+        expected_task_revision: Some(opened.task.revision),
+        ..command
+    };
+    assert_eq!(
+        decide(Some(&opened), &duplicate),
+        Err(RejectionCode::AlreadyExists)
+    );
+}
+
+#[test]
+fn native_browser_rejects_stale_foreign_or_partial_bindings_without_mutation() {
+    use devmanager::domain::native_browser::NativeBrowserSessionProjection;
+    let (snapshot, intent) = native_browser_fixture();
+    let command = envelope(
+        CommandId::new(),
+        Some(snapshot.task.id),
+        Some(snapshot.task.revision),
+        Command::OpenTaskBrowser(intent.clone()),
+    );
+    let stale = CommandEnvelope {
+        expected_task_revision: Some(snapshot.task.revision + 1),
+        ..command.clone()
+    };
+    assert_eq!(
+        decide(Some(&snapshot), &stale),
+        Err(RejectionCode::RevisionConflict)
+    );
+    let mut foreign = intent.clone();
+    foreign.resource.task_id = Some(TaskId::new());
+    assert!(decide(
+        Some(&snapshot),
+        &CommandEnvelope {
+            command: Command::OpenTaskBrowser(foreign),
+            ..command.clone()
+        }
+    )
+    .is_err());
+    let mut partial = snapshot.clone();
+    partial
+        .resources
+        .insert(intent.resource.id, intent.resource.clone());
+    assert_eq!(
+        NativeBrowserSessionProjection::from_snapshot(&partial),
+        Err(RejectionCode::OwnershipConflict)
+    );
+    assert!(decide(Some(&partial), &command).is_err());
+    let opened = apply_decided(Some(snapshot), &command, 2, 0x30, 100).unwrap();
+    let mut replaced = opened.clone();
+    if let ResourceRecipe::Browser { context_id, .. } = &mut replaced
+        .resources
+        .get_mut(&intent.resource.id)
+        .unwrap()
+        .recipe
+    {
+        *context_id = Some(devmanager::domain::id::BrowserContextId::new());
+    }
+    assert!(NativeBrowserSessionProjection::from_snapshot(&replaced).is_err());
+    let mut closed = opened;
+    closed.task.lifecycle = TaskLifecycle::Archived;
+    assert!(NativeBrowserSessionProjection::from_snapshot(&closed).is_err());
+}
+
+#[test]
+fn native_browser_resource_compact_codec_keeps_legacy_and_owned_shapes() {
+    let (_, intent) = native_browser_fixture();
+    for recipe in [
+        ResourceRecipe::browser("about:blank").unwrap(),
+        intent.resource.recipe,
+    ] {
+        let compact = rmp_serde::to_vec(&recipe).unwrap();
+        assert_eq!(
+            rmp_serde::from_slice::<ResourceRecipe>(&compact).unwrap(),
+            recipe
+        );
+    }
+    let legacy = serde_json::json!({"browser": {"start_url": "about:blank"}});
+    assert_eq!(
+        serde_json::from_value::<ResourceRecipe>(legacy).unwrap(),
+        ResourceRecipe::browser("about:blank").unwrap()
+    );
+}
+
 fn envelope(
     command_id: CommandId,
     task_id: Option<TaskId>,
@@ -659,6 +817,7 @@ fn agent_and_resource_must_reference_same_task() {
         owner_kind: OwnerKind::Task,
         resource_kind: ResourceKind::BrowserContext,
         recipe: ResourceRecipe::Browser {
+            context_id: None,
             start_url: "https://example.com".into(),
         },
         lifecycle: ResourceLifecycle::Active,

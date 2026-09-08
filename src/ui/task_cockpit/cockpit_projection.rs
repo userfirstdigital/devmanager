@@ -160,6 +160,7 @@ impl TaskCockpitLiveProjection {
             TaskCockpitResult::Config(_)
             | TaskCockpitResult::AgentConnection(_)
             | TaskCockpitResult::BrowserProcessSession(_)
+            | TaskCockpitResult::BrowserNativeSession { .. }
             | TaskCockpitResult::Conversation(_)
             | TaskCockpitResult::Terminal(_)
             | TaskCockpitResult::ConfigCommandDetail(_) => {}

@@ -591,10 +591,12 @@ fn agent_artifact_resource_reject_invalid_labels_and_providers() {
     assert_eq!(
         browser,
         ResourceRecipe::Browser {
+            context_id: None,
             start_url: "https://example".into()
         }
     );
     assert!(ResourceRecipe::Browser {
+        context_id: None,
         start_url: "  https://example  ".into()
     }
     .validate()

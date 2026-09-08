@@ -32,6 +32,27 @@ const TASK_DETAIL_SECTIONS: [SnapshotSection; 3] = [
     SnapshotSection::Artifacts,
     SnapshotSection::Resources,
 ];
+const BROWSER_SNAPSHOT_SECTIONS: [SnapshotSection; 2] = [
+    SnapshotSection::BrowserContexts,
+    SnapshotSection::BrowserTabs,
+];
+
+pub(crate) fn snapshot_sections(browser: bool, task_detail: bool) -> Vec<SnapshotSection> {
+    let base = if task_detail {
+        &TASK_DETAIL_SECTIONS[..]
+    } else {
+        &SNAPSHOT_SECTIONS[..]
+    };
+    base.iter()
+        .copied()
+        .chain(
+            BROWSER_SNAPSHOT_SECTIONS
+                .into_iter()
+                .filter(move |_| browser),
+        )
+        .collect()
+}
+
 const MAX_SEEN_EVENT_IDS: usize = 8_192;
 const MAX_PENDING_REPLAY_EVENTS: usize = 8_192;
 
@@ -344,7 +365,12 @@ impl ClientSubscription {
         let mut snapshot_id: Option<SnapshotId> = None;
         let mut through_sequence: Option<u64> = None;
 
-        for section in SNAPSHOT_SECTIONS {
+        for section in snapshot_sections(
+            client
+                .granted_capabilities()
+                .contains(Capability::BrowserProjection),
+            false,
+        ) {
             let mut resume_cursor = None;
             let mut section_started = false;
             loop {
@@ -707,7 +733,12 @@ impl ClientSubscription {
         let mut pages = Vec::new();
         let mut snapshot_id: Option<SnapshotId> = None;
         let mut failure = None;
-        'sections: for section in TASK_DETAIL_SECTIONS {
+        'sections: for section in snapshot_sections(
+            client
+                .granted_capabilities()
+                .contains(Capability::BrowserProjection),
+            true,
+        ) {
             let mut resume_cursor: Option<Vec<u8>> = None;
             loop {
                 let page = match client

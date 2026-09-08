@@ -88,7 +88,7 @@ use webview2_com::{
 };
 #[cfg(target_os = "windows")]
 use windows::core::{BOOL, HSTRING};
-use wry::dpi::{LogicalPosition, LogicalSize};
+use wry::dpi::{PhysicalPosition, PhysicalSize};
 #[cfg(target_os = "windows")]
 use wry::{MemoryUsageLevel, WebView, WebViewExtWindows};
 use wry::{NewWindowResponse, PageLoadEvent, Rect, WebContext, WebViewBuilder};
@@ -1032,6 +1032,13 @@ impl BrowserNativeViewBuildJob {
                 }),
             }
             .and_then(|webview| {
+                #[cfg(target_os = "linux")]
+                attach_navigation_error_handler(
+                    &webview,
+                    event_sender.clone(),
+                    workspace_key.clone(),
+                    tab_id.clone(),
+                );
                 attach_document_lifecycle_handlers(&webview, document_secret_state.clone())?;
                 attach_permission_handler(
                     &webview,
@@ -1718,6 +1725,7 @@ impl BrowserWebViewHost {
                     .is_some_and(|parent| parent.raw_value() == destination.raw_value())
                 {
                     self.set_bounds(*bounds)?;
+                    self.set_active_workspace(Some(workspace_key.clone()))?;
                     return Ok(BrowserNativeHostOutcome::Idempotent);
                 }
                 let request = BrowserAttachRequest::new(receipt.descriptor, ClientId::new());
@@ -1729,6 +1737,7 @@ impl BrowserWebViewHost {
                         .map_err(native_shell_view_error)?;
                 }
                 self.set_bounds(*bounds)?;
+                self.set_active_workspace(Some(workspace_key.clone()))?;
                 Ok(BrowserNativeHostOutcome::Applied)
             }
             BrowserNativeHostCommand::Reattach {
@@ -1748,6 +1757,7 @@ impl BrowserWebViewHost {
                 self.reattach_task_surface(request, destination)
                     .map_err(native_shell_view_error)?;
                 self.set_bounds(*bounds)?;
+                self.set_active_workspace(Some(workspace_key.clone()))?;
                 Ok(BrowserNativeHostOutcome::Applied)
             }
             BrowserNativeHostCommand::BindGateway {
@@ -1792,6 +1802,9 @@ impl BrowserWebViewHost {
                 workspace_key,
                 ..
             } => {
+                if self.state.active_workspace() == Some(workspace_key) {
+                    self.set_active_workspace(None)?;
+                }
                 if let Some(receipt) = self.native_view(&identity.protocol_surface()) {
                     if !matches!(receipt.lifecycle, BrowserSurfaceLifecycle::Parked) {
                         let request = self
@@ -7421,7 +7434,8 @@ impl BrowserWebViewHost {
                 self.views.insert(key.clone(), webview);
                 match completed_task_aware_identity(prepared, surface_identity, agent_session_id) {
                     Ok(Some((identity, agent_session_id))) => {
-                        match self.bind_completed_identity(&key, identity) {
+                        let binding_result = self.bind_completed_identity(&key, identity);
+                        match binding_result {
                             Ok(()) => {
                                 let published = self.publish_completed_host_binding(
                                     &key,
@@ -7664,8 +7678,7 @@ impl BrowserWebViewHost {
             };
             #[cfg(target_os = "linux")]
             let result = if plan.visible {
-                view.set_bounds(wry_bounds(self.bounds))
-                    .and_then(|_| view.set_visible(true))
+                view.show_at_bounds(wry_bounds(self.bounds))
             } else {
                 view.set_visible(false)
             };
@@ -8928,8 +8941,8 @@ fn parking_hwnd_from_lifetime(
 
 fn wry_bounds(bounds: BrowserBounds) -> Rect {
     Rect {
-        position: LogicalPosition::new(bounds.x, bounds.y).into(),
-        size: LogicalSize::new(bounds.width.max(1), bounds.height.max(1)).into(),
+        position: PhysicalPosition::new(bounds.x, bounds.y).into(),
+        size: PhysicalSize::new(bounds.width.max(1) as u32, bounds.height.max(1) as u32).into(),
     }
 }
 

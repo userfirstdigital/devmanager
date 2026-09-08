@@ -233,3 +233,18 @@ impl Button {
         self.accessibility.set_focused(state.focused());
     }
 }
+
+/// Shared compact control for native UI gestures whose authority is held by
+/// their owning surface rather than a durable catalog command.
+pub fn native_toolbar_button(
+    id: &'static str,
+    label: &'static str,
+    enabled: bool,
+) -> gpui_component::button::Button {
+    use gpui_component::{button::ButtonVariants, Disableable, Sizable};
+    gpui_component::button::Button::new(id)
+        .label(label)
+        .ghost()
+        .small()
+        .disabled(!enabled)
+}

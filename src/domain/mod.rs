@@ -9,6 +9,7 @@ pub mod command;
 pub mod event;
 pub mod host;
 pub mod id;
+pub mod native_browser;
 pub mod operation;
 pub mod org;
 pub mod provider_input;

@@ -847,6 +847,7 @@ pub fn browser_response_resource_ids(response: &BrowserResponse) -> Vec<BrowserR
 pub enum BrowserPageLoadState {
     Started,
     Finished,
+    Failed,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

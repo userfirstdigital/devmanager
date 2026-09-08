@@ -67,6 +67,13 @@ impl Drop for NativeCall {
 }
 
 impl WebView {
+    pub(super) fn show_at_bounds(&self, bounds: Rect) -> wry::Result<()> {
+        // GTK ignores allocation of a hidden widget. Showing after allocating
+        // can restore its natural content size and leave most of the dock black.
+        self.native.set_visible(true)?;
+        self.native.set_bounds(bounds)
+    }
+
     pub(super) fn new(native: wry::WebView) -> Self {
         let upload: Rc<std::cell::RefCell<Option<NativeUpload>>> = Rc::default();
         let slot = Rc::downgrade(&upload);
@@ -238,6 +245,29 @@ pub(super) fn child_hwnd_from_webview(
     super::super::linux_window::require_live(&child)
         .map_err(|_| BrowserNativeViewError::LiveWryObservationUnavailable)?;
     Ok(child)
+}
+
+pub(super) fn attach_navigation_error_handler(
+    view: &WebView,
+    sender: Sender<BrowserHostEvent>,
+    workspace_key: BrowserWorkspaceKey,
+    tab_id: String,
+) {
+    view.webview().connect_load_failed(move |_, _, _, error| {
+        if !error.matches(webkit2gtk::NetworkError::Cancelled) {
+            // A typed terminal load fact survives secret containment without
+            // carrying the failed URL or a WebKit error string.
+            let _ = sender.send(BrowserHostEvent::PageLoad {
+                workspace_key: workspace_key.clone(),
+                tab_id: tab_id.clone(),
+                state: BrowserPageLoadState::Failed,
+                url: String::new(),
+            });
+        }
+        // The document containment handler remains responsible for suppressing
+        // WebKit's alternate error document. Never expose a failing secret URL.
+        false
+    });
 }
 
 pub(super) fn attach_document_lifecycle_handlers(
@@ -701,10 +731,13 @@ mod tests {
         let mut context = WebContext::new(Some(temp.path().join("webkit")));
         let native = WebViewBuilder::new_with_web_context(&mut context)
             .with_html(r#"<!doctype html><title>Linux adapter acceptance</title><input type="file" multiple id="upload" data-devmanager-upload="live-upload"><p>WebKit native lifecycle</p><div style="background:rgb(16,185,129);width:160px;height:100px"></div>"#)
-            .with_bounds(Rect { position: LogicalPosition::new(0, 0).into(), size: LogicalSize::new(800, 600).into() })
+            .with_bounds(Rect { position: PhysicalPosition::new(0, 0).into(), size: PhysicalSize::new(800, 600).into() })
             .build_as_child(&parent).expect("real Wry child");
         let view = WebView::new(native);
         let state = Arc::new(BrowserDocumentSecretState::default());
+        let key = BrowserWorkspaceKey::new("linux-native-test", "conversation").unwrap();
+        let (errors_tx, errors_rx) = std::sync::mpsc::channel();
+        attach_navigation_error_handler(&view, errors_tx, key.clone(), "live-tab".into());
         attach_document_lifecycle_handlers(&view, state.clone()).unwrap();
         let loaded = Rc::new(Cell::new(false));
         let loaded_callback = loaded.clone();
@@ -721,6 +754,7 @@ mod tests {
         );
         let parking = create_host_owned_parking_hwnd(parent.window as isize).unwrap();
         let parking_handle = BrowserWindowHandle::from_raw(parking).unwrap();
+        view.set_visible(false).unwrap();
         BrowserWebViewHost::reparent_wry_view(&view, &parking_handle).unwrap();
         assert_eq!(
             super::super::super::linux_window::parent(&child).unwrap(),
@@ -731,7 +765,11 @@ mod tests {
             &BrowserWindowHandle::from_raw(u64::from(parent.window)).unwrap(),
         )
         .unwrap();
-        view.set_visible(true).unwrap();
+        view.show_at_bounds(Rect {
+            position: PhysicalPosition::new(0, 0).into(),
+            size: PhysicalSize::new(800, 600).into(),
+        })
+        .unwrap();
         let result = Rc::new(std::cell::RefCell::new(None));
         let result_callback = result.clone();
         view.evaluate_local_script(
@@ -743,7 +781,6 @@ mod tests {
         until(|| result.borrow().is_some());
         assert_eq!(result.borrow().as_deref(), Some("\"awaited\""));
 
-        let key = BrowserWorkspaceKey::new("linux-native-test", "conversation").unwrap();
         let target = BrowserOperationTarget::new(key.clone(), "live-tab").unwrap();
         let mut host = BrowserWebViewHost::unavailable("standalone engine adapter acceptance");
         host.views.insert(view_key(&key, "live-tab"), view);
@@ -798,6 +835,19 @@ mod tests {
             "screenshot must contain the rendered page, not just a valid PNG header"
         );
         assert!(!state.is_tainted());
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let unavailable = format!("http://{}/unavailable", listener.local_addr().unwrap());
+        drop(listener);
+        view.load_url(&unavailable).unwrap();
+        let mut failed = None;
+        until(|| {
+            failed = errors_rx.try_recv().ok();
+            failed.is_some()
+        });
+        assert!(matches!(
+            contain_queued_host_event(failed.unwrap(), Some(true)),
+            Some(BrowserHostEvent::PageLoad { state: BrowserPageLoadState::Failed, url, .. }) if url.is_empty()
+        ));
         let canceled = Rc::new(Cell::new(false));
         let canceled_callback = canceled.clone();
         view.evaluate_local_script("new Promise(() => {})", move |_| {

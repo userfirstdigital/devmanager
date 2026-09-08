@@ -1432,25 +1432,20 @@ impl ClientModel {
     pub fn browser_dock_view(&self, task_id: TaskId) -> Option<ClientBrowserDockView> {
         let snapshot = self.tasks.get(&task_id)?;
         let browser = snapshot.browser.identity_snapshot();
-        let context = browser
-            .contexts
-            .iter()
-            .find(|context| context.task_id == task_id && !context.closed);
-        let selected_tab_id = context.and_then(|context| context.selected_tab_id);
-        let selected_tab = selected_tab_id.and_then(|tab_id| {
+        let binding =
+            crate::domain::native_browser::NativeBrowserSessionProjection::from_snapshot(snapshot)
+                .ok()
+                .flatten();
+        let context = binding.as_ref().and_then(|binding| {
             browser
-                .tabs
+                .contexts
                 .iter()
-                .find(|tab| tab.tab_id == tab_id && tab.task_id == task_id && !tab.closed)
+                .find(|context| context.context_id == binding.context_id)
         });
-        let resource_id = snapshot
-            .resources
-            .values()
-            .find(|resource| {
-                resource.resource_kind == ResourceKind::BrowserContext
-                    && resource.lifecycle != crate::domain::resource::ResourceLifecycle::Released
-            })
-            .map(|resource| resource.id);
+        let selected_tab_id = binding.as_ref().map(|binding| binding.tab_id);
+        let selected_tab =
+            selected_tab_id.and_then(|tab_id| browser.tabs.iter().find(|tab| tab.tab_id == tab_id));
+        let resource_id = binding.as_ref().map(|binding| binding.resource_id);
         Some(ClientBrowserDockView {
             task_id,
             title: snapshot.task.title.clone(),
@@ -1551,6 +1546,26 @@ impl ClientModel {
         if !self.tasks.contains_key(&task_id) {
             return Err(ClientModelError::MissingParentTask);
         }
+        let browser_pages = pages.iter().any(|page| {
+            matches!(
+                page.section,
+                SnapshotSection::BrowserContexts | SnapshotSection::BrowserTabs
+            )
+        });
+        if browser_pages
+            && [
+                SnapshotSection::BrowserContexts,
+                SnapshotSection::BrowserTabs,
+            ]
+            .into_iter()
+            .any(|section| {
+                !pages
+                    .iter()
+                    .any(|page| page.section == section && page.next_cursor.is_none())
+            })
+        {
+            return Err(ClientModelError::MissingSections);
+        }
         {
             let task = self
                 .tasks
@@ -1558,6 +1573,12 @@ impl ClientModel {
                 .ok_or(ClientModelError::MissingParentTask)?;
             task.agents.clear();
             task.resources.clear();
+            if browser_pages {
+                task.browser = crate::domain::browser::BrowserBook::new();
+                task.browser
+                    .open_task(task_id)
+                    .map_err(|_| ClientModelError::InvalidOwnership)?;
+            }
         }
         self.artifact_summaries
             .retain(|_, summary| summary.task_id != task_id);
@@ -1607,6 +1628,28 @@ impl ClientModel {
                         {
                             return Err(ClientModelError::DuplicateItem);
                         }
+                    }
+                    (SnapshotSection::BrowserContexts, SnapshotItem::BrowserContext(context)) => {
+                        if context.task_id != task_id {
+                            return Err(ClientModelError::InvalidOwnership);
+                        }
+                        self.tasks
+                            .get_mut(&task_id)
+                            .ok_or(ClientModelError::MissingParentTask)?
+                            .browser
+                            .project_context_view(context)
+                            .map_err(|_| ClientModelError::InvalidOwnership)?;
+                    }
+                    (SnapshotSection::BrowserTabs, SnapshotItem::BrowserTab(tab)) => {
+                        if tab.task_id != task_id {
+                            return Err(ClientModelError::InvalidOwnership);
+                        }
+                        self.tasks
+                            .get_mut(&task_id)
+                            .ok_or(ClientModelError::MissingParentTask)?
+                            .browser
+                            .project_tab_view(tab)
+                            .map_err(|_| ClientModelError::InvalidOwnership)?;
                     }
                     _ => return Err(ClientModelError::SectionItemMismatch),
                 }
@@ -2160,6 +2203,12 @@ impl ClientModelBuilder {
         if self.sections[..REQUIRED_SNAPSHOT_SECTION_COUNT]
             .iter()
             .any(|section| !section.finished)
+        {
+            return Err(ClientModelError::MissingSections);
+        }
+        let browser_sections = &self.sections[REQUIRED_SNAPSHOT_SECTION_COUNT..];
+        if browser_sections.iter().any(|section| section.started)
+            && browser_sections.iter().any(|section| !section.finished)
         {
             return Err(ClientModelError::MissingSections);
         }

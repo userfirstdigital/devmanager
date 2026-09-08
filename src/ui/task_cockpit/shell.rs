@@ -302,6 +302,13 @@ impl TaskCockpitShell {
         Ok(command)
     }
 
+    /// An admitted request is not a successfully attached native child.
+    pub(crate) fn browser_native_attach_failed(&mut self) {
+        if let Some(projection) = self.browser_projection.as_mut() {
+            projection.attached = false;
+        }
+    }
+
     pub fn resize_browser_native(
         &mut self,
         bounds: BrowserBounds,
@@ -445,7 +452,9 @@ impl TaskCockpitShell {
         self.timeline_error = None;
         self.conversation = None;
         self.attachment_banner = None;
-        self.browser_projection = None;
+        // The native child is above the UI. Retain its exact lease until the
+        // shell parks it and calls finish_browser_detach; losing this projection
+        // would leave an unowned page intercepting input after resync.
         self.dock.clear_selection();
     }
 

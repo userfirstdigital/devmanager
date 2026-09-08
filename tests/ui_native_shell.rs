@@ -713,6 +713,7 @@ fn isolated_profile_exposes_one_explicit_native_host_client_config() {
             ));
     assert!(granted.contains(devmanager::protocol::Capability::SemanticConversation));
     assert!(granted.contains(devmanager::protocol::Capability::SemanticSubagents));
+    assert!(granted.contains(devmanager::protocol::Capability::BrowserProjection));
     assert_ne!(profile.named_profile(), "native-next-dev");
     assert!(profile.named_profile().starts_with("native-next-"));
     assert_eq!(config.named_profile, profile.named_profile());

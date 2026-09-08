@@ -1283,6 +1283,8 @@ pub enum Command {
     /// task/resource binding before it performs the live process effect.
     StartProviderSession(StartProviderSessionIntent),
     Browser(BrowserRequest),
+    /// Host-minted native browser context, initial tab, and resource, atomically.
+    OpenTaskBrowser(crate::domain::native_browser::OpenTaskBrowserIntent),
     /// Host-boundary update handoff: inspect+prepare with expiring token.
     PrepareUpdate(PrepareUpdateIntent),
     /// Confirm drain after PrepareUpdate; stops new launches until abort/arm.
@@ -1712,6 +1714,11 @@ pub fn decide(
             Err(RejectionCode::InvalidTransition)
         }
         Command::Browser(request) => decide_browser(snapshot, envelope, request),
+        Command::OpenTaskBrowser(intent) => {
+            let snapshot = require_runtime_capable_task(snapshot, envelope)?;
+            require_expected_revision(snapshot, envelope)?;
+            crate::domain::native_browser::decide_open(snapshot, envelope, intent)
+        }
         Command::PrepareUpdate(_)
         | Command::ConfirmUpdateDrain(_)
         | Command::AbortUpdateHandoff

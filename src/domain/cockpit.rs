@@ -252,6 +252,12 @@ pub enum TaskCockpitQuery {
     /// The client may mirror this identity into its local Browser gateway, but
     /// must never synthesize or infer a replacement id.
     BrowserProcessSession,
+    /// Read an existing task-owned native browser session without opening it.
+    BrowserNativeSession,
+    /// Host-local gesture: atomically open the task browser, or reuse its exact session.
+    OpenBrowserSession {
+        expected_task_revision: u64,
+    },
     /// Host-owned project creation. The host validates the folder, persists
     /// it through ConfigStore, and re-issues workspace authority. Clients
     /// never write `config.json`.
@@ -920,6 +926,12 @@ pub enum TaskCockpitResult {
     ProviderSettings(crate::providers::settings::ProviderSettingsReply),
     RemoteAccess(crate::host::remote_setup::RemoteSetupReply),
     BrowserProcessSession(BrowserProcessSessionProjection),
+    /// Native-only host reply. The workspace root is resolved live and is never
+    /// included in durable snapshots or admitted through Browser Connect.
+    BrowserNativeSession {
+        session: crate::domain::native_browser::NativeBrowserSessionProjection,
+        workspace_root: std::path::PathBuf,
+    },
     Conversation(crate::domain::snapshot::SemanticJournalPage),
     ConversationSubscription {
         subscription_id: SubscriptionId,
@@ -1142,7 +1154,9 @@ pub fn cockpit_surface(query: &TaskCockpitQuery) -> TaskCockpitSurface {
         | TaskCockpitQuery::ConfigCommandDetail { .. }
         | TaskCockpitQuery::ProviderSettings(_)
         | TaskCockpitQuery::RemoteAccess(_) => TaskCockpitSurface::Workspace,
-        TaskCockpitQuery::BrowserProcessSession => TaskCockpitSurface::Browser,
+        TaskCockpitQuery::BrowserProcessSession
+        | TaskCockpitQuery::BrowserNativeSession
+        | TaskCockpitQuery::OpenBrowserSession { .. } => TaskCockpitSurface::Browser,
         TaskCockpitQuery::Conversation { .. }
         | TaskCockpitQuery::OpenConversationSubscription { .. }
         | TaskCockpitQuery::ReleaseConversationSubscription { .. }

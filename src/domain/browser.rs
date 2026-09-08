@@ -1972,6 +1972,10 @@ fn tab_id_of(request: &BrowserRequest) -> Result<BrowserTabId, BrowserContractEr
 }
 
 fn validate_url(raw: &str) -> Result<(), BrowserContractError> {
+    // The empty native tab has no origin or external navigation authority.
+    if raw == "about:blank" {
+        return Ok(());
+    }
     if raw.len() > MAX_BROWSER_FACT_URL_BYTES {
         return Err(BrowserContractError::BoundExceeded);
     }

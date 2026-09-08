@@ -8,8 +8,53 @@ The candidate is not release-approved. The latest complete Linux library run
 is green: **4,111 passed, zero failed, 20 ignored** on `d61142e4`. Native
 client/host integration (21 tests), exact-resume mismatch (four tests), file
 integration (83 tests), and all-target compiler checks passed. Real Windows
-desktop/install validation, Linux embedded-browser and package/update support,
-and live remote enrollment still require acceptance.
+desktop/install validation and Linux production package/update support still
+require acceptance. Linux remote enrollment and encrypted paged synchronization
+have passed; the native browser follow-up is recorded below.
+
+## Linux native browser startup and interaction
+
+The Browser panel now opens an exact task-owned browser context and resource
+through authenticated host authority. Its identity is independent of the
+provider conversation and PTY. Opening is revision-fenced and idempotent;
+ordinary refresh only reads an existing session. Both production peers negotiate
+BrowserProjection, and initial/task-detail snapshots include contexts and tabs,
+so a cold restart can attach the canonical browser rather than remain on a
+preview. Partial browser snapshots and foreign/duplicate detail fail closed.
+The native-only reply resolves its workspace root on the host from the saved
+opaque binding; browser file operations never default to the app directory.
+
+The Linux shell pumps the real WebKit child on its owning UI thread, waits for
+the native-view receipt before attachment, parks the view while another panel
+owns input, and restores its physical bounds after GTK shows it. NVIDIA systems
+automatically use the WebKit DMA-BUF fallback unless explicitly overridden.
+Navigation shows loading/error feedback, downloads report completion, and the
+address field handles Enter through the root input focus path. A tab gesture
+selects its exact task before dispatching its first query.
+
+The rendered Linux app passed typing, control-key editing, clicks, wheel
+scrolling, navigation, upload (exact selected filename and 31 bytes), and
+Browser/Terminal switching. The restored provider prompt accepted typing,
+control-key editing, drag selection copied to the private X11 clipboard, and
+wheel scrolling away from and back to the current prompt. Failed navigation
+remains visible after secret containment through a typed, URL-free load fact. A private X11 display isolates subsequent automation from
+the user's desktop. The native engine harness additionally proves awaited JS,
+upload bytes, rendered PNG pixels, hide/reparent/show sizing, connection-failure
+reporting through containment, cancellation and
+native child destruction. This is Linux evidence, not Windows certification.
+
+Focused validation: five native-browser startup/ownership regressions, 26 client
+model tests, the NVIDIA override policy, 53 UI projection tests, the production
+capability intersection, and the locked all-target compiler check. Evidence is
+in private `linux-production/browser-*.log` and `browser-private-*.png` files;
+these are excluded from release artifacts. A 20-second idle browser sample
+measured 0.95% of one core for the host and 0% for WebKit subprocesses. The
+software-rendered private-display debug client used 19.31% (terminal baseline
+32.95%); release rendering performance still needs the packaged-app pass. All
+nine captured app/host/provider/WebKit processes exited after shutdown, no
+owned harness/compiler remained, and production config/remote hashes matched.
+The full serial library suite must
+be rerun on the final Linux integration, including package/update changes.
 
 ## Changes panel and portable candidate follow-up
 
@@ -601,4 +646,5 @@ Resource storage now retains a directory descriptor and rejects directory/lock
 replacement, including replacement during an artifact write.
 
 This is engine acceptance. The native task Browser pane still needs its durable
-session startup wiring before complete desktop browser acceptance.
+session startup wiring; the completed native-shell follow-up is recorded at
+the top of this document.

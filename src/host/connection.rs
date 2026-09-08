@@ -4673,6 +4673,88 @@ impl HostRequestExecutor {
         }
     }
 
+    /// Create or reuse one exact task-owned native browser session.
+    fn open_browser_session_request(
+        &mut self,
+        client_id: ClientId,
+        task_id: Option<TaskId>,
+        expected_task_revision: u64,
+        request_id: RequestId,
+        connection_id: Uuid,
+    ) -> Result<(), QueryOutcome> {
+        use crate::domain::id::{BrowserContextId, BrowserRequestId, BrowserTabId};
+        use crate::domain::native_browser::{
+            NativeBrowserSessionProjection, OpenTaskBrowserIntent,
+        };
+        use crate::domain::resource::{OwnerKind, ResourceFacts, ResourceKind, ResourceRecipe};
+        let denied = || QueryOutcome::Err(QueryError::InvalidRequest);
+        let task_id = task_id.ok_or_else(denied)?;
+        let snapshot = self
+            .bus
+            .task_snapshot(task_id)
+            .map_err(|_| denied())?
+            .ok_or_else(denied)?;
+        if snapshot.task.revision != expected_task_revision
+            || !matches!(
+                snapshot.task.lifecycle,
+                crate::domain::TaskLifecycle::Open | crate::domain::TaskLifecycle::Settled
+            )
+        {
+            return Err(shell_open_denied(
+                crate::domain::TaskCockpitDeniedReason::RevisionConflict,
+            ));
+        }
+        if NativeBrowserSessionProjection::from_snapshot(&snapshot)
+            .map_err(|_| denied())?
+            .is_some()
+        {
+            return Ok(());
+        }
+        let agent_session_id = snapshot.primary_agent_id.ok_or_else(denied)?;
+        let now_ms = unix_time_ms_u64() as i64;
+        let mut resource = ResourceFacts::new(
+            Some(task_id),
+            OwnerKind::Task,
+            ResourceKind::BrowserContext,
+            ResourceRecipe::Browser {
+                start_url: "about:blank".into(),
+                context_id: Some(BrowserContextId::new()),
+            },
+            now_ms,
+        )
+        .map_err(|_| denied())?;
+        resource.runtime_generation = 1;
+        let envelope = CommandEnvelope {
+            command_id: crate::domain::CommandId::new(),
+            client_id,
+            task_id: Some(task_id),
+            issued_at_ms: now_ms,
+            expected_task_revision: Some(expected_task_revision),
+            command: Command::OpenTaskBrowser(OpenTaskBrowserIntent {
+                agent_session_id,
+                resource,
+                tab_id: BrowserTabId::new(),
+                create_request_id: BrowserRequestId::new(),
+                open_request_id: BrowserRequestId::new(),
+            }),
+        };
+        match self
+            .bus
+            .execute_host_authorized(envelope, None, request_id, connection_id)
+        {
+            Ok(CommandReceipt::Accepted { .. }) => {
+                self.fan_out_live_durable_events();
+                Ok(())
+            }
+            Ok(CommandReceipt::Rejected { .. }) => Err(shell_open_denied(
+                crate::domain::TaskCockpitDeniedReason::StaleFence,
+            )),
+            Err(_) => Err(QueryOutcome::Err(QueryError::Unavailable {
+                reason: "open_browser_execute",
+            })),
+        }
+    }
+
     /// Serve one host-authority `terminal.open_shell` request.
     ///
     /// The client names a Task, an optional working directory, and the exact
@@ -7325,6 +7407,46 @@ impl HostRequestExecutor {
                         outcome,
                     });
                 }
+                let query = if let TaskCockpitQuery::OpenBrowserSession {
+                    expected_task_revision,
+                } = &query
+                {
+                    if !negotiated.capabilities.grants_task_cockpit()
+                        || !negotiated
+                            .capabilities
+                            .contains(Capability::BrowserProjection)
+                    {
+                        return Ok(QueryReply {
+                            request_id: envelope.request_id,
+                            outcome: QueryOutcome::Err(QueryError::UnsupportedCapability),
+                        });
+                    }
+                    if envelope.client_id != negotiated.client_id {
+                        return Ok(QueryReply {
+                            request_id: envelope.request_id,
+                            outcome: QueryOutcome::Err(QueryError::Unauthorized),
+                        });
+                    }
+                    match self.open_browser_session_request(
+                        envelope.client_id,
+                        envelope.task_id,
+                        *expected_task_revision,
+                        envelope.request_id,
+                        output_id
+                            .map(ConnectionOutputId::as_uuid)
+                            .unwrap_or(Uuid::nil()),
+                    ) {
+                        Ok(()) => TaskCockpitQuery::BrowserNativeSession,
+                        Err(outcome) => {
+                            return Ok(QueryReply {
+                                request_id: envelope.request_id,
+                                outcome,
+                            })
+                        }
+                    }
+                } else {
+                    query
+                };
                 // Opening a shell is a host-authority mutation admitted as a
                 // typed query. Serve it here, then answer with the Task's
                 // refreshed strip so one round trip both opens and shows it.
@@ -9349,6 +9471,7 @@ fn validate_authenticated_command_capability(
         | Command::PresentProviderApproval(_)
         | Command::SettleProviderWait(_)
         | Command::BindProviderSession { .. }
+        | Command::OpenTaskBrowser(_)
         | Command::OpenShellTerminal(_)
         | Command::RebindUnstartedPrimaryProvider { .. } => Err(IpcError::UnsupportedCapability),
         Command::SubmitProviderInput(_) if !capabilities.contains(Capability::ProviderInput) => {
@@ -15292,6 +15415,306 @@ mod output_tests {
                 "the excluded shell must never be recorded: {launch:?}"
             );
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn native_browser_query_opens_idempotently_and_fences_authority() {
+        use crate::domain::id::{CommandId, EnvironmentId, ProjectId};
+        use crate::domain::query::{Query, QueryEnvelope, QueryError, QueryOutcome, QueryResult};
+        use crate::domain::{
+            AgentRole, AgentSessionFacts, CreateTaskRequestIntent, ReviewReadiness, TaskActivity,
+            TaskAssignment, TaskAttention, TaskConnectivity,
+        };
+        use crate::kernel::CommandBus;
+        use crate::protocol::{Capability, CapabilitySet, FrameLimits, ProtocolVersion};
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("browser-session.sqlite");
+        let mut bus = CommandBus::open(&database).unwrap();
+        let client = ClientId::new();
+        let project_id = ProjectId::new();
+        let roots = crate::workspace::WorkspaceProjectRoots::try_from_pairs([(
+            project_id,
+            directory.path().to_path_buf(),
+        )])
+        .unwrap();
+        let task = TaskId::new();
+        let envelope = |revision: Option<u64>, command| CommandEnvelope {
+            command_id: CommandId::new(),
+            client_id: client,
+            task_id: revision.map(|_| task),
+            issued_at_ms: 100,
+            expected_task_revision: revision,
+            command,
+        };
+        let create = envelope(
+            None,
+            Command::CreateTaskV2(CreateTaskRequestIntent {
+                id: task,
+                environment_id: EnvironmentId::new(),
+                title: "Native browser".into(),
+                description: None,
+                project_id,
+                workspace: crate::workspace::WorkspaceRequest::main(),
+                primary_provider: None,
+                defer_primary_provider_start: false,
+                assignment: TaskAssignment::LocalOwner,
+                created_at_ms: 100,
+                connectivity: TaskConnectivity::Connected,
+                attention: TaskAttention::None,
+                activity: TaskActivity::Idle,
+                review_readiness: ReviewReadiness::NotReady,
+            }),
+        );
+        let (normalized, authorization, request_id) =
+            super::normalize_task_create_at_host(create, Some(&roots), None, Uuid::nil(), None)
+                .unwrap();
+        bus.execute_host_authorized(normalized, authorization, request_id.unwrap(), Uuid::nil())
+            .unwrap();
+        let agent = AgentSessionFacts::new(
+            task,
+            AgentRole::Primary,
+            crate::providers::ProviderKind::Codex,
+            None,
+        )
+        .unwrap();
+        bus.execute_for_test(envelope(
+            Some(1),
+            Command::RegisterAgentSession {
+                agent: agent.clone(),
+            },
+        ))
+        .unwrap();
+        bus.execute_for_test(envelope(
+            Some(2),
+            Command::SetPrimaryAgent {
+                agent_session_id: agent.id,
+            },
+        ))
+        .unwrap();
+        let revision = bus.task_snapshot(task).unwrap().unwrap().task.revision;
+        let (requests, executor) = HostRequestExecutor::start_with_workspace_projects(bus, roots);
+        let (output, _ports) = ConnectionOutputHandle::new(32, 64, 1);
+        let registration = requests.register_output(output).await.unwrap();
+        let handle = requests.with_output(registration.id());
+        let config = crate::ui::native_shell::isolated_dev_profile(directory.path())
+            .unwrap()
+            .host_client_config();
+        let caps = config
+            .requested
+            .intersection(CapabilitySet::from_capabilities(
+                crate::host::NATIVE_HOST_BASE_CAPABILITIES,
+            ));
+        assert!(caps.contains(Capability::BrowserProjection));
+        macro_rules! query {
+            ($caps:expr, $client:expr, $query:expr) => {
+                query!($caps, $client, Some(task), $query)
+            };
+            ($caps:expr, $client:expr, $scope:expr, $query:expr) => {{
+                let request_id = RequestId::new();
+                let reply = handle
+                    .execute(
+                        NegotiatedParameters {
+                            version: ProtocolVersion::current(),
+                            client_id: client,
+                            capabilities: $caps,
+                            limits: FrameLimits::v1_default(),
+                        },
+                        ClientRequest::Query(QueryEnvelope {
+                            request_id,
+                            client_id: $client,
+                            task_id: $scope,
+                            query: $query,
+                        }),
+                    )
+                    .await
+                    .unwrap();
+                let ServerMessage::QueryReply(reply) = reply else {
+                    panic!("query reply")
+                };
+                assert_eq!(reply.request_id, request_id);
+                reply.outcome
+            }};
+        }
+        let open = Query::TaskCockpit(TaskCockpitQuery::OpenBrowserSession {
+            expected_task_revision: revision,
+        });
+        for capabilities in [
+            CapabilitySet::empty(),
+            CapabilitySet::from_capabilities([Capability::TaskCockpit]),
+            CapabilitySet::from_capabilities([Capability::BrowserProjection]),
+        ] {
+            assert!(matches!(
+                query!(capabilities, client, open.clone()),
+                QueryOutcome::Err(QueryError::UnsupportedCapability)
+            ));
+        }
+        let foreign = handle
+            .execute(
+                NegotiatedParameters {
+                    version: ProtocolVersion::current(),
+                    client_id: client,
+                    capabilities: caps,
+                    limits: FrameLimits::v1_default(),
+                },
+                ClientRequest::Query(QueryEnvelope {
+                    request_id: RequestId::new(),
+                    client_id: ClientId::new(),
+                    task_id: Some(task),
+                    query: open.clone(),
+                }),
+            )
+            .await;
+        assert!(matches!(foreign, Err(crate::host::IpcError::Unauthorized)));
+
+        assert!(matches!(
+            query!(
+                caps,
+                client,
+                Query::TaskCockpit(TaskCockpitQuery::BrowserNativeSession)
+            ),
+            QueryOutcome::Ok(QueryResult::TaskCockpit(
+                TaskCockpitResult::Unavailable { .. }
+            ))
+        ));
+        let opened = query!(caps, client, open);
+        let QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::BrowserNativeSession {
+            session,
+            workspace_root,
+        })) = &opened
+        else {
+            panic!("{opened:?}")
+        };
+        assert_eq!(session.agent_session_id, agent.id);
+        assert_eq!(workspace_root, &directory.path().canonicalize().unwrap());
+        let QueryOutcome::Ok(QueryResult::TaskSnapshot { snapshot }) =
+            query!(caps, client, Query::TaskSnapshot)
+        else {
+            panic!("snapshot")
+        };
+        let revision = snapshot.task.revision;
+        assert_eq!(
+            query!(
+                caps,
+                client,
+                Query::TaskCockpit(TaskCockpitQuery::OpenBrowserSession {
+                    expected_task_revision: revision
+                })
+            ),
+            opened
+        );
+        assert_eq!(
+            query!(
+                caps,
+                client,
+                Query::TaskCockpit(TaskCockpitQuery::BrowserNativeSession)
+            ),
+            opened
+        );
+        assert!(matches!(
+            query!(
+                caps,
+                client,
+                Query::TaskCockpit(TaskCockpitQuery::OpenBrowserSession {
+                    expected_task_revision: revision - 1
+                })
+            ),
+            QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Denied { .. }))
+        ));
+        // Use the production negotiated section list, not a synthetic task
+        // snapshot: omitting browser sections left the live shell unattached
+        // after restart even though its read-only session query succeeded.
+        let mut builder = crate::client::ClientModelBuilder::new();
+        let mut detail = Vec::new();
+        for task_detail in [false, true] {
+            let mut snapshot_id = None;
+            for section in crate::client::subscription::snapshot_sections(
+                caps.contains(Capability::BrowserProjection),
+                task_detail,
+            ) {
+                let mut resume_cursor = None;
+                loop {
+                    let result = query!(
+                        caps,
+                        client,
+                        task_detail.then_some(task),
+                        Query::SnapshotPage {
+                            section,
+                            snapshot_id,
+                            resume_cursor,
+                        }
+                    );
+                    let QueryOutcome::Ok(QueryResult::SnapshotPage { page }) = result else {
+                        panic!("snapshot section {section:?}: {result:?}")
+                    };
+                    snapshot_id = Some(page.snapshot_id);
+                    resume_cursor = page.next_cursor.clone();
+                    if task_detail {
+                        detail.push(page);
+                    } else {
+                        builder.ingest_page(page).unwrap();
+                    }
+                    if resume_cursor.is_none() {
+                        break;
+                    }
+                }
+            }
+            assert!(matches!(
+                query!(
+                    caps,
+                    client,
+                    task_detail.then_some(task),
+                    Query::ReleaseSnapshot {
+                        snapshot_id: snapshot_id.unwrap(),
+                    }
+                ),
+                QueryOutcome::Ok(_)
+            ));
+        }
+        let mut restored = builder.finish().unwrap();
+        let projection = |model: &crate::client::ClientModel| {
+            crate::domain::native_browser::NativeBrowserSessionProjection::from_snapshot(
+                model.task(task).unwrap(),
+            )
+            .unwrap()
+        };
+        assert_eq!(projection(&restored).as_ref(), Some(session));
+        restored.admit_task_detail_pages(task, &detail).unwrap();
+        restored.admit_task_detail_pages(task, &detail).unwrap();
+        assert_eq!(projection(&restored).as_ref(), Some(session));
+        let incomplete: Vec<_> = detail
+            .iter()
+            .filter(|page| page.section != crate::domain::snapshot::SnapshotSection::BrowserTabs)
+            .cloned()
+            .collect();
+        assert!(restored.admit_task_detail_pages(task, &incomplete).is_err());
+        let mut duplicated = detail.clone();
+        duplicated.extend(
+            detail
+                .iter()
+                .filter(|page| {
+                    page.section == crate::domain::snapshot::SnapshotSection::BrowserTabs
+                })
+                .cloned(),
+        );
+        assert!(restored.admit_task_detail_pages(task, &duplicated).is_err());
+        assert_eq!(
+            projection(&restored).as_ref(),
+            Some(session),
+            "invalid detail must leave the previous binding intact"
+        );
+        drop(registration);
+        drop(handle);
+        drop(requests);
+        executor.abort();
+        let _ = executor.await;
+        let bus = CommandBus::open(&database).unwrap();
+        let snapshot = bus.task_snapshot(task).unwrap().unwrap();
+        assert_eq!(
+            snapshot.task.revision, revision,
+            "repeated reads and opens write nothing"
+        );
+        assert_eq!(snapshot.resources.len(), 1);
+        assert_eq!(snapshot.agents[&agent.id].provider_session_id, None);
     }
 
     /// An authenticated client may not send `Command::OpenShellTerminal`.

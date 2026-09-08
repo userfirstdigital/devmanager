@@ -46,15 +46,11 @@ pub enum BrowserDockLifecycleError {
 impl BrowserDockLifecycleError {
     pub fn message(self) -> &'static str {
         match self {
-            Self::IdentityIncomplete => {
-                "Browser identity is incomplete — task/agent/context/resource required."
-            }
-            Self::GatewayMissing => {
-                "Browser gateway binding is absent — cannot attach real page pixels."
-            }
-            Self::ParentHwndMissing => "Browser parent HWND is unavailable.",
+            Self::IdentityIncomplete => "Select Browser to open a page for this task.",
+            Self::GatewayMissing => "Browser is reconnecting.",
+            Self::ParentHwndMissing => "Browser window is not ready.",
             Self::BoundsMissing => "Browser page bounds are not ready.",
-            Self::HostUnavailable => "BrowserWebViewHost is unavailable.",
+            Self::HostUnavailable => "Embedded browser is unavailable.",
         }
     }
 }

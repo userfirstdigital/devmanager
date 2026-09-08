@@ -112,6 +112,16 @@ pub fn finish_headless_test(cx: &mut App) {
 /// retain the user's original Wayland/X11 environment.
 #[cfg(target_os = "linux")]
 pub fn prepare_native_platform() {
+    // WebKitGTK's DMA-BUF renderer can produce a black child surface with the
+    // proprietary NVIDIA driver. Keep acceleration on other drivers and honor
+    // an explicit user override. This must run before WebKit/provider threads.
+    // https://v2.tauri.app/develop/debug/linux-graphics/
+    if needs_webkit_dmabuf_fallback(
+        std::path::Path::new("/sys/module/nvidia").is_dir(),
+        std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").as_deref(),
+    ) {
+        std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+    }
     if !std::env::var_os("DISPLAY").is_some_and(|display| !display.is_empty())
         || gtk::is_initialized()
     {
@@ -130,6 +140,29 @@ pub fn prepare_native_platform() {
     std::env::set_var("GDK_BACKEND", "x11");
     gtk::gdk::set_allowed_backends("x11");
     let _ = gtk::init();
+}
+
+#[cfg(target_os = "linux")]
+fn needs_webkit_dmabuf_fallback(
+    nvidia_loaded: bool,
+    override_value: Option<&std::ffi::OsStr>,
+) -> bool {
+    nvidia_loaded && override_value.is_none()
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod linux_graphics_tests {
+    use super::needs_webkit_dmabuf_fallback;
+    use std::ffi::OsStr;
+
+    #[test]
+    fn webkit_dmabuf_fallback_is_nvidia_only_and_preserves_explicit_overrides() {
+        assert!(needs_webkit_dmabuf_fallback(true, None));
+        assert!(!needs_webkit_dmabuf_fallback(false, None));
+        for value in ["0", "1", ""] {
+            assert!(!needs_webkit_dmabuf_fallback(true, Some(OsStr::new(value))));
+        }
+    }
 }
 
 /// The native browser is an X11 child, so use XWayland when it is available.

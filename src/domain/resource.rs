@@ -4,7 +4,7 @@ use serde::de::{self, Deserializer};
 use serde::{Deserialize, Serialize};
 
 use crate::domain::canonical;
-use crate::domain::id::{ResourceId, TaskId};
+use crate::domain::id::{BrowserContextId, ResourceId, TaskId};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResourceValidationError {
@@ -123,6 +123,9 @@ pub enum ResourceRecipe {
     },
     Browser {
         start_url: String,
+        /// Exact durable browser context. Absent in legacy resource recipes.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        context_id: Option<BrowserContextId>,
     },
     Service {
         command: String,
@@ -165,7 +168,10 @@ impl ResourceRecipe {
     pub fn browser(start_url: impl Into<String>) -> Result<Self, ResourceValidationError> {
         let start_url = canonical::canonicalize(start_url.into())
             .ok_or(ResourceValidationError::EmptyRecipe)?;
-        Ok(Self::Browser { start_url })
+        Ok(Self::Browser {
+            start_url,
+            context_id: None,
+        })
     }
 
     pub fn service(command: impl Into<String>) -> Result<Self, ResourceValidationError> {
@@ -199,7 +205,17 @@ impl ResourceRecipe {
                     title,
                 })
             }
-            Self::Browser { start_url } => Self::browser(start_url),
+            Self::Browser {
+                start_url,
+                context_id,
+            } => {
+                let start_url = canonical::canonicalize(start_url)
+                    .ok_or(ResourceValidationError::EmptyRecipe)?;
+                Ok(Self::Browser {
+                    start_url,
+                    context_id,
+                })
+            }
             Self::Service { command } => Self::service(command),
         }
     }
@@ -226,7 +242,7 @@ impl ResourceRecipe {
                 }
                 Ok(())
             }
-            Self::Browser { start_url } => {
+            Self::Browser { start_url, .. } => {
                 if canonical::is_canonical(start_url) {
                     Ok(())
                 } else {
@@ -259,6 +275,8 @@ impl<'de> Deserialize<'de> for ResourceRecipe {
             },
             Browser {
                 start_url: String,
+                #[serde(default)]
+                context_id: Option<BrowserContextId>,
             },
             Service {
                 command: String,
@@ -279,9 +297,15 @@ impl<'de> Deserialize<'de> for ResourceRecipe {
             }
             .canonicalize()
             .map_err(de::Error::custom),
-            ResourceRecipeWire::Browser { start_url } => {
-                Self::browser(start_url).map_err(de::Error::custom)
+            ResourceRecipeWire::Browser {
+                start_url,
+                context_id,
+            } => Self::Browser {
+                start_url,
+                context_id,
             }
+            .canonicalize()
+            .map_err(de::Error::custom),
             ResourceRecipeWire::Service { command } => {
                 Self::service(command).map_err(de::Error::custom)
             }

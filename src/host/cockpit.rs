@@ -152,7 +152,10 @@ pub(crate) fn serve_task_cockpit_bounded(
             reason: "config_mutate",
         });
     }
-    if matches!(dispatch.query, TaskCockpitQuery::OpenShellTerminal { .. }) {
+    if matches!(
+        dispatch.query,
+        TaskCockpitQuery::OpenShellTerminal { .. } | TaskCockpitQuery::OpenBrowserSession { .. }
+    ) {
         // Opening a shell resolves a launch and writes a durable resource.
         // Only the exclusive host executor holds the authority to do either,
         // so reaching this read-only serve path is a routing bug.
@@ -236,8 +239,68 @@ pub(crate) fn serve_task_cockpit_bounded(
         | TaskCockpitQuery::ConfigCommandDetail { .. }
         | TaskCockpitQuery::ProviderSettings(_)
         | TaskCockpitQuery::RemoteAccess(_)
-        | TaskCockpitQuery::OpenShellTerminal { .. } => {
+        | TaskCockpitQuery::OpenShellTerminal { .. }
+        | TaskCockpitQuery::OpenBrowserSession { .. } => {
             unreachable!("config snapshot is handled before task-scoped lookup")
+        }
+        TaskCockpitQuery::BrowserNativeSession => {
+            if !dispatch
+                .capabilities
+                .contains(Capability::BrowserProjection)
+            {
+                return QueryOutcome::Err(QueryError::UnsupportedCapability);
+            }
+            if !matches!(
+                snapshot.task.lifecycle,
+                crate::domain::TaskLifecycle::Open | crate::domain::TaskLifecycle::Settled
+            ) {
+                return denied(
+                    TaskCockpitSurface::Browser,
+                    TaskCockpitDeniedReason::StaleFence,
+                );
+            }
+            match crate::domain::native_browser::NativeBrowserSessionProjection::from_snapshot(
+                &snapshot,
+            ) {
+                Ok(Some(session)) => {
+                    // Durable workspace facts intentionally contain no host path.
+                    // Resolve the exact task binding here for the native gateway;
+                    // never substitute the application's current directory.
+                    let workspace_root = dispatch.workspace_projects.and_then(|projects| {
+                        WorkspaceService::from_durable(
+                            snapshot.task.project_id,
+                            projects,
+                            &snapshot.task.workspace,
+                        )
+                        .ok()
+                        .and_then(|service| {
+                            service
+                                .current()
+                                .map(|binding| binding.path().to_path_buf())
+                        })
+                    });
+                    let Some(workspace_root) = workspace_root else {
+                        return unavailable(
+                            TaskCockpitSurface::Browser,
+                            TaskCockpitUnavailableReason::WorkspaceAuthorityUnavailable,
+                        );
+                    };
+                    QueryOutcome::Ok(QueryResult::TaskCockpit(
+                        TaskCockpitResult::BrowserNativeSession {
+                            session,
+                            workspace_root,
+                        },
+                    ))
+                }
+                Ok(None) => unavailable(
+                    TaskCockpitSurface::Browser,
+                    TaskCockpitUnavailableReason::BrowserProcessSessionUnavailable,
+                ),
+                Err(_) => denied(
+                    TaskCockpitSurface::Browser,
+                    TaskCockpitDeniedReason::StaleFence,
+                ),
+            }
         }
         TaskCockpitQuery::BrowserProcessSession => {
             let process_session_id = dispatch

@@ -381,6 +381,18 @@ impl BrowserGatewayRegistrar {
         true
     }
 
+    /// Register a host-attested browser resource without borrowing provider identity.
+    pub fn register_native_session(
+        &self,
+        session: &crate::domain::native_browser::NativeBrowserSessionProjection,
+        snapshot: BrowserWorkspaceSnapshot,
+        workspace_root: &Path,
+    ) -> Result<BrowserGatewayRegistration, String> {
+        let key = BrowserWorkspaceKey::new(session.task_id.to_string(), session.tab_id.to_string())
+            .map_err(|error| error.to_string())?;
+        self.register_with_project_root(session.routing_key(), key, snapshot, workspace_root)
+    }
+
     pub fn register(
         &self,
         process_session_id: impl Into<String>,
