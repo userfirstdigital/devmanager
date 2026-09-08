@@ -878,7 +878,11 @@ impl ProcessSampler {
         {
             observe_exact_windows_process(expected)
         }
-        #[cfg(not(windows))]
+        #[cfg(target_os = "linux")]
+        {
+            observe_exact_linux_process(expected)
+        }
+        #[cfg(not(any(windows, target_os = "linux")))]
         {
             let _ = expected;
             ExactProcessIdentityStatus::Inaccessible
@@ -1230,6 +1234,69 @@ fn file_time_value(value: &FileTime) -> u64 {
     ((value.high_date_time as u64) << 32) | value.low_date_time as u64
 }
 
+// Keep a pidfd alive across every /proc read. A reused PID or an exited
+// zombie must never be accepted as a persisted runtime's live process.
+#[cfg(target_os = "linux")]
+fn linux_process_handle(pid: u32) -> Result<std::os::fd::OwnedFd, ExactProcessIdentityStatus> {
+    use std::os::fd::FromRawFd;
+    if pid == 0 || pid > i32::MAX as u32 {
+        return Err(ExactProcessIdentityStatus::Absent);
+    }
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) };
+    if fd < 0 {
+        return Err(
+            if std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+                ExactProcessIdentityStatus::Absent
+            } else {
+                ExactProcessIdentityStatus::Inaccessible
+            },
+        );
+    }
+    Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd as i32) })
+}
+
+#[cfg(target_os = "linux")]
+fn linux_process_live(fd: &std::os::fd::OwnedFd) -> Result<(), ExactProcessIdentityStatus> {
+    use std::os::fd::AsRawFd;
+    let mut poll = libc::pollfd {
+        fd: fd.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    match unsafe { libc::poll(&mut poll, 1, 0) } {
+        0 => Ok(()),
+        n if n > 0 && poll.revents & libc::POLLIN != 0 => Err(ExactProcessIdentityStatus::Absent),
+        _ => Err(ExactProcessIdentityStatus::Inaccessible),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn observe_exact_linux_process(expected: &ManagedProcessIdentity) -> ExactProcessIdentityStatus {
+    let fd = match linux_process_handle(expected.id().pid()) {
+        Ok(fd) => fd,
+        Err(status) => return status,
+    };
+    if let Err(status) = linux_process_live(&fd) {
+        return status;
+    }
+    let creation =
+        crate::services::platform_service::capture_process_creation_time_100ns(expected.id().pid());
+    let executable = std::fs::canonicalize(format!("/proc/{}/exe", expected.id().pid()));
+    if let Err(status) = linux_process_live(&fd) {
+        return status;
+    }
+    match (creation, executable) {
+        (Some(creation), Ok(executable))
+            if creation == expected.id().creation_time_100ns()
+                && executable == expected.canonical_executable() =>
+        {
+            ExactProcessIdentityStatus::Present
+        }
+        (Some(_), Ok(_)) => ExactProcessIdentityStatus::Different,
+        _ => ExactProcessIdentityStatus::Inaccessible,
+    }
+}
+
 #[cfg(unix)]
 fn observe_proc_process(
     pid: u32,
@@ -1239,6 +1306,11 @@ fn observe_proc_process(
         ProcessMemberObservation::Inaccessible(
             InaccessibleProcess::new(pid, creation_time).with_reason(reason),
         )
+    };
+    #[cfg(target_os = "linux")]
+    let process_handle = match linux_process_handle(pid) {
+        Ok(fd) if linux_process_live(&fd).is_ok() => fd,
+        _ => return inaccessible("process is no longer accessible".into(), None),
     };
     let stat_path = format!("/proc/{pid}/stat");
     let stat = match std::fs::read_to_string(&stat_path) {
@@ -1252,16 +1324,28 @@ fn observe_proc_process(
     let Some(start_time_ticks) = fields.get(19).and_then(|value| value.parse::<u64>().ok()) else {
         return inaccessible("missing process start time".to_string(), None);
     };
+    let ticks_per_second = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    if ticks_per_second <= 0 {
+        return inaccessible("process clock rate unavailable".into(), None);
+    }
+    let to_100ns = |ticks: u64| {
+        ticks
+            .checked_mul(10_000_000)?
+            .checked_div(ticks_per_second as u64)
+    };
+    let Some(start_time_100ns) = to_100ns(start_time_ticks).filter(|value| *value != 0) else {
+        return inaccessible("invalid process start time".into(), None);
+    };
     let Some(user_ticks) = fields.get(11).and_then(|value| value.parse::<u64>().ok()) else {
         return inaccessible(
             "missing process user time".to_string(),
-            Some(start_time_ticks),
+            Some(start_time_100ns),
         );
     };
     let Some(kernel_ticks) = fields.get(12).and_then(|value| value.parse::<u64>().ok()) else {
         return inaccessible(
             "missing process kernel time".to_string(),
-            Some(start_time_ticks),
+            Some(start_time_100ns),
         );
     };
     let executable = match std::fs::canonicalize(format!("/proc/{pid}/exe")) {
@@ -1269,25 +1353,25 @@ fn observe_proc_process(
         Err(error) => {
             return inaccessible(
                 format!("read process executable failed: {error}"),
-                Some(start_time_ticks),
+                Some(start_time_100ns),
             )
         }
     };
     let identity = match ManagedProcessIdentity::new(
-        ManagedProcessId::new(pid, start_time_ticks).expect("nonzero proc identity"),
+        ManagedProcessId::new(pid, start_time_100ns).expect("nonzero proc identity"),
         executable,
     ) {
         Ok(identity) => identity,
         Err(error) => {
             return inaccessible(
                 format!("could not canonicalize process executable: {error}"),
-                Some(start_time_ticks),
+                Some(start_time_100ns),
             )
         }
     };
     if let Some(expected) = expected {
         if let Err(reason) = require_exact_process_identity(expected, &identity) {
-            return inaccessible(reason, Some(start_time_ticks));
+            return inaccessible(reason, Some(start_time_100ns));
         }
     }
     let private_memory_bytes = match read_proc_private_memory(pid) {
@@ -1295,20 +1379,28 @@ fn observe_proc_process(
         None => {
             return inaccessible(
                 "private memory metrics were inaccessible".to_string(),
-                Some(start_time_ticks),
+                Some(start_time_100ns),
             )
         }
     };
     let io = read_proc_io(pid);
+    #[cfg(target_os = "linux")]
+    if linux_process_live(&process_handle).is_err()
+        || observe_exact_linux_process(&identity) != ExactProcessIdentityStatus::Present
+    {
+        return inaccessible(
+            "process changed during observation".into(),
+            Some(start_time_100ns),
+        );
+    }
+    let Some(cpu_time) = user_ticks.checked_add(kernel_ticks).and_then(to_100ns) else {
+        return inaccessible(
+            "process CPU counter overflow".into(),
+            Some(start_time_100ns),
+        );
+    };
     ProcessMemberObservation::Accessible(
-        AccessibleProcess::new(
-            identity,
-            user_ticks
-                .saturating_add(kernel_ticks)
-                .saturating_mul(100_000),
-            private_memory_bytes,
-        )
-        .with_optional_io(io),
+        AccessibleProcess::new(identity, cpu_time, private_memory_bytes).with_optional_io(io),
     )
 }
 
@@ -1354,9 +1446,71 @@ fn read_proc_io(pid: u32) -> Option<(u64, u64)> {
     Some((read_bytes?, write_bytes?))
 }
 
-#[cfg(all(test, windows))]
+#[cfg(all(test, any(windows, target_os = "linux")))]
 mod exact_identity_tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_exact_identity_rejects_missing_and_unreaped_exited_processes() {
+        let missing = ManagedProcessIdentity::new(
+            ManagedProcessId::new(u32::MAX, 1).unwrap(),
+            std::env::current_exe().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            ProcessSampler::observe_exact_process_identity(&missing),
+            ExactProcessIdentityStatus::Absent
+        );
+        struct Child(std::process::Child);
+        impl Drop for Child {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let mut child = Child(
+            std::process::Command::new("/usr/bin/sleep")
+                .arg("30")
+                .spawn()
+                .unwrap(),
+        );
+        let creation =
+            crate::services::platform_service::capture_process_creation_time_100ns(child.0.id())
+                .unwrap();
+        let identity = ManagedProcessIdentity::new(
+            ManagedProcessId::new(child.0.id(), creation).unwrap(),
+            std::fs::canonicalize(format!("/proc/{}/exe", child.0.id())).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            ProcessSampler::observe_exact_process_identity(&identity),
+            ExactProcessIdentityStatus::Present
+        );
+        let sampled = ProcessSampler::observe_process(child.0.id());
+        assert!(
+            matches!(sampled, ProcessMemberObservation::Accessible(value) if value.identity == identity)
+        );
+        let fd = linux_process_handle(child.0.id()).unwrap();
+        child.0.kill().unwrap();
+        use std::os::fd::AsRawFd;
+        let mut poll = libc::pollfd {
+            fd: fd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        assert_eq!(unsafe { libc::poll(&mut poll, 1, 5000) }, 1);
+        assert_eq!(
+            ProcessSampler::observe_exact_process_identity(&identity),
+            ExactProcessIdentityStatus::Absent,
+            "exit must be observable before the parent reaps the zombie"
+        );
+        child.0.wait().unwrap();
+        assert_eq!(
+            ProcessSampler::observe_exact_process_identity(&identity),
+            ExactProcessIdentityStatus::Absent
+        );
+    }
 
     #[test]
     fn exact_identity_observation_distinguishes_present_root_from_pid_reuse() {

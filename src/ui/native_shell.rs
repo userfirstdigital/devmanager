@@ -985,7 +985,10 @@ fn hold_pending_draft_first_send_for_provider_setup(
         return;
     };
     pending.readiness_request_id = None;
-    pending.readiness_requested_at = None;
+    // Setup proves the exact probe found a running provider. After approval,
+    // poll readiness for that runtime instead of starting another conversation.
+    pending.stage = PendingDraftFirstSendStage::StartAcceptedAwaitingReady;
+    pending.readiness_requested_at = Some(Instant::now());
     let owner = pending.owner.clone();
     let first_hold = !slot.provider_setup_approvals.contains_key(&owner.task_id);
     slot.provider_setup_approvals
@@ -15906,8 +15909,56 @@ impl NativeShell {
         }
         vec![ActionRequest::TaskCockpit {
             task_id: owner.task_id,
-            query: self.focused_terminal_target(owner).readiness_query(),
+            query: self.terminal_display_query(owner, self.focused_terminal_target(owner)),
         }]
+    }
+
+    fn terminal_display_query(
+        &self,
+        owner: &HostTaskKey,
+        target: TerminalTarget,
+    ) -> TaskCockpitQuery {
+        let setup_visible = self.selected_task_key.as_ref() == Some(owner)
+            && self.settling_terminal_target(owner, target) == TerminalTarget::Provider
+            && self
+                .host_slot(&owner.host)
+                .is_some_and(|slot| slot.provider_setup_approvals.contains_key(&owner.task_id));
+        if setup_visible {
+            target.screen_query()
+        } else {
+            target.readiness_query()
+        }
+    }
+
+    /// Read the exact held provider's screen so an explicit setup decision can
+    /// be bound to the rendered prompt. Readiness refusals carry no screen.
+    fn request_provider_setup_screen(&mut self, host_id: &HostId) {
+        let Some(owner) = self
+            .host_slot(host_id)
+            .and_then(|slot| slot.pending_draft_first_send.as_ref())
+            .map(|pending| pending.owner.clone())
+        else {
+            return;
+        };
+        let query = TerminalTarget::Provider.screen_query();
+        let record = self.host_slot_mut(host_id).and_then(|slot| {
+            slot.interaction
+                .action_on_current_handler(ActionRequest::TaskCockpit {
+                    task_id: owner.task_id,
+                    query,
+                })
+        });
+        if let Some(mut record) = record {
+            if matches!(
+                self.enqueue_host_action_for_owner(host_id, &mut record),
+                NativeHostActionResult::Queued
+            ) {
+                self.task_surfaces.note_terminal_query_started_for(
+                    owner,
+                    TerminalTarget::Provider.surface_target(),
+                );
+            }
+        }
     }
 
     /// A terminal mutation the host accepted changes the strip, so ask for it.
@@ -22820,7 +22871,7 @@ impl NativeShell {
                     // Same rule as the local path: probe the chip the strip
                     // focuses, and refresh the strip that decides it.
                     let target = self.focused_terminal_target(&key);
-                    let query = target.readiness_query();
+                    let query = self.terminal_display_query(&key, target);
                     self.task_surfaces
                         .note_terminal_query_started_for(key.clone(), target.surface_target());
                     self.request_task_terminals_refresh(&key);
@@ -22875,7 +22926,7 @@ impl NativeShell {
                 if let Some(task_id) = selected_task_id {
                     let owner = self.local_task_key(task_id);
                     let target = self.focused_terminal_target(&owner);
-                    let query = target.readiness_query();
+                    let query = self.terminal_display_query(&owner, target);
                     self.task_surfaces
                         .note_terminal_query_started_for(owner.clone(), target.surface_target());
                     self.request_task_terminals_refresh(&owner);
@@ -35930,6 +35981,7 @@ impl NativeShell {
                 if let Some(slot) = self.host_slot_mut(host_id) {
                     hold_pending_draft_first_send_for_provider_setup(slot, Some(request_id));
                 }
+                self.request_provider_setup_screen(host_id);
                 return;
             }
             if first_send_terminal_probe_not_started(result) {
@@ -35955,6 +36007,7 @@ impl NativeShell {
             if let Some(slot) = self.host_slot_mut(host_id) {
                 hold_pending_draft_first_send_for_provider_setup(slot, Some(request_id));
             }
+            self.request_provider_setup_screen(host_id);
             return;
         }
         let ready = match result {
@@ -36301,6 +36354,16 @@ impl NativeShell {
         else {
             return;
         };
+        if self.host_slot(host_id).is_some_and(|slot| {
+            slot.provider_setup_approvals
+                .get(&pending.task_id)
+                .is_some_and(|approval| approval.state == ProviderSetupApprovalState::Waiting)
+        }) {
+            // A readiness refusal contains no screen. Reissuing it while the
+            // decision is held also advances the action epoch before the actual
+            // screen reply arrives, continually discarding that reply.
+            return;
+        }
         if &pending.owner.host != host_id {
             return;
         }
@@ -48044,6 +48107,11 @@ impl Render for NativeShell {
         // Re-checked every paint so a selection path added later cannot leave
         // a menu acting on a Task that is no longer on screen.
         self.retire_terminal_chip_menu_for_selection();
+        if !self.selected_center_terminal_is_interactive()
+            && self.terminal_focus_handle.is_focused(window)
+        {
+            self.focus_handle.focus(window);
+        }
         if self.pending_terminal_focus && self.selected_center_terminal_is_interactive() {
             self.terminal_focus_handle.focus(window);
             self.pending_terminal_focus = false;
@@ -67236,6 +67304,32 @@ mod "
                         ),
                     },
                 );
+                let screens = remote_shared.lock().expect("remote").accepted.iter()
+                    .filter(|record| matches!(record.command,
+                        NativeHostCommand::TaskCockpitQuery { task_id: id, query: TaskCockpitQuery::Terminal, .. }
+                        if id == task_id)).count();
+                assert_eq!(screens, 1, "setup refusal must load the held owner's actual terminal for approval");
+                assert!(matches!(shell.terminal_display_query(&remote_key, super::TerminalTarget::Provider), TaskCockpitQuery::Terminal),
+                    "visible setup must keep refreshing the actual prompt without a readiness refusal replacing it");
+                let before_refresh = remote_shared.lock().unwrap().accepted.len();
+                for _ in 0..3 {
+                    shell.request_pending_first_send_readiness_for_host(&remote_host);
+                    shell.try_advance_all_pending_composer_workflows();
+                }
+                assert_eq!(remote_shared.lock().unwrap().accepted.len(), before_refresh,
+                    "waiting approval must not spin readiness queries or stale the pending screen");
+                let screen_action = remote_shared.lock().unwrap().accepted.iter().find(|record|
+                    matches!(record.command, NativeHostCommand::TaskCockpitQuery { query: TaskCockpitQuery::Terminal, .. })
+                ).cloned().unwrap();
+                let mut terminal = provider_terminal_projection_for_test(&draft_model, task_id, 1);
+                terminal.text_lines = vec!["Do you trust the contents of this directory?".into(),
+                    "1. Yes, continue".into(), "2. No, quit".into()];
+                terminal.action_epoch = draft_model.task(task_id).unwrap().task.action_epoch;
+                shell.apply_epoch_fenced_action_outcome_for_host(&remote_host,
+                    NativeHostActionOutcome::Queried { action: screen_action, detail: "setup screen".into(),
+                        body: NativeHostQueryBody::TaskCockpit(crate::domain::TaskCockpitResult::Terminal(terminal)) });
+                assert!(shell.task_surfaces.state(remote_key.clone()).and_then(|surface| surface.latest_terminal()).is_some(),
+                    "the exact queried screen must survive the production outcome handler and enable approval");
                 let sends = remote_shared
                     .lock()
                     .expect("remote")

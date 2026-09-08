@@ -1741,6 +1741,17 @@ impl ProcessManager {
         )
     }
 
+    // Stored inside `inner`: it must not cast an external ownership vote, or
+    // the last host handle can never initiate shutdown and break this cycle.
+    fn internal_provider_process_launcher(
+        &self,
+    ) -> crate::services::provider_process_launcher::ProcessManagerProviderLauncher {
+        crate::services::provider_process_launcher::ProcessManagerProviderLauncher::new(
+            process_manager_from_inner(self.inner.clone())
+                .expect("live manager owns its operation queue"),
+        )
+    }
+
     pub fn start_adapter_sealed_provider_session<S>(
         &self,
         store: S,
@@ -1782,7 +1793,7 @@ impl ProcessManager {
             .map_err(crate::providers::session::ProviderSessionError::StateStore)?;
             *slot = Some(
                 crate::providers::session::ProviderSessionManager::with_state_store(
-                    self.provider_process_launcher(),
+                    self.internal_provider_process_launcher(),
                     store,
                 ),
             );
@@ -1850,7 +1861,7 @@ impl ProcessManager {
             .map_err(crate::providers::session::ProviderSessionError::StateStore)?;
             *slot = Some(
                 crate::providers::session::ProviderSessionManager::with_state_store(
-                    self.provider_process_launcher(),
+                    self.internal_provider_process_launcher(),
                     store,
                 ),
             );
@@ -1905,7 +1916,7 @@ impl ProcessManager {
             })?;
             *slot = Some(
                 crate::providers::session::ProviderSessionManager::with_state_store(
-                    self.provider_process_launcher(),
+                    self.internal_provider_process_launcher(),
                     store,
                 ),
             );
@@ -5700,6 +5711,16 @@ fn shutdown_process_manager_workers(inner: &ProcessManagerInner) {
     for worker in workers {
         join_process_manager_helper(worker);
     }
+
+    // The retained provider manager owns an internal facade back into `inner`.
+    // Retire it after all worker admission has stopped, outside its mutex: its
+    // recovery handoff may access the runtime book before exact terminal close.
+    let provider_sessions = inner
+        .provider_sessions
+        .lock()
+        .unwrap_or_else(|_| std::process::abort())
+        .take();
+    drop(provider_sessions);
 
     // Worker admission is now closed and every helper has joined. Snapshot
     // the one real terminal objects without holding the store lock, then route
@@ -15524,6 +15545,31 @@ mod tests {
         assert!(
             inner.upgrade().is_none(),
             "the non-owning internal facade must release shared state without initiating worker shutdown"
+        );
+    }
+
+    #[test]
+    fn retained_provider_manager_does_not_keep_host_ownership_alive() {
+        let root = tempfile::tempdir().unwrap();
+        let manager = ProcessManager::new_with_provider_session_store_path(
+            root.path().join("provider-sessions.sqlite3"),
+        );
+        let inner = Arc::downgrade(&manager.inner);
+        let lifecycle = manager.handle_lifecycle.clone();
+        assert!(manager
+            .peek_persisted_provider_launch_spec(crate::domain::AgentSessionId::new())
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            lifecycle_state_for_test(&lifecycle),
+            (1, false),
+            "retained provider store must not acquire an external shutdown vote"
+        );
+        drop(manager);
+        assert_eq!(lifecycle_state_for_test(&lifecycle), (0, true));
+        assert!(
+            inner.upgrade().is_none(),
+            "shutdown must break the retained provider facade cycle and join workers"
         );
     }
 

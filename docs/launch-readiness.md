@@ -182,6 +182,38 @@ stop, and their cgroup disappeared. The running-process ledger still retains the
 stopped provider; process reconciliation and shutdown ledger settlement remain
 acceptance gates. Production configuration hashes are unchanged.
 
+### Linux provider handoff and shutdown, 2026-09-07
+
+The desktop pass now completes Codex workspace approval and first-send delivery.
+The exact response `linux launch ok` appears in both the real provider terminal
+and the canonical Conversation view, with a correlated provider session ID.
+Physical typing is immediately visible; Ctrl+W edits the provider prompt, and
+physical drag selection plus Ctrl+C copies the exact answer to the desktop
+clipboard. Wheel-scroll acceptance remains open: a longer completed provider
+answer exposed missing automatic terminal refresh, leaving the visible terminal
+on its initial Working frame. The composer also retains the delivered draft.
+
+Setup holds now request the actual terminal screen and suspend readiness polling
+while waiting for the user. The previous readiness loop invalidated the screen
+reply continuously. The regression runs the production outcome handler, advances
+controller work, and proves the screen remains admitted without sending input.
+Linux process identity uses retained pidfds and correct clock-tick conversion;
+missing, reused, live and unreaped exited processes are distinguished. Internal
+provider-manager references no longer prevent last-owner shutdown. Both live
+stop passes removed the new provider's exact process tree and running-ledger row.
+An older debug-profile row from the pre-fix crash remains separately recorded.
+
+Focused evidence: `handoff-identity-tests.log` (2), `handoff-manager.log` (1),
+`handoff-session.log` (92), `handoff-custody.log` (3, including real wallet),
+`handoff-trust-final.log` (1), `handoff-check-final.log`, `handoff-build.log`.
+The wallet dependency now uses zbus's async-io backend, preserving GPUI's D-Bus
+calls outside Tokio; rebuilt desktop logs no longer contain the reactor panic.
+During the live terminal pass, a three-second CPU sample measured the native
+shell at 1.33% and host at 3.67% of one core; this does not certify the pending
+refresh fix. All owned app/host/provider processes were stopped before edits;
+Cargo and harness processes were joined. Production configuration hashes match.
+Private screenshots and exact identities are under `linux-production/handoff2-*`.
+
 - [ ] Complete Linux provider ownership and discovery,
       protected storage, workspace mutation and process reporting.
 - [ ] Pass Linux integration/serial library checks, real provider desktop input,

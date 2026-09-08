@@ -110,8 +110,8 @@ libc = "0.2.183"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 ring = "=0.17.14"
-secret-service = { version = "=5.2.0", features = ["rt-tokio-crypto-rust"] }
-zbus = { version = "=5.14.0", default-features = false, features = ["tokio"] }
+secret-service = { version = "=5.2.0", features = ["rt-async-io-crypto-rust"] }
+zbus = { version = "=5.14.0", default-features = false, features = ["async-io"] }
 
 [target.'cfg(windows)'.build-dependencies]
 embed-resource = "3.0"
