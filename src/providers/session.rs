@@ -5103,7 +5103,6 @@ impl ProviderSessionStateStore for SqliteProviderSessionStateStore {
     }
 
     fn clear_recovery_release(&mut self, receipt: &RecoveryReleaseReceipt) -> Result<(), String> {
-        let state_json = receipt.state.encode()?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -5121,17 +5120,20 @@ impl ProviderSessionStateStore for SqliteProviderSessionStateStore {
                 pending_release_row,
             )
             .optional()
-            .map_err(|error| error.to_string())?
-            .map(decode_recovery_release_row)
-            .transpose()?;
+            .map_err(|error| error.to_string())?;
         let Some(existing) = existing else {
             transaction.commit().map_err(|error| error.to_string())?;
             return Ok(());
         };
+        // Encryption uses a fresh nonce. Compare the decoded receipt, then
+        // retain the exact ciphertext read under this write transaction for
+        // the delete CAS; re-encoding an equal state cannot match its bytes.
+        let state_json = existing.5.clone();
+        let existing = decode_recovery_release_row(existing)?;
         if existing != *receipt {
             return Err("provider recovery release receipt is stale".to_string());
         }
-        transaction
+        let removed = transaction
             .execute(
                 "DELETE FROM provider_session_recovery_release_pending
                  WHERE receipt_id = ?1 AND agent_session_id = ?2
@@ -5150,6 +5152,9 @@ impl ProviderSessionStateStore for SqliteProviderSessionStateStore {
                 ],
             )
             .map_err(|error| error.to_string())?;
+        if removed != 1 {
+            return Err("provider recovery release receipt was not removed".to_string());
+        }
         transaction.commit().map_err(|error| error.to_string())
     }
 }
@@ -10539,6 +10544,31 @@ mod tests {
         assert_eq!(launcher.snapshot().stop_attempts(), 1);
         assert_eq!(launcher.snapshot().lease_drops(), 1);
         drop(reopened);
+    }
+
+    #[test]
+    fn encrypted_recovery_receipt_clear_removes_the_exact_stored_row() {
+        let executable = ProviderExecutable::from_path(std::env::current_exe().unwrap()).unwrap();
+        let mut state = repin_fixture_state(executable, None);
+        state
+            .launch_spec
+            .environment
+            .insert("PRIVATE_ENV".into(), "test-owned-secret".into());
+        let mut store = SqliteProviderSessionStateStore::open(":memory:").unwrap();
+        store.persist(state.clone()).unwrap();
+        let claim = store
+            .claim_recovery(&state, Uuid::now_v7(), recovery_now_ms())
+            .unwrap()
+            .unwrap();
+        let receipt = RecoveryReleaseReceipt::new(&state, &claim);
+        store.record_recovery_release(&receipt).unwrap();
+        let mut stale = receipt.clone();
+        stale.state.revision += 1;
+        assert!(store.clear_recovery_release(&stale).is_err());
+        assert_eq!(store.list_recovery_releases().unwrap().len(), 1);
+        store.clear_recovery_release(&receipt).unwrap();
+        assert!(store.list_recovery_releases().unwrap().is_empty());
+        store.clear_recovery_release(&receipt).unwrap();
     }
 
     #[test]

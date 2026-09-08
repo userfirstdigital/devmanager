@@ -2513,7 +2513,9 @@ impl TaskComposer {
         replace_text: bool,
     ) -> Result<(), ComposerError> {
         if replace_text {
-            self.field.set_value(projection.draft.text)?;
+            if self.field.value() != projection.draft.text {
+                self.field.set_value(projection.draft.text)?;
+            }
             self.inserted_prompt = projection
                 .draft
                 .prompt
@@ -3498,6 +3500,21 @@ mod tests {
         let epoch = epochs.current();
         composer.set_focus_epoch(epoch).expect("focus epoch");
         composer.focus_input(epoch).expect("focus input");
+    }
+
+    #[test]
+    fn unchanged_projection_preserves_selection_in_a_restored_draft() {
+        let mut composer = bind_granted("restored draft");
+        let mut epochs = FocusEpochSource::new();
+        focus(&mut composer, &mut epochs);
+        let epoch = epochs.current();
+        composer.select_all_draft(epoch).unwrap();
+        composer
+            .apply_projection(projection_with(composer.fence(), "restored draft"), epoch)
+            .unwrap();
+        assert!(composer.draft_is_all_selected());
+        composer.paste_text("replacement", epoch).unwrap();
+        assert_eq!(composer.draft_text(), "replacement");
     }
 
     #[test]

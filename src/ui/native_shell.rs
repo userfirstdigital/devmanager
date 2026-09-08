@@ -868,6 +868,22 @@ fn first_send_terminal_probe_start_pending(result: &crate::domain::TaskCockpitRe
     )
 }
 
+fn terminal_query_needs_readiness_followup(
+    query: &TaskCockpitQuery,
+    result: &crate::domain::TaskCockpitResult,
+) -> bool {
+    first_send_terminal_probe_start_pending(result)
+        || (matches!(query, TaskCockpitQuery::Terminal)
+            && matches!(
+                result,
+                crate::domain::TaskCockpitResult::Unavailable {
+                    surface: crate::domain::TaskCockpitSurface::Terminal,
+                    reason: crate::domain::TaskCockpitUnavailableReason::TerminalUnavailable,
+                    ..
+                }
+            ))
+}
+
 /// What a panel and a board row both say when the provider has forgotten a
 /// task's conversation.
 ///
@@ -11706,6 +11722,7 @@ pub struct NativeShell {
     /// Owner-qualified retries for a provider runtime that reported
     /// TerminalStartPending. Empty during ordinary idle operation.
     pending_terminal_requeries: BTreeMap<TerminalKey, Instant>,
+    visible_terminal_refreshes: BTreeMap<TerminalKey, Instant>,
     /// One `TaskTerminals` lease per owner, stamped when the strip query goes
     /// out and dropped by the answer that settles it. The stamp -- rather than
     /// a bare flag -- is what keeps a lost or refused answer from wedging the
@@ -12815,6 +12832,7 @@ impl NativeShell {
             terminal_selections: BTreeMap::new(),
             pending_terminal_resizes: BTreeMap::new(),
             pending_terminal_requeries: BTreeMap::new(),
+            visible_terminal_refreshes: BTreeMap::new(),
             pending_task_terminals_queries: BTreeMap::new(),
             selecting_terminal_owner: None,
             pending_terminal_echoes: BTreeMap::new(),
@@ -15372,7 +15390,7 @@ impl NativeShell {
                             TerminalTarget::for_screen_query(&query)
                                 .unwrap_or(TerminalTarget::Provider),
                         );
-                        if first_send_terminal_probe_start_pending(&result) {
+                        if terminal_query_needs_readiness_followup(&query, &result) {
                             self.schedule_terminal_start_retry(key);
                         } else {
                             // The requery map keys by the outgoing target it
@@ -15448,6 +15466,11 @@ impl NativeShell {
                         self.pending_terminal_requeries
                             .remove(&(owner.clone(), query_target));
                     }
+                    let screen_changed = self
+                        .task_surfaces
+                        .state(owner.clone())
+                        .and_then(|state| state.latest_terminal())
+                        != Some(projection);
                     if command_task_id != Some(projection.task_id)
                         || self
                             .task_surfaces
@@ -15458,6 +15481,9 @@ impl NativeShell {
                     }
                     if let Some(query_target) = query_target {
                         self.settle_pending_terminal_echo(&owner, query_target, projection);
+                    }
+                    if !screen_changed {
+                        return;
                     }
                     // A terminal screen reply is the third leg of the strip
                     // cadence: a chip's runtime state, title or cwd may have
@@ -16055,6 +16081,100 @@ impl NativeShell {
             .insert(key, Instant::now() + TERMINAL_START_RETRY_INTERVAL);
     }
 
+    // Terminal cockpit queries are snapshots, not output subscriptions. Keep
+    // painted, attached panes current after the input echo has settled. Pure
+    // readiness reads never restore an unopened provider, and a held setup
+    // decision keeps its screen until the user resolves it.
+    fn visible_terminal_refresh_keys(&self) -> Vec<TerminalKey> {
+        self.layout
+            .task_workspace
+            .as_ref()
+            .map(|workspace| {
+                workspace
+                    .task_ids()
+                    .into_iter()
+                    .filter(|owner| {
+                        workspace.pane_for_task(owner.clone()).is_some_and(|pane| {
+                            pane.presentation
+                                != crate::ui::task_workspace::PanePresentation::Minimised
+                                && workspace.zoomed().is_none_or(|zoomed| zoomed == pane.id)
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|owner| {
+                if self.pane_view(&owner) != PaneView::Terminal
+                    || !self.task_surfaces.terminal_is_interactive(owner.clone())
+                    || self.host_slot(&owner.host).is_none_or(|slot| {
+                        slot.provider_setup_approvals.contains_key(&owner.task_id)
+                    })
+                {
+                    return None;
+                }
+                let target = self.focused_terminal_target(&owner);
+                Some((owner, target))
+            })
+            .collect()
+    }
+
+    fn next_visible_terminal_refresh(&self, now: Instant) -> Option<Duration> {
+        self.visible_terminal_refresh_keys()
+            .iter()
+            .map(|key| {
+                self.visible_terminal_refreshes
+                    .get(key)
+                    .map(|deadline| deadline.saturating_duration_since(now))
+                    .unwrap_or(Duration::ZERO)
+            })
+            .min()
+    }
+
+    fn refresh_visible_terminals(&mut self, now: Instant) {
+        const INTERVAL: Duration = Duration::from_millis(250);
+        let keys = self.visible_terminal_refresh_keys();
+        self.visible_terminal_refreshes
+            .retain(|key, _| keys.contains(key));
+        for key in keys {
+            if self
+                .visible_terminal_refreshes
+                .get(&key)
+                .is_some_and(|deadline| *deadline > now)
+            {
+                continue;
+            }
+            // Even an unavailable lane waits the full cadence before retrying.
+            self.visible_terminal_refreshes
+                .insert(key.clone(), now + INTERVAL);
+            let (owner, target) = key;
+            let settles = self.settling_terminal_target(&owner, target);
+            if self.action_lane_len_for_owner(&owner.host) >= MAX_ACTION_LANE_RECORDS / 2
+                || self
+                    .task_surfaces
+                    .terminal_query_in_flight_for(owner.clone(), settles.surface_target())
+            {
+                continue;
+            }
+            let record = self.host_slot_mut(&owner.host).and_then(|slot| {
+                slot.interaction
+                    .background_terminal_read_on_current_handler(
+                        owner.task_id,
+                        target.readiness_query(),
+                    )
+            });
+            if let Some(mut record) = record {
+                if matches!(
+                    self.enqueue_host_action_for_owner(&owner.host, &mut record),
+                    NativeHostActionResult::Queued
+                ) {
+                    self.task_surfaces
+                        .note_terminal_query_started_for(owner, settles.surface_target());
+                }
+            }
+        }
+    }
+
     fn retry_due_terminal_queries(&mut self, now: Instant) -> bool {
         if self.pending_terminal_requeries.is_empty() {
             return false;
@@ -16515,6 +16635,7 @@ impl NativeShell {
                 .pending_terminal_requeries
                 .values()
                 .map(|deadline| deadline.saturating_duration_since(now))
+                .chain(self.next_visible_terminal_refresh(now))
                 .min(),
         })
     }
@@ -17624,6 +17745,34 @@ impl NativeShell {
         if !self.outcome_admission_matches_live_for_host(host_id, &action) {
             return;
         }
+        if host_id == &self.local_host_id() {
+            if let NativeHostCommand::ProviderInput {
+                command_id,
+                arguments,
+                ..
+            } = &action.command
+            {
+                let owns_submission = self
+                    .pending_composer_submissions
+                    .get(command_id)
+                    .is_some_and(|submission| {
+                        &submission.key.task_id.host == host_id
+                            && submission.key.task_id.task_id == arguments.task_id
+                            && submission.key.agent_session_id == arguments.agent_session_id
+                    });
+                if owns_submission {
+                    let epochs = self.local_slot().interaction.action_epochs();
+                    if action.connection_epoch == epochs.connection_epoch
+                        && action.resource_generation == epochs.resource_generation
+                        && action.runtime_generation == epochs.runtime_generation
+                        && action.client_epoch <= epochs.client_epoch
+                    {
+                        self.apply_action_outcome(outcome);
+                    }
+                    return;
+                }
+            }
+        }
         // Owner-routed delete / settled-send / first-send use the captured host
         // slot's pending + epochs. Same raw TaskId on another host never matches.
         if host_id != &self.local_host_id() {
@@ -18221,7 +18370,7 @@ impl NativeShell {
                         TerminalTarget::for_screen_query(&query)
                             .unwrap_or(TerminalTarget::Provider),
                     );
-                    if first_send_terminal_probe_start_pending(result) {
+                    if terminal_query_needs_readiness_followup(&query, result) {
                         self.schedule_terminal_start_retry(key);
                     } else {
                         // Same split as the local lane: the map keys by the
@@ -18506,6 +18655,11 @@ impl NativeShell {
         // reply dropped here for an unselected owner is a screen the pane
         // asked for on the background lane and would never see, which is what
         // left a background pane's terminal blank on a remote host.
+        let screen_changed = self
+            .task_surfaces
+            .state(owner.clone())
+            .and_then(|state| state.latest_terminal())
+            != Some(projection);
         if self
             .task_surfaces
             .admit_terminal(owner.clone(), projection)
@@ -18514,6 +18668,10 @@ impl NativeShell {
             return;
         }
         self.settle_pending_terminal_echo(&owner, query_target, projection);
+        if !screen_changed {
+            return;
+        }
+
         // A terminal screen reply is the third leg of the strip cadence: a
         // chip's runtime state, title or cwd may have moved with it.
         self.request_task_terminals_refresh(&owner);
@@ -19280,6 +19438,7 @@ impl NativeShell {
         let mut semantic_repaint = self.settle_provider_setup_input_completions();
         semantic_repaint |= self.expire_stalled_provider_setup_approvals();
         semantic_repaint |= self.retry_due_terminal_queries(now);
+        self.refresh_visible_terminals(now);
         if let Some(preferences) = self.pending_preferences.pop_back() {
             self.pending_preferences.clear();
             // Only a preferences snapshot that CHANGED anything is a semantic
@@ -21302,6 +21461,10 @@ impl NativeShell {
     }
 
     fn set_pane_view(&mut self, owner: &HostTaskKey, view: PaneView) {
+        if view != PaneView::Terminal && self.selected_task_key.as_ref() == Some(owner) {
+            self.terminal_input_owner = None;
+            self.pending_terminal_focus = false;
+        }
         let Some(workspace) = self.layout.task_workspace.as_mut() else {
             // No tree at all is the ordinary idle canvas, not a defect.
             return;
@@ -26183,7 +26346,7 @@ impl NativeShell {
                 let _ = view_entity.update(app, |shell, cx| {
                     shell.focus_workspace_pane_for(&key);
                     shell.select_panel_subagent(&key, None);
-                    shell.set_pane_view(&key, view);
+                    shell.select_pane_view_for(&key, view);
                     cx.notify();
                 });
             }),
@@ -26255,21 +26418,11 @@ impl NativeShell {
         accepted
     }
 
-    /// The four facts the terminal body's 22 px debug strip used to print
-    /// across its own top, for the panel's Terminal tab tooltip (fix wave 1,
-    /// F7). `None` when this panel has no terminal attached yet.
-    ///
-    /// Called on hover only. Projecting the pane model clones a terminal
-    /// screen, which is why this is behind a handler the painter asks lazily
-    /// rather than a field on `PanelChrome` that every panel would pay for on
-    /// every frame.
+    /// Read the same attachment state the visible terminal uses.
     fn terminal_tab_diagnostic(&self, owner: &HostTaskKey) -> Option<String> {
-        let pane = self
-            .task_surfaces
+        self.task_surfaces
             .state(owner.clone())
-            .and_then(|state| state.latest_terminal())
-            .map(crate::ui::task_cockpit::dock::ContextDock::terminal_pane_model_for_projection)?;
-        Some(crate::terminal::view::terminal_surface_diagnostic(&pane))
+            .map(|state| state.terminal_label())
     }
 
     /// The row a pane keeps when the fleet projection no longer lists its
@@ -26646,6 +26799,27 @@ impl NativeShell {
     /// is what asks for. This runs the same admission the dock's own tabs ran.
     fn select_pane_view_for(&mut self, owner: &HostTaskKey, view: PaneView) {
         self.set_pane_view(owner, view);
+        if view == PaneView::Terminal {
+            // A deliberate tab selection may attach/resume its exact provider.
+            // Automatic refresh remains a readiness-only read.
+            let target = self.focused_terminal_target(owner);
+            self.request_task_terminals_refresh(owner);
+            if self
+                .dispatch_action_recorded_for_owner(
+                    &owner.host,
+                    ActionRequest::TaskCockpit {
+                        task_id: owner.task_id,
+                        query: target.screen_query(),
+                    },
+                )
+                .is_ok()
+            {
+                let settles = self.settling_terminal_target(owner, target);
+                self.task_surfaces
+                    .note_terminal_query_started_for(owner.clone(), settles.surface_target());
+            }
+            return;
+        }
         let Some(tool) = Self::dock_tool_for_view(view) else {
             return;
         };
@@ -29400,29 +29574,7 @@ impl NativeShell {
                     let _ = shell_for_scroll.update(app, |shell, cx| {
                         cx.stop_propagation();
                         window.prevent_default();
-                        if shell.selected_task_key.as_ref() != Some(&scroll_owner) {
-                            return;
-                        }
-                        let delta: f32 = event
-                            .delta
-                            .pixel_delta(px(terminal_line_height.max(1.0)))
-                            .y
-                            .into();
-                        let delta_lines = terminal_scroll_lines_from_pixels(
-                            &mut shell.terminal_scroll_px,
-                            delta,
-                            terminal_line_height,
-                        );
-                        if delta_lines == 0 {
-                            return;
-                        }
-                        // Repaint from the retained rows FIRST, then tell the
-                        // host. The notify below therefore renders the new
-                        // position on this frame instead of in ~97 ms, and the
-                        // host's reply -- which still arrives -- replaces the
-                        // window and restores the styled cells.
-                        shell.paint_terminal_scroll_locally(&scroll_owner, delta_lines);
-                        shell.dispatch_terminal_scroll_for_owner(&scroll_owner, delta_lines);
+                        shell.handle_terminal_wheel(&scroll_owner, event, terminal_line_height);
                         cx.notify();
                     });
                 },
@@ -29551,6 +29703,25 @@ impl NativeShell {
         self.task_surfaces
             .scroll_terminal_locally(owner.clone(), resource_id, delta_lines)
             .is_some()
+    }
+
+    fn handle_terminal_wheel(
+        &mut self,
+        owner: &HostTaskKey,
+        event: &ScrollWheelEvent,
+        line_height: f32,
+    ) -> bool {
+        if self.selected_task_key.as_ref() != Some(owner) {
+            return false;
+        }
+        let delta: f32 = event.delta.pixel_delta(px(line_height.max(1.0))).y.into();
+        let delta_lines =
+            terminal_scroll_lines_from_pixels(&mut self.terminal_scroll_px, delta, line_height);
+        if delta_lines == 0 {
+            return false;
+        }
+        self.paint_terminal_scroll_locally(owner, delta_lines);
+        self.dispatch_terminal_scroll_for_owner(owner, delta_lines)
     }
 
     /// Scroll the terminal the owner's surface is actually showing.
@@ -30403,6 +30574,9 @@ impl NativeShell {
 
             let shell_for_focus = cx.weak_entity();
             let shell_for_key = cx.weak_entity();
+            let shell_for_scroll = cx.weak_entity();
+            let scroll_owner = owner.clone();
+            let line_height = tokens.density.typography.code_line_height;
             surface
                 .tab_stop(true)
                 .track_focus(&self.terminal_focus_handle)
@@ -30429,6 +30603,14 @@ impl NativeShell {
                         });
                     },
                 )
+                .on_scroll_wheel(move |event, window, app| {
+                    let _ = shell_for_scroll.update(app, |shell, cx| {
+                        cx.stop_propagation();
+                        window.prevent_default();
+                        shell.handle_terminal_wheel(&scroll_owner, event, line_height);
+                        cx.notify();
+                    });
+                })
                 .into_any_element()
         } else {
             // Design language rule 9: an empty state is ONE 11.5 px muted
@@ -46379,6 +46561,12 @@ impl NativeShell {
                     }
                     return;
                 }
+                // Printable composer keys propagate for platform text input.
+                // A terminal armed by an earlier tab must never also receive
+                // them as PTY writes while the composer owns physical focus.
+                if shell.composer_focus_handle.is_focused(window) {
+                    return;
+                }
                 let center_terminal_visible = shell
                     .selected_task_key
                     .clone()
@@ -49724,6 +49912,10 @@ pub(crate) mod tests {
         assert!(
             body.contains(".on_key_down("),
             "Enter, arrows, escape, and control chords must reach the PTY"
+        );
+        assert!(
+            body.contains(".on_scroll_wheel(") && body.contains("handle_terminal_wheel"),
+            "the workspace terminal must register the shared wheel gesture handler"
         );
     }
 
@@ -67208,6 +67400,253 @@ mod "
     }
 
     #[test]
+    fn explicit_terminal_open_waits_for_exact_restore_then_stops_on_a_real_refusal() {
+        if rerun_headless_shell_test_in_child(
+            "ui::native_shell::tests::explicit_terminal_open_waits_for_exact_restore_then_stops_on_a_real_refusal",
+        ) { return; }
+        let (runtime, shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
+        gpui::Application::headless().run(move |cx| {
+            crate::ui::init(cx);
+            with_test_shell_in_app(cx, runtime, |shell| {
+                let (model, task_id) = terminal_bound_client_model();
+                shell.apply_client_model(Arc::new(model)).unwrap();
+                let owner = shell.local_task_key(task_id);
+                shell
+                    .select_fleet_task_key(owner.clone(), FleetSelectMode::Replace)
+                    .unwrap();
+                shared.lock().unwrap().accepted.clear();
+                shell.select_pane_view_for(&owner, PaneView::Terminal);
+                let open = shared
+                    .lock()
+                    .unwrap()
+                    .accepted
+                    .iter()
+                    .find(|record| {
+                        matches!(
+                            record.command,
+                            NativeHostCommand::TaskCockpitQuery {
+                                query: TaskCockpitQuery::Terminal,
+                                ..
+                            }
+                        )
+                    })
+                    .unwrap()
+                    .clone();
+                let refused = || crate::domain::TaskCockpitResult::Unavailable {
+                    surface: crate::domain::TaskCockpitSurface::Terminal,
+                    reason: crate::domain::TaskCockpitUnavailableReason::TerminalUnavailable,
+                    detail: None,
+                };
+                shell.apply_epoch_fenced_action_outcome_for_host(
+                    &owner.host,
+                    NativeHostActionOutcome::Queried {
+                        action: open,
+                        detail: "attachment queued".into(),
+                        body: NativeHostQueryBody::TaskCockpit(refused()),
+                    },
+                );
+                let key = (owner.clone(), super::TerminalTarget::Provider);
+                let due = *shell
+                    .pending_terminal_requeries
+                    .get(&key)
+                    .expect("legacy attach refusal needs readiness classification");
+                shared.lock().unwrap().accepted.clear();
+                shell.retry_due_terminal_queries(due);
+                let reads = shared.lock().unwrap().accepted.clone();
+                let read = reads
+                    .iter()
+                    .find(|record| {
+                        matches!(
+                            record.command,
+                            NativeHostCommand::TaskCockpitQuery {
+                                query: TaskCockpitQuery::TerminalReadiness,
+                                ..
+                            }
+                        )
+                    })
+                    .expect("follow-up is a read, not another restore")
+                    .clone();
+                shell.apply_epoch_fenced_action_outcome_for_host(
+                    &owner.host,
+                    NativeHostActionOutcome::Queried {
+                        action: read,
+                        detail: "real readiness refusal".into(),
+                        body: NativeHostQueryBody::TaskCockpit(refused()),
+                    },
+                );
+                assert!(!shell.pending_terminal_requeries.contains_key(&key));
+            });
+            crate::ui::finish_headless_test(cx);
+        });
+    }
+
+    #[test]
+    fn visible_terminal_refresh_is_bounded_and_stops_when_hidden() {
+        if rerun_headless_shell_test_in_child(
+            "ui::native_shell::tests::visible_terminal_refresh_is_bounded_and_stops_when_hidden",
+        ) {
+            return;
+        }
+        gpui::Application::headless().run(|cx| {
+            crate::ui::init(cx);
+            let (runtime, shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
+            with_test_shell_in_app(cx, runtime, |shell| {
+                shell.install_idle_conversation_photo_for_test();
+                let (model, task_id) = terminal_bound_client_model();
+                let model = Arc::new(model);
+                shell.apply_client_model(model.clone()).unwrap();
+                let owner = HostTaskKey::new(shell.local_host_id(), task_id);
+                shell
+                    .select_fleet_task_key(owner.clone(), FleetSelectMode::Replace)
+                    .unwrap();
+                shell.note_terminal_presentation_on_pane(&owner, true);
+                let now = Instant::now();
+                shared.lock().unwrap().accepted.clear();
+                shell.refresh_visible_terminals(now);
+                assert!(
+                    shared.lock().unwrap().accepted.is_empty(),
+                    "an unattached terminal must never be restored by the refresh lane"
+                );
+                let mut projection = provider_terminal_projection_for_test(&model, task_id, 1);
+                shell
+                    .task_surfaces
+                    .admit_terminal(owner.clone(), &projection)
+                    .unwrap();
+                shell.refresh_visible_terminals(now);
+                let first = shared.lock().unwrap().accepted.clone();
+                assert_eq!(first.len(), 1);
+                assert!(matches!(
+                    first[0].command,
+                    NativeHostCommand::TaskCockpitQuery {
+                        query: TaskCockpitQuery::TerminalReadiness,
+                        ..
+                    }
+                ));
+                shell.refresh_visible_terminals(now + Duration::from_millis(249));
+                shell.refresh_visible_terminals(now + Duration::from_millis(250));
+                assert_eq!(
+                    shared.lock().unwrap().accepted.len(),
+                    1,
+                    "one query stays in flight across cadence boundaries"
+                );
+                projection.sequence = 2;
+                projection.text_lines = vec!["output arrived after the input echo".into()];
+                shell.apply_epoch_fenced_action_outcome_for_host(
+                    &owner.host,
+                    NativeHostActionOutcome::Queried {
+                        action: first[0].clone(),
+                        detail: "updated screen".into(),
+                        body: NativeHostQueryBody::TaskCockpit(
+                            crate::domain::TaskCockpitResult::Terminal(projection),
+                        ),
+                    },
+                );
+                assert_eq!(
+                    shell
+                        .task_surfaces
+                        .state(owner.clone())
+                        .unwrap()
+                        .latest_terminal()
+                        .unwrap()
+                        .sequence,
+                    2
+                );
+                shared.lock().unwrap().accepted.clear();
+                shell.refresh_visible_terminals(now + Duration::from_millis(500));
+                assert_eq!(
+                    shared.lock().unwrap().accepted.len(),
+                    1,
+                    "the next screen must be requested after the prior reply settled"
+                );
+                shell.note_terminal_presentation_on_pane(&owner, false);
+                shared.lock().unwrap().accepted.clear();
+                shell.refresh_visible_terminals(now + Duration::from_secs(2));
+                assert!(shared.lock().unwrap().accepted.is_empty());
+                assert!(
+                    shell.next_visible_terminal_refresh(now).is_none(),
+                    "hidden terminals must not wake the controller"
+                );
+            });
+            crate::ui::finish_headless_test(cx);
+        });
+    }
+
+    #[test]
+    fn local_send_receipt_settles_its_draft_after_projection_and_navigation_advance() {
+        if rerun_headless_shell_test_in_child("ui::native_shell::tests::local_send_receipt_settles_its_draft_after_projection_and_navigation_advance") { return; }
+        gpui::Application::headless().run(|cx| {
+            crate::ui::init(cx);
+            for replacement in [None, Some("newer unsent draft")] {
+                let (runtime, shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
+                with_test_shell_in_app(cx, runtime, |shell| {
+                    shell.install_idle_conversation_photo_for_test();
+                    let (model, task_id) = terminal_bound_client_model();
+                    shell.apply_client_model(Arc::new(model)).unwrap();
+                    let host = shell.local_host_id();
+                    shell
+                        .select_fleet_task_key(
+                            HostTaskKey::new(host.clone(), task_id),
+                            FleetSelectMode::Replace,
+                        )
+                        .unwrap();
+                    let focus = shell.rearm_composer_focus().unwrap();
+                    shell
+                        .composer
+                        .as_mut()
+                        .unwrap()
+                        .replace_draft("accepted message", focus)
+                        .unwrap();
+                    shell.activate_composer_control(ComposerControl::SendNow);
+                    let action = shared
+                        .lock()
+                        .unwrap()
+                        .accepted
+                        .iter()
+                        .find(|record| {
+                            matches!(record.command, NativeHostCommand::ProviderInput { .. })
+                        })
+                        .cloned()
+                        .unwrap();
+                    let command_id = native_command_id(&action.command).unwrap();
+                    assert!(shell.pending_composer_submissions.contains_key(&command_id));
+                    shell
+                        .local_slot_mut()
+                        .interaction
+                        .set_client_epoch(action.client_epoch + 1);
+                    let focus = shell.rearm_composer_focus().unwrap();
+                    if let Some(text) = replacement {
+                        shell
+                            .composer
+                            .as_mut()
+                            .unwrap()
+                            .replace_draft(text, focus)
+                            .unwrap();
+                    }
+                    shell.apply_epoch_fenced_action_outcome_for_host(
+                        &host,
+                        NativeHostActionOutcome::Accepted {
+                            action,
+                            receipt: crate::domain::command::CommandReceipt::Accepted {
+                                command_id,
+                                operation_id: crate::domain::id::OperationId::new(),
+                                task_revision: None,
+                                event_ids: Vec::new(),
+                                prompt_mutation: None,
+                            },
+                        },
+                    );
+                    assert_eq!(
+                        shell.composer.as_ref().unwrap().draft_text(),
+                        replacement.unwrap_or("")
+                    );
+                    assert!(!shell.pending_composer_submissions.contains_key(&command_id));
+                });
+            }
+            crate::ui::finish_headless_test(cx);
+        });
+    }
+
+    #[test]
     fn first_send_trust_screen_presents_approval_and_keeps_pending_send() {
         if rerun_headless_shell_test_in_child(
             "ui::native_shell::tests::first_send_trust_screen_presents_approval_and_keeps_pending_send",
@@ -72870,11 +73309,11 @@ mod "
                     "an answered background pane must stop saying starting/unavailable"
                 );
 
-                // A pane the host has answered leaves the sweep for good: the
-                // cadence is a bounded retry, not a poll.
+                // An answered pane leaves the attachment sweep. Live output
+                // refresh has its own bounded cadence, tested separately.
                 shared.lock().expect("test runtime").accepted.clear();
                 shell.last_unattached_terminal_sweep_at = None;
-                shell.controller_tick_for_test(0);
+                shell.sweep_unattached_open_pane_terminals(std::time::Instant::now());
                 let after = dispatched_terminal_queries_for_test(&shared);
                 assert!(
                     !after.iter().any(|(task_id, query)| *task_id == second

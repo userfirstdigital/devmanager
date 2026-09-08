@@ -214,6 +214,45 @@ refresh fix. All owned app/host/provider processes were stopped before edits;
 Cargo and harness processes were joined. Production configuration hashes match.
 Private screenshots and exact identities are under `linux-production/handoff2-*`.
 
+### Live terminal, composer and repeated resume (2026-09-07)
+
+The rebuilt production Linux shell completed first Send, canonical reply,
+automatic task naming and draft clearing. Switching from Terminal to Conversation
+now disarms hidden PTY input; typing a new composer draft left the provider prompt
+empty, and Send delivered that exact draft once. Unchanged host projections keep
+selection in a restored draft. Exact owned Send receipts settle even if navigation
+or the command's own projection has advanced, while newer text is preserved.
+
+Visible attached terminal panes refresh at a bounded 250 ms cadence with one
+in-flight read; hidden/minimised panes and panes hidden by zoom do not refresh.
+Unchanged screens do not trigger redundant terminal-strip queries. The actual
+provider's delayed 90-line response painted without another input gesture.
+The workspace terminal now registers the shared wheel handler. Physical input,
+Ctrl+W editing, drag selection with exact clipboard comparison, and wheel-up /
+wheel-down restoration passed against the rebuilt native prompt. Five seconds
+with the terminal idle measured the host at 2.8% and shell at 7.2% of one core;
+this is a bounded refresh, but further shell repaint optimisation remains useful.
+
+Encrypted recovery receipt cleanup now compares the decoded receipt and uses
+the exact stored ciphertext for its transactional delete CAS. Re-encryption uses
+a fresh nonce and previously deleted zero rows without reporting failure. A new
+test reproduces that defect with protected environment data, rejects a stale
+receipt, and proves deletion and idempotence. The new live task reopened the same
+provider conversation twice (action epochs 1, 2, 3); after each stop, its exact
+provider PID, process ledger row and recovery receipt were gone. Explicit terminal
+opening now follows the legacy attachment response with bounded readiness reads,
+so asynchronous exact restore paints after one click. Earlier debug conversations
+with already stranded historical receipts remain preserved; migration/recovery of
+those old rows is still a separate gate, not silently discarded evidence.
+
+Validation: 93 provider-session tests passed, restored-draft selection regression
+passed, 329 native-shell tests passed (five existing ignores), all-target check,
+formatting and native app/host rebuild passed. These focused results do not
+replace the pending complete serial library run. Evidence is private under
+`linux-production/{receipt-*,resume-*,new-candidate-*,final-terminal-*}`.
+Production config/remote hashes are unchanged; all owned app/host/provider and
+build/test processes exited after this pass.
+
 - [ ] Complete Linux provider ownership and discovery,
       protected storage, workspace mutation and process reporting.
 - [ ] Pass Linux integration/serial library checks, real provider desktop input,
@@ -242,6 +281,7 @@ before normalizing CRLF-only changes; its staged tree was unchanged.
 
 Production `config.json` and `remote.json` hashes match the captured baseline.
 No installed DevManager process was present at baseline or after verification.
-No installed app, provider conversation or production configuration was changed.
+No installed app or production configuration was changed. Test-owned provider
+conversations were created and exercised in the isolated project.
 `launch-evidence` contains private local verification and recovery data and is
 not part of the candidate commit.
