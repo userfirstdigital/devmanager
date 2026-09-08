@@ -41,6 +41,212 @@ fn wait_for_test_pause() {
     panic!("file-service test pause did not become ready");
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_cross_filesystem_mutations_leave_no_private_residue() {
+    use std::os::unix::fs::MetadataExt;
+    let temp = tempfile::Builder::new()
+        .prefix("devmanager-crossfs-")
+        .tempdir_in("/dev/shm")
+        .expect("create isolated tmpfs workspace");
+    assert_ne!(
+        fs::metadata(temp.path()).unwrap().dev(),
+        fs::metadata(std::env::temp_dir()).unwrap().dev(),
+        "test requires a different filesystem"
+    );
+    let service = WorkspaceFileService::new_for_test(temp.path()).expect("bind tmpfs");
+    let plan = service
+        .plan_write("notes.txt", b"first".to_vec(), ExpectedRevision::missing())
+        .unwrap();
+    service
+        .execute_write(plan)
+        .expect("create on another filesystem");
+    let revision = service
+        .read("notes.txt", ReadOptions::default())
+        .unwrap()
+        .revision;
+    let plan = service
+        .plan_write(
+            "notes.txt",
+            b"second".to_vec(),
+            ExpectedRevision::exact(revision),
+        )
+        .unwrap();
+    service
+        .execute_write(plan)
+        .expect("replace on another filesystem");
+    assert_eq!(fs::read(temp.path().join("notes.txt")).unwrap(), b"second");
+    assert_eq!(
+        service.cleanup_occupancy_for_test(),
+        0,
+        "replacement cleanup must settle"
+    );
+    let revision = service
+        .read("notes.txt", ReadOptions::default())
+        .unwrap()
+        .revision;
+    let plan = service
+        .plan_delete("notes.txt", ExpectedRevision::exact(revision))
+        .unwrap();
+    service
+        .execute_delete(plan)
+        .expect("delete on another filesystem");
+    assert_eq!(
+        service.cleanup_occupancy_for_test(),
+        0,
+        "delete cleanup must settle"
+    );
+    assert_eq!(
+        fs::read_dir(temp.path()).unwrap().count(),
+        0,
+        "no private files or directories remain"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_local_cleanup_restart_requires_exact_parent_file_and_private_directory() {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    let root = tempfile::Builder::new()
+        .prefix("devmanager-quarantine-")
+        .tempdir_in("/dev/shm")
+        .unwrap();
+    let parent = fs::metadata(root.path()).unwrap();
+    let make_entry = |slot: u8, parent_inode: u64, mode: u32| {
+        let directory = root
+            .path()
+            .join(format!(".devmanager-file-cleanup-{slot:032x}"));
+        fs::DirBuilder::new().mode(mode).create(&directory).unwrap();
+        let source = directory.join("source");
+        fs::write(&source, b"owned cleanup bytes").unwrap();
+        let file = fs::metadata(&source).unwrap();
+        let name = format!(
+            ".devmanager-cleanup-{:016x}-{parent_inode:016x}-{:016x}-{:016x}-{:032x}.entry",
+            parent.dev(),
+            file.dev(),
+            file.ino(),
+            u128::from(slot)
+        );
+        let target = directory.join(name);
+        fs::rename(source, &target).unwrap();
+        (directory, target)
+    };
+    let (valid_dir, valid) = make_entry(1, parent.ino(), 0o700);
+    let (foreign_dir, foreign) = make_entry(2, parent.ino(), 0o700);
+    fs::rename(&foreign, root.path().join("retained-original")).unwrap();
+    fs::write(&foreign, b"replacement survives").unwrap();
+    let (wrong_parent_dir, wrong_parent) = make_entry(3, parent.ino().wrapping_add(1), 0o700);
+    let (public_dir, public) = make_entry(4, parent.ino(), 0o755);
+    let service = WorkspaceFileService::new_for_test(root.path()).expect("restart recovery");
+    assert!(
+        !valid.exists() && !valid_dir.exists(),
+        "exact crash residue must settle"
+    );
+    assert_eq!(fs::read(&foreign).unwrap(), b"replacement survives");
+    assert_eq!(fs::read(&wrong_parent).unwrap(), b"owned cleanup bytes");
+    assert_eq!(fs::read(&public).unwrap(), b"owned cleanup bytes");
+    assert_eq!(service.cleanup_occupancy_for_test(), 0);
+    let listing = service.list(None, 64).unwrap();
+    for directory in [&foreign_dir, &wrong_parent_dir, &public_dir] {
+        let name = directory.file_name().unwrap().to_str().unwrap();
+        assert!(!listing.iter().any(|entry| entry.path.as_str() == name));
+        assert!(
+            matches!(
+                service.read(&format!("{name}/source"), ReadOptions::default()),
+                Err(FileServiceError::NotFound { .. })
+            ),
+            "private directory cannot be traversed through UI"
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires unprivileged user and mount namespaces; run explicitly on Linux"]
+fn linux_bind_mount_cleanup_uses_the_source_mount() {
+    use std::os::unix::fs::MetadataExt;
+    if std::env::var_os("DEVMANAGER_TEST_BIND_MOUNT_CHILD").is_none() {
+        let result = std::process::Command::new("unshare")
+            .args(["--user", "--map-root-user", "--mount"])
+            .arg(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "linux_bind_mount_cleanup_uses_the_source_mount",
+                "--ignored",
+                "--test-threads=1",
+            ])
+            .env("DEVMANAGER_TEST_BIND_MOUNT_CHILD", "1")
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "isolated mount test: {} {}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+        return;
+    }
+    let root = tempfile::Builder::new()
+        .prefix("devmanager-bindmount-")
+        .tempdir()
+        .unwrap();
+    let source = root.path().join("source");
+    let mounted = root.path().join("mounted");
+    fs::create_dir(&source).unwrap();
+    fs::create_dir(&mounted).unwrap();
+    assert!(std::process::Command::new("mount")
+        .arg("--bind")
+        .arg(&source)
+        .arg(&mounted)
+        .status()
+        .unwrap()
+        .success());
+    struct Unmount(std::path::PathBuf);
+    impl Drop for Unmount {
+        fn drop(&mut self) {
+            assert!(std::process::Command::new("umount")
+                .arg(&self.0)
+                .status()
+                .unwrap()
+                .success());
+        }
+    }
+    let _mount = Unmount(mounted.clone());
+    assert_eq!(
+        fs::metadata(&mounted).unwrap().dev(),
+        fs::metadata(std::env::temp_dir()).unwrap().dev(),
+        "bind mount shares the device number"
+    );
+    let service = WorkspaceFileService::new_for_test(&mounted).unwrap();
+    fs::write(mounted.join("notes.txt"), b"before").unwrap();
+    let revision = service
+        .read("notes.txt", ReadOptions::default())
+        .unwrap()
+        .revision;
+    let plan = service
+        .plan_write(
+            "notes.txt",
+            b"after".to_vec(),
+            ExpectedRevision::exact(revision),
+        )
+        .unwrap();
+    service
+        .execute_write(plan)
+        .expect("replace across mount identities on one device");
+    let revision = service
+        .read("notes.txt", ReadOptions::default())
+        .unwrap()
+        .revision;
+    let plan = service
+        .plan_delete("notes.txt", ExpectedRevision::exact(revision))
+        .unwrap();
+    service
+        .execute_delete(plan)
+        .expect("delete on the bind mount");
+    assert_eq!(service.cleanup_occupancy_for_test(), 0);
+    assert_eq!(fs::read_dir(&mounted).unwrap().count(), 0);
+}
+
 #[test]
 fn linux_atomic_replace_does_not_use_anchor_bindings_before_declaration() {
     let source = include_str!("../src/workspace/files.rs");

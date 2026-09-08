@@ -9,7 +9,7 @@ is green: **4,111 passed, zero failed, 20 ignored** on `d61142e4`. Native
 client/host integration (21 tests), exact-resume mismatch (four tests), file
 integration (83 tests), and all-target compiler checks passed. Real Windows
 desktop/install validation, Linux embedded-browser and package/update support,
-Cursor discovery, cross-filesystem file cleanup, historical stranded recovery
+Cursor discovery, historical stranded recovery
 receipts, and live remote enrollment still require acceptance.
 
 ## Changes panel and portable candidate follow-up
@@ -219,7 +219,7 @@ portable test cleanup of symlinks and aligned old fixtures with the existing
 secret-content read refusal; the production refusal was not relaxed. All-target
 check and formatting passed. Logs: `linux-production/files-{host,integration,
 workspace,check}.log`. This acceptance used workspaces on the same filesystem as
-the isolated temporary directory; cross-filesystem cleanup remains to be checked.
+the isolated temporary directory. Cross-filesystem and bind-mount cleanup now also pass (see below).
 Production config/remote hashes and installed-process baseline remain unchanged.
 
 ### Linux browser resource retention
@@ -454,3 +454,20 @@ No installed app or production configuration was changed. Test-owned provider
 conversations were created and exercised in the isolated project.
 `launch-evidence` contains private local verification and recovery data and is
 not part of the candidate commit.
+
+### Linux cross-filesystem cleanup
+
+Overwrite and delete now quarantine private residue on the source mount when
+the shared temporary directory is on another mount. Retained descriptor mount
+identity also distinguishes bind mounts on the same device. Restart recovery
+requires the exact source parent, file identity, and owner-only directory;
+foreign replacements and untrusted directories remain untouched and hidden
+from file browsing. Empty local quarantine directories are removed.
+
+Validation: 85 file integration tests passed; the separate user/mount-namespace
+bind-mount acceptance test passed explicitly; 261 workspace tests passed
+(one existing ignored test); `cargo check --locked --lib --bins --tests` passed.
+The cross-filesystem overwrite test reproduced the original conflict before
+the fix. Production config and remote hashes remain unchanged, and no owned
+app, harness, Cargo, compiler or linker remains. Private logs: `crossfs-red.log`,
+`crossfs-bind.log`, and `crossfs-final-{integration,workspace,check}.log`.

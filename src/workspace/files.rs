@@ -3427,6 +3427,8 @@ impl WorkspaceFileService {
             .map_err(|_| FileServiceError::RootUnavailable)?;
         let mut pending = vec![(root, self.root.path.clone(), 0_usize)];
         let mut scanned_directories = 0_usize;
+        #[cfg(target_os = "linux")]
+        let mut settled_local = 0_usize;
         while let Some((directory, fallback, depth)) = pending.pop() {
             deadline.check()?;
             scanned_directories = scanned_directories.saturating_add(1);
@@ -3461,6 +3463,29 @@ impl WorkspaceFileService {
                 };
                 deadline.check()?;
                 if metadata.is_dir() {
+                    #[cfg(target_os = "linux")]
+                    if is_local_cleanup_authority_name(name) {
+                        if is_private_cleanup_authority(&child)
+                            .map_err(|_| FileServiceError::CleanupFailed)?
+                        {
+                            let identity = opened_file_info(&child)
+                                .map_err(|_| FileServiceError::CleanupFailed)?
+                                .0;
+                            let children = read_directory_from_handle(&child, &fallback.join(name))
+                                .map_err(|_| FileServiceError::CleanupFailed)?;
+                            drain_cleanup_authority(
+                                &child,
+                                children,
+                                Some(parent_identity),
+                                &mut scanned_directories,
+                                &mut settled_local,
+                                deadline,
+                            )
+                            .map_err(|_| FileServiceError::CleanupFailed)?;
+                            remove_empty_local_authority(&directory, name, identity);
+                        }
+                        continue;
+                    }
                     if depth < MAX_SEARCH_DEPTH {
                         pending.push((child, fallback.join(name), depth.saturating_add(1)));
                     }
@@ -7611,11 +7636,107 @@ static CLEANUP_AUTHORITY: OnceLock<CleanupAuthority> = OnceLock::new();
 
 #[cfg(target_os = "linux")]
 fn is_private_cleanup_authority(handle: &File) -> io::Result<bool> {
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     let metadata = handle.metadata()?;
     let mode = metadata.permissions().mode();
-    Ok(metadata.is_dir() && mode & 0o700 == 0o700 && mode & 0o077 == 0)
+    Ok(metadata.is_dir()
+        && metadata.uid() == unsafe { libc::geteuid() }
+        && mode & 0o700 == 0o700
+        && mode & 0o077 == 0)
+}
+
+#[cfg(target_os = "linux")]
+struct LocalCleanupAuthority {
+    authority: CleanupAuthority,
+    parent: File,
+    name: String,
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for LocalCleanupAuthority {
+    fn drop(&mut self) {
+        remove_empty_local_authority(&self.parent, &self.name, self.authority.identity);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn remove_empty_local_authority(parent: &File, name: &str, identity: FileIdentity) {
+    use std::os::fd::AsRawFd;
+    // Only remove our exact empty directory. Foreign or retained contents make
+    // rmdir fail, leaving the original recovery evidence intact.
+    let current = open_child_nofollow(parent, name).and_then(|file| opened_file_info(&file));
+    if current.is_ok_and(|info| info.0 == identity) {
+        if let Ok(name) = std::ffi::CString::new(name) {
+            unsafe {
+                libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR);
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn is_local_cleanup_authority_name(name: &str) -> bool {
+    strip_ascii_case_insensitive_prefix(name, ".devmanager-file-cleanup-").is_some_and(|suffix| {
+        suffix.len() == 32 && suffix.bytes().all(|byte| byte.is_ascii_hexdigit())
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn same_cleanup_mount(left: &File, right: &File) -> bool {
+    use std::os::fd::AsRawFd;
+    let mount_id = |file: &File| {
+        let mut metadata: libc::statx = unsafe { std::mem::zeroed() };
+        let result = unsafe {
+            libc::statx(
+                file.as_raw_fd(),
+                c"".as_ptr(),
+                libc::AT_EMPTY_PATH | libc::AT_STATX_DONT_SYNC,
+                libc::STATX_MNT_ID,
+                &mut metadata,
+            )
+        };
+        (result == 0 && metadata.stx_mask & libc::STATX_MNT_ID != 0).then_some(metadata.stx_mnt_id)
+    };
+    // Device numbers alone cannot distinguish bind mounts. If mount identity
+    // is unavailable, use the source-local quarantine instead of guessing.
+    mount_id(left)
+        .zip(mount_id(right))
+        .is_some_and(|(left, right)| left == right)
+}
+
+#[cfg(target_os = "linux")]
+fn local_cleanup_authority(
+    parent: &File,
+    deadline: &OperationDeadline,
+) -> io::Result<LocalCleanupAuthority> {
+    use std::os::fd::AsRawFd;
+    check_deadline_io(deadline)?;
+    let mut random = [0_u8; 16];
+    fill_random(&mut random).map_err(io::Error::other)?;
+    let name = format!(".devmanager-file-cleanup-{}", encode_nonce(&random));
+    let native_name = std::ffi::CString::new(name.as_str()).map_err(io::Error::other)?;
+    // mkdirat on the retained source parent guarantees the quarantine is on
+    // the same filesystem, including nested mounts and tmpfs workspaces.
+    if unsafe { libc::mkdirat(parent.as_raw_fd(), native_name.as_ptr(), 0o700) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let handle = open_child_nofollow(parent, &name)?;
+    if !is_private_cleanup_authority(&handle)? {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "cleanup authority is not private",
+        ));
+    }
+    let identity = opened_file_info(&handle)?.0;
+    let local = LocalCleanupAuthority {
+        authority: CleanupAuthority { handle, identity },
+        parent: parent.try_clone()?,
+        name,
+    };
+    sync_parent_directory_with_deadline(parent, deadline)?;
+    check_deadline_io(deadline)?;
+    Ok(local)
 }
 
 #[cfg(target_os = "linux")]
@@ -7723,54 +7844,75 @@ fn discover_cleanup_authority(deadline: &OperationDeadline) -> io::Result<()> {
             Ok(children) => children,
             Err(_) => continue,
         };
-        for child_name in children {
-            check_deadline_io(deadline)?;
-            scanned = scanned.saturating_add(1);
-            if scanned > MAX_SEARCH_ENTRIES {
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    "cleanup authority scan exceeded bound",
-                ));
-            }
-            let Some(child_name) = child_name.to_str() else {
-                continue;
-            };
-            if !is_private_authority_entry_name(child_name) {
-                continue;
-            }
-            let child = match open_child_nofollow(&authority, child_name) {
-                Ok(child) => child,
-                Err(_) => continue,
-            };
-            check_deadline_io(deadline)?;
-            let (identity, links) = match opened_file_info(&child) {
-                Ok(info) => info,
-                Err(_) => continue,
-            };
-            let Some(binding) = parse_authority_entry_binding(child_name) else {
-                continue;
-            };
-            if identity != binding.identity
-                || binding.expected_target_identity != Some(identity)
-                || links == 0
-            {
-                continue;
-            }
-            if settled >= MAX_TOMBSTONES {
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    "cleanup authority capacity exceeded",
-                ));
-            }
-            settled += 1;
-            check_deadline_io(deadline)?;
-            if unlink_target(&authority, child_name).is_ok() {
-                sync_parent_directory_with_deadline(&authority, deadline)?;
-            }
-        }
+        drain_cleanup_authority(
+            &authority,
+            children,
+            None,
+            &mut scanned,
+            &mut settled,
+            deadline,
+        )?;
     }
     check_deadline_io(deadline)?;
     let _ = cleanup_authority(deadline)?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn drain_cleanup_authority(
+    authority: &File,
+    children: Vec<std::ffi::OsString>,
+    expected_parent: Option<FileIdentity>,
+    scanned: &mut usize,
+    settled: &mut usize,
+    deadline: &OperationDeadline,
+) -> io::Result<()> {
+    for child_name in children {
+        check_deadline_io(deadline)?;
+        *scanned = scanned.saturating_add(1);
+        if *scanned > MAX_SEARCH_ENTRIES {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                "cleanup authority scan exceeded bound",
+            ));
+        }
+        let Some(child_name) = child_name.to_str() else {
+            continue;
+        };
+        if !is_private_authority_entry_name(child_name) {
+            continue;
+        }
+        let child = match open_child_nofollow(&authority, child_name) {
+            Ok(child) => child,
+            Err(_) => continue,
+        };
+        check_deadline_io(deadline)?;
+        let (identity, links) = match opened_file_info(&child) {
+            Ok(info) => info,
+            Err(_) => continue,
+        };
+        let Some(binding) = parse_authority_entry_binding(child_name) else {
+            continue;
+        };
+        if expected_parent.is_some_and(|parent| binding.parent_identity != Some(parent))
+            || identity != binding.identity
+            || binding.expected_target_identity != Some(identity)
+            || links == 0
+        {
+            continue;
+        }
+        if *settled >= MAX_TOMBSTONES {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                "cleanup authority capacity exceeded",
+            ));
+        }
+        *settled += 1;
+        check_deadline_io(deadline)?;
+        if unlink_target(&authority, child_name).is_ok() {
+            sync_parent_directory_with_deadline(&authority, deadline)?;
+        }
+    }
     Ok(())
 }
 
@@ -8071,7 +8213,16 @@ fn cleanup_exact_private_entry(
         ));
     }
 
-    let authority = cleanup_authority(deadline)?;
+    let shared_authority = cleanup_authority(deadline)?;
+    let local_authority = if !same_cleanup_mount(&shared_authority.handle, parent) {
+        Some(local_cleanup_authority(parent, deadline)?)
+    } else {
+        None
+    };
+    let authority = local_authority
+        .as_ref()
+        .map(|local| &local.authority)
+        .unwrap_or(shared_authority);
     deadline.check().map_err(|_| deadline_error())?;
     let mut reservation = if slot_already_reserved {
         TombstoneReservation {
@@ -8358,6 +8509,10 @@ fn is_private_cleanup_name(name: &str) -> bool {
 fn is_private_cleanup_component(name: &str) -> bool {
     #[cfg(any(unix, windows))]
     {
+        #[cfg(target_os = "linux")]
+        if is_local_cleanup_authority_name(name) {
+            return true;
+        }
         is_private_cleanup_name(name)
     }
     #[cfg(not(any(unix, windows)))]
