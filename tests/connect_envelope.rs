@@ -1,5 +1,8 @@
 //! Focused Connect envelope privacy fail-closed proofs.
 
+#[path = "support/connect_wire_fixtures.rs"]
+mod connect_wire_fixtures;
+
 use devmanager::connect::{
     ChannelBinding, ChannelId, ChannelKind, Compression, ConnectEnvelope, ConnectLimits,
     ConnectPayload, ConnectPrivacyClass, ConnectionId, EnvelopeError, HostOutputPayload,
@@ -45,9 +48,8 @@ fn actual_wasm_payload_fixtures_match_native_serializer() {
     let expected: serde_json::Value =
         serde_json::from_str(include_str!("fixtures/connect/v1/native-payloads.json"))
             .expect("native WASM fixtures");
-    let actual = devmanager::connect::native_browser_contract_fixtures()
+    let actual = connect_wire_fixtures::native_browser_wire_fixtures()
         .into_iter()
-        .filter(|fixture| matches!(fixture.payload.kind().get(), 1 | 18 | 19 | 20 | 21 | 22))
         .map(|fixture| {
             serde_json::json!({
                 "name": fixture.name,
