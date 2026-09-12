@@ -14074,11 +14074,14 @@ mod desktop_publish_tests {
             .status
             .success());
         let root = RepositoryRoot::open(dir.path()).unwrap();
-        let path = dir.path().join(".git/config");
-        let original = fs::read_to_string(&path).unwrap();
         let mut graph = root.graph.clone();
         drop(root);
-        let index = dir.path().join(".git/index");
+        // Exercise the admitted paths exactly as production revalidation sees
+        // them. On Windows the canonical graph root may use a verbatim path,
+        // which is not component-equal to `TempDir`'s display path.
+        let path = graph.git_dir.join("config");
+        let index = graph.git_dir.join("index");
+        let original = fs::read_to_string(&path).unwrap();
         assert!(graph.retry_inflight_file_replacement(GraphTransition::Stage, &index, false));
         assert!(graph.retry_inflight_file_replacement(GraphTransition::Switch, &index, false));
         assert!(!graph.retry_inflight_file_replacement(GraphTransition::Stage, &index, true));
