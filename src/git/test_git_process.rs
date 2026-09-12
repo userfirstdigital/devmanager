@@ -10,6 +10,10 @@ use tempfile::TempDir;
 fn git(repo: &Path, args: &[&str]) -> String {
     let output = Command::new("git")
         .current_dir(repo)
+        // Keep fixture mutations synchronous. A runner-level maintenance
+        // policy may otherwise detach `git gc --auto` after `commit` and race
+        // the repository-graph binding this test is meant to exercise.
+        .args(["-c", "gc.auto=0", "-c", "maintenance.auto=false"])
         .args(args)
         .env("GIT_TERMINAL_PROMPT", "0")
         .output()

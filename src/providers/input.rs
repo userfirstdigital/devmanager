@@ -1116,7 +1116,7 @@ mod tests {
             .iter()
             .map(ProviderComposerWriteStep::bytes)
             .collect();
-        let expected = format!("\x1b[200~{absolute}\x1b[201~");
+        let expected = format!("\x1b[200~{absolute} \x1b[201~");
         assert_eq!(steps, vec![expected.as_bytes(), b"\r".as_slice()]);
 
         let plain =
@@ -1127,7 +1127,11 @@ mod tests {
             .iter()
             .map(ProviderComposerWriteStep::bytes)
             .collect();
-        assert_eq!(plain_steps, vec![absolute.as_bytes(), b"\r".as_slice()]);
+        let expected_plain = format!("{absolute} ");
+        assert_eq!(
+            plain_steps,
+            vec![expected_plain.as_bytes(), b"\r".as_slice()]
+        );
     }
 
     #[test]
