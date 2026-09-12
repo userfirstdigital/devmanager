@@ -7,7 +7,7 @@ use devmanager::connect::{
     SessionId, CONNECT_ERROR_FORBIDDEN, CONNECT_ERROR_PROTOCOL, CONNECT_ERROR_UNAUTHORIZED,
     CONNECT_HOLD_CALLBACK_FRAGMENT,
 };
-use devmanager::domain::command::{Command, CommandEnvelope};
+use devmanager::domain::command::{Command, CommandEnvelope, RenameTaskIntent};
 use devmanager::domain::id::{ClientId, CommandId, OperationId, RequestId, TaskId};
 use devmanager::domain::query::{Query, QueryEnvelope, QueryOutcome, QueryReply, QueryResult};
 use devmanager::domain::snapshot::SnapshotSection;
@@ -79,7 +79,8 @@ async fn connect_query_and_command_reach_existing_host_request_handle() {
     let mut session = ConnectDispatchSession::bind_paired(
         "web-paired".to_owned(),
         ConnectIdentityLiveState::Live,
-    );
+    )
+    .with_legacy_host_compat();
     let client_id = hello(&mut session, binding).await;
     let request_id = RequestId::new();
     let query = ConnectPayload::Query(QueryEnvelope {
@@ -110,7 +111,9 @@ async fn connect_query_and_command_reach_existing_host_request_handle() {
         task_id: Some(TaskId::new()),
         issued_at_ms: 1,
         expected_task_revision: None,
-        command: Command::BeginCloseTask,
+        command: Command::RenameTask(RenameTaskIntent {
+            title: "Connect dispatch probe".into(),
+        }),
     });
     let env = envelope(binding, 3, Some(RequestId::new()), command.clone());
     let (reply, _) = session.handle_payload(&env, command, host.as_deref()).await;
@@ -136,7 +139,8 @@ async fn connected_host_advertises_and_serves_bounded_event_replay() {
     let mut session = ConnectDispatchSession::bind_paired(
         "web-paired".to_owned(),
         ConnectIdentityLiveState::Live,
-    );
+    )
+    .with_legacy_host_compat();
     let requested = CapabilitySet::from_bits(
         advertised_connect_capabilities().bits() | Capability::EventReplay.bit(),
     );
@@ -239,7 +243,8 @@ async fn connect_resync_returns_a_fresh_bounded_snapshot_through_the_host_lane()
     let mut session = ConnectDispatchSession::bind_paired(
         "web-paired".to_owned(),
         ConnectIdentityLiveState::Live,
-    );
+    )
+    .with_legacy_host_compat();
     let client_id = hello(&mut session, binding).await;
     let payload = ConnectPayload::Resync(devmanager::connect::ResyncPayload {
         channel_sequence: 1,
@@ -266,26 +271,28 @@ async fn connect_resync_returns_a_fresh_bounded_snapshot_through_the_host_lane()
     let _ = executor.await;
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn connect_resync_rejects_an_inverted_cursor_before_host_dispatch() {
+#[test]
+fn connect_resync_rejects_an_inverted_cursor_before_host_dispatch() {
     let binding = binding();
-    let mut session = ConnectDispatchSession::bind_paired(
-        "web-paired".to_owned(),
-        ConnectIdentityLiveState::Live,
-    );
-    hello(&mut session, binding).await;
     let payload = ConnectPayload::Resync(devmanager::connect::ResyncPayload {
         channel_sequence: 4,
         newest_sequence: 3,
         reason: devmanager::connect::ResyncReason::Gap,
     });
-    let env = envelope(binding, 2, None, payload.clone());
-
-    let (reply, disposition) = session.handle_payload(&env, payload, None).await;
-    assert_eq!(disposition, ConnectSessionDisposition::Continue);
     assert!(matches!(
-        reply,
-        ConnectPayload::Error(error) if error.code == devmanager::connect::CONNECT_ERROR_CONFLICT
+        ConnectEnvelope::new(
+            binding,
+            payload.channel(),
+            2,
+            None,
+            None,
+            ConnectLimits::v1_default(),
+            ConnectPrivacyClass::LocalOnly,
+            payload,
+        ),
+        Err(devmanager::connect::EnvelopeError::Schema(
+            devmanager::connect::PayloadDecodeError::Ambiguous { .. }
+        ))
     ));
 }
 
