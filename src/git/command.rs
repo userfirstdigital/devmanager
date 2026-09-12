@@ -4093,7 +4093,7 @@ impl RepositoryGraph {
                         &self.git_dir,
                         update_baseline,
                         full_content,
-                    ) == OptionalMutableAbsencePolicy::AllowApprovedIndexGone)
+                    ) == OptionalMutableAbsencePolicy::AllowApprovedInFlightGone)
             {
                 stable_file_identity_with_index_retry(
                     &node.path, false, deadline, true, true, true, true,
@@ -4279,7 +4279,9 @@ impl RepositoryGraph {
             );
             let actual = if !input.is_file && !full_content {
                 optional_mutable_container_identity_with_deadline(&input.path, deadline)
-            } else if absence_policy == OptionalMutableAbsencePolicy::AllowApprovedIndexGone {
+            } else if absence_policy
+                == OptionalMutableAbsencePolicy::AllowApprovedInFlightGone
+            {
                 optional_mutable_identity_with_absence_policy(
                     &input.path,
                     input.is_file,
@@ -4299,9 +4301,9 @@ impl RepositoryGraph {
                         if !input.is_file && !full_content {
                             "optional_mutable_container_identity_with_deadline"
                         } else if absence_policy
-                            == OptionalMutableAbsencePolicy::AllowApprovedIndexGone
+                            == OptionalMutableAbsencePolicy::AllowApprovedInFlightGone
                         {
-                            "optional_mutable_identity_with_absence_policy(AllowApprovedIndexGone)"
+                            "optional_mutable_identity_with_absence_policy(AllowApprovedInFlightGone)"
                         } else {
                             "optional_mutable_identity_with_deadline"
                         }
@@ -4747,14 +4749,14 @@ fn optional_mutable_identity(path: &Path, is_file: bool) -> Result<Option<FileId
     optional_mutable_identity_with_deadline(path, is_file, None)
 }
 
-/// When [`OptionalMutableAbsencePolicy::AllowApprovedIndexGone`] is selected by
-/// the Stage in-flight index caller, a typed canonicalize `NotFound` may recover
-/// to `None` only after the approved parent/live-metadata window. Default/public
-/// callers remain strict.
+/// When [`OptionalMutableAbsencePolicy::AllowApprovedInFlightGone`] is selected
+/// for an exact Git-owned in-flight file, a typed disappearance may recover to
+/// `None` only after the approved parent/live-metadata window. Default/public
+/// and complete post-transition callers remain strict.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum OptionalMutableAbsencePolicy {
     Strict,
-    AllowApprovedIndexGone,
+    AllowApprovedInFlightGone,
 }
 
 fn optional_mutable_identity_with_deadline(
@@ -4771,8 +4773,9 @@ fn optional_mutable_identity_with_deadline(
     )
 }
 
-/// Exact Stage in-flight index absence policy for optional mutable revalidation.
-/// All other callers remain [`OptionalMutableAbsencePolicy::Strict`].
+/// Exact in-flight absence policy for Git files that are atomically replaced or
+/// deliberately created and removed by the authorized transition. All read and
+/// complete post-transition callers remain strict.
 fn optional_mutable_absence_policy_for_revalidate(
     transition: GraphTransition,
     is_file: bool,
@@ -4781,13 +4784,18 @@ fn optional_mutable_absence_policy_for_revalidate(
     update_baseline: bool,
     full_content: bool,
 ) -> OptionalMutableAbsencePolicy {
-    if matches!(transition, GraphTransition::Stage)
-        && is_file
-        && same_path(input_path, &git_dir.join("index"))
-        && !update_baseline
-        && !full_content
-    {
-        OptionalMutableAbsencePolicy::AllowApprovedIndexGone
+    if !is_file || update_baseline || full_content {
+        return OptionalMutableAbsencePolicy::Strict;
+    }
+    let approved = match transition {
+        GraphTransition::Stage => same_path(input_path, &git_dir.join("index")),
+        GraphTransition::Pull => ["MERGE_HEAD", "MERGE_MODE", "MERGE_RR", "AUTO_MERGE"]
+            .iter()
+            .any(|name| same_path(input_path, &git_dir.join(name))),
+        _ => false,
+    };
+    if approved {
+        OptionalMutableAbsencePolicy::AllowApprovedInFlightGone
     } else {
         OptionalMutableAbsencePolicy::Strict
     }
@@ -4818,7 +4826,7 @@ where
     let canonical = match canonicalize(path) {
         Ok(canonical) => canonical,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return recover_optional_mutable_canonicalize_not_found(
+            return recover_approved_optional_mutable_absence(
                 path,
                 is_file,
                 deadline,
@@ -4845,29 +4853,41 @@ where
         return Err("repository graph path canonical identity changed".to_string());
     }
     let identity =
-        if is_file && absence_policy == OptionalMutableAbsencePolicy::AllowApprovedIndexGone {
-            stable_file_identity_with_index_retry(path, false, deadline, true, true, true, true)?
+        if is_file && absence_policy == OptionalMutableAbsencePolicy::AllowApprovedInFlightGone {
+            stable_file_identity_with_index_retry(path, false, deadline, true, true, true, true)
         } else if is_file {
             deadline.map_or_else(
                 || data_file_identity(path),
                 |deadline| data_file_identity_with_deadline(path, deadline),
-            )?
+            )
         } else {
-            mutable_directory_identity_with_deadline(path, deadline)?
+            mutable_directory_identity_with_deadline(path, deadline)
         };
-    Ok(Some(identity))
+    match identity {
+        Ok(identity) => Ok(Some(identity)),
+        Err(original)
+            if absence_policy == OptionalMutableAbsencePolicy::AllowApprovedInFlightGone =>
+        {
+            match recover_approved_optional_mutable_absence(path, is_file, deadline, absence_policy)
+            {
+                Ok(None) => Ok(None),
+                Ok(Some(_)) | Err(_) => Err(original),
+            }
+        }
+        Err(error) => Err(error),
+    }
 }
 
-/// Exact approved window for Stage in-flight index: typed canonicalize NotFound
-/// plus live direct parent + fresh index metadata NotFound. Never walks missing
-/// ancestors or ignores non-NotFound canonicalize errors.
-fn recover_optional_mutable_canonicalize_not_found(
+/// Exact approved window for an in-flight Git-owned file: live direct parent
+/// plus fresh leaf metadata `NotFound`. Never walks missing ancestors or turns
+/// a replacement, reparse point, or other I/O failure into absence.
+fn recover_approved_optional_mutable_absence(
     path: &Path,
     is_file: bool,
     deadline: Option<OperationDeadline>,
     absence_policy: OptionalMutableAbsencePolicy,
 ) -> Result<Option<FileIdentity>, String> {
-    if absence_policy != OptionalMutableAbsencePolicy::AllowApprovedIndexGone {
+    if absence_policy != OptionalMutableAbsencePolicy::AllowApprovedInFlightGone {
         #[cfg(test)]
         {
             eprintln!(
@@ -12685,7 +12705,7 @@ mod tests {
             &index,
             true,
             Some(OperationDeadline::from_now(Duration::from_secs(5))),
-            OptionalMutableAbsencePolicy::AllowApprovedIndexGone,
+            OptionalMutableAbsencePolicy::AllowApprovedInFlightGone,
             {
                 let index = index.clone();
                 move |path| {
@@ -12709,6 +12729,40 @@ mod tests {
         );
         assert!(result
             .expect("approved Stage in-flight index absence")
+            .is_none());
+    }
+
+    #[test]
+    fn pull_inflight_auto_merge_identity_not_found_recovers_after_canonicalize() {
+        let fixture = tempfile::tempdir().expect("AUTO_MERGE race fixture");
+        let git_dir = fixture.path().join(".git");
+        fs::create_dir_all(&git_dir).expect("git dir");
+        let auto_merge = git_dir.join("AUTO_MERGE");
+        fs::write(&auto_merge, b"fixture-tree\n").expect("seed AUTO_MERGE");
+        let observed = Arc::new(AtomicBool::new(false));
+        let observed_flag = Arc::clone(&observed);
+        let result = optional_mutable_identity_with_absence_policy(
+            &auto_merge,
+            true,
+            Some(OperationDeadline::from_now(Duration::from_secs(5))),
+            OptionalMutableAbsencePolicy::AllowApprovedInFlightGone,
+            {
+                let auto_merge = auto_merge.clone();
+                move |path| {
+                    assert!(same_path(path, &auto_merge));
+                    let canonical = fs::canonicalize(path).expect("canonicalize AUTO_MERGE");
+                    fs::remove_file(path).expect("remove AUTO_MERGE before identity");
+                    observed_flag.store(true, Ordering::SeqCst);
+                    Ok(canonical)
+                }
+            },
+        );
+        assert!(
+            observed.load(Ordering::SeqCst),
+            "injected removal must run after canonicalization"
+        );
+        assert!(result
+            .expect("approved Pull in-flight AUTO_MERGE absence")
             .is_none());
     }
 
@@ -12749,7 +12803,7 @@ mod tests {
             &index,
             true,
             Some(OperationDeadline::from_now(Duration::from_secs(5))),
-            OptionalMutableAbsencePolicy::AllowApprovedIndexGone,
+            OptionalMutableAbsencePolicy::AllowApprovedInFlightGone,
             |_path| Err(io::Error::new(io::ErrorKind::NotFound, "fake gone")),
         )
         .map(|_| ())
@@ -12768,7 +12822,7 @@ mod tests {
             &index,
             true,
             Some(OperationDeadline::from_now(Duration::from_secs(5))),
-            OptionalMutableAbsencePolicy::AllowApprovedIndexGone,
+            OptionalMutableAbsencePolicy::AllowApprovedInFlightGone,
             {
                 let index = index.clone();
                 move |path| {
@@ -12798,7 +12852,7 @@ mod tests {
             &index,
             true,
             Some(OperationDeadline::from_now(Duration::from_secs(5))),
-            OptionalMutableAbsencePolicy::AllowApprovedIndexGone,
+            OptionalMutableAbsencePolicy::AllowApprovedInFlightGone,
             {
                 let index = index.clone();
                 move |path| {
@@ -12831,7 +12885,7 @@ mod tests {
             &index,
             true,
             Some(OperationDeadline::from_now(Duration::ZERO)),
-            OptionalMutableAbsencePolicy::AllowApprovedIndexGone,
+            OptionalMutableAbsencePolicy::AllowApprovedInFlightGone,
             {
                 let index = index.clone();
                 move |path| {
@@ -12850,7 +12904,7 @@ mod tests {
             &index,
             true,
             Some(OperationDeadline::from_now(Duration::from_secs(5))),
-            OptionalMutableAbsencePolicy::AllowApprovedIndexGone,
+            OptionalMutableAbsencePolicy::AllowApprovedInFlightGone,
             {
                 let index = index.clone();
                 let git_dir = git_dir.clone();
@@ -12881,7 +12935,7 @@ mod tests {
             &index,
             true,
             Some(OperationDeadline::from_now(Duration::from_secs(5))),
-            OptionalMutableAbsencePolicy::AllowApprovedIndexGone,
+            OptionalMutableAbsencePolicy::AllowApprovedInFlightGone,
             {
                 let index = index.clone();
                 let target = target.clone();
@@ -13055,12 +13109,14 @@ mod tests {
     }
 
     #[test]
-    fn optional_mutable_absence_policy_selector_permits_only_stage_inflight_index() {
+    fn optional_mutable_absence_policy_selector_is_exact_for_inflight_git_files() {
         let git_dir = PathBuf::from(r"C:\repo\.git");
         let index = git_dir.join("index");
         let sibling_index = PathBuf::from(r"C:\repo\.git\worktrees\wt\index");
         let head = git_dir.join("HEAD");
         let refs = git_dir.join("refs");
+        let cherry_pick_head = git_dir.join("CHERRY_PICK_HEAD");
+        let auto_merge = git_dir.join("AUTO_MERGE");
 
         assert_eq!(
             optional_mutable_absence_policy_for_revalidate(
@@ -13071,9 +13127,25 @@ mod tests {
                 false,
                 false,
             ),
-            OptionalMutableAbsencePolicy::AllowApprovedIndexGone,
+            OptionalMutableAbsencePolicy::AllowApprovedInFlightGone,
             "Stage + current index file + in-flight must permit recovery"
         );
+
+        for name in ["MERGE_HEAD", "MERGE_MODE", "MERGE_RR", "AUTO_MERGE"] {
+            let path = git_dir.join(name);
+            assert_eq!(
+                optional_mutable_absence_policy_for_revalidate(
+                    GraphTransition::Pull,
+                    true,
+                    &path,
+                    &git_dir,
+                    false,
+                    false,
+                ),
+                OptionalMutableAbsencePolicy::AllowApprovedInFlightGone,
+                "Pull + exact {name} file + in-flight must permit recovery"
+            );
+        }
 
         let strict_cases = [
             (
@@ -13139,6 +13211,30 @@ mod tests {
                 index.as_path(),
                 false,
                 true,
+            ),
+            (
+                "Pull index",
+                GraphTransition::Pull,
+                true,
+                index.as_path(),
+                false,
+                false,
+            ),
+            (
+                "Pull unrelated state",
+                GraphTransition::Pull,
+                true,
+                cherry_pick_head.as_path(),
+                false,
+                false,
+            ),
+            (
+                "Pull post-transition AUTO_MERGE",
+                GraphTransition::Pull,
+                true,
+                auto_merge.as_path(),
+                true,
+                false,
             ),
         ];
         for (label, transition, is_file, path, update_baseline, full_content) in strict_cases {
