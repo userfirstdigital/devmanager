@@ -81,6 +81,14 @@ impl From<String> for HostRunError {
 }
 
 fn main() -> ExitCode {
+    // An SSH terminal with a saved password runs ssh through this executable,
+    // and ssh runs it again as SSH_ASKPASS. Both roles exit before anything
+    // else here -- never parse host flags or take the HostLock.
+    if let Some(code) =
+        devmanager::ssh::askpass::run_subcommand(&std::env::args().skip(1).collect::<Vec<_>>())
+    {
+        return code;
+    }
     #[cfg(target_os = "linux")]
     if let Some(code) = devmanager::process::linux_cgroup::run_guardian_subcommand(
         &std::env::args().skip(1).collect::<Vec<_>>(),

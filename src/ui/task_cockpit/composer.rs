@@ -1538,6 +1538,33 @@ impl TaskComposer {
         )
     }
 
+    /// Send text captured at the gesture rather than whatever the field holds
+    /// now.
+    ///
+    /// A task's first message leaves the field immediately so it can appear in
+    /// the transcript at once, while the task is still being created and its
+    /// provider started. By the time that finishes the person may be typing the
+    /// next message: it must not be sent by mistake, and it must not be wiped.
+    pub fn activate_captured_send(
+        &mut self,
+        text: String,
+        artifact_ids: Vec<ArtifactId>,
+        focus_epoch: FocusEpoch,
+    ) -> Result<ComposerIntent, ComposerError> {
+        self.require_epoch(focus_epoch)?;
+        self.require_available(ComposerControl::SendNow)?;
+        self.submit(
+            ComposerControl::SendNow,
+            self.fence,
+            focus_epoch,
+            ComposerPayload::SendNow {
+                text,
+                artifact_ids,
+                prompt: self.inserted_prompt.clone(),
+            },
+        )
+    }
+
     pub fn activate_with_fence(
         &mut self,
         control: ComposerControl,

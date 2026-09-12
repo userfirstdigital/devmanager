@@ -8,8 +8,9 @@
 //! in the first place (see `rows.rs`).
 
 use gpui::{
-    div, font, px, rems, AnyElement, App, ClipboardItem, ElementId, Font, FontFeatures,
-    InteractiveElement, IntoElement, ParentElement, StatefulInteractiveElement, Styled, Window,
+    div, font, px, relative, rems, AnimationExt, AnyElement, App, ClipboardItem, ElementId, Font,
+    FontFeatures, InteractiveElement, IntoElement, ParentElement, StatefulInteractiveElement,
+    Styled, Window,
 };
 use gpui_component::{
     text::{TextView, TextViewStyle},
@@ -139,6 +140,12 @@ const CARD_GAP: f32 = 4.0;
 /// under every block at `4 + caption line + 8`, so two blocks stood ~40 px
 /// apart whether or not anything was visible in that space.
 const BLOCK_GAP: f32 = 10.0;
+/// The person's own message sits right, bounded so a long paste still wraps
+/// into a readable column rather than running the full width.
+const USER_MESSAGE_MAX_WIDTH: f32 = 0.82;
+const USER_MESSAGE_PADDING_X: f32 = 10.0;
+const USER_MESSAGE_PADDING_Y: f32 = 6.0;
+const USER_MESSAGE_RADIUS: f32 = 8.0;
 /// Rule 2: message body -- 11.5 px `text.primary`.
 const BODY_FONT_SIZE: f32 = 11.5;
 /// 11.5 px at the mockup stream's 1.5 leading (`.stream { font: 11.5px/1.5 }`).
@@ -190,7 +197,11 @@ const ASSISTANT_TURN_LABEL: &str = "Answer";
 const USER_TURN_LABEL: &str = "You";
 /// Rule 2: a group header. The plan card's own label.
 const PLAN_CARD_LABEL: &str = "Tasks";
-const META_REST_OPACITY: f32 = 0.0;
+/// The time and copy control stay on screen rather than appearing under the
+/// pointer. Hidden, they fought the message they sat on: the pointer that
+/// revealed them was the pointer trying to select text. Quiet at rest, full
+/// strength when the block is hovered or the control takes focus.
+const META_REST_OPACITY: f32 = 0.45;
 const META_REVEALED_OPACITY: f32 = 1.0;
 
 /// The markdown metrics the stream hands `TextView`. One struct so the painted
@@ -222,7 +233,9 @@ fn role_label(text: &str) -> String {
 
 /// The label element every message block wears. One builder so the user turn
 /// and the assistant turn cannot end up with two different labels.
-fn role_label_element(text: &str, tokens: ThemeTokens) -> AnyElement {
+/// Returns the div rather than an erased element so a caller can align it: the
+/// user's label follows its message to the right.
+fn role_label_element(text: &str, tokens: ThemeTokens) -> gpui::Div {
     div()
         .w_full()
         .text_size(px(ROLE_LABEL_FONT_SIZE))
@@ -233,7 +246,6 @@ fn role_label_element(text: &str, tokens: ThemeTokens) -> AnyElement {
         .line_height(px(ROLE_LABEL_LINE_HEIGHT))
         .text_color(tokens.text.muted.to_gpui())
         .child(role_label(text))
-        .into_any_element()
 }
 
 fn tabular_numeral_font() -> Font {
@@ -521,7 +533,44 @@ fn message_block_element(
     cx: &mut App,
 ) -> AnyElement {
     let metrics = conversation_markdown_metrics(tokens.density.density);
+    // The picture is painted by the timeline row, which owns the click that
+    // opens it; here the path only has to stop being read out as text.
+    let (text, _) = crate::ui::conversation::rows::split_pasted_images(text);
+    let text = text.as_str();
     let view = native_markdown_view(row_key, text, markdown, user, tokens, window, cx);
+    let body = div()
+        .min_w(px(0.0))
+        .text_size(px(metrics.body_size))
+        .line_height(px(metrics.body_line_height))
+        .text_color(tokens.text.primary.to_gpui())
+        .child(view);
+    // What the person said sits on the right, the way every chat puts your own
+    // words; the agent's answer keeps the full column, because answers are long
+    // and a reply squeezed into half the width is harder to read. A quiet
+    // surface -- not a coloured bubble -- is what separates the two sides.
+    if user {
+        return div()
+            .w_full()
+            .min_w(px(0.0))
+            .flex()
+            .flex_col()
+            .items_end()
+            .gap(px(ROLE_LABEL_GAP))
+            // The label belongs over its own message, not at the far side of
+            // the column from it.
+            .child(role_label_element(label, tokens).text_right())
+            .child(
+                body.max_w(relative(USER_MESSAGE_MAX_WIDTH))
+                    .px(px(USER_MESSAGE_PADDING_X))
+                    .py(px(USER_MESSAGE_PADDING_Y))
+                    .rounded(px(USER_MESSAGE_RADIUS))
+                    // `surfaces.raised` is four values off the canvas and reads
+                    // as nothing at this size; the chip needs to be seen to do
+                    // its job of separating your words from the answer.
+                    .bg(mix_color(tokens.surfaces.canvas, tokens.text.primary, 0.08).to_gpui()),
+            )
+            .into_any_element();
+    }
     div()
         .w_full()
         .min_w(px(0.0))
@@ -529,15 +578,7 @@ fn message_block_element(
         .flex_col()
         .gap(px(ROLE_LABEL_GAP))
         .child(role_label_element(label, tokens))
-        .child(
-            div()
-                .w_full()
-                .min_w(px(0.0))
-                .text_size(px(metrics.body_size))
-                .line_height(px(metrics.body_line_height))
-                .text_color(tokens.text.primary.to_gpui())
-                .child(view),
-        )
+        .child(body.w_full())
         .into_any_element()
 }
 
@@ -583,20 +624,21 @@ fn message_row_element(
         // label line instead: the label is two short words at the left and the
         // meta is right-aligned, so the two never meet, and no message body is
         // ever covered by an affordance that appears under the pointer.
-        .child(
-            div()
-                .absolute()
-                .top_0()
-                .right_0()
-                .child(message_meta_element(
-                    group,
-                    text,
-                    occurred_at_ms,
-                    user,
-                    streaming,
-                    tokens,
-                )),
-        )
+        .child({
+            // Opposite the message it belongs to: your words sit right, so the
+            // time and copy control sit left, and the answer's sit right. They
+            // never land on top of the text any more.
+            let meta = div().absolute().top_0();
+            let meta = if user { meta.left_0() } else { meta.right_0() };
+            meta.child(message_meta_element(
+                group,
+                text,
+                occurred_at_ms,
+                user,
+                streaming,
+                tokens,
+            ))
+        })
         .into_any_element()
 }
 
@@ -1254,25 +1296,35 @@ fn question_element(
 
 /// Working indicator. Three dots plus an elapsed label.
 fn working_element(elapsed_ms: Option<u64>, step: Option<&str>, tokens: ThemeTokens) -> AnyElement {
-    let dot = || {
+    // The three dots pulse in sequence, as T3 Code's status pulse does. This is
+    // the one thing on screen that says the wait is alive rather than stuck, so
+    // it moves; everything else about the row stays quiet.
+    let dot = |index: usize| {
         div()
             .flex_none()
             .size(px(WORKING_DOT))
             .rounded_full()
             .bg(mix_color(tokens.surfaces.canvas, tokens.text.muted, 0.30).to_gpui())
+            .with_animation(
+                ("native-conversation-working-dot", index),
+                gpui::Animation::new(std::time::Duration::from_millis(900))
+                    .repeat()
+                    .with_easing(move |delta| {
+                        let shifted = (delta + index as f32 / 3.0) % 1.0;
+                        let triangle = if shifted <= 0.5 {
+                            shifted * 2.0
+                        } else {
+                            (1.0 - shifted) * 2.0
+                        };
+                        0.35 + triangle * 0.65
+                    }),
+                |dot, opacity| dot.opacity(opacity),
+            )
+            .into_any_element()
     };
     let elapsed_label = match elapsed_ms {
         None => "Working".to_string(),
-        Some(ms) => {
-            let total_secs = ms / 1000;
-            let minutes = total_secs / 60;
-            let seconds = total_secs % 60;
-            if minutes > 0 {
-                format!("Working for {minutes}m {seconds}s")
-            } else {
-                format!("Working for {seconds}s")
-            }
-        }
+        Some(ms) => crate::ui::conversation::rows::format_working_elapsed(ms as i64),
     };
     // Rule 1/2: the streaming indicator is one more quiet 11 px row. It is the
     // only animated thing in the stream, so it earns no colour on top.
@@ -1296,9 +1348,9 @@ fn working_element(elapsed_ms: Option<u64>, step: Option<&str>, tokens: ThemeTok
                 .items_center()
                 .justify_center()
                 .gap(px(3.0))
-                .child(dot())
-                .child(dot())
-                .child(dot()),
+                .child(dot(0))
+                .child(dot(1))
+                .child(dot(2)),
         )
         .child(div().flex_none().child(elapsed_label))
         .children(step.map(|step| {
@@ -1427,9 +1479,12 @@ mod tests {
             .expect("the block painter ends where the next function begins");
         let compact: String = block.chars().filter(|c| !c.is_whitespace()).collect();
         assert!(
-            compact.contains(".absolute().top_0().right_0()"),
+            compact.contains(".absolute().top_0()")
+                && compact.contains("meta.left_0()")
+                && compact.contains("meta.right_0()"),
             "the meta row must be positioned over the block rather than laid \
-             out under it"
+             out under it, and on the side away from the message: left for the \
+             user's own right-aligned words, right for the answer"
         );
         assert!(
             compact.contains(".pb(px(BLOCK_GAP))"),
@@ -1599,8 +1654,13 @@ mod tests {
         }
     }
 
+    /// The stream used to refuse both turns a surface of their own. That rule
+    /// was overruled deliberately: a chat reads as a chat when your own words
+    /// sit on the right on their own quiet surface. The assistant's side keeps
+    /// the original treatment -- full column, no card, no shadow -- because an
+    /// answer is long and half a column is harder to read.
     #[test]
-    fn both_turns_are_the_same_label_headed_block_with_no_bubble() {
+    fn the_user_turn_sits_right_on_its_own_surface_and_the_answer_stays_plain() {
         // KNOWN LIMITATION: a source assertion, for the same reason the border
         // invariant below is one -- GPUI exposes no painted style to a unit
         // test. It is anchored on the two painter names rather than on any
@@ -1616,9 +1676,15 @@ mod tests {
             "one definition and exactly two callers -- the user turn and the \
              assistant turn must paint through the same block"
         );
+        assert!(
+            renderers.contains(".items_end()") && renderers.contains("USER_MESSAGE_MAX_WIDTH"),
+            "the person's own message is right-aligned and bounded"
+        );
+        assert!(
+            renderers.contains("body.w_full()"),
+            "the answer keeps the full column"
+        );
         for gone in [
-            "USER_BUBBLE",
-            "rounded(px(USER",
             "ASSISTANT_PROSE_MAX_WIDTH",
             "PLAN_CARD_HORIZONTAL_INSET",
             "shadow_sm()",
@@ -1626,8 +1692,7 @@ mod tests {
         ] {
             assert!(
                 !renderers.contains(gone),
-                "the stream has no bubbles, no prose inset and no drop shadow; \
-                 found {gone}"
+                "the stream still has no prose inset and no drop shadow; found {gone}"
             );
         }
         assert_eq!(role_label(USER_TURN_LABEL), "YOU");
@@ -1740,8 +1805,11 @@ mod tests {
     }
 
     #[test]
-    fn message_meta_is_invisible_at_rest_and_visible_when_revealed() {
-        assert_eq!(message_meta_opacity(false), 0.0);
+    fn message_meta_is_quiet_at_rest_and_full_strength_when_revealed() {
+        // Never zero: a control that only exists under the pointer competed
+        // with selecting the very text it sits on.
+        assert!(message_meta_opacity(false) > 0.0);
+        assert!(message_meta_opacity(false) < message_meta_opacity(true));
         assert_eq!(message_meta_opacity(true), 1.0);
     }
 

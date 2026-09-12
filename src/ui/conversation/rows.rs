@@ -9,6 +9,7 @@ use crate::domain::PlanStepStatus;
 use crate::ui::renderers::{
     MarkdownDocument, MessageRole, TimelineItemContent, TimelineItemId, TimelineItemModel,
 };
+use serde::{Deserialize, Serialize};
 
 #[cfg(test)]
 use super::fixtures::{generic_item, message_item, plan_item, tool_item};
@@ -345,6 +346,158 @@ pub fn derive_conversation_rows(
     }
 
     rows
+}
+
+/// The folder a pasted image is staged in, and the only place the transcript
+/// will treat a path as a picture of its own.
+const PASTED_IMAGE_MARKER: &str = ".devmanager/pasted-images/";
+
+/// Split the pictures out of a message.
+///
+/// A pasted image reaches the provider as an absolute path typed into its
+/// composer, so it comes back in the echoed message as a long unreadable path.
+/// The transcript shows the picture instead: the paths leave the text and are
+/// returned separately.
+pub fn split_pasted_images(text: &str) -> (String, Vec<String>) {
+    if !text.contains(PASTED_IMAGE_MARKER) {
+        return (text.to_string(), Vec::new());
+    }
+    let mut images = Vec::new();
+    let mut kept: Vec<String> = Vec::new();
+    for line in text.lines() {
+        let mut remaining: Vec<&str> = Vec::new();
+        for token in line.split_whitespace() {
+            let candidate = token.trim_start_matches('@');
+            let lower = candidate.to_ascii_lowercase();
+            let is_image = candidate.contains(PASTED_IMAGE_MARKER)
+                && (lower.ends_with(".png") || lower.ends_with(".jpg") || lower.ends_with(".jpeg"));
+            if is_image {
+                let candidate = candidate.to_string();
+                if !images.contains(&candidate) {
+                    images.push(candidate);
+                }
+            } else {
+                remaining.push(token);
+            }
+        }
+        // A line that was nothing but paths leaves no blank line behind.
+        if !remaining.is_empty() {
+            kept.push(remaining.join(" "));
+        }
+    }
+    (kept.join("\n").trim().to_string(), images)
+}
+
+/// A message as this shell sent it, together with the pictures it carried.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SentMessageImages {
+    pub text: String,
+    pub paths: Vec<String>,
+}
+
+/// Drop the markers a provider substitutes for an attached image.
+///
+/// Codex echoes the message back as `"[Image #1] what colour is this"` -- the
+/// picture is gone and so is its path, so the transcript alone cannot say what
+/// was attached. Removing the markers leaves the words that were typed, which
+/// is what [`images_for_message`] matches on.
+pub fn strip_provider_image_markers(text: &str) -> &str {
+    let mut rest = text.trim_start();
+    while let Some(open) = rest.strip_prefix("[Image #") {
+        let Some(close) = open.find(']') else { break };
+        if !open[..close].chars().all(|c| c.is_ascii_digit()) {
+            break;
+        }
+        rest = open[close + 1..].trim_start();
+    }
+    rest
+}
+
+/// The pictures a transcript message carried, matched back to what was sent.
+///
+/// Matching is on the words rather than on position, so a message that arrives
+/// out of order, or twice, still shows its own picture and never someone
+/// else's.
+pub fn images_for_message<'a>(text: &str, sent: &'a [SentMessageImages]) -> Option<&'a [String]> {
+    let stripped = strip_provider_image_markers(text).trim();
+    if stripped.is_empty() {
+        return None;
+    }
+    sent.iter()
+        .find(|entry| entry.text.trim() == stripped)
+        .map(|entry| entry.paths.as_slice())
+}
+
+/// What the provider is doing right now, for the working row at the tail.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct WorkingIndicator {
+    /// When this turn started, so the row can count up. `None` keeps the bare
+    /// "Working" label rather than inventing an elapsed time.
+    pub since_ms: Option<i64>,
+    /// The current step, e.g. a tool name or "Thinking".
+    pub step: Option<String>,
+}
+
+impl WorkingIndicator {
+    /// The label the row paints, and the value a caller compares to decide
+    /// whether a repaint is owed. Cheap enough to call once a second.
+    pub fn label(&self, now_ms: i64) -> String {
+        let elapsed = self
+            .since_ms
+            .map(|since| format_working_elapsed((now_ms - since).max(0)))
+            .unwrap_or_else(|| "Working".to_string());
+        match &self.step {
+            Some(step) => format!("{elapsed} · {step}"),
+            None => elapsed,
+        }
+    }
+}
+
+/// "Working for 20s" / "Working for 3m 4s". Shared by the row and its label so
+/// the two cannot drift.
+pub fn format_working_elapsed(elapsed_ms: i64) -> String {
+    let total = elapsed_ms.max(0) / 1000;
+    let (minutes, seconds) = (total / 60, total % 60);
+    if minutes > 0 {
+        format!("Working for {minutes}m {seconds}s")
+    } else {
+        format!("Working for {seconds}s")
+    }
+}
+
+/// Put a working row at the tail, or take it away.
+///
+/// The row used to appear only while a tool call was unresolved, so the window
+/// between pressing send and the provider's first tool call -- exactly when
+/// someone asks "is this stuck?" -- showed nothing at all. The caller owns the
+/// question of whether a turn is open; this only paints the answer.
+pub fn apply_working_indicator(
+    rows: &mut Vec<ConversationRow>,
+    working: Option<&WorkingIndicator>,
+    now_ms: i64,
+) {
+    let tail_is_working = matches!(rows.last(), Some(ConversationRow::Working { .. }));
+    match working {
+        None => {
+            if tail_is_working {
+                rows.pop();
+            }
+        }
+        Some(indicator) => {
+            let row = ConversationRow::Working {
+                elapsed_ms: indicator
+                    .since_ms
+                    .map(|since| (now_ms - since).max(0) as u64),
+                step: indicator.step.clone(),
+            };
+            if tail_is_working {
+                let last = rows.len() - 1;
+                rows[last] = row;
+            } else {
+                rows.push(row);
+            }
+        }
+    }
 }
 
 /// For each row, the index of the row that opened its elapsed-time window. A
@@ -875,6 +1028,144 @@ mod tests {
             matches!(rows.last(), Some(ConversationRow::Working { .. })),
             "an active group must be followed by a working row, got {rows:?}"
         );
+    }
+
+    /// The complaint this answers: a sent message that sits there with nothing
+    /// on screen. No tool call has run yet, so derivation emits no working row
+    /// at all -- the indicator has to come from the caller.
+    #[test]
+    fn a_waiting_transcript_takes_a_working_row_from_the_caller() {
+        let mut rows = derive_conversation_rows(
+            &[message_item(MessageRole::User, "fix the tests")],
+            ConversationVerbosity::Calm,
+        );
+        assert!(
+            !matches!(rows.last(), Some(ConversationRow::Working { .. })),
+            "derivation alone still says nothing while the provider is silent"
+        );
+
+        let indicator = WorkingIndicator {
+            since_ms: Some(1_000),
+            step: Some("Thinking".to_string()),
+        };
+        apply_working_indicator(&mut rows, Some(&indicator), 21_000);
+        assert!(matches!(
+            rows.last(),
+            Some(ConversationRow::Working {
+                elapsed_ms: Some(20_000),
+                step: Some(step),
+            }) if step == "Thinking"
+        ));
+
+        // A later second replaces the row rather than stacking another.
+        apply_working_indicator(&mut rows, Some(&indicator), 22_000);
+        assert_eq!(
+            rows.iter()
+                .filter(|row| matches!(row, ConversationRow::Working { .. }))
+                .count(),
+            1
+        );
+        assert!(matches!(
+            rows.last(),
+            Some(ConversationRow::Working {
+                elapsed_ms: Some(21_000),
+                ..
+            })
+        ));
+
+        // The turn ends: the row goes, and the transcript is left alone.
+        apply_working_indicator(&mut rows, None, 23_000);
+        assert_eq!(rows.len(), 1);
+        assert!(matches!(rows.last(), Some(ConversationRow::Message { .. })));
+    }
+
+    /// A pasted picture reached the transcript as a wall of path, which is
+    /// neither readable nor the picture.
+    #[test]
+    fn a_pasted_image_leaves_the_text_and_comes_back_as_a_picture() {
+        let (text, images) = split_pasted_images(
+            "look at this\n/home/me/proj/.devmanager/pasted-images/clipboard-image-1-2.png",
+        );
+        assert_eq!(text, "look at this");
+        assert_eq!(
+            images,
+            vec!["/home/me/proj/.devmanager/pasted-images/clipboard-image-1-2.png"]
+        );
+
+        // The web path form carries an @ prefix, and two images are two rows.
+        let (text, images) = split_pasted_images(
+            "@.devmanager/pasted-images/a.png @.devmanager/pasted-images/b.JPG fix these",
+        );
+        assert_eq!(text, "fix these");
+        assert_eq!(
+            images,
+            vec![
+                ".devmanager/pasted-images/a.png",
+                ".devmanager/pasted-images/b.JPG"
+            ]
+        );
+
+        // The same picture twice is one picture.
+        let (_, images) = split_pasted_images(
+            "/w/.devmanager/pasted-images/a.png /w/.devmanager/pasted-images/a.png",
+        );
+        assert_eq!(images.len(), 1);
+
+        // Ordinary text is untouched, including paths that are not images and
+        // images that were never staged by the composer.
+        let untouched = "see src/main.rs and https://example.com/logo.png";
+        let (text, images) = split_pasted_images(untouched);
+        assert_eq!(text, untouched);
+        assert!(images.is_empty());
+    }
+
+    /// Codex does not echo the path back at all -- it substitutes a marker of
+    /// its own -- so path-sniffing alone left every pasted picture invisible in
+    /// the transcript. What this shell sent is the second source.
+    #[test]
+    fn a_message_the_provider_renamed_still_finds_its_picture() {
+        let sent = vec![SentMessageImages {
+            text: "what colour is this".into(),
+            paths: vec!["/w/.devmanager/pasted-images/a.png".into()],
+        }];
+
+        assert_eq!(
+            images_for_message("[Image #1] what colour is this", &sent),
+            Some(&sent[0].paths[..])
+        );
+        // Several pictures, several markers.
+        assert_eq!(
+            images_for_message("[Image #1] [Image #2] what colour is this", &sent),
+            Some(&sent[0].paths[..])
+        );
+        // Matched on the words, so the reply and an unrelated message get
+        // nothing rather than someone else's picture.
+        assert_eq!(images_for_message("Purple", &sent), None);
+        assert_eq!(images_for_message("[Image #1]", &sent), None);
+        // A marker-shaped thing that is not a marker is left alone.
+        assert_eq!(
+            images_for_message("[Image #x] what colour is this", &sent),
+            None
+        );
+    }
+
+    #[test]
+    fn the_working_label_counts_up_and_names_the_step() {
+        let bare = WorkingIndicator::default();
+        assert_eq!(bare.label(5_000), "Working");
+        let counting = WorkingIndicator {
+            since_ms: Some(0),
+            step: None,
+        };
+        assert_eq!(counting.label(20_400), "Working for 20s");
+        assert_eq!(counting.label(184_000), "Working for 3m 4s");
+        let stepped = WorkingIndicator {
+            since_ms: Some(0),
+            step: Some("Thinking".to_string()),
+        };
+        assert_eq!(stepped.label(20_000), "Working for 20s · Thinking");
+        // A clock that jumps backwards must not print a negative age.
+        assert_eq!(counting.label(-5_000), "Working for 0s");
     }
 
     #[test]

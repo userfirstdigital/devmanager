@@ -1460,6 +1460,11 @@ impl HostFleet {
         }
         match admission.task_id {
             Some(task_id) if request.context.task_id == task_id => {}
+            // A host-global admission may only write plain-shell input: the
+            // host's own terminals (SSH opened without a Task). The host still
+            // fences it on the terminal, its session and focus epoch, and the
+            // per-client input grant.
+            None if request.context.is_plain_shell_fence() => {}
             _ => return Err(FleetError::AdmissionOwnerMismatch),
         }
         self.classify_request_support(&admission.host, FleetUnsupportedKind::RawTerminalInput)?;

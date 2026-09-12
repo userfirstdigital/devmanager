@@ -15,6 +15,7 @@ pub mod components;
 pub mod conversation;
 pub mod frame_trace;
 pub mod header_actions;
+pub mod model_picker;
 #[path = "composer/mod.rs"]
 pub mod native_composer;
 pub mod native_fleet;
@@ -44,8 +45,8 @@ pub mod task_workspace;
 pub mod terminal_adapter;
 pub mod theme_system;
 pub mod tokens;
-pub mod workspace_layout;
 mod window_identity;
+pub mod workspace_layout;
 
 pub use native_shell::{NativeClientDetach, NativeHostFullQuit};
 pub use preview::PreviewInitReport;

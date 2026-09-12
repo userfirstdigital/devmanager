@@ -77,7 +77,10 @@ mod tests {
         ] {
             let full = crate::assets::asset_path(path);
             let bytes = std::fs::read(&full).unwrap_or_else(|e| panic!("{full:?}: {e}"));
-            assert!(bytes.len() < 2048, "{path} must stay under 2 KB");
+            // 4 KB, not the 2 KB a stand-in glyph needed: a real vendor mark
+            // is drawn, not sketched, and Anthropic's carries ~1.8 KB of path
+            // on its own. The cap still refuses a pasted multi-layer export.
+            assert!(bytes.len() < 4096, "{path} must stay under 4 KB");
             let text = String::from_utf8(bytes).expect("utf-8 svg");
             assert!(text.contains("<svg"), "{path} is not an svg");
             assert!(

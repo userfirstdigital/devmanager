@@ -156,6 +156,10 @@ struct PendingUserMessage {
     command_id: CommandId,
     event_id: EventId,
     text: String,
+    /// The newest durable fact at the moment this row went up. A later
+    /// assistant fact is proof the provider received this message, whatever it
+    /// chose to record it as -- see [`TaskSurfaceRegistry::admit_pending_user_message`].
+    admitted_after_sequence: u64,
 }
 
 impl TaskConversationCache {
@@ -787,13 +791,32 @@ impl TaskSurfaceState {
 
     fn reconcile_pending_user_messages(&mut self, page: &SemanticJournalPage) {
         for fact in &page.facts {
+            // The backstop. Matching an optimistic row to the provider's own
+            // record of it is guesswork -- the provider rewrites the text, and
+            // any rewrite we have not anticipated left the row up for ever.
+            // That is not merely a duplicate on screen: an unretired row is
+            // read as a turn still in flight, so the task stayed "Working"
+            // and refused every later message. An assistant answer is proof
+            // the provider received everything shown before it, so those rows
+            // retire here whatever they were renamed to.
+            if matches!(fact.payload, SemanticJournalPayload::AssistantText { .. }) {
+                self.pending_user_messages
+                    .retain(|pending| pending.admitted_after_sequence >= fact.sequence);
+                continue;
+            }
             let SemanticJournalPayload::UserMessage { text } = &fact.payload else {
                 continue;
             };
+            // A provider rewrites an attached image into a marker of its own
+            // at the head of the message it records ("[Image #1] ..."), so the
+            // canonical fact never equals the words that were typed and the
+            // optimistic bubble stayed on screen beside its own echo.
+            let canonical =
+                crate::ui::conversation::rows::strip_provider_image_markers(text).trim();
             if let Some(index) = self
                 .pending_user_messages
                 .iter()
-                .position(|pending| pending.text == *text)
+                .position(|pending| pending.text == *text || pending.text.trim() == canonical)
             {
                 self.pending_user_messages.remove(index);
                 continue;
@@ -1048,10 +1071,17 @@ impl<K: Clone + Ord + Eq> TaskSurfaceRegistry<K> {
         {
             existing.text = text.to_string();
         } else {
+            let admitted_after_sequence = state
+                .conversation
+                .facts()
+                .last()
+                .map(|fact| fact.sequence)
+                .unwrap_or(0);
             state.pending_user_messages.push(PendingUserMessage {
                 command_id,
                 event_id: EventId::new(),
                 text: text.to_string(),
+                admitted_after_sequence,
             });
         }
         state.latest_snippet = state.presentation_latest_snippet().map(ToOwned::to_owned);
@@ -2417,6 +2447,86 @@ mod tests {
         assert_eq!(registry.conversation_after_sequence(task), 2);
     }
 
+    /// The stuck chat, at its root. Retiring an optimistic row by matching the
+    /// provider's own record of it is guesswork; any rewrite we have not
+    /// anticipated leaves the row up, and an unretired row reads as a turn
+    /// still in flight -- so the task stays "Working" for ever and refuses
+    /// every later message. An answer is proof the message arrived.
+    #[test]
+    fn an_answer_retires_an_optimistic_row_the_provider_recorded_differently() {
+        let task = TaskId::new();
+        let mut registry = TaskSurfaceRegistry::default();
+        registry.admit_pending_user_message(task, "what colour is this", CommandId::new());
+        registry.begin_conversation(task, 1);
+
+        // Nothing recognisable came back: the provider called it something
+        // else entirely.
+        let mut page = user_page(1, "<<unrecognisable rewrite>>");
+        page.facts.push(assistant_fact(2, "Orange"));
+        page.through_sequence = 2;
+        registry
+            .admit_conversation(task, 1, &page)
+            .expect("admit the provider's own record and its answer");
+
+        assert!(
+            !registry.conversation_turn_pending(task),
+            "an answered turn is not in flight, so the task can go idle and take \
+             the next message"
+        );
+        assert!(registry.conversation_turn_completed(task));
+    }
+
+    /// The backstop must not fire early: a message still being worked on is
+    /// still in flight, and the previous turn's answer is not proof of this
+    /// one arriving.
+    #[test]
+    fn an_earlier_answer_does_not_retire_a_message_sent_after_it() {
+        let task = TaskId::new();
+        let mut registry = TaskSurfaceRegistry::default();
+        registry.begin_conversation(task, 1);
+        let mut first = user_page(1, "first question");
+        first.facts.push(assistant_fact(2, "first answer"));
+        first.through_sequence = 2;
+        registry
+            .admit_conversation(task, 1, &first)
+            .expect("admit the settled first turn");
+
+        registry.admit_pending_user_message(task, "second question", CommandId::new());
+        assert!(
+            registry.conversation_turn_pending(task),
+            "the new message is in flight even though the page ends in an answer"
+        );
+
+        // Nor does re-admitting that same settled turn on a later poll.
+        registry.begin_conversation(task, 2);
+        registry
+            .admit_conversation(task, 2, &first)
+            .expect("re-admit the same facts on a later poll");
+        assert!(registry.conversation_turn_pending(task));
+    }
+
+    /// The duplicate the user saw: a message with a picture attached appeared
+    /// twice, once as typed and once as the provider records it, because the
+    /// provider puts its own image marker in front of the words.
+    #[test]
+    fn a_message_the_provider_marked_with_an_image_retires_its_optimistic_row() {
+        let task = TaskId::new();
+        let mut registry = TaskSurfaceRegistry::default();
+        registry.admit_pending_user_message(task, "what colour is this", CommandId::new());
+        assert_eq!(registry.displayed_user_message_count(task), 1);
+
+        registry.begin_conversation(task, 1);
+        registry
+            .admit_conversation(task, 1, &user_page(1, "[Image #1] what colour is this"))
+            .expect("admit the provider's own record of the message");
+
+        assert_eq!(
+            registry.displayed_user_message_count(task),
+            1,
+            "one message sent is one message shown, whatever the provider called it"
+        );
+    }
+
     #[test]
     fn coalesced_provider_user_fact_retires_each_ordered_optimistic_message() {
         let task = TaskId::new();
@@ -2479,6 +2589,22 @@ mod tests {
             .expect("admit assistant response");
         assert!(!registry.conversation_turn_pending(task));
         assert!(registry.conversation_turn_completed(task));
+    }
+
+    fn assistant_fact(sequence: u64, text: &str) -> SemanticJournalFact {
+        SemanticJournalFact {
+            subagent_id: None,
+            id: EventId::new(),
+            sequence,
+            occurred_at_ms: None,
+            provider: "test".into(),
+            schema_version: 1,
+            kind: "assistant_text".into(),
+            visibility: "conversation".into(),
+            privacy_class: PrivacyClass::LocalOnly,
+            redacted: false,
+            payload: SemanticJournalPayload::AssistantText { text: text.into() },
+        }
     }
 
     fn user_page(sequence: u64, text: &str) -> SemanticJournalPage {

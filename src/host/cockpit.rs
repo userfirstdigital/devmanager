@@ -137,6 +137,8 @@ pub(crate) fn serve_task_cockpit_bounded(
     if matches!(
         dispatch.query,
         TaskCockpitQuery::ConfigCreateProject { .. }
+            | TaskCockpitQuery::ConfigUpdateProject { .. }
+            | TaskCockpitQuery::ConfigArchiveProject { .. }
             | TaskCockpitQuery::ConfigUpsertSsh { .. }
             | TaskCockpitQuery::ConfigArchiveSsh { .. }
             | TaskCockpitQuery::ConfigUpsertCommand { .. }
@@ -156,6 +158,11 @@ pub(crate) fn serve_task_cockpit_bounded(
         TaskCockpitQuery::OpenShellTerminal { .. }
             | TaskCockpitQuery::OpenSshTerminal { .. }
             | TaskCockpitQuery::OpenBrowserSession { .. }
+            | TaskCockpitQuery::HostSshOpen { .. }
+            | TaskCockpitQuery::HostTerminal { .. }
+            | TaskCockpitQuery::HostTerminalScroll { .. }
+            | TaskCockpitQuery::HostTerminalResize { .. }
+            | TaskCockpitQuery::HostTerminalClose { .. }
     ) {
         // Opening a shell resolves a launch and writes a durable resource.
         // Only the exclusive host executor holds the authority to do either,
@@ -220,6 +227,11 @@ pub(crate) fn serve_task_cockpit_bounded(
     }
 
     match dispatch.query {
+        // Naming runs a provider binary, which this pure projection layer
+        // cannot do; the native host connection answers it.
+        TaskCockpitQuery::SuggestTaskTitle { .. } => {
+            QueryOutcome::Err(QueryError::UnsupportedCapability)
+        }
         TaskCockpitQuery::ProviderInputState => {
             if !dispatch.capabilities.contains(Capability::ProviderInput) {
                 return QueryOutcome::Err(QueryError::UnsupportedCapability);
@@ -242,6 +254,8 @@ pub(crate) fn serve_task_cockpit_bounded(
         | TaskCockpitQuery::ConfigSnapshot
         | TaskCockpitQuery::AgentConnection
         | TaskCockpitQuery::ConfigCreateProject { .. }
+        | TaskCockpitQuery::ConfigUpdateProject { .. }
+        | TaskCockpitQuery::ConfigArchiveProject { .. }
         | TaskCockpitQuery::ConfigUpsertSsh { .. }
         | TaskCockpitQuery::ConfigArchiveSsh { .. }
         | TaskCockpitQuery::ConfigUpsertCommand { .. }
@@ -252,7 +266,12 @@ pub(crate) fn serve_task_cockpit_bounded(
         | TaskCockpitQuery::RemoteAccess(_)
         | TaskCockpitQuery::OpenShellTerminal { .. }
         | TaskCockpitQuery::OpenSshTerminal { .. }
-        | TaskCockpitQuery::OpenBrowserSession { .. } => {
+        | TaskCockpitQuery::OpenBrowserSession { .. }
+        | TaskCockpitQuery::HostSshOpen { .. }
+        | TaskCockpitQuery::HostTerminal { .. }
+        | TaskCockpitQuery::HostTerminalScroll { .. }
+        | TaskCockpitQuery::HostTerminalResize { .. }
+        | TaskCockpitQuery::HostTerminalClose { .. } => {
             unreachable!("config snapshot is handled before task-scoped lookup")
         }
         TaskCockpitQuery::BrowserNativeSession => {
@@ -449,6 +468,33 @@ pub(crate) fn serve_task_cockpit_bounded(
         TaskCockpitQuery::WorkspaceStatus => QueryOutcome::Ok(QueryResult::TaskCockpit(
             TaskCockpitResult::Workspace(workspace_projection(task_id, &snapshot.task.workspace)),
         )),
+        TaskCockpitQuery::ImageStagingRoot => {
+            // Resolved from the project, exactly as the browser surface does,
+            // so a task whose durable binding has not landed yet still knows
+            // where its own files belong.
+            let workspace_root = dispatch.workspace_projects.and_then(|projects| {
+                WorkspaceService::from_durable(
+                    snapshot.task.project_id,
+                    projects,
+                    &snapshot.task.workspace,
+                )
+                .ok()
+                .and_then(|service| {
+                    service
+                        .current()
+                        .map(|binding| binding.path().to_path_buf())
+                })
+            });
+            match workspace_root {
+                Some(workspace_root) => QueryOutcome::Ok(QueryResult::TaskCockpit(
+                    TaskCockpitResult::ImageStagingRoot(workspace_root),
+                )),
+                None => unavailable(
+                    TaskCockpitSurface::Workspace,
+                    TaskCockpitUnavailableReason::WorkspaceAuthorityUnavailable,
+                ),
+            }
+        }
         TaskCockpitQuery::GitRepositories => {
             serve_git_repositories(&dispatch, task_id, &snapshot.task)
         }
@@ -1105,18 +1151,68 @@ fn serve_plain_shell_terminal(
     {
         return refusal;
     }
+    match plain_shell_projection(
+        service,
+        dispatch.client_id,
+        dispatch.request_id,
+        task_id,
+        terminal,
+        max_response_bytes,
+    ) {
+        Ok(projection) => QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Terminal(
+            projection,
+        ))),
+        Err(outcome) => outcome,
+    }
+}
+
+/// A host-owned terminal's screen (SSH opened without a Task). The caller has
+/// already proved the terminal belongs to its host lane; there is no Task
+/// snapshot to fence on.
+pub(crate) fn host_terminal_projection(
+    service: &TerminalService,
+    client_id: ClientId,
+    request_id: RequestId,
+    owner: TaskId,
+    terminal: crate::terminal::service::TaskTerminalView,
+    max_response_bytes: u32,
+) -> QueryOutcome {
+    match plain_shell_projection(
+        service,
+        client_id,
+        request_id,
+        owner,
+        terminal,
+        max_response_bytes,
+    ) {
+        Ok(projection) => QueryOutcome::Ok(QueryResult::TaskCockpit(
+            TaskCockpitResult::HostTerminal(projection),
+        )),
+        Err(outcome) => outcome,
+    }
+}
+
+/// Grant the reader input, then compact one shell screen for the wire.
+fn plain_shell_projection(
+    service: &TerminalService,
+    client_id: ClientId,
+    request_id: RequestId,
+    task_id: TaskId,
+    terminal: crate::terminal::service::TaskTerminalView,
+    max_response_bytes: u32,
+) -> Result<TaskTerminalProjection, QueryOutcome> {
     if service
         .grant_client(
             terminal.terminal_id,
-            dispatch.client_id,
+            client_id,
             crate::terminal::protocol::ClientInputGrant::ReadWrite,
         )
         .is_err()
     {
-        return denied(
+        return Err(denied(
             TaskCockpitSurface::Terminal,
             TaskCockpitDeniedReason::StaleFence,
-        );
+        ));
     }
     let styled_cell_limit = if max_response_bytes <= 64 * 1024 {
         MAX_TERMINAL_CONNECT_STYLED_CELLS
@@ -1150,17 +1246,12 @@ fn serve_plain_shell_terminal(
         is_provider: false,
         runtime_state,
     };
-    let Some(projection) =
-        fit_terminal_projection_for_wire(projection, dispatch.request_id, max_response_bytes)
-    else {
-        return unavailable(
+    fit_terminal_projection_for_wire(projection, request_id, max_response_bytes).ok_or_else(|| {
+        unavailable(
             TaskCockpitSurface::Terminal,
             TaskCockpitUnavailableReason::TerminalUnavailable,
-        );
-    };
-    QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Terminal(
-        projection,
-    )))
+        )
+    })
 }
 
 /// The Task's terminal strip: the provider chip first, then the durable order.
@@ -1917,19 +2008,29 @@ pub(crate) fn config_sidebar_snapshot(config: &AppConfig) -> ConfigSidebarSnapsh
         .iter()
         .filter(|connection| !is_archived(&connection.archived))
         .take(MAX_SERVERS)
-        .map(|connection| ConfigSidebarSsh {
-            config_id: bounded_config_text(&connection.id, MAX_LABEL),
-            label: bounded_config_text(
-                if connection.label.trim().is_empty() {
-                    &connection.id
-                } else {
-                    &connection.label
-                },
-                MAX_LABEL,
-            ),
-            host: bounded_config_text(&connection.host, MAX_HOST),
-            port: connection.port,
-            username: bounded_config_text(&connection.username, MAX_LABEL),
+        .map(|connection| {
+            let (has_password, has_private_key) = connection
+                .auth
+                .as_ref()
+                .and_then(|auth| auth.credential_ref.as_ref())
+                .map(|reference| crate::ssh::vault::presence(reference))
+                .unwrap_or((false, false));
+            ConfigSidebarSsh {
+                config_id: bounded_config_text(&connection.id, MAX_LABEL),
+                label: bounded_config_text(
+                    if connection.label.trim().is_empty() {
+                        &connection.id
+                    } else {
+                        &connection.label
+                    },
+                    MAX_LABEL,
+                ),
+                host: bounded_config_text(&connection.host, MAX_HOST),
+                port: connection.port,
+                username: bounded_config_text(&connection.username, MAX_LABEL),
+                has_password,
+                has_private_key,
+            }
         })
         .collect();
     let settings = config.settings();

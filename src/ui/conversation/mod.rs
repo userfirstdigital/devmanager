@@ -4,3 +4,4 @@
 pub(crate) mod fixtures;
 pub mod render;
 pub mod rows;
+pub mod sent_image_store;

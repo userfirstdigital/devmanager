@@ -764,9 +764,16 @@ pub const fn cockpit_query_action_id(query: &TaskCockpitQuery) -> &'static str {
     match query {
         TaskCockpitQuery::DesktopRepositories
         | TaskCockpitQuery::DesktopRepositoryAction { .. }
+        // Where a task's files live is a workspace fact, under the authority
+        // that already answers workspace status.
+        | TaskCockpitQuery::ImageStagingRoot
         | TaskCockpitQuery::ConfigSnapshot => ACTION_WORKSPACE_STATUS,
         TaskCockpitQuery::AgentConnection => ACTION_HOST_STATUS,
-        TaskCockpitQuery::ConfigCreateProject { .. } => ACTION_CONFIG_CREATE_PROJECT,
+        // Editing and removing a project are the same host-local project
+        // configuration authority as adding one.
+        TaskCockpitQuery::ConfigCreateProject { .. }
+        | TaskCockpitQuery::ConfigUpdateProject { .. }
+        | TaskCockpitQuery::ConfigArchiveProject { .. } => ACTION_CONFIG_CREATE_PROJECT,
         TaskCockpitQuery::ConfigUpsertCommand { .. }
         | TaskCockpitQuery::ConfigUpsertSsh { .. }
         | TaskCockpitQuery::ConfigArchiveSsh { .. } => ACTION_CONFIG_UPSERT_COMMAND,
@@ -782,6 +789,9 @@ pub const fn cockpit_query_action_id(query: &TaskCockpitQuery) -> &'static str {
         TaskCockpitQuery::Conversation { .. }
         | TaskCockpitQuery::OpenConversationSubscription { .. }
         | TaskCockpitQuery::ReleaseConversationSubscription { .. }
+        // Naming a task reads its conversation and returns a few words; it
+        // grants nothing the conversation surface does not already grant.
+        | TaskCockpitQuery::SuggestTaskTitle { .. }
         | TaskCockpitQuery::ProviderInputState => ACTION_CONVERSATION_STATUS,
         // The legacy variants keep their historical id: they are the provider's
         // interactive terminal, and clients already gate that surface on it.
@@ -796,9 +806,13 @@ pub const fn cockpit_query_action_id(query: &TaskCockpitQuery) -> &'static str {
         | TaskCockpitQuery::TerminalResizeFor { .. }
         | TaskCockpitQuery::TerminalReadinessFor { .. }
         | TaskCockpitQuery::TaskTerminals => ACTION_TERMINAL_VIEW,
-        TaskCockpitQuery::OpenShellTerminal { .. } | TaskCockpitQuery::OpenSshTerminal { .. } => {
-            ACTION_TERMINAL_OPEN_SHELL
-        }
+        TaskCockpitQuery::OpenShellTerminal { .. }
+        | TaskCockpitQuery::OpenSshTerminal { .. }
+        | TaskCockpitQuery::HostSshOpen { .. }
+        | TaskCockpitQuery::HostTerminalClose { .. } => ACTION_TERMINAL_OPEN_SHELL,
+        TaskCockpitQuery::HostTerminal { .. }
+        | TaskCockpitQuery::HostTerminalScroll { .. }
+        | TaskCockpitQuery::HostTerminalResize { .. } => ACTION_TERMINAL_VIEW,
         TaskCockpitQuery::WorkspaceStatus => ACTION_WORKSPACE_STATUS,
         TaskCockpitQuery::GitRepositories => ACTION_GIT_REPOSITORIES,
         TaskCockpitQuery::GitStatus

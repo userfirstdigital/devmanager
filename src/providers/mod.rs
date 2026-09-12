@@ -20,6 +20,7 @@ pub mod registry;
 pub mod session;
 pub mod settings;
 pub mod startup;
+pub mod title;
 
 // Test-only provider identities are copied from the real test executable so
 // the production attestation invariant remains exercised on every platform.

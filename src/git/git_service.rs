@@ -34,6 +34,14 @@ pub struct GitStatusResult {
     pub is_detached: bool,
     pub is_merging: bool,
     pub is_rebasing: bool,
+    /// Entries left out because the full list was too large to send in one
+    /// bounded host reply. The host trims instead of failing the status.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub omitted_entries: u32,
+}
+
+fn is_zero_u32(value: &u32) -> bool {
+    *value == 0
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -45,6 +53,9 @@ pub struct GitLogEntry {
     pub author_name: String,
     pub date: String,
     pub refs: Vec<String>,
+    /// On no remote-tracking branch yet: a commit a push would send.
+    #[serde(default)]
+    pub unpushed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -129,7 +140,11 @@ pub fn git_available() -> bool {
 // ── Status ──────────────────────────────────────────────────────────────────
 
 pub(crate) fn status(repository: &GitRepository) -> Result<GitStatusResult, String> {
-    let status = repository.status().map_err(|error| error.to_string())?;
+    // The status list is display-only: it never consumes the per-file mutation
+    // fingerprint, and building one overflowed the output cap on busy repos.
+    let status = repository
+        .status_summary()
+        .map_err(|error| error.to_string())?;
     let (is_merging, is_rebasing) = repository
         .operation_state()
         .map_err(|error| error.to_string())?;
@@ -178,6 +193,7 @@ pub(crate) fn status(repository: &GitRepository) -> Result<GitStatusResult, Stri
         is_detached: status.is_detached,
         is_merging,
         is_rebasing,
+        omitted_entries: 0,
     })
 }
 
@@ -212,6 +228,21 @@ pub(crate) fn log(
     let skip_arg = format!("--skip={skip}");
 
     let output = run_git(repository, &["log", &format_arg, &limit_arg, &skip_arg])?;
+    // Commits a push would send: reachable from HEAD but from no remote-
+    // tracking branch. Bounded; a failure (an unborn branch) marks none.
+    let unpushed: std::collections::HashSet<String> = run_git(
+        repository,
+        &["rev-list", "--max-count=5000", "HEAD", "--not", "--remotes"],
+    )
+    .map(|output| {
+        output
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_string)
+            .collect()
+    })
+    .unwrap_or_default();
     let mut entries = Vec::new();
 
     for record in output.split(LOG_SEPARATOR) {
@@ -244,6 +275,7 @@ pub(crate) fn log(
             author_name: fields[4].to_string(),
             date: fields[5].to_string(),
             refs,
+            unpushed: unpushed.contains(fields[1]),
         });
     }
 
@@ -261,8 +293,11 @@ pub(crate) fn diff_file(
     repository
         .validate_service_path(&path)
         .map_err(|error| error.to_string())?;
+    // Only the entry kind is needed. The full status also builds the mutation
+    // fingerprint, which overflowed the output cap on busy repositories and
+    // refreshed the index mid-read.
     let is_untracked = repository
-        .status()
+        .status_summary()
         .map_err(|error| error.to_string())?
         .entry(file_path)
         .is_some_and(|entry| entry.kind == StatusKind::Untracked);
@@ -276,7 +311,19 @@ pub(crate) fn diff_file(
             file_path,
         ]
     } else {
-        vec!["diff", "--no-ext-diff", "--no-textconv", "--", file_path]
+        // Plumbing, not `git diff`: porcelain diff refreshes and rewrites a
+        // stale index even with GIT_OPTIONAL_LOCKS=0 (e.g. after a checkout
+        // moved between machines), which turns this read into a mutation the
+        // repository graph guard refuses. `diff-files` compares content
+        // without touching the index.
+        vec![
+            "diff-files",
+            "-p",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--",
+            file_path,
+        ]
     };
     let output = run_git(repository, &args)?;
 
@@ -613,7 +660,7 @@ pub(crate) fn commit(
 
 pub(crate) fn push(repository: &GitRepository) -> Result<String, String> {
     let plan = repository
-        .plan_push(None, None)
+        .plan_service_push(None, None)
         .map_err(|error| error.to_string())?;
     execute_push(repository, &plan)
 }
@@ -624,7 +671,7 @@ pub(crate) fn push_set_upstream(
 ) -> Result<String, String> {
     let branch = BranchName::new(branch.to_string()).map_err(|message| message)?;
     let plan = repository
-        .plan_push(Some("origin"), Some(branch.as_str()))
+        .plan_service_push(Some("origin"), Some(branch.as_str()))
         .map_err(|error| error.to_string())?;
     execute_push(repository, &plan)
 }
@@ -660,7 +707,9 @@ fn execute_push(
 }
 
 pub(crate) fn pull(repository: &GitRepository) -> Result<String, String> {
-    let (stdout, stderr, success) = run_authorized_remote(repository, &["pull"])?;
+    // A merge, like GitHub Desktop: the user's `pull.rebase` is not visible in
+    // the sandbox, and a bare pull refuses a diverged branch.
+    let (stdout, stderr, success) = run_authorized_remote(repository, &["pull", "--no-rebase"])?;
     if !success || stderr.contains("error:") || stderr.contains("fatal:") {
         Err(stderr.trim().to_string())
     } else {
@@ -712,8 +761,10 @@ fn run_authorized_remote(
     repository: &GitRepository,
     args: &[&str],
 ) -> Result<(String, String, bool), String> {
+    // Only the upstream's remote name is needed: the porcelain summary, not
+    // the content fingerprint that overflows on a large working tree.
     let remote = repository
-        .status()
+        .status_summary()
         .map_err(|error| error.to_string())?
         .upstream
         .as_deref()

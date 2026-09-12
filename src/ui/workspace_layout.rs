@@ -155,6 +155,9 @@ pub struct KeyedWorkspaceLayout<K = TaskId> {
     /// Board column collapsed to the 36 px rail.
     #[serde(default)]
     pub board_rail: bool,
+    /// Saved SSH list in the sidebar collapsed to its header.
+    #[serde(default)]
+    pub ssh_collapsed: bool,
 }
 
 /// Local raw-`TaskId` layout (existing public API).
@@ -232,6 +235,7 @@ impl<K> Default for KeyedWorkspaceLayout<K> {
             }),
             project_colours: BTreeMap::new(),
             board_rail: false,
+            ssh_collapsed: false,
         }
     }
 }
@@ -615,6 +619,7 @@ impl KeyedWorkspaceLayout<TaskId> {
             composer_launch_options: self.composer_launch_options,
             project_colours: self.project_colours,
             board_rail: self.board_rail,
+            ssh_collapsed: self.ssh_collapsed,
         })
     }
 }

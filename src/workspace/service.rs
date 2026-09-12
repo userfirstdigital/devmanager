@@ -501,16 +501,20 @@ mod fingerprint_tests {
 
     #[cfg(unix)]
     #[test]
-    fn group_or_world_writable_paths_are_rejected_by_the_acl_policy() {
+    fn shared_group_or_world_writable_paths_are_admitted() {
         use std::os::unix::fs::PermissionsExt;
 
         let temp = tempfile::tempdir().expect("permissions tempdir");
-        let path = temp.path().join("metadata");
+        let shared = temp.path().join("shared");
+        fs::create_dir(&shared).expect("shared folder");
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o777)).expect("shared mode");
+        let path = shared.join("metadata");
         fs::write(&path, "permission sentinel").expect("metadata");
         fs::set_permissions(&path, fs::Permissions::from_mode(0o666)).expect("permissive mode");
 
-        let error = PinnedPath::open(&path).expect_err("permissive path must fail closed");
-        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        PinnedPath::open(&path).expect("shared file under a shared folder is admissible");
+        super::validate_host_workspace_path(&shared, true)
+            .expect("shared folder is a valid project root");
     }
 
     #[cfg(unix)]
@@ -2581,7 +2585,6 @@ impl PinnedPath {
         })?;
         let is_dir = metadata.is_dir();
         let permissions = file_permissions(&metadata);
-        reject_unsafe_permissions(permissions)?;
         let security_fingerprint = security_fingerprint(&file)?;
         let link_count = hard_link_count(&file, &metadata);
         if !is_dir && link_count > 1 {
@@ -2981,7 +2984,6 @@ fn open_no_follow_chain(path: &Path) -> io::Result<OpenedPath> {
         )
     })?;
     let root_permissions = file_permissions(&root_metadata);
-    reject_unsafe_permissions(root_permissions)?;
     let root_security_fingerprint = security_fingerprint(&current)?;
     ancestors.push(PinnedAncestor {
         path: current_path.clone(),
@@ -3021,7 +3023,6 @@ fn open_no_follow_chain(path: &Path) -> io::Result<OpenedPath> {
             )
         })?;
         let permissions = file_permissions(&metadata);
-        reject_unsafe_permissions(permissions)?;
         let security_fingerprint = security_fingerprint(&opened)?;
         if final_component {
             return Ok(OpenedPath {
@@ -3065,7 +3066,6 @@ fn open_no_follow_chain(path: &Path) -> io::Result<OpenedPath> {
             ));
         }
         let permissions = file_permissions(&metadata);
-        reject_unsafe_permissions(permissions)?;
         let security_fingerprint = security_fingerprint(&file)?;
         let identity = stable_identity_from_file(&file).ok_or_else(|| {
             io::Error::new(
@@ -3096,9 +3096,7 @@ fn open_no_follow_chain(path: &Path) -> io::Result<OpenedPath> {
 #[cfg(not(any(unix, windows)))]
 fn open_no_follow_chain(path: &Path) -> io::Result<OpenedPath> {
     let file = open_read_handle(path)?;
-    let metadata = file.metadata()?;
-    let permissions = file_permissions(&metadata);
-    reject_unsafe_permissions(permissions)?;
+    file.metadata()?;
     let _security_fingerprint = security_fingerprint(&file)?;
     Ok(OpenedPath {
         file,
@@ -3106,6 +3104,10 @@ fn open_no_follow_chain(path: &Path) -> io::Result<OpenedPath> {
     })
 }
 
+// Permissions are recorded for change detection only, never as an admission
+// gate: shared folders (group/world writable, e.g. a collaborator's checkout
+// or a removable drive mounted 777) are valid workspaces. A later mode or
+// Windows DACL change still invalidates an existing pin.
 #[cfg(unix)]
 fn file_permissions(metadata: &fs::Metadata) -> u32 {
     use std::os::unix::fs::MetadataExt;
@@ -3115,23 +3117,6 @@ fn file_permissions(metadata: &fs::Metadata) -> u32 {
 #[cfg(not(unix))]
 fn file_permissions(metadata: &fs::Metadata) -> u32 {
     u32::from(metadata.permissions().readonly())
-}
-
-fn reject_unsafe_permissions(permissions: u32) -> io::Result<()> {
-    // Admission policy is platform-specific and deliberately explicit. Unix
-    // rejects group/world writes (the mode bits are the complete local ACL
-    // surface used here). Windows readonly metadata is not an ACL policy: the
-    // owner, group, and DACL are inspected and hashed by `security_fingerprint`
-    // and any inspection failure or later descriptor change fails closed.
-    #[cfg(unix)]
-    if permissions & 0o022 != 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "workspace path has group/world writable permissions",
-        ));
-    }
-    let _ = permissions;
-    Ok(())
 }
 
 #[cfg(windows)]

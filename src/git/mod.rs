@@ -45,6 +45,10 @@ pub struct RepoEntry {
     pub label: String,
     pub path: String,
     pub has_changes: bool,
+    /// Distinct changed paths in the last status read, and whether the host
+    /// had to leave some out of its reply, in which case the count is a floor.
+    pub change_count: usize,
+    pub changes_truncated: bool,
     pub behind: u32,
     pub ahead: u32,
     pub status_error: Option<String>,
@@ -52,11 +56,47 @@ pub struct RepoEntry {
 }
 
 impl RepoEntry {
+    fn new(label: String, path: String) -> Self {
+        Self {
+            label,
+            path,
+            has_changes: false,
+            change_count: 0,
+            changes_truncated: false,
+            behind: 0,
+            ahead: 0,
+            status_error: None,
+            status_known: false,
+        }
+    }
+
+    /// Whether the last status read found work waiting to be committed. An
+    /// unreadable status is not "no changes", but it is not changes either.
+    pub fn has_uncommitted(&self) -> bool {
+        self.status_known && self.status_error.is_none() && self.has_changes
+    }
+
+    /// "12 uncommitted", or "12+ uncommitted" when the list was cut short.
+    pub fn uncommitted_label(&self) -> String {
+        format!(
+            "{}{} uncommitted",
+            self.change_count,
+            if self.changes_truncated { "+" } else { "" }
+        )
+    }
+
     fn apply_status(&mut self, status: &Result<GitStatusResult, String>) {
         self.status_known = true;
         match status {
             Ok(status) => {
-                self.has_changes = !status.entries.is_empty();
+                self.change_count = status
+                    .entries
+                    .iter()
+                    .map(|entry| entry.path.as_str())
+                    .collect::<std::collections::HashSet<_>>()
+                    .len();
+                self.changes_truncated = status.omitted_entries > 0;
+                self.has_changes = self.change_count > 0 || self.changes_truncated;
                 self.ahead = status.ahead;
                 self.behind = status.behind;
                 self.status_error = None;
@@ -74,7 +114,7 @@ impl RepoEntry {
         }
         let mut parts = Vec::new();
         if self.has_changes {
-            parts.push("Changes".to_string());
+            parts.push(self.uncommitted_label());
         }
         if self.ahead > 0 {
             parts.push(format!("↑ {}", self.ahead));
@@ -149,7 +189,25 @@ pub struct GitWindow {
     pub login_state: Option<LoginState>,
     pub last_fetch_at: Option<Instant>,
     pub operation_result: Option<(bool, String)>,
+    /// The window's logical width from the last render. GPUI only paints a
+    /// real ellipsis into a definite pixel width, so the columns are sized
+    /// from this rather than from percentages.
+    pub viewport_width: f32,
+    /// When every repository's status was last read, so regaining focus
+    /// re-reads them at most every `FOCUS_SWEEP_INTERVAL`.
+    last_status_sweep: Option<Instant>,
+    activation_subscription: Option<gpui::Subscription>,
+    /// Changed files the user unticked. Everything else goes into the next
+    /// commit, like GitHub Desktop: the selection is the window's own, and
+    /// the index is brought in line with it only when committing.
+    pub excluded_paths: std::collections::HashSet<String>,
+    /// The repository list itself is being re-read, so indexes into it are
+    /// about to change and a switch must wait.
+    loading_repositories: bool,
 }
+
+/// The least time between two focus-driven sweeps of every repository.
+const FOCUS_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
 
 #[derive(Clone)]
 enum GitBackend {
@@ -251,6 +309,15 @@ impl GitWindow {
                 );
         }
         view.commit_inputs = Some((summary, description));
+        // Like GitHub Desktop: coming back to the window re-reads the
+        // repositories, so the uncommitted-changes lights follow edits made
+        // in an editor while the window was in the background.
+        view.activation_subscription =
+            Some(cx.observe_window_activation(window, |this, window, cx| {
+                if window.is_window_active() {
+                    this.refresh_statuses_after_focus(cx);
+                }
+            }));
         view
     }
 
@@ -262,15 +329,7 @@ impl GitWindow {
         let focus = cx.focus_handle();
         let repos: Vec<RepoEntry> = repos
             .into_iter()
-            .map(|(label, path)| RepoEntry {
-                label,
-                path,
-                has_changes: false,
-                behind: 0,
-                ahead: 0,
-                status_error: None,
-                status_known: false,
-            })
+            .map(|(label, path)| RepoEntry::new(label, path))
             .collect();
         let mut win = Self {
             backend,
@@ -316,6 +375,11 @@ impl GitWindow {
             login_state: None,
             last_fetch_at: None,
             operation_result: None,
+            viewport_width: 1100.0,
+            last_status_sweep: None,
+            activation_subscription: None,
+            excluded_paths: std::collections::HashSet::new(),
+            loading_repositories: false,
         };
         if matches!(win.backend, GitBackend::Local(_)) {
             win.load_persisted_token();
@@ -464,13 +528,17 @@ impl GitWindow {
         if index >= self.repos.len() || index == self.active_repo {
             return;
         }
-        if self.is_mutating || self.is_loading {
+        // A status still loading does not block switching: the epoch bump
+        // below drops its late result. Only an operation in flight, or the
+        // repository list itself reloading, holds the selection still.
+        if self.is_mutating || self.loading_repositories {
             return;
         }
         self.repo_epoch += 1;
         self.is_generating_message = false;
         self.active_repo = index;
         self.show_repo_dropdown = false;
+        self.excluded_paths.clear();
         self.status = None;
         self.selected_file = None;
         self.file_diff = None;
@@ -501,6 +569,7 @@ impl GitWindow {
         let previous = self.repo_path().to_string();
         self.is_generating_message = false;
         self.is_loading = true;
+        self.loading_repositories = true;
         self.repo_epoch += 1;
         self.repo_scan_epoch += 1;
         let epoch = self.repo_epoch;
@@ -513,20 +582,13 @@ impl GitWindow {
                 if this.repo_epoch != epoch {
                     return;
                 }
+                this.loading_repositories = false;
                 match result {
                     Ok((client, repos)) => {
                         this.backend = GitBackend::Native(client);
                         this.repos = repos
                             .into_iter()
-                            .map(|(label, path)| RepoEntry {
-                                label,
-                                path,
-                                has_changes: false,
-                                behind: 0,
-                                ahead: 0,
-                                status_error: None,
-                                status_known: false,
-                            })
+                            .map(|(label, path)| RepoEntry::new(label, path))
                             .collect();
                         this.active_repo = this
                             .repos
@@ -536,6 +598,7 @@ impl GitWindow {
                         this.status = None;
                         this.file_diff = None;
                         if this.repo_path() != previous {
+                            this.excluded_paths.clear();
                             this.commit_summary.clear();
                             this.commit_description.clear();
                             this.draft_epoch += 1;
@@ -616,7 +679,34 @@ impl GitWindow {
         });
     }
 
+    /// Re-read every repository and the open one after the window regains
+    /// focus, unless work is in flight or the last sweep was moments ago.
+    fn refresh_statuses_after_focus(&mut self, cx: &mut Context<Self>) {
+        if self.is_loading || self.is_mutating || self.is_committing || self.repos.is_empty() {
+            return;
+        }
+        if self
+            .last_status_sweep
+            .is_some_and(|at| at.elapsed() < FOCUS_SWEEP_INTERVAL)
+        {
+            return;
+        }
+        self.refresh_all_repo_statuses(cx);
+        self.refresh_status(cx);
+    }
+
+    /// Drop the loaded history so its pushed/unpushed marks are re-read: now
+    /// if the History tab is showing, otherwise when it is next opened.
+    fn reset_history(&mut self, cx: &mut Context<Self>) {
+        self.log_page = 0;
+        self.log_entries.clear();
+        if self.active_view == GitView::History {
+            self.load_history(cx);
+        }
+    }
+
     pub fn refresh_all_repo_statuses(&mut self, cx: &mut Context<Self>) {
+        self.last_status_sweep = Some(Instant::now());
         self.repo_scan_epoch += 1;
         let scan_epoch = self.repo_scan_epoch;
         let paths: Vec<(usize, String)> = self
@@ -763,6 +853,11 @@ impl GitWindow {
                 }
                 match status {
                     Ok(s) => {
+                        // Forget unticks for files that are no longer changed.
+                        let present: std::collections::HashSet<&str> =
+                            s.entries.iter().map(|entry| entry.path.as_str()).collect();
+                        this.excluded_paths
+                            .retain(|path| present.contains(path.as_str()));
                         this.status = Some(s);
                         let selected = this
                             .selected_file
@@ -1503,6 +1598,7 @@ impl GitWindow {
         let remote_client = self.remote_client();
         let local_repository = self.local_repository();
         let token = self.github_token.clone().unwrap_or_default();
+        let (to_stage, to_unstage) = self.index_changes_for_selection();
         self.is_generating_message = true;
         cx.notify();
 
@@ -1510,7 +1606,13 @@ impl GitWindow {
             let result =
                 cx.background_executor()
                     .spawn(async move {
+                        // The summary is of what will be committed: the ticks.
                         if let Some(client) = remote_client {
+                            if let Err(error) =
+                                apply_selection_remote(&client, &repo, &to_stage, &to_unstage)
+                            {
+                                return Err(error);
+                            }
                             match client
                                 .request(RemoteAction::GitGenerateCommitMessage { repo_path: repo })
                             {
@@ -1530,6 +1632,7 @@ impl GitWindow {
                             let repository = local_repository.as_ref().ok_or_else(|| {
                                 "Local Git repository is unavailable.".to_string()
                             })?;
+                            apply_selection_local(repository, &to_stage, &to_unstage)?;
                             let diff = git_service::get_staged_diff(repository)?;
                             if diff.trim().is_empty() {
                                 return Err("No staged changes to summarize".to_string());
@@ -1549,6 +1652,8 @@ impl GitWindow {
                         this.draft_epoch += 1;
                         this.commit_summary = msg.title;
                         this.commit_description = msg.description;
+                        // Staging the ticks changed the index.
+                        this.refresh_status(cx);
                     }
                     Err(e) => {
                         this.operation_result = Some((false, format!("AI: {}", e)));
@@ -1562,7 +1667,7 @@ impl GitWindow {
     // ── Commit ──────────────────────────────────────────────────────────
 
     pub fn commit_action(&mut self, cx: &mut Context<Self>) {
-        if self.is_committing || self.is_generating_message || self.staged_count() == 0 {
+        if self.is_committing || self.is_generating_message || self.included_count() == 0 {
             return;
         }
         let draft_epoch = self.draft_epoch;
@@ -1584,6 +1689,7 @@ impl GitWindow {
         };
         let remote_client = self.remote_client();
         let local_repository = self.local_repository();
+        let (to_stage, to_unstage) = self.index_changes_for_selection();
 
         self.is_committing = true;
         cx.notify();
@@ -1593,7 +1699,14 @@ impl GitWindow {
             let result = cx
                 .background_executor()
                 .spawn(async move {
+                    // The index is brought in line with the ticked files
+                    // first, so exactly those are committed.
                     if let Some(client) = remote_client {
+                        if let Err(error) =
+                            apply_selection_remote(&client, &repo, &to_stage, &to_unstage)
+                        {
+                            return Err(error);
+                        }
                         match client.request(RemoteAction::GitCommit {
                             repo_path: repo,
                             summary,
@@ -1613,6 +1726,7 @@ impl GitWindow {
                             .as_ref()
                             .ok_or_else(|| "Local Git repository is unavailable.".to_string())
                             .and_then(|repository| {
+                                apply_selection_local(repository, &to_stage, &to_unstage)?;
                                 git_service::commit(repository, &summary, body.as_deref())
                             })
                     }
@@ -1627,6 +1741,7 @@ impl GitWindow {
                 match result {
                     Ok(hash) => {
                         this.operation_result = Some((true, format!("Committed {}", hash)));
+                        this.reset_history(cx);
                         if this.draft_epoch == draft_epoch {
                             this.commit_summary.clear();
                             this.commit_description.clear();
@@ -1674,8 +1789,11 @@ impl GitWindow {
                 .background_executor()
                 .spawn(async move {
                     if let Some(client) = remote_client {
+                        // A plain push, like GitHub Desktop: when the remote has
+                        // moved on it says so and the toolbar offers Pull,
+                        // instead of rebasing over uncommitted work unasked.
                         let action = if has_upstream {
-                            RemoteAction::GitSync { repo_path: repo }
+                            RemoteAction::GitPush { repo_path: repo }
                         } else {
                             RemoteAction::GitPushSetUpstream {
                                 repo_path: repo,
@@ -1694,7 +1812,7 @@ impl GitWindow {
                             .as_ref()
                             .ok_or_else(|| "Local Git repository is unavailable.".to_string())?;
                         if has_upstream {
-                            git_service::sync(repository)
+                            git_service::push(repository)
                         } else {
                             git_service::push_set_upstream(repository, &branch)
                         }
@@ -1714,10 +1832,11 @@ impl GitWindow {
                             if msg.is_empty() {
                                 "Pushed successfully".into()
                             } else {
-                                msg
+                                summarize_remote_output(RemoteOperation::Push, &msg)
                             },
                         ));
                         this.refresh_status(cx);
+                        this.reset_history(cx);
                     }
                     Err(e) => this.operation_result = Some((false, e)),
                 }
@@ -1772,10 +1891,11 @@ impl GitWindow {
                             if msg.is_empty() {
                                 "Pulled successfully".into()
                             } else {
-                                msg
+                                summarize_remote_output(RemoteOperation::Pull, &msg)
                             },
                         ));
                         this.refresh_status(cx);
+                        this.reset_history(cx);
                     }
                     Err(e) => this.operation_result = Some((false, e)),
                 }
@@ -1824,8 +1944,10 @@ impl GitWindow {
                 }
                 this.is_fetching = false;
                 match result {
-                    Ok(_) => {
+                    Ok(msg) => {
                         this.last_fetch_at = Some(Instant::now());
+                        this.operation_result =
+                            Some((true, summarize_remote_output(RemoteOperation::Fetch, &msg)));
                         this.refresh_status(cx);
                     }
                     Err(e) => this.operation_result = Some((false, e)),
@@ -2032,7 +2154,7 @@ impl GitWindow {
     fn handle_key_down(
         &mut self,
         event: &KeyDownEvent,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let keystroke = &event.keystroke;
@@ -2048,11 +2170,20 @@ impl GitWindow {
                 cx.notify();
                 return;
             }
+            if self.show_repo_dropdown {
+                self.show_repo_dropdown = false;
+                cx.notify();
+                return;
+            }
             if self.active_field.is_some() {
                 self.active_field = None;
                 cx.notify();
                 return;
             }
+            // Nothing transient is open: Escape closes the window, which may
+            // have no system title bar to close it with.
+            window.remove_window();
+            return;
         }
 
         if keystroke.modifiers.control && keystroke.key == "tab" {
@@ -2189,6 +2320,69 @@ impl GitWindow {
         }
     }
 
+    /// Distinct changed paths in the current status, in listed order.
+    fn changed_paths(&self) -> Vec<&str> {
+        let mut seen = std::collections::HashSet::new();
+        self.status
+            .iter()
+            .flat_map(|status| status.entries.iter())
+            .map(|entry| entry.path.as_str())
+            .filter(|path| seen.insert(*path))
+            .collect()
+    }
+
+    pub fn is_included(&self, path: &str) -> bool {
+        !self.excluded_paths.contains(path)
+    }
+
+    /// Ticked files: the ones the next commit will contain.
+    pub fn included_count(&self) -> usize {
+        self.changed_paths()
+            .into_iter()
+            .filter(|path| self.is_included(path))
+            .count()
+    }
+
+    pub fn toggle_included(&mut self, path: &str, cx: &mut Context<Self>) {
+        if !self.excluded_paths.remove(path) {
+            self.excluded_paths.insert(path.to_string());
+        }
+        cx.notify();
+    }
+
+    /// Tick or untick every file in `paths` (the list as filtered).
+    pub fn set_included_for(&mut self, paths: Vec<String>, included: bool, cx: &mut Context<Self>) {
+        for path in paths {
+            if included {
+                self.excluded_paths.remove(&path);
+            } else {
+                self.excluded_paths.insert(path);
+            }
+        }
+        cx.notify();
+    }
+
+    /// What the index must change to match the ticks: files to stage and
+    /// files to take back out of it.
+    fn index_changes_for_selection(&self) -> (Vec<String>, Vec<String>) {
+        let mut stage = Vec::new();
+        let mut unstage = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for entry in self.status.iter().flat_map(|status| status.entries.iter()) {
+            let included = self.is_included(&entry.path);
+            if included && !entry.staged && seen.insert((entry.path.clone(), true)) {
+                stage.push(entry.path.clone());
+            } else if !included && entry.staged && seen.insert((entry.path.clone(), false)) {
+                unstage.push(entry.path.clone());
+                // A staged rename leaves the index with its old path too.
+                if let Some(original) = &entry.original_path {
+                    unstage.push(original.clone());
+                }
+            }
+        }
+        (stage, unstage)
+    }
+
     pub fn staged_count(&self) -> usize {
         self.status
             .as_ref()
@@ -2211,13 +2405,14 @@ impl Render for GitWindow {
         }
         let show_branch_dd = self.show_branch_dropdown;
         let show_repo_dd = self.show_repo_dropdown;
+        self.viewport_width = window.viewport_size().width.into();
         div()
             .size_full()
             .flex()
             .flex_col()
             .bg(self.tokens.surfaces.canvas.to_gpui())
             .text_color(self.tokens.text.primary.to_gpui())
-            .text_size(px(13.0))
+            .text_size(px(crate::ui::task_cockpit::panel::ROW_FONT_SIZE))
             .track_focus(&self.focus)
             .on_key_down(cx.listener(Self::handle_key_down))
             .child(git_ui::render_git_window(self, cx))
@@ -2271,5 +2466,272 @@ impl Render for GitWindow {
                 )
                 .with_priority(1)
             }))
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RemoteOperation {
+    Push,
+    Pull,
+    Fetch,
+}
+
+/// Git narrates a push, pull or fetch at length, remote chatter included
+/// ("remote: GitHub found 198 vulnerabilities..."). The banner gets the one
+/// line that says what happened.
+fn summarize_remote_output(operation: RemoteOperation, output: &str) -> String {
+    let lines: Vec<&str> = output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with("remote:"))
+        .collect();
+    let ref_updates: Vec<&str> = lines
+        .iter()
+        .copied()
+        .filter(|line| line.contains(" -> "))
+        .collect();
+    let changed = lines
+        .iter()
+        .copied()
+        .find(|line| line.contains(" changed"))
+        .map(|line| format!(" · {line}"))
+        .unwrap_or_default();
+    match operation {
+        RemoteOperation::Push => match ref_updates.first() {
+            Some(line) => {
+                let tokens: Vec<&str> = line.split_whitespace().collect();
+                let branch = tokens.last().copied().unwrap_or("branch");
+                if line.contains("[new branch]") {
+                    format!("Published {branch}")
+                } else if let Some(range) = tokens.first().filter(|token| token.contains("..")) {
+                    format!("Pushed {branch} ({range})")
+                } else {
+                    format!("Pushed {branch}")
+                }
+            }
+            None if lines
+                .iter()
+                .any(|line| line.contains("Everything up-to-date")) =>
+            {
+                "Nothing to push: the remote already has these commits.".to_string()
+            }
+            None => "Pushed successfully".to_string(),
+        },
+        RemoteOperation::Pull => {
+            if lines
+                .iter()
+                .any(|line| line.starts_with("Already up to date"))
+            {
+                "Already up to date.".to_string()
+            } else if lines.iter().any(|line| line.starts_with("Merge made by")) {
+                format!("Pulled and merged{changed}")
+            } else if lines.iter().any(|line| line.starts_with("Fast-forward")) {
+                format!("Pulled{changed}")
+            } else {
+                "Pulled successfully".to_string()
+            }
+        }
+        RemoteOperation::Fetch => match ref_updates.len() {
+            0 => "Fetched: already up to date.".to_string(),
+            1 => "Fetched 1 updated branch".to_string(),
+            count => format!("Fetched {count} updated branches"),
+        },
+    }
+}
+
+/// One stage/unstage request's bounds, inside the host's per-request limits
+/// (`HARD_MAX_STAGE_FILES` 256 files, 256 KiB of path bytes) with headroom
+/// for the argument overhead.
+const SELECTION_BATCH_FILES: usize = 256;
+const SELECTION_BATCH_BYTES: usize = 192 * 1024;
+
+/// Split `files` into requests that each fit both bounds.
+fn selection_batches(files: &[String]) -> Vec<&[String]> {
+    let mut batches = Vec::new();
+    let mut start = 0;
+    let mut bytes = 0;
+    for (index, file) in files.iter().enumerate() {
+        if index > start
+            && (index - start == SELECTION_BATCH_FILES
+                || bytes + file.len() > SELECTION_BATCH_BYTES)
+        {
+            batches.push(&files[start..index]);
+            start = index;
+            bytes = 0;
+        }
+        bytes += file.len();
+    }
+    if start < files.len() {
+        batches.push(&files[start..]);
+    }
+    batches
+}
+
+/// Bring the host repository's index in line with the ticked files: take
+/// unticked ones out, then stage every ticked one, in bounded batches.
+fn apply_selection_remote(
+    client: &GitCommandClient,
+    repo: &str,
+    stage: &[String],
+    unstage: &[String],
+) -> Result<(), String> {
+    for (files, add) in [(unstage, false), (stage, true)] {
+        for batch in selection_batches(files) {
+            let action = if add {
+                RemoteAction::GitStage {
+                    repo_path: repo.to_string(),
+                    files: batch.to_vec(),
+                }
+            } else {
+                RemoteAction::GitUnstage {
+                    repo_path: repo.to_string(),
+                    files: batch.to_vec(),
+                }
+            };
+            match client.request(action) {
+                Ok(result) if result.ok => {}
+                Ok(result) => {
+                    return Err(result.message.unwrap_or_else(|| {
+                        "Could not prepare the ticked files for this commit.".to_string()
+                    }))
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+    Ok(())
+}
+
+fn apply_selection_local(
+    repository: &GitRepository,
+    stage: &[String],
+    unstage: &[String],
+) -> Result<(), String> {
+    for batch in selection_batches(unstage) {
+        let paths: Vec<&str> = batch.iter().map(String::as_str).collect();
+        git_service::unstage(repository, &paths)?;
+    }
+    for batch in selection_batches(stage) {
+        let paths: Vec<&str> = batch.iter().map(String::as_str).collect();
+        git_service::stage(repository, &paths)?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod repo_entry_tests {
+    use super::git_service::{GitFileStatus, GitStatusEntry, GitStatusResult};
+    use super::RepoEntry;
+
+    fn status(paths: &[(&str, bool)], omitted: u32, ahead: u32) -> GitStatusResult {
+        GitStatusResult {
+            branch: Some("main".into()),
+            upstream: Some("origin/main".into()),
+            ahead,
+            behind: 0,
+            entries: paths
+                .iter()
+                .map(|(path, staged)| GitStatusEntry {
+                    path: (*path).into(),
+                    status: GitFileStatus::Modified,
+                    staged: *staged,
+                    original_path: None,
+                })
+                .collect(),
+            is_detached: false,
+            is_merging: false,
+            is_rebasing: false,
+            omitted_entries: omitted,
+        }
+    }
+
+    #[test]
+    fn remote_operations_are_summarized_in_one_line() {
+        use super::{summarize_remote_output, RemoteOperation};
+        let push = "remote:\nremote: GitHub found 198 vulnerabilities on the default branch.\nremote:\nTo https://github.com/Org/Repo.git\n   5501a2bc9..762b8e458  master -> master\n";
+        assert_eq!(
+            summarize_remote_output(RemoteOperation::Push, push),
+            "Pushed master (5501a2bc9..762b8e458)"
+        );
+        let publish = "To https://github.com/Org/Repo.git\n * [new branch]      feature -> feature\nbranch 'feature' set up to track 'origin/feature'.";
+        assert_eq!(
+            summarize_remote_output(RemoteOperation::Push, publish),
+            "Published feature"
+        );
+        let merged = "From https://github.com/Org/Repo\n   c55641d..9f1e2aa  master     -> origin/master\nMerge made by the 'ort' strategy.\n src/a.ts | 2 +-\n 1 file changed, 1 insertion(+), 1 deletion(-)";
+        assert_eq!(
+            summarize_remote_output(RemoteOperation::Pull, merged),
+            "Pulled and merged · 1 file changed, 1 insertion(+), 1 deletion(-)"
+        );
+        assert_eq!(
+            summarize_remote_output(RemoteOperation::Pull, "Already up to date."),
+            "Already up to date."
+        );
+        let fetched = "From https://github.com/Org/Repo\n   c55641d..9f1e2aa  master     -> origin/master\n * [new branch]      next -> origin/next";
+        assert_eq!(
+            summarize_remote_output(RemoteOperation::Fetch, fetched),
+            "Fetched 2 updated branches"
+        );
+        assert_eq!(
+            summarize_remote_output(RemoteOperation::Fetch, ""),
+            "Fetched: already up to date."
+        );
+    }
+
+    #[test]
+    fn ticked_files_are_staged_in_requests_the_host_accepts() {
+        use super::{selection_batches, SELECTION_BATCH_BYTES, SELECTION_BATCH_FILES};
+        let short: Vec<String> = (0..600)
+            .map(|index| format!("src/file-{index}.rs"))
+            .collect();
+        let sizes: Vec<usize> = selection_batches(&short)
+            .iter()
+            .map(|batch| batch.len())
+            .collect();
+        assert_eq!(sizes, vec![256, 256, 88]);
+
+        // Long paths split on bytes before they reach the file count.
+        let long: Vec<String> = (0..300)
+            .map(|index| format!("{}/{index}", "d".repeat(2000)))
+            .collect();
+        let batches = selection_batches(&long);
+        assert!(batches.len() > 2);
+        for batch in &batches {
+            assert!(batch.len() <= SELECTION_BATCH_FILES);
+            assert!(batch.iter().map(String::len).sum::<usize>() <= SELECTION_BATCH_BYTES);
+        }
+        assert_eq!(batches.iter().map(|batch| batch.len()).sum::<usize>(), 300);
+        assert!(selection_batches(&[]).is_empty());
+    }
+
+    #[test]
+    fn uncommitted_light_counts_distinct_files_and_marks_a_cut_list() {
+        let mut repo = RepoEntry::new("DevManager".into(), "/repo".into());
+        assert!(!repo.has_uncommitted(), "an unread repository is not lit");
+        assert_eq!(repo.status_label(), "Checking…");
+
+        // A file both staged and unstaged is listed twice but is one file.
+        repo.apply_status(&Ok(status(
+            &[("a.rs", true), ("a.rs", false), ("b.rs", false)],
+            0,
+            3,
+        )));
+        assert!(repo.has_uncommitted());
+        assert_eq!(repo.status_label(), "2 uncommitted · ↑ 3");
+
+        repo.apply_status(&Ok(status(&[("a.rs", false)], 40, 0)));
+        assert_eq!(repo.status_label(), "1+ uncommitted");
+
+        repo.apply_status(&Ok(status(&[], 0, 0)));
+        assert!(!repo.has_uncommitted());
+        assert_eq!(repo.status_label(), "Up to date locally");
+
+        repo.apply_status(&Ok(status(&[("a.rs", false)], 0, 0)));
+        repo.apply_status(&Err("kernel store unavailable".into()));
+        assert!(
+            !repo.has_uncommitted(),
+            "an unreadable status does not claim changes"
+        );
+        assert_eq!(repo.status_label(), "Could not read status");
     }
 }

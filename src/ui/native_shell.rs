@@ -199,6 +199,7 @@ use crate::ui::browser_dock_lifecycle::{
     BrowserDockSurfaceState,
 };
 use crate::ui::browser_gateway_identity::registered_process_session_id;
+use crate::ui::conversation::sent_image_store::SentImageStore;
 use crate::ui::header_actions::{HeaderCommitPhase, HeaderCommitWorkflow, HeaderOpenTarget};
 use crate::ui::native_composer::{
     apply_suggestion, detect_trigger, filter_suggestions, ComposerCursor, PromptDocument,
@@ -356,15 +357,14 @@ fn task_row_right_click_should_rename() -> bool {
 /// naming the "+Claude" / "+Codex" buttons the board deleted, and nothing
 /// could go red over it -- a screen reader heard the right advice while the
 /// screen showed instructions for controls that are gone.
-const INBOX_EMPTY_STATE_HINT: &str =
-    "Add or choose a project, then start one from the board's + New menu.";
+const INBOX_EMPTY_STATE_HINT: &str = "Add or choose a project, then start one with + New.";
 
 /// What a failed agent start tells the reader to do next. One constant for the
 /// same reason as [`INBOX_EMPTY_STATE_HINT`]: six call sites across the shell
 /// and the cockpit had each spelled out the deleted "+Claude" / "+Codex"
 /// buttons, and copy repeated six times is copy that goes stale six times.
 pub(crate) const AGENT_NOT_STARTED_HINT: &str =
-    "The agent didn't start. Check Settings, then start it again from the board's + New menu.";
+    "The agent didn't start. Check Settings, then start it again with + New.";
 
 /// Task-rail row capture must shield right/middle from the terminal behind the
 /// list, but must not consume left so the archived Delete child can receive the
@@ -481,6 +481,33 @@ const CONVERSATION_EMPTY_COPY: &str =
     "This conversation is open and ready. Send a message to begin.";
 const COMPOSER_DRAFT_PERSIST_INTERVAL: Duration = Duration::from_millis(250);
 const AUTOMATIC_TASK_TITLE_DELAY: Duration = Duration::from_secs(2);
+
+/// How many stand-in task names are remembered while their model-written
+/// replacements are still in flight.
+const MAX_APPLIED_AUTOMATIC_TITLES: usize = 64;
+
+/// How many of a task's picture-carrying messages are remembered. Older ones
+/// have scrolled far out of sight, and the record exists only to paint them.
+const MAX_SENT_MESSAGE_IMAGES: usize = 32;
+
+/// How long before asking the host again where a task's files live. The answer
+/// is unavailable until the workspace is bound, and a first message carrying an
+/// image waits for it.
+const IMAGE_STAGING_ROOT_RETRY: Duration = Duration::from_secs(2);
+
+/// How long the desktop's file chooser gets to show itself. Past this the
+/// request is treated as unanswered: some desktops accept the portal call and
+/// never render a window, and a button that waits forever reads as broken.
+const FILE_PICKER_ANSWER_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// What the file chooser came back with.
+enum PickedPaths {
+    Paths(Vec<PathBuf>),
+    /// The person closed the chooser.
+    Cancelled,
+    /// No chooser at all, or it failed. The caller offers another way in.
+    Unavailable,
+}
 const LAYOUT_PERSIST_INTERVAL: Duration = Duration::from_millis(250);
 /// ~512ms blink at the 16ms controller pump.
 const COMPOSER_CARET_BLINK_TICKS: usize = 32;
@@ -1049,6 +1076,25 @@ fn composer_waits_for_provider_identity(
     provider_session_present: bool,
 ) -> bool {
     !unstarted_draft && !provider_session_present && provider_kind != ProviderKind::Codex
+}
+
+/// May a model's suggestion replace the name a task currently has?
+///
+/// Only a name this app invented: the provider placeholder, or the shortened
+/// first message the heuristic left behind. A name the person typed outranks
+/// any suggestion, and silence is the right response to one.
+fn suggested_title_is_replaceable(current_title: &str, our_last_title: Option<&str>) -> bool {
+    let current = current_title.trim();
+    if current.is_empty() {
+        return true;
+    }
+    if matches!(
+        current,
+        "New task" | "New Claude task" | "New Codex task" | "New Cursor task"
+    ) {
+        return true;
+    }
+    our_last_title.is_some_and(|ours| ours.trim() == current)
 }
 
 fn automatic_task_title(current_title: &str, first_prompt: &str) -> Option<String> {
@@ -3620,6 +3666,14 @@ struct PendingDraftFirstSend {
     readiness_request_id: Option<RequestId>,
     readiness_requested_at: Option<Instant>,
     ready_without_conversation_id: bool,
+    /// The optimistic transcript row this send already painted, and proof that
+    /// the field was cleared at the gesture. Set means the captured text -- not
+    /// whatever the field holds when the provider finally answers -- is what
+    /// gets sent, and that a failure owes the person their draft back.
+    echo_command_id: Option<CommandId>,
+    /// Which draft the consumed text came out of, so a failure puts it back in
+    /// that task's own draft even when focus has since moved elsewhere.
+    echo_draft_key: Option<KeyedComposerDraftKey<HostTaskKey>>,
 }
 
 /// Last painted composer layout reused for caret, selection, and pointer hit-testing.
@@ -4131,6 +4185,22 @@ struct AddProjectDraft {
     pending: Option<NativeActionRecord>,
     name: TextField,
     path: String,
+    error: Option<String>,
+    submitting: bool,
+    /// The configured project this dialog edits; `None` adds a new one.
+    /// While editing, an empty `path` keeps the project's current folder.
+    editing: Option<String>,
+}
+
+/// Confirmation for taking a project out of DevManager. It never touches the
+/// folder: the host archives the project in ConfigStore.
+struct RemoveProjectDraft {
+    config_id: String,
+    label: String,
+    /// Tasks of this project still on the board when the dialog opened;
+    /// removal waits until they are archived.
+    open_tasks: usize,
+    pending: Option<NativeActionRecord>,
     error: Option<String>,
     submitting: bool,
 }
@@ -4876,10 +4946,6 @@ enum ProjectInboxItem {
 /// beyond the one that applies them.
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum BoardMenuAction {
-    NewTaskIn(HostProjectKey),
-    /// Start a local task straight onto a provider -- what the project rail's
-    /// "+Claude" / "+Codex" buttons did, moved into the one board menu.
-    StartAgentIn(ProjectId, ProviderKind),
     ToggleArchived,
     ToggleRail,
     ToggleDensity,
@@ -4954,12 +5020,10 @@ fn board_body_kind(archived: bool, has_rows: bool) -> BoardBody {
     }
 }
 
-/// Which board menu is open. One field holds both, so opening either closes
-/// the other by construction rather than by remembering to.
+/// Which board menu is open. `+ New` opens the Create task dialog directly,
+/// so the header's `⋯` is the only board menu.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BoardMenu {
-    /// The header's `+ New`: every project a task can be started in.
-    NewTask,
     /// The header's `⋯`: archived view, rail, density.
     Options,
 }
@@ -8880,6 +8944,10 @@ async fn execute_native_command(
         } => {
             let _ = request_id;
             let action_id = action::cockpit_query_action_id(&query);
+            let creates_project = matches!(query, TaskCockpitQuery::ConfigCreateProject { .. });
+            let edits_project = matches!(query, TaskCockpitQuery::ConfigUpdateProject { .. });
+            let removes_project = matches!(query, TaskCockpitQuery::ConfigArchiveProject { .. });
+            let saves_ssh = matches!(query, TaskCockpitQuery::ConfigUpsertSsh { .. });
             match query_task_cockpit(&mut port, task_id, query).await? {
                 Ok(result) => {
                     let detail = cockpit_result_detail(action_id, &result);
@@ -8888,6 +8956,18 @@ async fn execute_native_command(
                         body: NativeHostQueryBody::TaskCockpit(result),
                     })
                 }
+                Err(error) if creates_project => Ok(NativeHostExecutionResult::QueryFailed(
+                    bounded_host_error(add_project_failure_message(&error)),
+                )),
+                Err(error) if edits_project => Ok(NativeHostExecutionResult::QueryFailed(
+                    bounded_host_error(project_edit_failure_message(&error)),
+                )),
+                Err(error) if removes_project => Ok(NativeHostExecutionResult::QueryFailed(
+                    bounded_host_error(project_remove_failure_message(&error)),
+                )),
+                Err(error) if saves_ssh => Ok(NativeHostExecutionResult::QueryFailed(
+                    bounded_host_error(ssh_save_failure_message(&error)),
+                )),
                 Err(error) => Ok(NativeHostExecutionResult::QueryFailed(bounded_host_error(
                     format!("task cockpit query failed: {error:?}"),
                 ))),
@@ -9867,6 +9947,56 @@ impl NativeInteraction {
             expected_task_revision: Some(expected_task_revision),
             captured_task_action_epoch: Some(captured_task_action_epoch),
             capability,
+            disabled_reason: None,
+            event,
+            command: NativeHostCommand::TerminalInput(request),
+        })
+    }
+
+    /// Input for a host-owned terminal (SSH opened without a Task). There is
+    /// no Task to check here: the host fences the write on the terminal itself
+    /// (resource, generation, session, focus epoch and input sequence).
+    pub fn host_terminal_input(
+        &mut self,
+        request: TerminalInputRequest,
+    ) -> Option<NativeActionRecord> {
+        request.validate().ok()?;
+        if !self.interaction.state().can_activate() || !request.context.is_plain_shell_fence() {
+            return None;
+        }
+        let descriptor = action::catalog()
+            .iter()
+            .find(|descriptor| descriptor.id == action::ACTION_PROVIDER_TERMINAL_INPUT)?;
+        let (focus_epoch, request_generation) = self.begin_handler(None);
+        let event = ActionEvent::new(
+            ActionRequest::TaskCockpit {
+                task_id: request.context.task_id,
+                query: TaskCockpitQuery::HostTerminal {
+                    resource_id: request.context.resource_id,
+                },
+            },
+            ActivationSource::Keyboard {
+                key: crate::ui::components::KeyboardKey::Enter,
+            },
+            focus_epoch,
+        );
+        Some(NativeActionRecord {
+            id: descriptor.id,
+            focus_epoch,
+            request_generation,
+            action_epoch: self.action_epoch,
+            connection_epoch: self.connection_epoch,
+            client_epoch: self.client_epoch,
+            navigation_epoch: self.shell.navigation_epoch(),
+            resource_generation: self.resource_generation,
+            runtime_generation: self.runtime_generation,
+            task_id: None,
+            fleet_admission: None,
+            purpose: NativeActionPurpose::Ordinary,
+            background_read: false,
+            expected_task_revision: None,
+            captured_task_action_epoch: None,
+            capability: Some(Capability::TaskCockpit),
             disabled_reason: None,
             event,
             command: NativeHostCommand::TerminalInput(request),
@@ -11905,6 +12035,10 @@ pub struct NativeShell {
     draft_launch_prefs:
         BTreeMap<HostTaskKey, (ProviderKind, crate::providers::ProviderLaunchOptions)>,
     pending_automatic_titles: BTreeMap<HostTaskKey, PendingAutomaticTitle>,
+    /// The stand-in names this app already applied, so a model-written name can
+    /// still replace one. Forgetting we wrote it left every task named after the
+    /// first few words of its own first message.
+    applied_automatic_titles: BTreeMap<HostTaskKey, String>,
     composer_images: BTreeMap<
         crate::ui::task_cockpit::draft_store::KeyedComposerDraftKey<HostTaskKey>,
         Vec<NativeComposerImage>,
@@ -11921,6 +12055,7 @@ pub struct NativeShell {
         ComposerDraftProjection,
     >,
     composer_draft_store: ComposerDraftStore,
+    sent_image_store: SentImageStore,
     composer_drafts_dirty: bool,
     last_composer_draft_persist: Option<Instant>,
     /// Idle main-canvas photo shown only while no task is selected.
@@ -11974,7 +12109,6 @@ pub struct NativeShell {
     /// real scrollbar instead of clipping silently.
     theme_editor_scroll_handle: gpui::ScrollHandle,
     /// Scroll position of the composer's provider/model selector popover.
-    composer_selector_scroll_handle: gpui::ScrollHandle,
     composer_reveal_cursor: bool,
     last_window_persist: Option<Instant>,
     add_project: Option<AddProjectDraft>,
@@ -12000,6 +12134,7 @@ pub struct NativeShell {
     new_task: Option<NewTaskDraft>,
     rename_task: Option<RenameTaskDraft>,
     delete_task: Option<DeleteTaskDraft>,
+    remove_project: Option<RemoveProjectDraft>,
     /// Retired delete-flow identities with owner + generation provenance so a
     /// same raw CommandId on another host/generation never consumes the marker.
     retired_delete_flow_commands: Vec<RetiredDeleteFlowCommand>,
@@ -12101,6 +12236,32 @@ pub struct NativeShell {
     trigger_menu: Option<TriggerMenuState>,
     composer_selector: Option<ComposerSelectorKind>,
     composer_selector_highlight: usize,
+    /// Where the chip that opened the selector was clicked, so the menu hangs
+    /// off it instead of off the composer's left edge.
+    composer_selector_anchor: Option<(f32, f32)>,
+    /// The composer's model picker: every provider's models behind one search
+    /// field, a provider rail and the favourites star.
+    model_picker: Option<crate::ui::model_picker::ModelPickerState>,
+    /// When this shell first saw each task working, so the transcript can say
+    /// how long the wait has been.
+    working_since: BTreeMap<HostTaskKey, i64>,
+    /// A pasted image opened at full size from the transcript.
+    image_lightbox: Option<PathBuf>,
+    /// Tasks already asked about. Naming costs a model call, so it is asked
+    /// once per task and never again.
+    suggested_title_requests: BTreeSet<HostTaskKey>,
+    /// Folders the host resolved for tasks whose own projection carries none.
+    image_staging_roots: BTreeMap<HostTaskKey, PathBuf>,
+    image_staging_root_requests: BTreeMap<HostTaskKey, Instant>,
+    /// What went out with a picture attached, per task. A provider rewrites the
+    /// path out of the message it echoes back, so this is the only record of
+    /// which picture belongs to which message.
+    sent_message_images:
+        BTreeMap<HostTaskKey, Vec<crate::ui::conversation::rows::SentMessageImages>>,
+    /// First sends whose draft was already consumed, kept until the host says
+    /// yes or no. A refusal arrives long after the dispatch, and it has to put
+    /// those words back rather than leave a message that was never sent.
+    consumed_first_sends: BTreeMap<CommandId, PendingDraftFirstSend>,
     /// Explicit HOLD marker kept readable in source for skill trigger honesty.
     #[allow(dead_code)]
     skill_trigger_hold: &'static str,
@@ -12815,6 +12976,8 @@ impl NativeShell {
                 .expect("legacy layout maps through the exact local profile")
         });
         let composer_draft_store = ComposerDraftStore::at_profile_root(profile.root());
+        let sent_image_store = SentImageStore::at_profile_root(profile.root());
+        let sent_message_images = sent_image_store.load();
         // One keyed drafts map. Legacy v1 files enter through load_keyed's local
         // profile mapper; remote owners use the same HostTaskKey-qualified keys.
         let draft_profile = profile.named_profile().to_string();
@@ -12980,6 +13143,7 @@ impl NativeShell {
             composer_recovery_targets: BTreeMap::new(),
             draft_launch_prefs,
             pending_automatic_titles: BTreeMap::new(),
+            applied_automatic_titles: BTreeMap::new(),
             composer_images: BTreeMap::new(),
             next_composer_image_id: 1,
             slash_command_selection: 0,
@@ -12988,6 +13152,7 @@ impl NativeShell {
             slash_command_catalog: Vec::new(),
             composer_drafts,
             composer_draft_store,
+            sent_image_store,
             composer_drafts_dirty: false,
             last_composer_draft_persist: None,
             splash_image: None,
@@ -13021,12 +13186,11 @@ impl NativeShell {
             composer_draft_content_height: COMPOSER_LINE_HEIGHT,
             composer_scroll_handle: gpui::ScrollHandle::new(),
             theme_editor_scroll_handle: gpui::ScrollHandle::new(),
-            composer_selector_scroll_handle: gpui::ScrollHandle::new(),
             composer_reveal_cursor: false,
             last_window_persist: None,
             add_project: None,
             settings_open: false,
-            ssh_ui: ssh::SshUi::default(),
+            ssh_ui: ssh::SshUi::new(cx.focus_handle().tab_stop(true)),
             git_session: crate::git::native_client::NativeGitSession::default(),
             pending_git_window: None,
             show_archived_tasks: false,
@@ -13044,6 +13208,7 @@ impl NativeShell {
             new_task: None,
             rename_task: None,
             delete_task: None,
+            remove_project: None,
             retired_delete_flow_commands: Vec::new(),
             known_deleted_task_keys: BTreeSet::new(),
             selected_project_id: None,
@@ -13090,6 +13255,15 @@ impl NativeShell {
             trigger_menu: None,
             composer_selector: None,
             composer_selector_highlight: 0,
+            composer_selector_anchor: None,
+            model_picker: None,
+            working_since: BTreeMap::new(),
+            image_lightbox: None,
+            suggested_title_requests: BTreeSet::new(),
+            image_staging_roots: BTreeMap::new(),
+            image_staging_root_requests: BTreeMap::new(),
+            sent_message_images,
+            consumed_first_sends: BTreeMap::new(),
             skill_trigger_hold: SKILL_TRIGGER_HOLD,
             palette_index: 0,
             pending_select_task: None,
@@ -14807,13 +14981,13 @@ impl NativeShell {
         // else. It published a node for a footer icon composition A deleted, so
         // the tree named a control that is not on screen and cannot be reached.
         // The board header's own `+ New`. The per-project "+Claude"/"+Codex"
-        // buttons went with the project rail; this one control opens the menu
-        // that lists every project instead.
+        // buttons went with the project rail; this one control opens the
+        // Create task dialog, which carries the project choice itself.
         overlay_nodes.push(
             AccessibilityNode::new(
                 AccessibleRole::Button,
                 "New task",
-                "Open the board's new-task menu and choose the project to start in.",
+                "Open the Create task dialog and choose the project to start in.",
             )
             .gpui("board-header-new", true, true)
             .with_disabled(self.startup_gates_actions()),
@@ -15499,6 +15673,9 @@ impl NativeShell {
                 if !self.local_slot_mut().config_sidebar.projects.is_empty() {
                     self.finish_add_project_after_host_accept(action);
                 }
+                // Removing the last project leaves the list empty, which is
+                // still a successful removal.
+                self.finish_remove_project_after_host_accept(action);
                 self.sync_header_projection();
                 self.refresh_accessibility_tree();
             }
@@ -15675,6 +15852,8 @@ impl NativeShell {
                             TaskCockpitQuery::ConfigSnapshot
                                 | TaskCockpitQuery::AgentConnection
                                 | TaskCockpitQuery::ConfigCreateProject { .. }
+                                | TaskCockpitQuery::ConfigUpdateProject { .. }
+                                | TaskCockpitQuery::ConfigArchiveProject { .. }
                                 | TaskCockpitQuery::ConfigUpsertCommand { .. }
                                 | TaskCockpitQuery::ConfigArchiveCommand { .. }
                                 | TaskCockpitQuery::ConfigRunCommand { .. }
@@ -15682,6 +15861,21 @@ impl NativeShell {
                         )
                     },
                 );
+                // A title can arrive long after focus has moved on. It names the
+                // task it was asked about, so it must not be dropped for being
+                // off-screen.
+                if let crate::domain::TaskCockpitResult::ImageStagingRoot(root) = &result {
+                    if let Some(task_id) = command_task_id {
+                        self.apply_image_staging_root(task_id, root.clone());
+                    }
+                    return;
+                }
+                if let crate::domain::TaskCockpitResult::TaskTitle(title) = &result {
+                    if let Some(task_id) = command_task_id {
+                        self.apply_suggested_task_title(task_id, title.clone());
+                    }
+                    return;
+                }
                 let global_result = global_command
                     || matches!(
                         &result,
@@ -15702,6 +15896,7 @@ impl NativeShell {
                     self.local_slot_mut().config_sidebar =
                         ConfigSidebarProjection::from_host_snapshot(snapshot);
                     self.finish_add_project_after_host_accept(action);
+                    self.finish_remove_project_after_host_accept(action);
                     self.sync_header_projection();
                     self.refresh_accessibility_tree();
                 }
@@ -16275,8 +16470,7 @@ impl NativeShell {
             .unwrap_or_default()
             .into_iter()
             .filter_map(|owner| {
-                if (self.pane_view(&owner) != PaneView::Terminal
-                    && !self.ssh_terminal_is_visible(&owner))
+                if self.pane_view(&owner) != PaneView::Terminal
                     || !self.task_surfaces.terminal_is_interactive(owner.clone())
                     || self.host_slot(&owner.host).is_none_or(|slot| {
                         slot.provider_setup_approvals.contains_key(&owner.task_id)
@@ -16369,8 +16563,7 @@ impl NativeShell {
                 .task_workspace
                 .as_ref()
                 .is_some_and(|workspace| workspace.contains_task(owner.clone()))
-                && (self.pane_view(&owner) == PaneView::Terminal
-                    || self.ssh_terminal_is_visible(&owner));
+                && self.pane_view(&owner) == PaneView::Terminal;
             if self.pending_terminal_echoes.contains_key(&key) {
                 if !visible {
                     self.pending_terminal_echoes.remove(&key);
@@ -16764,6 +16957,17 @@ impl NativeShell {
     }
 
     fn controller_wait_deadline(&self) -> Duration {
+        let wait = self.controller_wait_deadline_without_ssh();
+        // A visible SSH terminal is refreshed on the controller cadence, so an
+        // otherwise idle shell must still wake for it.
+        if self.ssh_ui.is_polling() {
+            wait.min(Duration::from_millis(250))
+        } else {
+            wait
+        }
+    }
+
+    fn controller_wait_deadline_without_ssh(&self) -> Duration {
         let now = Instant::now();
         let since = |at: Option<Instant>| at.map(|instant| now.saturating_duration_since(instant));
         let bootstrap_retry_armed = self.retry_host_bootstrap
@@ -17523,6 +17727,10 @@ impl NativeShell {
             "Project addition was not confirmed. Check the project list before trying again."
                 .into(),
         );
+        self.settle_remove_project_failure(
+            action,
+            "Project removal was not confirmed. Check the project list before trying again.".into(),
+        );
         if let Some(request_id) = native_request_id(&action.command) {
             self.local_slot_mut()
                 .first_send_readiness_requests
@@ -17576,6 +17784,7 @@ impl NativeShell {
 
     fn settle_native_query_failure(&mut self, action: &NativeActionRecord, error: String) {
         self.settle_add_project_failure(action, error.clone());
+        self.settle_remove_project_failure(action, error.clone());
         let local = self.local_host_id();
         if self.settle_pending_draft_first_send_probe_transport_failure_for_host(
             &local,
@@ -17928,15 +18137,7 @@ impl NativeShell {
         // SSH writes settle by their exact owned request, even when their own
         // durable resource publication advances the client projection first.
         if host_id == &self.local_host_id()
-            && (self
-                .ssh_ui
-                .pending
-                .is_some_and(|(id, _)| native_request_id(&action.command) == Some(id))
-                || self
-                    .ssh_ui
-                    .disconnecting
-                    .as_ref()
-                    .is_some_and(|(id, _, _)| native_command_id(&action.command) == Some(*id)))
+            && self.ssh_ui.owns_request(native_request_id(&action.command))
         {
             let epochs = self.local_slot().interaction.action_epochs();
             if action.connection_epoch == epochs.connection_epoch
@@ -18128,6 +18329,14 @@ impl NativeShell {
                 return;
             }
             self.apply_action_outcome_for_host(host_id, outcome);
+            return;
+        }
+        if self.owns_remove_project_action(&action) {
+            if self.remove_project_action_is_current(&action) {
+                self.apply_action_outcome(outcome);
+            } else {
+                self.settle_remove_project_failure(&action, "The connection changed before project removal was confirmed. Check the project list before trying again.".into());
+            }
             return;
         }
         if self.owns_add_project_action(&action) {
@@ -19067,6 +19276,14 @@ impl NativeShell {
         let Some(command_id) = native_command_id(&action.command) else {
             return;
         };
+        // A first send that emptied the box owes the words back the moment the
+        // host refuses it, and the message it painted has to come down: the
+        // person was told it was sent.
+        if let Some(consumed) = self.consumed_first_sends.remove(&command_id) {
+            if !success {
+                self.restore_consumed_first_send_draft(&consumed);
+            }
+        }
         if let Some(admission) = action.fleet_admission.as_ref() {
             if &admission.host != owner_host {
                 return;
@@ -19162,6 +19379,11 @@ impl NativeShell {
                             },
                         );
                     }
+                    // The shortened first message is only a stand-in until a
+                    // model returns a real name. Asking costs one small call
+                    // and the answer may take seconds, so it is asked for once,
+                    // here, and applied whenever it lands.
+                    self.request_suggested_task_title(&submission.key.task_id, seed);
                 }
                 let open_provider_terminal = submission.open_provider_terminal;
                 let active_matches = self.composer.as_ref().is_some_and(|composer| {
@@ -19188,6 +19410,22 @@ impl NativeShell {
                 }
             }
             // Failure keeps the submitted draft version; never touch newer B text.
+        }
+        // A refused send must take its message out of the transcript. Leaving
+        // it there says the provider has it, which is the opposite of what the
+        // error underneath says.
+        if !success {
+            if let Some(task_id) = action.task_id {
+                let owner = HostTaskKey::new(owner_host.clone(), task_id);
+                let admission = self
+                    .task_surfaces
+                    .reject_pending_user_message(owner.clone(), command_id);
+                if admission.changed && self.selected_task_key.as_ref() == Some(&owner) {
+                    if let Some(page) = admission.page {
+                        self.project_owner_conversation_presentation(owner_host, &owner, &page);
+                    }
+                }
+            }
         }
         if let Some(slot) = self.host_slot_mut(owner_host) {
             if success {
@@ -19780,6 +20018,7 @@ impl NativeShell {
         semantic_repaint |= self.expire_stalled_provider_setup_approvals();
         semantic_repaint |= self.retry_due_terminal_queries(now);
         self.refresh_visible_terminals(now);
+        self.poll_ssh_terminal(now);
         if let Some(preferences) = self.pending_preferences.pop_back() {
             self.pending_preferences.clear();
             // Only a preferences snapshot that CHANGED anything is a semantic
@@ -20469,6 +20708,16 @@ impl NativeShell {
             return;
         }
         self.pending_automatic_titles.remove(&owner);
+        // Remember that this name is ours: the model's name arrives seconds
+        // later and may only replace a name this app invented.
+        while self.applied_automatic_titles.len() >= MAX_APPLIED_AUTOMATIC_TITLES {
+            let Some(oldest) = self.applied_automatic_titles.keys().next().cloned() else {
+                break;
+            };
+            self.applied_automatic_titles.remove(&oldest);
+        }
+        self.applied_automatic_titles
+            .insert(owner.clone(), proposed_title.clone());
         let _ = self.dispatch_action(ActionRequest::TaskRename(
             crate::client::action::TaskRenameArguments {
                 task_id,
@@ -21150,6 +21399,11 @@ impl NativeShell {
             .interaction
             .bind_projected_model(Arc::clone(&model));
         self.promote_ephemeral_tasks_for_host(&local, model.as_ref());
+        // A task's folder becomes known a moment after it is created, which is
+        // often after promotion has already run. Sweep again on every model
+        // update so an image staged before the task existed is in the project
+        // by the time the first message is sent.
+        self.restage_scratch_images_for_known_workspaces();
         self.local_slot_mut().services_projection = project_services_panel(&[], &[]);
         self.sync_header_projection();
         let client_epoch = self
@@ -21822,8 +22076,7 @@ impl NativeShell {
         // the workspace, so a task reselected after a return to the idle canvas
         // opens on Conversation; one keypress puts it back on the terminal.
         let was_showing_terminal = self.local_slot_mut().cockpit.dock().showing_raw_terminal();
-        let show_terminal =
-            self.pane_view(&owner) == PaneView::Terminal || self.ssh_terminal_is_visible(&owner);
+        let show_terminal = self.pane_view(&owner) == PaneView::Terminal;
         let result = if show_terminal {
             self.local_slot_mut()
                 .cockpit
@@ -21859,9 +22112,6 @@ impl NativeShell {
     /// showing the terminal: a pane parked on Files stays on Files, because the
     /// dock's terminal presentation says nothing about a surface it does not own.
     fn note_terminal_presentation_on_pane(&mut self, owner: &HostTaskKey, raw: bool) {
-        if self.ssh_ui.side_owner.as_ref() == Some(owner) {
-            return;
-        }
         if raw {
             self.set_pane_view(owner, PaneView::Terminal);
         } else if self.pane_view(owner) == PaneView::Terminal {
@@ -22205,6 +22455,9 @@ impl NativeShell {
                 || self.selected_task_is_unstarted_draft_for(&owner))
     }
 
+    /// The model chip opens the model picker now; this remains as the entry
+    /// point the selector's own regression test drives.
+    #[allow(dead_code)]
     fn open_composer_model_selector(&mut self) {
         self.open_composer_selector(ComposerSelectorKind::Model);
     }
@@ -22225,18 +22478,13 @@ impl NativeShell {
         }
     }
 
-    fn open_composer_provider_selector(&mut self) {
-        if !self.selected_task_is_unstarted_draft() {
-            return;
-        }
-        self.open_composer_selector(ComposerSelectorKind::Provider);
-    }
-
-    fn open_composer_reasoning_selector(&mut self) {
+    fn open_composer_reasoning_selector(&mut self, anchor: Option<(f32, f32)>) {
+        self.composer_selector_anchor = anchor;
         self.open_composer_selector(ComposerSelectorKind::Reasoning);
     }
 
-    fn open_composer_access_selector(&mut self) {
+    fn open_composer_access_selector(&mut self, anchor: Option<(f32, f32)>) {
+        self.composer_selector_anchor = anchor;
         self.open_composer_selector(ComposerSelectorKind::Access);
     }
 
@@ -22330,6 +22578,432 @@ impl NativeShell {
             return;
         };
         self.apply_composer_selector_choice(choice);
+    }
+
+    /// Where a click landed, so a popup can hang off the control that opened
+    /// it. A keyboard "click" has no pointer, and anchors to the window.
+    fn click_anchor(event: &ClickEvent) -> Option<(f32, f32)> {
+        match event {
+            ClickEvent::Mouse(mouse) => Some((
+                f32::from(mouse.down.position.x),
+                f32::from(mouse.down.position.y),
+            )),
+            _ => None,
+        }
+    }
+
+    /// Open the model picker under the model chip.
+    ///
+    /// The rail starts on the instance the composer would launch with, so the
+    /// list opens on familiar models rather than on an empty favourites tab.
+    fn open_model_picker(&mut self, anchor: Option<(f32, f32)>) {
+        if !self.composer_model_reasoning_editable() {
+            return;
+        }
+        if self.model_picker.is_some() {
+            self.close_model_picker();
+            return;
+        }
+        self.dismiss_composer_selector();
+        let rail = self
+            .current_model_picker_instance()
+            .map(crate::ui::model_picker::ModelPickerRail::Instance)
+            .unwrap_or(crate::ui::model_picker::ModelPickerRail::Favorites);
+        let mut state = crate::ui::model_picker::ModelPickerState::new(rail, anchor);
+        let rows = self.model_picker_rows();
+        let visible = crate::ui::model_picker::visible_rows(&rows, "", state.rail());
+        if let Some(index) = visible.iter().position(|row| row.is_current) {
+            state.set_highlight(index);
+        }
+        self.model_picker = Some(state);
+        // The search field types through the root editor, so the root has to
+        // take focus back from the composer input the chip click just armed.
+        self.pending_root_overlay_focus = true;
+        self.local_slot_mut().interaction.close_palettes();
+    }
+
+    fn close_model_picker(&mut self) {
+        self.model_picker = None;
+    }
+
+    /// The provider instance the composer would launch with right now.
+    fn current_model_picker_instance(&self) -> Option<String> {
+        let provider = self.composer_provider_for_launch()?;
+        let options = self.composer_launch_options_for(provider);
+        Some(options.provider_instance_id.clone().unwrap_or_else(|| {
+            crate::providers::settings::default_instance_id_for_kind(provider).to_string()
+        }))
+    }
+
+    /// A driver token names exactly one launchable provider. Stub drivers own
+    /// no models, so they never reach the rail.
+    fn provider_kind_for_driver(driver: &str) -> Option<ProviderKind> {
+        match driver {
+            "claude" => Some(ProviderKind::ClaudeCode),
+            "codex" => Some(ProviderKind::Codex),
+            "cursor" => Some(ProviderKind::Cursor),
+            _ => None,
+        }
+    }
+
+    /// The typed model a slug stands for, or `None` when only `--model <slug>`
+    /// can express it.
+    fn provider_model_for_slug(
+        provider: ProviderKind,
+        slug: &str,
+    ) -> Option<crate::providers::ProviderModel> {
+        match (provider, slug) {
+            (ProviderKind::Codex, "gpt-5.6-sol") => Some(crate::providers::ProviderModel::CodexSol),
+            (ProviderKind::Codex, "gpt-5.6-terra") => {
+                Some(crate::providers::ProviderModel::CodexTerra)
+            }
+            (ProviderKind::Codex, "gpt-5.6-luna") => {
+                Some(crate::providers::ProviderModel::CodexLuna)
+            }
+            (ProviderKind::ClaudeCode, "opus") => Some(crate::providers::ProviderModel::ClaudeOpus),
+            (ProviderKind::ClaudeCode, "sonnet") => {
+                Some(crate::providers::ProviderModel::ClaudeSonnet)
+            }
+            (ProviderKind::ClaudeCode, "haiku") => {
+                Some(crate::providers::ProviderModel::ClaudeHaiku)
+            }
+            _ => None,
+        }
+    }
+
+    /// The instance a started task is stuck with, if it has started.
+    ///
+    /// A running task IS its provider's CLI process: model and thinking changes
+    /// are typed into that CLI's own picker, and no keystroke turns Codex into
+    /// Claude. Rather than list models that would be refused, the picker shows
+    /// only the provider the task is actually on.
+    fn model_picker_locked_instance(&self) -> Option<String> {
+        let owner = self
+            .composer_draft_owner()
+            .or_else(|| self.selected_task_key.clone())?;
+        if self.selected_task_is_unstarted_draft() {
+            return None;
+        }
+        self.task_provider_kind_for_owner(&owner)?;
+        self.current_model_picker_instance()
+    }
+
+    /// The rail's entries: every enabled, launchable provider instance.
+    ///
+    /// Before the first settings snapshot lands there is nothing to read, and
+    /// an empty rail would strand the picker -- so the builtin trio stands in.
+    fn model_picker_instances(&self) -> Vec<crate::ui::model_picker::ModelPickerInstance> {
+        let configured = self
+            .provider_settings
+            .as_ref()
+            .map(|ctl| ctl.snapshot().composer_instances.clone())
+            .or_else(|| {
+                self.provider_settings_cache
+                    .as_ref()
+                    .map(|cache| cache.composer_instances.clone())
+            })
+            .unwrap_or_default();
+        let mut instances: Vec<crate::ui::model_picker::ModelPickerInstance> = configured
+            .into_iter()
+            .filter(|choice| Self::provider_kind_for_driver(&choice.driver).is_some())
+            .map(|choice| crate::ui::model_picker::ModelPickerInstance {
+                instance_id: choice.instance_id,
+                display_name: choice.display_name,
+                driver: choice.driver,
+            })
+            .collect();
+        if instances.is_empty() {
+            for kind in [
+                ProviderKind::ClaudeCode,
+                ProviderKind::Codex,
+                ProviderKind::Cursor,
+            ] {
+                instances.push(crate::ui::model_picker::ModelPickerInstance {
+                    instance_id: crate::providers::settings::default_instance_id_for_kind(kind)
+                        .to_string(),
+                    display_name: kind.display_name().to_string(),
+                    driver: crate::providers::settings::ProviderDriverKind::from_provider_kind(
+                        kind,
+                    )
+                    .as_str()
+                    .to_string(),
+                });
+            }
+        }
+        if let Some(locked) = self.model_picker_locked_instance() {
+            instances.retain(|instance| instance.instance_id == locked);
+        }
+        instances
+    }
+
+    /// The favourited slugs for one instance, draft included: a star toggled a
+    /// moment ago has to paint filled before the host reply lands.
+    fn model_picker_favorites(&self, instance_id: &str) -> Vec<String> {
+        if let Some(instance) = self
+            .provider_settings
+            .as_ref()
+            .and_then(|ctl| ctl.working_instance(instance_id))
+        {
+            return instance.model_policy.favorite_order.clone();
+        }
+        self.provider_settings_cache
+            .as_ref()
+            .and_then(|cache| cache.document.get(instance_id))
+            .map(|instance| instance.model_policy.favorite_order.clone())
+            .unwrap_or_default()
+    }
+
+    /// Every model the picker can offer, across every provider instance.
+    fn model_picker_rows(&self) -> Vec<crate::ui::model_picker::ModelPickerRow> {
+        let current_instance = self.current_model_picker_instance();
+        let current_provider = self
+            .composer_provider_for_launch()
+            .unwrap_or(ProviderKind::Codex);
+        let current_slug = {
+            let options = self.composer_launch_options_for(current_provider);
+            self.selected_model_slug_for_effort(current_provider, &options)
+        };
+        let document = self
+            .provider_settings
+            .as_ref()
+            .map(|ctl| ctl.document())
+            .or_else(|| {
+                self.provider_settings_cache
+                    .as_ref()
+                    .map(|cache| cache.document.clone())
+            });
+        let empty: &[crate::ui::provider_metadata::UiModelCatalog] = &[];
+        let catalogs = self
+            .provider_settings
+            .as_ref()
+            .map(|ctl| ctl.model_catalogs())
+            .unwrap_or(empty);
+        let mut rows = Vec::new();
+        for instance in self.model_picker_instances() {
+            let Some(provider) = Self::provider_kind_for_driver(&instance.driver) else {
+                continue;
+            };
+            let driver =
+                crate::providers::settings::ProviderDriverKind::from_provider_kind(provider);
+            let catalog = catalogs
+                .iter()
+                .find(|catalog| catalog.instance_id == instance.instance_id);
+            let builtins = catalog
+                .filter(|catalog| !catalog.models.is_empty())
+                .map(|catalog| {
+                    catalog
+                        .models
+                        .iter()
+                        .filter(|model| !model.hidden && !model.is_custom)
+                        .map(|model| model.slug.clone())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_else(|| crate::ui::provider_settings::builtin_model_slugs(driver));
+            let policy_ordered = document
+                .as_ref()
+                .and_then(|doc| {
+                    doc.ordered_picker_models(&instance.instance_id, &builtins)
+                        .ok()
+                })
+                .unwrap_or_else(|| builtins.clone());
+            let ordered =
+                crate::ui::provider_metadata::merge_picker_slugs(&policy_ordered, catalog);
+            let favorites = self.model_picker_favorites(&instance.instance_id);
+            for slug in ordered {
+                // Symbolic defaults are a provider implementation detail, not
+                // a model someone can choose.
+                if provider_default_model_slug(&slug) {
+                    continue;
+                }
+                let label = catalog
+                    .and_then(|catalog| catalog.models.iter().find(|model| model.slug == slug))
+                    .map(|model| model.display_name.clone())
+                    .unwrap_or_else(|| slug.clone());
+                let is_current = current_instance.as_deref() == Some(instance.instance_id.as_str())
+                    && current_provider == provider
+                    && current_slug.as_deref() == Some(slug.as_str());
+                rows.push(crate::ui::model_picker::ModelPickerRow {
+                    instance_id: instance.instance_id.clone(),
+                    provider_label: instance.display_name.clone(),
+                    driver: instance.driver.clone(),
+                    is_favorite: favorites.iter().any(|favorite| favorite == &slug),
+                    is_current,
+                    slug,
+                    label,
+                });
+            }
+        }
+        rows
+    }
+
+    /// The rows the picker is painting right now, in painted order.
+    fn model_picker_visible_rows(&self) -> Vec<crate::ui::model_picker::ModelPickerRow> {
+        let Some(state) = self.model_picker.as_ref() else {
+            return Vec::new();
+        };
+        let rows = self.model_picker_rows();
+        crate::ui::model_picker::visible_rows(&rows, state.query(), state.rail())
+            .into_iter()
+            .cloned()
+            .collect()
+    }
+
+    /// Choose a model, and the provider that owns it.
+    ///
+    /// Switching provider rewrites the whole launch line, which a running
+    /// session cannot take -- there the picker still moves between that
+    /// provider's own models, and says so instead of failing quietly.
+    fn apply_model_picker_row(&mut self, row: crate::ui::model_picker::ModelPickerRow) {
+        let Some(provider) = Self::provider_kind_for_driver(&row.driver) else {
+            return;
+        };
+        let current_provider = self
+            .composer_provider_for_launch()
+            .unwrap_or(ProviderKind::Codex);
+        let same_instance = current_provider == provider
+            && self.current_model_picker_instance().as_deref() == Some(row.instance_id.as_str());
+        let typed = Self::provider_model_for_slug(provider, &row.slug);
+        if same_instance {
+            match typed {
+                Some(model) => self.set_composer_model(model),
+                None => self.set_composer_custom_model(row.slug.clone()),
+            }
+            self.model_picker = None;
+            return;
+        }
+        if !self.selected_task_is_unstarted_draft() {
+            if let Some(state) = self.model_picker.as_mut() {
+                state.set_notice("Start a new task to switch provider.");
+            }
+            return;
+        }
+        self.set_composer_provider(provider);
+        let mut options = self.composer_launch_options_for(provider);
+        options.provider_instance_id = Some(row.instance_id.clone());
+        match typed {
+            Some(model) => {
+                options.model = model;
+                options.custom_model_slug = None;
+            }
+            None => {
+                options.model = crate::providers::ProviderModel::ProviderDefault;
+                options.custom_model_slug = Some(row.slug.clone());
+            }
+        }
+        // Effort is resolved against the model that was just chosen, so a
+        // level the new model does not offer snaps to its own default.
+        self.normalize_composer_effort_for_model(&mut options, provider);
+        self.store_draft_launch_prefs(provider, options);
+        self.model_picker = None;
+    }
+
+    /// Star or unstar a model from the picker.
+    ///
+    /// Model-policy edits are draft-local until a save, so the picker saves
+    /// immediately -- a star that vanished on the next snapshot would be a lie.
+    /// A draft open on another instance owns the save, and is left alone.
+    fn toggle_model_picker_favorite(&mut self, instance_id: &str, slug: &str) {
+        let refusal = match self.provider_settings.as_ref() {
+            None => Some("Provider settings are still loading.".to_string()),
+            Some(ctl) if ctl.mutation_in_flight() => {
+                Some("Still saving the last change. Try again in a moment.".to_string())
+            }
+            Some(ctl)
+                if ctl
+                    .dirty_instance_id()
+                    .is_some_and(|dirty| dirty != instance_id) =>
+            {
+                Some("Finish your provider settings edits first.".to_string())
+            }
+            Some(_) => None,
+        };
+        if let Some(refusal) = refusal {
+            if let Some(state) = self.model_picker.as_mut() {
+                state.set_notice(refusal);
+            }
+            return;
+        }
+        let error = {
+            let Some(ctl) = self.provider_settings.as_mut() else {
+                return;
+            };
+            ctl.toggle_favorite(instance_id, slug);
+            ctl.save_draft();
+            ctl.error().map(str::to_string)
+        };
+        self.flush_provider_settings_pending();
+        if let Some(error) = error {
+            if let Some(state) = self.model_picker.as_mut() {
+                state.set_notice(error);
+            }
+        }
+    }
+
+    /// Keys belong to the picker while it is open: the search field owns
+    /// printable text, and Ctrl+1..9 jump straight to a row.
+    fn handle_model_picker_key(&mut self, event: &KeyDownEvent, window: &mut Window) {
+        let visible = self.model_picker_visible_rows();
+        let len = visible.len();
+        let key = event.keystroke.key.as_str();
+        if event.keystroke.modifiers.control || event.keystroke.modifiers.platform {
+            if let Some(index) = crate::ui::model_picker::jump_target(key, len) {
+                window.prevent_default();
+                if let Some(row) = visible.get(index).cloned() {
+                    self.apply_model_picker_row(row);
+                }
+                return;
+            }
+        }
+        match key {
+            "escape" => {
+                window.prevent_default();
+                self.close_model_picker();
+            }
+            "enter" => {
+                window.prevent_default();
+                let index = self
+                    .model_picker
+                    .as_ref()
+                    .map(|state| state.highlight_within(len))
+                    .unwrap_or(0);
+                if let Some(row) = visible.get(index).cloned() {
+                    self.apply_model_picker_row(row);
+                }
+            }
+            "up" | "arrowup" => {
+                window.prevent_default();
+                if let Some(state) = self.model_picker.as_mut() {
+                    state.move_highlight(-1, len);
+                }
+            }
+            "down" | "arrowdown" => {
+                window.prevent_default();
+                if let Some(state) = self.model_picker.as_mut() {
+                    state.move_highlight(1, len);
+                }
+            }
+            "backspace" => {
+                window.prevent_default();
+                if let Some(state) = self.model_picker.as_mut() {
+                    let mut query = state.query().to_string();
+                    query.pop();
+                    state.set_query(query);
+                }
+            }
+            _ => {
+                // Printable text normally arrives through the platform input
+                // handler; this covers synthetic dispatch and automation.
+                if let Some(crate::ui::components::text_field::TextFieldKey::Character(character)) =
+                    Self::overlay_key_input(event)
+                {
+                    if let Some(state) = self.model_picker.as_mut() {
+                        let mut query = state.query().to_string();
+                        query.push(character);
+                        state.set_query(query);
+                    }
+                }
+            }
+        }
     }
 
     fn set_composer_provider(&mut self, provider: ProviderKind) {
@@ -22958,10 +23632,11 @@ impl NativeShell {
         }
     }
 
-    fn composer_selector_menu(
+    fn render_composer_selector_overlay(
         &self,
         tokens: crate::ui::tokens::ThemeTokens,
-        cx: &mut Context<Self>,
+        viewport: Size<Pixels>,
+        cx: &Context<Self>,
     ) -> Option<AnyElement> {
         let choices = self.composer_selector_choices();
         if choices.is_empty() {
@@ -23028,66 +23703,64 @@ impl NativeShell {
                     )
                     .into_any_element()
             });
+        // Sized and anchored exactly as the model picker is, for the same
+        // reason: mounted inside the composer's clipped meta strip, this menu
+        // was cut off at the strip's edge, so its rows could not be read.
+        let window_margin = crate::ui::model_picker::WINDOW_MARGIN;
+        let viewport_width = f32::from(viewport.width);
+        let viewport_height = f32::from(viewport.height);
+        let panel_width = 240.0f32.min((viewport_width - window_margin * 2.0).max(160.0));
+        let panel_max_height = overlay_chrome::OVERLAY_MAX_HEIGHT
+            .min((viewport_height - window_margin * 2.0).max(120.0));
+        let (position, corner) = match self.composer_selector_anchor {
+            Some((x, y)) => (
+                point(px(x), px(y - overlay_chrome::OVERLAY_ANCHOR_DROP)),
+                gpui::Corner::BottomLeft,
+            ),
+            None => (
+                point(
+                    px(((viewport_width - panel_width) / 2.0).max(window_margin)),
+                    px(((viewport_height - panel_max_height) / 2.0).max(window_margin)),
+                ),
+                gpui::Corner::TopLeft,
+            ),
+        };
         Some(
-            div()
-                .id("native-composer-selector-layer")
-                .absolute()
-                .inset_0()
-                .child(
-                    div()
-                        .id("native-composer-selector-dismiss")
-                        .absolute()
-                        .inset_0()
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|shell, _event: &MouseDownEvent, _window, cx| {
-                                cx.stop_propagation();
-                                shell.dismiss_composer_selector();
-                                cx.notify();
-                            }),
-                        ),
-                )
-                .child(
-                    div()
-                        .id("native-composer-selector-menu")
-                        .absolute()
-                        .bottom(px(28.0 + overlay_chrome::OVERLAY_ANCHOR_DROP))
-                        .left(px(0.0))
-                        .w(px(200.0))
-                        .max_w(px(240.0))
-                        .max_h(px(220.0))
-                        .relative()
-                        .overflow_y_scroll()
-                        .track_scroll(&self.composer_selector_scroll_handle)
-                        .child(crate::ui::scrollbar::AppScrollbar::vertical(
-                            "native-composer-selector-scrollbar",
-                            &self.composer_selector_scroll_handle,
-                            tokens.scrollbar,
-                            tokens.surfaces.overlay,
-                        ))
-                        // Rule 7: one overlay chrome, read from `overlay_chrome`
-                        // so this menu and every other cannot disagree.
-                        .flex()
-                        .flex_col()
-                        .py(px(overlay_chrome::OVERLAY_PADDING_Y))
-                        .rounded(px(overlay_chrome::OVERLAY_RADIUS))
-                        .bg(tokens.surfaces.overlay.to_gpui())
-                        .border(px(overlay_chrome::OVERLAY_BORDER_WIDTH))
-                        .border_color(tokens.borders.default.to_gpui())
-                        .shadow_sm()
-                        .text_size(px(overlay_chrome::ROW_TITLE_FONT_SIZE))
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|_shell, _event: &MouseDownEvent, _window, cx| {
-                                // Keep the shell-wide outside-click dismiss
-                                // from removing this menu before a row's click
-                                // commits its selected value.
-                                cx.stop_propagation();
-                            }),
-                        )
-                        .children(rows),
-                )
-                .into_any_element(),
+            deferred(
+                anchored()
+                    .position(position)
+                    .anchor(corner)
+                    .snap_to_window_with_margin(px(window_margin))
+                    .child(
+                        overlay_chrome::overlay_surface("native-composer-selector-menu", tokens)
+                            .occlude()
+                            .w(px(panel_width))
+                            .max_h(px(panel_max_height))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|_shell, _event: &MouseDownEvent, _window, cx| {
+                                    // Keep the shell-wide outside-click dismiss
+                                    // from removing this menu before a row's
+                                    // click commits its selected value.
+                                    cx.stop_propagation();
+                                }),
+                            )
+                            .child(
+                                div()
+                                    .id("native-composer-selector-scroll")
+                                    .flex()
+                                    .flex_col()
+                                    .min_h(px(0.0))
+                                    .max_h(px(
+                                        panel_max_height - overlay_chrome::OVERLAY_PADDING_Y * 2.0
+                                    ))
+                                    .app_scroll_y(tokens)
+                                    .children(rows),
+                            ),
+                    ),
+            )
+            .with_priority(3)
+            .into_any_element(),
         )
     }
 
@@ -23894,6 +24567,9 @@ impl NativeShell {
         let NativeHostCommand::TerminalInput(request) = &action.command else {
             return;
         };
+        if self.settle_ssh_input_ack(request, &ack) {
+            return;
+        }
         let owner = HostTaskKey::new(host_id.clone(), request.context.task_id);
         // The request's own fence says which terminal it addressed: a shell
         // carries the documented zero sentinels, the provider carries a real
@@ -24518,6 +25194,9 @@ impl NativeShell {
                 return Some(editor.name.value().to_string());
             }
         }
+        if let Some(state) = self.model_picker.as_ref() {
+            return Some(state.query().to_string());
+        }
         if self.task_search.open() {
             return Some(self.task_search.query().to_string());
         }
@@ -24561,6 +25240,8 @@ impl NativeShell {
             } else {
                 (value.chars().count(), false)
             }
+        } else if let Some(state) = self.model_picker.as_ref() {
+            (state.query().chars().count(), false)
         } else if self.task_search.open() {
             (self.task_search.query().chars().count(), false)
         } else if self.browser_address_focused {
@@ -24599,7 +25280,23 @@ impl NativeShell {
             end_scalar = start_scalar;
         }
         let scalar_range = start_scalar..end_scalar;
-        if self.task_search.open() {
+        if self.model_picker.is_some() {
+            let start = value
+                .char_indices()
+                .nth(scalar_range.start)
+                .map(|(index, _)| index)
+                .unwrap_or(value.len());
+            let end = value
+                .char_indices()
+                .nth(scalar_range.end)
+                .map(|(index, _)| index)
+                .unwrap_or(value.len());
+            let mut next = value;
+            next.replace_range(start..end, text);
+            if let Some(state) = self.model_picker.as_mut() {
+                state.set_query(next);
+            }
+        } else if self.task_search.open() {
             let start = value
                 .char_indices()
                 .nth(scalar_range.start)
@@ -25166,10 +25863,26 @@ impl NativeShell {
                         }
                         return;
                     };
+                    // The text leaves the box and reaches the transcript now.
+                    // Everything below this line is the slow part, and it is
+                    // no longer the person's problem.
+                    // Only a plain Send is taken out of the box early. Steering
+                    // or queueing a follow-up builds its payload from the live
+                    // composer and carries the open turn's id, so consuming the
+                    // draft there would send the wrong shape and the domain
+                    // would refuse it.
+                    let (echo_command_id, echo_draft_key) =
+                        if attachment_only || control != ComposerControl::SendNow {
+                            (None, None)
+                        } else {
+                            self.consume_draft_for_first_send(&owner_key, &captured_draft)
+                        };
                     if let Some(slot) = self.host_slot_mut(&owner_host) {
                         slot.pending_draft_first_send = Some(PendingDraftFirstSend {
                             owner: owner_key.clone(),
                             task_id,
+                            echo_command_id,
+                            echo_draft_key,
                             start_command_id: None,
                             control,
                             attachment_only,
@@ -25449,6 +26162,14 @@ impl NativeShell {
         );
         let provider_kind = self.composer_provider_for_launch_for(&owner_key);
         let is_slash_command_send = matches!(&intent.payload, ComposerPayload::SendNow { .. });
+        // What is going out, not what the box holds. A first send is taken out
+        // of the box before it is dispatched, so reading the live field here
+        // named every new task after an empty string -- which is why they all
+        // stayed "New Codex task".
+        let sent_text = match &intent.payload {
+            ComposerPayload::SendNow { text, .. } => Some(text.clone()),
+            _ => None,
+        };
         if is_slash_command_send
             && provider_kind.is_some()
             && self.layout.composer_provider != provider_kind
@@ -25480,20 +26201,23 @@ impl NativeShell {
                         prompt: None,
                     }),
                 image_ids,
-                open_provider_terminal: is_slash_command_send
-                    && provider_kind.as_ref().is_some_and(|provider_kind| {
-                        self.composer.as_ref().is_some_and(|composer| {
-                            provider_command_opens_terminal(provider_kind, composer.draft_text())
-                        })
-                    }),
-                automatic_title_seed: is_slash_command_send
-                    .then(|| self.composer.as_ref().map(TaskComposer::draft_text))
-                    .flatten()
-                    .map(str::to_string),
+                open_provider_terminal: provider_kind.as_ref().is_some_and(|provider_kind| {
+                    sent_text
+                        .as_deref()
+                        .is_some_and(|text| provider_command_opens_terminal(provider_kind, text))
+                }),
+                automatic_title_seed: sent_text.clone(),
                 // Overwritten with NeverEnqueued only when enqueue retains the record.
                 retention: ComposerSubmissionRetention::AwaitingHostOutcome,
             }
         });
+        // An image staged before the task existed still carries its scratch
+        // path. The host admits an image only from inside the task's own
+        // workspace, and a rejected image is not a rejected image -- it stops
+        // the whole message reaching the provider, and the turn never settles.
+        // By here the task exists, so this is the last and surest place to move
+        // the file in.
+        self.restage_draft_images_into_workspace(&owner_key, &draft_key);
         let images = self
             .composer_images
             .get(&draft_key)
@@ -25504,6 +26228,49 @@ impl NativeShell {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
+        // Unresolvable is as bad as wrong: without the workspace there is no way
+        // to know the path is one the host will take, and guessing is what let a
+        // scratch path through and stopped the conversation.
+        let stray_image = !images.is_empty()
+            && match self.resolved_task_folder(&owner_key) {
+                Some(workspace) => images
+                    .iter()
+                    .any(|image| !std::path::Path::new(image.path()).starts_with(&workspace)),
+                None => true,
+            };
+        if stray_image {
+            // Refuse here rather than send a path the host will reject: a
+            // refused send leaves the turn open and blocks every later message.
+            if matches!(intent.payload, ComposerPayload::SendNow { .. }) {
+                let admission = self
+                    .task_surfaces
+                    .reject_pending_user_message(owner_key.clone(), command_id);
+                let _ = admission;
+            }
+            if let Some(composer) = self.composer.as_mut() {
+                let _ = composer.cancel_pending(command_id);
+            }
+            // The refusal has to be visible where the person is looking. A
+            // first send changes owner mid-flight, so the message goes to the
+            // composer's current owner as well as the sending one.
+            let message =
+                "Couldn't attach the image: it is not in the project folder yet. Try again.";
+            if let Some(slot) = self.host_slot_mut(&owner_host) {
+                slot.composer_error = Some(message.into());
+            }
+            if let Some(current) = self.composer_draft_owner() {
+                if current.host != owner_host {
+                    if let Some(slot) = self.host_slot_mut(&current.host) {
+                        slot.composer_error = Some(message.into());
+                    }
+                }
+            }
+            // And the words come back, since nothing was sent.
+            if let Some(consumed) = self.consumed_first_sends.remove(&command_id) {
+                self.restore_consumed_first_send_draft(&consumed);
+            }
+            return;
+        }
         if !images.is_empty() && !matches!(intent.payload, ComposerPayload::SendNow { .. }) {
             if let Some(composer) = self.composer.as_mut() {
                 let _ = composer.cancel_pending(command_id);
@@ -25515,6 +26282,39 @@ impl NativeShell {
                 );
             }
             return;
+        }
+        // Remember which pictures went with these words. The provider echoes the
+        // message back with the path taken out of it, so without this record the
+        // transcript has no way to paint what was attached.
+        if !images.is_empty() {
+            if let Some(text) = sent_text
+                .as_deref()
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+            {
+                let entry = crate::ui::conversation::rows::SentMessageImages {
+                    text: text.to_string(),
+                    paths: images
+                        .iter()
+                        .map(|image| image.path().to_string())
+                        .collect(),
+                };
+                let sent = self
+                    .sent_message_images
+                    .entry(owner_key.clone())
+                    .or_default();
+                sent.retain(|existing| existing.text != entry.text);
+                sent.push(entry);
+                while sent.len() > MAX_SENT_MESSAGE_IMAGES {
+                    sent.remove(0);
+                }
+                if let Err(error) = self.sent_image_store.save(&self.sent_message_images) {
+                    eprintln!(
+                        "devmanager: sent conversation images not persisted ({}): {error}",
+                        self.sent_image_store.path().display()
+                    );
+                }
+            }
         }
         if let ComposerPayload::SendNow { text, .. } = &intent.payload {
             let admission =
@@ -25661,6 +26461,11 @@ impl NativeShell {
                     .to_string(),
             );
         }
+        self.workspace_root_for_key(&key)
+    }
+
+    /// The folder a task's workspace is bound to on this machine.
+    fn workspace_root_for_key(&self, key: &HostTaskKey) -> Result<PathBuf, String> {
         let model = self
             .host_slot(&key.host)
             .and_then(|slot| slot.client_model.as_ref())
@@ -25678,6 +26483,196 @@ impl NativeShell {
             return Err("task workspace binding is missing".to_string());
         }
         Ok(root.to_path_buf())
+    }
+
+    /// Where a pasted or attached image is written.
+    ///
+    /// A task whose first message has not been sent yet exists only in this
+    /// shell: the host has no projection for it, so there is no workspace
+    /// folder to stage into, and asking for one used to fail with "task
+    /// projection unavailable" -- which is what made an image impossible to
+    /// attach to a first message. Such a draft stages into a scratch folder of
+    /// its own instead, and [`Self::restage_draft_images_into_workspace`] moves
+    /// the files into the project the moment the task is created.
+    fn composer_image_staging_root(&mut self) -> Result<PathBuf, String> {
+        let key = self
+            .composer_draft_owner()
+            .or_else(|| self.selected_task_key.clone())
+            .ok_or_else(|| "select a task before attaching images".to_string())?;
+        if key.host != self.local_host_id() {
+            return Err(
+                "Remote image attach is not available yet; paste and attach stay on the local host."
+                    .to_string(),
+            );
+        }
+        if let Some(root) = self.image_staging_roots.get(&key) {
+            return Ok(root.clone());
+        }
+        if !self.ephemeral_tasks.contains_key(&key) {
+            if let Ok(root) = self.workspace_root_for_key(&key) {
+                return Ok(root);
+            }
+            // The task exists but its folder is not in this projection: a
+            // durable binding that has not landed yet. The host can resolve it
+            // from the project, so ask -- and stage in scratch meanwhile rather
+            // than refusing the paste, since the sweep moves the file in as
+            // soon as the answer arrives.
+            self.request_image_staging_root(&key);
+        }
+        let root = Self::draft_image_staging_root(&key);
+        std::fs::create_dir_all(&root)
+            .map_err(|error| format!("Failed to prepare pasted image staging: {error}"))?;
+        Ok(root)
+    }
+
+    /// Where this task's files live: what the host resolved, else what the
+    /// task's own projection carries. One answer, so the mover and the guard
+    /// that checks its work can never disagree.
+    fn resolved_task_folder(&self, owner: &HostTaskKey) -> Option<PathBuf> {
+        self.image_staging_roots
+            .get(owner)
+            .cloned()
+            .or_else(|| self.workspace_root_for_key(owner).ok())
+    }
+
+    fn composer_draft_key_for(
+        &self,
+        owner: &HostTaskKey,
+    ) -> Option<KeyedComposerDraftKey<HostTaskKey>> {
+        self.composer.as_ref().map(|composer| {
+            Self::fleet_draft_key_for(owner.clone(), composer.fence().agent_session_id)
+        })
+    }
+
+    /// Whether every staged image already sits inside the folder the host will
+    /// admit it from.
+    ///
+    /// The first message of a new task is typed before that task has a folder,
+    /// so its image is staged in scratch. Sending that path is refused, and a
+    /// refused image stops the whole message -- so the send waits for this to
+    /// become true rather than going out early.
+    fn composer_images_ready_for_send(&self, owner: &HostTaskKey) -> bool {
+        let Some(draft_key) = self.composer_draft_key_for(owner) else {
+            return true;
+        };
+        let Some(images) = self.composer_images.get(&draft_key) else {
+            return true;
+        };
+        if images.is_empty() {
+            return true;
+        }
+        match self.resolved_task_folder(owner) {
+            Some(workspace) => images
+                .iter()
+                .all(|image| image.path.starts_with(&workspace)),
+            None => false,
+        }
+    }
+
+    /// Ask the host where this task's files live.
+    ///
+    /// Re-askable, because the answer is unavailable until the workspace is
+    /// bound and a send can be waiting on it: one unanswered query would
+    /// otherwise strand the message until the startup deadline.
+    fn request_image_staging_root(&mut self, owner: &HostTaskKey) {
+        if owner.host != self.local_host_id() {
+            return;
+        }
+        let now = Instant::now();
+        if self
+            .image_staging_root_requests
+            .get(owner)
+            .is_some_and(|asked| now.duration_since(*asked) < IMAGE_STAGING_ROOT_RETRY)
+        {
+            return;
+        }
+        self.image_staging_root_requests.insert(owner.clone(), now);
+        let _ = self.dispatch_task_cockpit_query(owner.task_id, TaskCockpitQuery::ImageStagingRoot);
+    }
+
+    /// Remember a resolved folder and move anything already staged in scratch
+    /// into it.
+    fn apply_image_staging_root(&mut self, task_id: TaskId, root: PathBuf) {
+        let owner = self.local_task_key(task_id);
+        self.image_staging_roots.insert(owner, root);
+        self.restage_scratch_images_for_known_workspaces();
+        // A first send held for exactly this answer can go out now.
+        self.try_advance_pending_draft_first_send();
+    }
+
+    /// One scratch folder per unsent draft, so two drafts cannot collide and
+    /// abandoning one cannot delete the other's images.
+    fn draft_image_staging_root(key: &HostTaskKey) -> PathBuf {
+        std::env::temp_dir()
+            .join("devmanager-unsent-drafts")
+            .join(key.task_id.to_string())
+    }
+
+    /// Move every scratch-staged image into its task's folder, for any task
+    /// whose folder is now known.
+    ///
+    /// The first message of a new task is the case that matters: its image is
+    /// staged before the task exists, and the send that follows is refused
+    /// unless the file has reached the project by then.
+    fn restage_scratch_images_for_known_workspaces(&mut self) {
+        let scratch_root = std::env::temp_dir().join("devmanager-unsent-drafts");
+        let pending: Vec<(HostTaskKey, KeyedComposerDraftKey<HostTaskKey>)> = self
+            .composer_images
+            .iter()
+            .filter(|(_, images)| {
+                images
+                    .iter()
+                    .any(|image| image.path.starts_with(&scratch_root))
+            })
+            .map(|(draft_key, _)| (draft_key.task_id.clone(), draft_key.clone()))
+            .collect();
+        for (owner, draft_key) in pending {
+            if self.resolved_task_folder(&owner).is_some() {
+                self.restage_draft_images_into_workspace(&owner, &draft_key);
+            }
+        }
+    }
+
+    /// Move an unsent draft's images into the project folder now that the task
+    /// exists there.
+    ///
+    /// The host admits an image only when its path is inside that session's own
+    /// workspace, so a scratch path has to be rewritten before the first send
+    /// carries it. The bytes are unchanged, so the digest the host re-checks
+    /// still matches.
+    fn restage_draft_images_into_workspace(
+        &mut self,
+        key: &HostTaskKey,
+        draft_key: &KeyedComposerDraftKey<HostTaskKey>,
+    ) {
+        let Some(workspace) = self.resolved_task_folder(key) else {
+            return;
+        };
+        let Some(images) = self.composer_images.get_mut(draft_key) else {
+            return;
+        };
+        let mut failure = None;
+        images.retain_mut(|image| {
+            if image.path.starts_with(&workspace) {
+                return true;
+            }
+            match restage_native_composer_image(&workspace, image) {
+                Ok(()) => true,
+                Err(error) => {
+                    // Dropping the image is the honest outcome: kept, it would
+                    // be refused by the host at send time with a path error.
+                    failure.get_or_insert(error);
+                    false
+                }
+            }
+        });
+        if let Some(error) = failure {
+            let host = key.host.clone();
+            if let Some(slot) = self.host_slot_mut(&host) {
+                slot.composer_error = Some(format!("Couldn't attach the image: {error}"));
+            }
+        }
+        let _ = std::fs::remove_dir_all(Self::draft_image_staging_root(key));
     }
 
     fn remote_image_attach_blocked_reason(&self) -> Option<&'static str> {
@@ -25857,7 +26852,7 @@ impl NativeShell {
             return true;
         };
         let expected_owner = expected_key.task_id.clone();
-        let workspace = match self.selected_task_workspace_root() {
+        let workspace = match self.composer_image_staging_root() {
             Ok(workspace) => workspace,
             Err(error) => {
                 self.set_composer_error_for_owner(&expected_owner, error);
@@ -25892,6 +26887,58 @@ impl NativeShell {
         true
     }
 
+    /// Attach files dropped onto the composer from the desktop.
+    ///
+    /// The same staging, validation and limits as a paste: this is a second
+    /// door into one room, not a second room.
+    fn attach_dropped_paths(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+        if paths.is_empty() {
+            return;
+        }
+        if let Some(reason) = self.remote_image_attach_blocked_reason() {
+            self.set_draft_owner_composer_error(reason);
+            return;
+        }
+        let Some(expected_key) = self.current_composer_draft_key() else {
+            self.set_draft_owner_composer_error("composer is unavailable");
+            return;
+        };
+        let expected_owner = expected_key.task_id.clone();
+        let workspace = match self.composer_image_staging_root() {
+            Ok(workspace) => workspace,
+            Err(error) => {
+                self.set_composer_error_for_owner(&expected_owner, error);
+                return;
+            }
+        };
+        let executor = cx.background_executor().clone();
+        cx.spawn(
+            move |this: gpui::WeakEntity<NativeShell>, cx: &mut gpui::AsyncApp| {
+                let mut async_cx = cx.clone();
+                async move {
+                    let prepared = executor
+                        .spawn(async move {
+                            prepare_native_composer_images_from_paths(&workspace, paths)
+                        })
+                        .await;
+                    let _ = this.update(&mut async_cx, |shell, cx| {
+                        match prepared.and_then(|prepared| {
+                            shell.admit_prepared_native_composer_images(expected_key, prepared)
+                        }) {
+                            Ok(()) => shell.clear_composer_error_for_owner(&expected_owner),
+                            Err(error) => {
+                                shell.set_composer_error_for_owner(&expected_owner, error)
+                            }
+                        }
+                        shell.pending_composer_focus = true;
+                        cx.notify();
+                    });
+                }
+            },
+        )
+        .detach();
+    }
+
     fn schedule_composer_image_picker(&mut self, cx: &mut Context<Self>) {
         if cfg!(test) {
             return;
@@ -25909,7 +26956,7 @@ impl NativeShell {
             return;
         };
         let expected_owner = expected_key.task_id.clone();
-        let workspace = match self.selected_task_workspace_root() {
+        let workspace = match self.composer_image_staging_root() {
             Ok(workspace) => workspace,
             Err(error) => {
                 self.set_composer_error_for_owner(&expected_owner, error);
@@ -25927,9 +26974,39 @@ impl NativeShell {
             move |this: gpui::WeakEntity<NativeShell>, cx: &mut gpui::AsyncApp| {
                 let mut async_cx = cx.clone();
                 async move {
-                    let picked = match rx.await {
-                        Ok(Ok(Some(paths))) => paths,
-                        _ => return,
+                    // The file chooser is the desktop's, through the XDG
+                    // portal. Some desktops accept the request and never show a
+                    // window, which made this button look dead: no dialog, no
+                    // error, nothing. Waiting forever is not an answer, so the
+                    // wait is bounded and the refusal says what still works.
+                    let outcome = {
+                        let timeout = executor.timer(FILE_PICKER_ANSWER_TIMEOUT);
+                        futures_util::pin_mut!(rx);
+                        futures_util::pin_mut!(timeout);
+                        match futures_util::future::select(rx, timeout).await {
+                            futures_util::future::Either::Left((answer, _)) => match answer {
+                                Ok(Ok(Some(paths))) => PickedPaths::Paths(paths),
+                                Ok(Ok(None)) => PickedPaths::Cancelled,
+                                _ => PickedPaths::Unavailable,
+                            },
+                            futures_util::future::Either::Right(_) => PickedPaths::Unavailable,
+                        }
+                    };
+                    let picked = match outcome {
+                        PickedPaths::Paths(paths) => paths,
+                        PickedPaths::Cancelled => return,
+                        PickedPaths::Unavailable => {
+                            let _ = this.update(&mut async_cx, |shell, cx| {
+                                shell.set_composer_error_for_owner(
+                                    &expected_owner,
+                                    "This desktop did not open a file chooser. Drag the image \
+                                     onto the message box, or paste it."
+                                        .to_string(),
+                                );
+                                cx.notify();
+                            });
+                            return;
+                        }
                     };
                     let prepared = executor
                         .spawn(async move {
@@ -28222,6 +29299,28 @@ impl NativeShell {
                 timeline.set_viewport_height(timeline_height);
             }
         }
+        {
+            let now_ms = unix_time_ms();
+            let indicator = self.conversation_working_indicator(&owner, now_ms);
+            // These records were admitted at the exact successful task send
+            // and the bounded store accepts only absolute, normalized paths in
+            // a `.devmanager/pasted-images` folder. Do not make presentation
+            // depend on a second workspace query: on restart the transcript can
+            // arrive before that query, which permanently measured the row as
+            // text-only and hid the restored picture.
+            let sent_images = self
+                .sent_message_images
+                .get(&owner)
+                .cloned()
+                .unwrap_or_default();
+            if let Some(timeline) = self
+                .host_slot_mut(&owner.host)
+                .and_then(|slot| slot.cockpit.timeline_mut_for(owner_task_id))
+            {
+                timeline.set_working_indicator(indicator, now_ms);
+                timeline.set_sent_message_images(sent_images);
+            }
+        }
         #[cfg(debug_assertions)]
         if self.preview_conversation_installed() {
             let steps = self.preview_plan_steps.clone().unwrap_or_default();
@@ -28443,32 +29542,24 @@ impl NativeShell {
             crate::providers::ProviderAccessMode::WorkspaceWrite => "Workspace write",
             crate::providers::ProviderAccessMode::ReadOnly => "Read only",
         };
-        let open_provider = cx.listener(|shell, _event: &ClickEvent, window, cx| {
+        let open_model = cx.listener(|shell, event: &ClickEvent, window, cx| {
             cx.stop_propagation();
             if shell.focus_composer_for_selector(window) {
-                shell.open_composer_provider_selector();
+                shell.open_model_picker(Self::click_anchor(event));
             }
             cx.notify();
         });
-        let open_model = cx.listener(|shell, _event: &ClickEvent, window, cx| {
+        let open_reasoning = cx.listener(|shell, event: &ClickEvent, window, cx| {
             cx.stop_propagation();
             if shell.focus_composer_for_selector(window) {
-                shell.open_composer_model_selector();
+                shell.open_composer_reasoning_selector(Self::click_anchor(event));
             }
             cx.notify();
         });
-        let draft_provider_selectable = self.selected_task_is_unstarted_draft();
-        let open_reasoning = cx.listener(|shell, _event: &ClickEvent, window, cx| {
+        let open_access = cx.listener(|shell, event: &ClickEvent, window, cx| {
             cx.stop_propagation();
             if shell.focus_composer_for_selector(window) {
-                shell.open_composer_reasoning_selector();
-            }
-            cx.notify();
-        });
-        let open_access = cx.listener(|shell, _event: &ClickEvent, window, cx| {
-            cx.stop_propagation();
-            if shell.focus_composer_for_selector(window) {
-                shell.open_composer_access_selector();
+                shell.open_composer_access_selector(Self::click_anchor(event));
             }
             cx.notify();
         });
@@ -28750,19 +29841,9 @@ impl NativeShell {
         let mut push_segment = |label: String, element: AnyElement| {
             meta_segments.push((label, element));
         };
-        push_segment(
-            provider_label.to_string(),
-            if draft_provider_selectable {
-                Self::composer_meta_action(
-                    "native-composer-provider",
-                    provider_label.to_string(),
-                    tokens,
-                    open_provider,
-                )
-            } else {
-                meta_static(provider_label.to_string())
-            },
-        );
+        // The provider used to have a chip of its own. The model picker now
+        // carries providers in its rail and names each model's provider under
+        // it, so a second menu for the same fact was one menu too many.
         if self.composer_launch_preferences_editable() {
             push_segment(
                 model_label.clone(),
@@ -29010,6 +30091,16 @@ impl NativeShell {
                     div().w_full().flex().justify_center().child(
                         div()
                             .id("native-task-composer-card")
+                            // Files dragged from the desktop attach exactly as
+                            // a paste does. This is the way in that does not
+                            // depend on the desktop's file chooser, which some
+                            // systems accept and then never show.
+                            .on_drop(cx.listener(
+                                |shell, paths: &gpui::ExternalPaths, _window, cx| {
+                                    shell.attach_dropped_paths(paths.paths().to_vec(), cx);
+                                    cx.notify();
+                                },
+                            ))
                             .w(px(CONVERSATION_CONTENT_MAX_WIDTH))
                             .max_w_full()
                             // Rule 3: an input is `surfaces.sunken` behind a
@@ -29583,7 +30674,8 @@ impl NativeShell {
                                                 separator.into_iter().chain(Some(segment))
                                             },
                                         ))
-                                        .children(self.composer_selector_menu(tokens, cx)),
+                                    // The selector paints as an overlay now,
+                                    // not as a child of this clipped strip.
                                 )
                                 // The three labels come from the constants the
                                 // width arithmetic above measured, so the room
@@ -29694,6 +30786,10 @@ impl NativeShell {
                             .is_some_and(|timeline| timeline.toggle_activity_group(&group)),
                         crate::ui::task_cockpit::timeline::ActivityAction::OpenSubagent(id) => {
                             shell.select_panel_subagent(&owner_key, Some(id))
+                        }
+                        crate::ui::task_cockpit::timeline::ActivityAction::OpenImage(path) => {
+                            shell.image_lightbox = Some(std::path::PathBuf::from(path));
+                            true
                         }
                     };
                     if toggled {
@@ -31529,6 +32625,9 @@ impl NativeShell {
                     || self.new_task.is_some()
                     || self.rename_task.is_some()
                     || self.delete_task.is_some()
+                    || self.remove_project.is_some()
+                    || self.model_picker.is_some()
+                    || self.image_lightbox.is_some()
                     || self.settings_open
                     || !matches!(self.header_commit.phase, HeaderCommitPhase::Idle)
                     || !matches!(self.project_actions.mode, ProjectActionMenuMode::Closed)
@@ -31548,6 +32647,9 @@ impl NativeShell {
                 self.dismiss_composer_selector();
                 self.trigger_menu = None;
                 self.add_project = None;
+                self.remove_project = None;
+                self.model_picker = None;
+                self.image_lightbox = None;
                 self.new_task = None;
                 self.rename_task = None;
                 self.task_search.close();
@@ -33967,6 +35069,7 @@ impl NativeShell {
             action.client_epoch = client_epoch;
         }
         self.promote_ephemeral_tasks_for_host(host_id, model.as_ref());
+        self.restage_scratch_images_for_known_workspaces();
         // Drop tombstones once the owning projection no longer lists the task.
         let present: HashSet<TaskId> = keys.iter().map(|key| key.task_id).collect();
         self.known_deleted_task_keys
@@ -34120,7 +35223,6 @@ impl NativeShell {
     ) -> AnyElement {
         let menu = self.board_menu.expect("board menu is open");
         let (title, entries): (&str, Vec<BoardMenuEntry>) = match menu {
-            BoardMenu::NewTask => ("New task in", self.board_new_task_menu_entries()),
             BoardMenu::Options => ("Board", self.board_options_menu_entries()),
         };
         let mut rows: Vec<AnyElement> = Vec::new();
@@ -34381,12 +35483,6 @@ impl NativeShell {
             return;
         }
         match entry.action.clone() {
-            BoardMenuAction::NewTaskIn(project_key) => {
-                self.begin_new_task_for_project_key(project_key);
-            }
-            BoardMenuAction::StartAgentIn(project_id, provider) => {
-                self.start_task_with_agent_for_project(project_id, provider);
-            }
             BoardMenuAction::ToggleArchived => {
                 self.show_archived_tasks = !self.show_archived_tasks;
             }
@@ -34791,6 +35887,252 @@ impl NativeShell {
         self.board_age_label_repaints
     }
 
+    /// Ask the host to name this task from its first message.
+    ///
+    /// Local tasks only: naming runs a provider binary, which is the local
+    /// host's authority. Asked once per task, and never for a task the person
+    /// has already named themselves.
+    fn request_suggested_task_title(&mut self, owner: &HostTaskKey, seed: &str) {
+        if owner.host != self.local_host_id() || seed.trim().is_empty() {
+            return;
+        }
+        if !self.suggested_title_requests.insert(owner.clone()) {
+            return;
+        }
+        let title_is_automatic = self
+            .host_slot(&owner.host)
+            .and_then(|slot| slot.client_model.as_ref())
+            .and_then(|model| model.task(owner.task_id))
+            .is_some_and(|snapshot| {
+                automatic_task_title(&snapshot.task.title, seed).is_some()
+                    || snapshot.task.title.trim() == seed.trim()
+            });
+        if !title_is_automatic {
+            return;
+        }
+        let _ = self.dispatch_task_cockpit_query(
+            owner.task_id,
+            TaskCockpitQuery::SuggestTaskTitle {
+                seed: seed.to_string(),
+            },
+        );
+    }
+
+    /// Apply a model-written name, if the task still has the stand-in one.
+    ///
+    /// A person who renamed the task in the meantime outranks the model: their
+    /// name stays, and the suggestion is dropped without a word.
+    fn apply_suggested_task_title(&mut self, task_id: TaskId, title: Option<String>) {
+        let Some(title) = title else {
+            return;
+        };
+        let title = title.trim().to_string();
+        if title.is_empty() {
+            return;
+        }
+        let owner = self.local_task_key(task_id);
+        let Some(current_title) = self
+            .host_slot(&owner.host)
+            .and_then(|slot| slot.client_model.as_ref())
+            .and_then(|model| model.task(task_id))
+            .map(|snapshot| snapshot.task.title.clone())
+        else {
+            return;
+        };
+        if current_title.trim() == title {
+            return;
+        }
+        let ours = self
+            .pending_automatic_titles
+            .get(&owner)
+            .map(|pending| pending.proposed_title.clone())
+            .or_else(|| self.applied_automatic_titles.get(&owner).cloned());
+        if !suggested_title_is_replaceable(&current_title, ours.as_deref()) {
+            self.applied_automatic_titles.remove(&owner);
+            return;
+        }
+        self.applied_automatic_titles.remove(&owner);
+        // The heuristic rename is no longer wanted: this is the real name.
+        // Dispatched the same way the heuristic one is, so it carries the same
+        // revision fence the host requires of a rename.
+        self.pending_automatic_titles.remove(&owner);
+        let _ = self.dispatch_action(ActionRequest::TaskRename(
+            crate::client::action::TaskRenameArguments { task_id, title },
+        ));
+    }
+
+    /// Take the first message out of the composer and put it in the transcript
+    /// straight away.
+    ///
+    /// Creating the task, probing the terminal, starting the provider and
+    /// waiting for it to come up are four host round-trips. Keeping the text in
+    /// the box until they finish is what made sending feel slow, so the text
+    /// moves now and the round-trips happen behind it. Returns the id of the
+    /// optimistic row, which is also the record that the draft was consumed.
+    fn consume_draft_for_first_send(
+        &mut self,
+        owner: &HostTaskKey,
+        text: &str,
+    ) -> (
+        Option<CommandId>,
+        Option<KeyedComposerDraftKey<HostTaskKey>>,
+    ) {
+        if text.trim().is_empty() {
+            return (None, None);
+        }
+        let Some((projection, draft_key)) = self.composer.as_ref().map(|composer| {
+            (
+                composer.draft_projection(),
+                Self::fleet_draft_key_for(owner.clone(), composer.fence().agent_session_id),
+            )
+        }) else {
+            return (None, None);
+        };
+        let command_id = CommandId::new();
+        let admission =
+            self.task_surfaces
+                .admit_pending_user_message(owner.clone(), text, command_id);
+        if admission.changed && self.selected_task_key.as_ref() == Some(owner) {
+            if let Some(page) = admission.page {
+                self.project_owner_conversation_presentation(&owner.host, owner, &page);
+            }
+        }
+        let cleared = self
+            .composer
+            .as_mut()
+            .and_then(|composer| composer.clear_draft_if_matches(&projection).ok())
+            .unwrap_or(false);
+        if !cleared {
+            // The field moved under the gesture; leave it alone and take the
+            // optimistic row back rather than showing a message twice.
+            let admission = self
+                .task_surfaces
+                .reject_pending_user_message(owner.clone(), command_id);
+            if admission.changed && self.selected_task_key.as_ref() == Some(owner) {
+                if let Some(page) = admission.page {
+                    self.project_owner_conversation_presentation(&owner.host, owner, &page);
+                }
+            }
+            return (None, None);
+        }
+        // The cached copy goes too, or switching away and back would refill the
+        // box with a message already on its way.
+        self.composer_drafts.remove(&draft_key);
+        self.composer_drafts_dirty = true;
+        (Some(command_id), Some(draft_key))
+    }
+
+    /// Give a consumed draft back when its send could not go through, and take
+    /// the optimistic row down. Anything else would lose typed words.
+    fn restore_consumed_first_send_draft(&mut self, pending: &PendingDraftFirstSend) {
+        let Some(command_id) = pending.echo_command_id else {
+            return;
+        };
+        let admission = self
+            .task_surfaces
+            .reject_pending_user_message(pending.owner.clone(), command_id);
+        if admission.changed && self.selected_task_key.as_ref() == Some(&pending.owner) {
+            if let Some(page) = admission.page {
+                self.project_owner_conversation_presentation(
+                    &pending.owner.host,
+                    &pending.owner,
+                    &page,
+                );
+            }
+        }
+        // The task's own cached draft is the authority -- it is what a return to
+        // this task will show, and what the rest of the shell reads. Refill it
+        // unless something newer was typed for this task in the meantime.
+        if let Some(draft_key) = pending.echo_draft_key.clone() {
+            let cache_is_free = self
+                .composer_drafts
+                .get(&draft_key)
+                .map_or(true, |draft| draft.text.trim().is_empty());
+            if cache_is_free {
+                self.composer_drafts.insert(
+                    draft_key,
+                    crate::ui::task_cockpit::composer::ComposerDraftProjection {
+                        text: pending.captured_draft.clone(),
+                        attachments: Vec::new(),
+                        prompt: None,
+                    },
+                );
+                self.composer_drafts_dirty = true;
+            }
+        }
+        // And back into the live field when it still belongs to this task and
+        // is empty: if the person moved on, or started the next message, that
+        // is theirs to keep.
+        let live_owner_matches = self.composer_draft_owner().as_ref() == Some(&pending.owner);
+        let field_empty = self
+            .composer
+            .as_ref()
+            .is_some_and(|composer| composer.draft_text().trim().is_empty());
+        if live_owner_matches && field_empty {
+            if let Ok(epoch) = self.rearm_composer_focus() {
+                let text = pending.captured_draft.clone();
+                if let Some(composer) = self.composer.as_mut() {
+                    let _ = composer.replace_draft(&text, epoch);
+                }
+                self.composer_drafts_dirty = true;
+            }
+        }
+    }
+
+    /// Whether this task's transcript should carry a working row, and what it
+    /// should say.
+    ///
+    /// An open provider turn is the obvious case. The one that matters more is
+    /// earlier: between pressing Send and the provider's first output there is
+    /// no turn yet, and that silence is exactly what reads as stuck. A message
+    /// this shell is still carrying, or a transcript whose last word is the
+    /// user's, counts as working too.
+    fn conversation_working_indicator(
+        &mut self,
+        owner: &HostTaskKey,
+        now_ms: i64,
+    ) -> Option<crate::ui::conversation::rows::WorkingIndicator> {
+        let status_working = self
+            .host_slot(&owner.host)
+            .and_then(|slot| slot.client_model.as_ref())
+            .and_then(|model| model.task(owner.task_id))
+            .is_some_and(|snapshot| {
+                snapshot.visible_status() == crate::domain::task::VisibleTaskStatus::Working
+            });
+        // Only sends this shell is still carrying count. An optimistic row that
+        // the provider never echoes back stays pending forever, and keying off
+        // it left the row counting under a finished answer.
+        let send_in_flight = self.host_slot(&owner.host).is_some_and(|slot| {
+            slot.pending_draft_first_send
+                .as_ref()
+                .is_some_and(|pending| &pending.owner == owner)
+                || slot
+                    .pending_settled_send
+                    .as_ref()
+                    .is_some_and(|pending| &pending.owner == owner)
+        }) || self
+            .pending_composer_submissions
+            .values()
+            .any(|submission| &submission.key.task_id == owner);
+        // An open turn alone is not evidence: nothing in the projection ever
+        // closes one, so it reads Working forever after the first message. The
+        // turn counts only while the last word is still the user's -- once the
+        // answer lands, the wait is over whatever the projection still says.
+        let awaiting_reply = self.task_surfaces.conversation_turn_pending(owner.clone());
+        if !send_in_flight && !(status_working && awaiting_reply) {
+            self.working_since.remove(owner);
+            return None;
+        }
+        // Counted from when this shell first saw the work, which is what the
+        // person actually waited. A host timestamp would be more precise and
+        // less true: it cannot include the gesture that has not reached it yet.
+        let since_ms = *self.working_since.entry(owner.clone()).or_insert(now_ms);
+        Some(crate::ui::conversation::rows::WorkingIndicator {
+            since_ms: Some(since_ms),
+            step: self.board_activity_for(owner).doing_now,
+        })
+    }
+
     /// This task's plan progress and doing-now, recomputed only when its
     /// conversation actually moved.
     ///
@@ -34840,8 +36182,8 @@ impl NativeShell {
 
     /// Every project a new task can be started in, owner-qualified and in a
     /// stable order: local folders first, then each attached host's configured
-    /// projects. The `+ New` menu and the accessibility tree read the same
-    /// list, so a project reachable by one is reachable by the other.
+    /// projects. `+ New`'s fallback project and the accessibility tree read
+    /// the same list, so a project reachable by one is reachable by the other.
     fn board_new_task_targets(&self) -> Vec<(HostProjectKey, String)> {
         let local = self.local_host_id();
         let mut targets = Vec::new();
@@ -34896,43 +36238,6 @@ impl NativeShell {
             }
         }
         targets
-    }
-
-    /// The `+ New` menu's rows. A local project gets one row per provider the
-    /// connection snapshot reports signed in -- the "+Claude" / "+Codex" pair
-    /// the project rail carried, now in one place instead of on every header.
-    /// A remote project, and a local one with no provider signed in, gets the
-    /// new-task dialog instead: provider start there stays deferred.
-    fn board_new_task_menu_entries(&self) -> Vec<BoardMenuEntry> {
-        let local = self.local_host_id();
-        let providers: Vec<ProviderKind> = self
-            .local_slot()
-            .agent_connection
-            .as_ref()
-            .map(inbox_agent_actions)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|action| action.provider)
-            .collect();
-        let mut entries = Vec::new();
-        for (index, (project_key, label)) in self.board_new_task_targets().into_iter().enumerate() {
-            if project_key.host == local && !providers.is_empty() {
-                for (slot, provider) in providers.iter().copied().enumerate() {
-                    entries.push(BoardMenuEntry::live(
-                        format!("board-menu-new-{index}-{slot}"),
-                        format!("{label} · {}", provider.display_name()),
-                        BoardMenuAction::StartAgentIn(project_key.project_id, provider),
-                    ));
-                }
-            } else {
-                entries.push(BoardMenuEntry::live(
-                    format!("board-menu-new-{index}"),
-                    format!("{label} · New task…"),
-                    BoardMenuAction::NewTaskIn(project_key),
-                ));
-            }
-        }
-        entries
     }
 
     /// The board flattened for the accessibility tree: one node per section,
@@ -35142,6 +36447,7 @@ impl NativeShell {
             path: String::new(),
             error: None,
             submitting: false,
+            editing: None,
         });
         self.pending_root_overlay_focus = true;
         self.new_task = None;
@@ -35239,6 +36545,7 @@ impl NativeShell {
                     path: path.display().to_string(),
                     error: None,
                     submitting: false,
+                    editing: None,
                 });
                 self.pending_root_overlay_focus = true;
             }
@@ -35395,10 +36702,11 @@ impl NativeShell {
     }
 
     fn submit_add_project(&mut self, cx: &mut Context<Self>) {
+        // Editing without a new folder keeps the current one: no prompt.
         if self
             .add_project
             .as_ref()
-            .is_some_and(|draft| draft.path.trim().is_empty())
+            .is_some_and(|draft| draft.path.trim().is_empty() && draft.editing.is_none())
         {
             self.schedule_folder_prompt(cx);
             return;
@@ -35415,7 +36723,9 @@ impl NativeShell {
         }
         let name = draft.name.value().trim().to_string();
         let root_path = draft.path.trim().to_string();
-        if root_path.is_empty() {
+        // Editing keeps the current folder when no new one was chosen.
+        let editing = draft.editing.clone();
+        if root_path.is_empty() && editing.is_none() {
             self.pending_folder_prompt = true;
             return;
         }
@@ -35437,13 +36747,20 @@ impl NativeShell {
             &local,
             ActionRequest::TaskCockpit {
                 task_id: TaskId::new(),
-                query: TaskCockpitQuery::ConfigCreateProject { name, root_path },
+                query: match editing {
+                    Some(project_id) => TaskCockpitQuery::ConfigUpdateProject {
+                        project_id,
+                        name,
+                        root_path: (!root_path.is_empty()).then_some(root_path),
+                    },
+                    None => TaskCockpitQuery::ConfigCreateProject { name, root_path },
+                },
             },
         ) {
             Ok(action) => action,
             Err(_) => {
                 if let Some(draft) = self.add_project.as_mut() {
-                    draft.error = Some("Couldn't add this project. Try again.".into());
+                    draft.error = Some("Couldn't save this project. Try again.".into());
                     draft.submitting = false;
                     draft.pending = None;
                 }
@@ -35461,7 +36778,8 @@ impl NativeShell {
         matches!(
             &action.command,
             NativeHostCommand::TaskCockpitQuery {
-                query: TaskCockpitQuery::ConfigCreateProject { .. },
+                query: TaskCockpitQuery::ConfigCreateProject { .. }
+                    | TaskCockpitQuery::ConfigUpdateProject { .. },
                 ..
             }
         ) && self
@@ -35503,6 +36821,167 @@ impl NativeShell {
     }
 
     fn offer_first_task_if_needed(&mut self) {}
+
+    /// Open the Add project dialog on an existing project, to rename it or
+    /// point it at a different folder.
+    fn open_edit_project(&mut self, config_id: String, label: String) {
+        if !self.shows_add_project_plus() {
+            return;
+        }
+        let mut name = TextField::new("Project name").expect("project name field");
+        let _ = name.set_value(&label);
+        name.focus();
+        name.select_all();
+        self.add_project = Some(AddProjectDraft {
+            pending: None,
+            name,
+            path: String::new(),
+            error: None,
+            submitting: false,
+            editing: Some(config_id),
+        });
+        self.pending_root_overlay_focus = true;
+        self.new_task = None;
+        self.local_slot_mut().interaction.close_palettes();
+    }
+
+    fn open_remove_project(&mut self, config_id: String, label: String, workspace_id: String) {
+        if !self.shows_add_project_plus() {
+            return;
+        }
+        let open_tasks = self.board_task_count_for_project(&workspace_id);
+        self.remove_project = Some(RemoveProjectDraft {
+            config_id,
+            label,
+            open_tasks,
+            pending: None,
+            error: None,
+            submitting: false,
+        });
+        self.pending_root_overlay_focus = true;
+        self.new_task = None;
+        self.local_slot_mut().interaction.close_palettes();
+    }
+
+    /// Tasks of this project still on the local board, archived ones aside.
+    fn board_task_count_for_project(&self, workspace_id: &str) -> usize {
+        let Ok(project_id) = ProjectId::parse(workspace_id) else {
+            return 0;
+        };
+        let local = self.local_host_id();
+        self.host_slot(&local)
+            .map(|slot| {
+                slot.inbox
+                    .presentation_rows()
+                    .filter(|row| {
+                        row.project_id == project_id
+                            && slot.inbox.history_row(row.task_id).is_none()
+                    })
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
+    /// Keys reach the confirmation through the shell's own routing, as for
+    /// Add project: its backdrop does not reliably hold focus.
+    fn handle_remove_project_key(&mut self, event: &KeyDownEvent, window: &mut Window) {
+        match event.keystroke.key.as_str() {
+            "escape" => {
+                window.prevent_default();
+                self.remove_project = None;
+            }
+            "enter" => {
+                window.prevent_default();
+                // Refuses while a removal is pending or tasks remain.
+                self.confirm_remove_project();
+            }
+            _ => {}
+        }
+    }
+
+    fn confirm_remove_project(&mut self) {
+        let Some(draft) = self.remove_project.as_ref() else {
+            return;
+        };
+        if draft.submitting || draft.open_tasks > 0 {
+            return;
+        }
+        let project_id = draft.config_id.clone();
+        if !self.shows_add_project_plus() {
+            if let Some(draft) = self.remove_project.as_mut() {
+                draft.error = Some("Connect the local host before removing a project.".into());
+            }
+            return;
+        }
+        let local = self.local_host_id();
+        match self.dispatch_action_recorded_for_owner(
+            &local,
+            ActionRequest::TaskCockpit {
+                task_id: TaskId::new(),
+                query: TaskCockpitQuery::ConfigArchiveProject { project_id },
+            },
+        ) {
+            Ok(action) => {
+                if let Some(draft) = self.remove_project.as_mut() {
+                    draft.pending = Some(action);
+                    draft.submitting = true;
+                    draft.error = None;
+                }
+            }
+            Err(_) => {
+                if let Some(draft) = self.remove_project.as_mut() {
+                    draft.error = Some("Couldn't remove this project. Try again.".into());
+                }
+            }
+        }
+    }
+
+    fn owns_remove_project_action(&self, action: &NativeActionRecord) -> bool {
+        matches!(
+            &action.command,
+            NativeHostCommand::TaskCockpitQuery {
+                query: TaskCockpitQuery::ConfigArchiveProject { .. },
+                ..
+            }
+        ) && self
+            .remove_project
+            .as_ref()
+            .and_then(|draft| draft.pending.as_ref())
+            .is_some_and(|pending| {
+                same_native_action_identity(pending, action)
+                    && pending.connection_epoch == action.connection_epoch
+                    && pending.resource_generation == action.resource_generation
+                    && pending.runtime_generation == action.runtime_generation
+            })
+    }
+
+    fn remove_project_action_is_current(&self, action: &NativeActionRecord) -> bool {
+        let epochs = self.local_slot().interaction.action_epochs();
+        self.owns_remove_project_action(action)
+            && action.connection_epoch == epochs.connection_epoch
+            && action.resource_generation == epochs.resource_generation
+            && action.runtime_generation == epochs.runtime_generation
+            && action.client_epoch <= epochs.client_epoch
+    }
+
+    fn settle_remove_project_failure(&mut self, action: &NativeActionRecord, error: String) {
+        if self.owns_remove_project_action(action) {
+            if let Some(draft) = self.remove_project.as_mut() {
+                draft.pending = None;
+                draft.submitting = false;
+                draft.error = Some(error);
+            }
+        }
+    }
+
+    fn finish_remove_project_after_host_accept(&mut self, action: &NativeActionRecord) {
+        if self.owns_remove_project_action(action) {
+            self.remove_project = None;
+            // A scope on the removed project falls back to All projects.
+            let scope = self.project_scope();
+            self.set_project_scope(scope);
+        }
+    }
 
     fn start_task_with_agent(&mut self, kind: ProviderKind) {
         let Some(project_id) = self.current_workspace_project_id() else {
@@ -37132,6 +38611,16 @@ impl NativeShell {
         host_id: &HostId,
         message: impl Into<String>,
     ) {
+        // A send that was taken out of the box owes it back before anything
+        // else: the message must never be lost between the two.
+        let consumed = self
+            .host_slot(host_id)
+            .and_then(|slot| slot.pending_draft_first_send.as_ref())
+            .filter(|pending| pending.echo_command_id.is_some())
+            .cloned();
+        if let Some(pending) = consumed {
+            self.restore_consumed_first_send_draft(&pending);
+        }
         if let Some(slot) = self.host_slot_mut(host_id) {
             if let Some(pending) = slot.pending_draft_first_send.take() {
                 // Keep admitted readiness request IDs as tombstones so a late
@@ -37462,15 +38951,49 @@ impl NativeShell {
             .iter()
             .map(|image| image.id)
             .collect::<Vec<_>>();
-        if current_draft != pending.captured_draft
-            || current_artifacts != pending.captured_artifact_ids
-            || current_images != pending.captured_image_ids
+        // Only a SHRINKING set means the person removed an attachment. The set
+        // also changes when this shell moves a scratch-staged image into the
+        // project between the gesture and the dispatch, and cancelling for our
+        // own housekeeping is what left a first message with an image sitting
+        // in the box, unsent and unexplained.
+        let attachments_removed = pending
+            .captured_image_ids
+            .iter()
+            .any(|captured| !current_images.contains(captured));
+        // A consumed draft is no longer in the field to compare against: the
+        // captured text is the authority, and whatever is in the box now is the
+        // next message being typed. Only an unconsumed send still has to match.
+        if pending.echo_command_id.is_none()
+            && (current_draft != pending.captured_draft
+                || current_artifacts != pending.captured_artifact_ids
+                || attachments_removed)
         {
             self.cancel_pending_draft_first_send_for_host(
                 host_id,
                 "Draft changed after first-send was requested. Draft kept; send cancelled.",
             );
             return;
+        }
+        if pending.echo_command_id.is_some() && attachments_removed {
+            self.cancel_pending_draft_first_send_for_host(
+                host_id,
+                "Attachments changed after send was requested. Send cancelled; draft restored.",
+            );
+            return;
+        }
+        // An image pasted before this task existed still carries a scratch path.
+        // The host admits an image only from inside the session's own workspace,
+        // so hold the send until the file has moved in -- dispatching now would
+        // be refused, and a refused image takes the whole message with it. The
+        // startup deadline above still bounds this wait.
+        if !self.composer_images_ready_for_send(&pending.owner) {
+            if let Some(draft_key) = self.composer_draft_key_for(&pending.owner) {
+                self.restage_draft_images_into_workspace(&pending.owner, &draft_key);
+            }
+            if !self.composer_images_ready_for_send(&pending.owner) {
+                self.request_image_staging_root(&pending.owner);
+                return;
+            }
         }
         let epoch = match self.rearm_composer_focus() {
             Ok(epoch) => epoch,
@@ -37492,11 +39015,19 @@ impl NativeShell {
                 }
                 return;
             };
+            let captured_text = pending.captured_draft.clone();
+            let captured_artifacts = pending.captured_artifact_ids.clone();
+            let consumed =
+                pending.echo_command_id.is_some() && pending.control == ComposerControl::SendNow;
             match composer
                 .focus_control(pending.control, epoch)
                 .and_then(|_| {
                     if pending.attachment_only {
                         composer.activate_attachment_only_send(epoch)
+                    } else if consumed {
+                        // Send what was typed at the gesture, not what the box
+                        // holds now -- the box belongs to the next message.
+                        composer.activate_captured_send(captured_text, captured_artifacts, epoch)
                     } else {
                         composer.activate(pending.control, epoch)
                     }
@@ -37513,6 +39044,18 @@ impl NativeShell {
         };
         if let Some(slot) = self.host_slot_mut(host_id) {
             slot.pending_draft_first_send = None;
+        }
+        // The dispatch admits its own optimistic row, so the one painted at the
+        // gesture retires in the same frame -- the person sees no flicker and
+        // never two copies of one message.
+        if let Some(command_id) = pending.echo_command_id {
+            let admission = self
+                .task_surfaces
+                .reject_pending_user_message(pending.owner.clone(), command_id);
+            let _ = admission;
+            // If the host refuses this send, these are the words to give back.
+            self.consumed_first_sends
+                .insert(intent.command_id, pending.clone());
         }
         self.dispatch_composer_intent(intent);
     }
@@ -37547,6 +39090,15 @@ impl NativeShell {
             ProjectScope::All => self
                 .current_workspace_project_id()
                 .map(|project_id| HostProjectKey::new(self.local_host_id(), project_id)),
+        });
+        // Nothing selected and no scope: the dialog still opens on the first
+        // project, where its own project list lets the user switch. Only a
+        // shell with no project at all falls through to Add project.
+        let project_key = project_key.or_else(|| {
+            self.board_new_task_targets()
+                .into_iter()
+                .next()
+                .map(|(key, _)| key)
         });
         let Some(project_key) = project_key else {
             if self.selected_owner_is_remote() {
@@ -37598,6 +39150,9 @@ impl NativeShell {
         self.rename_task = None;
         self.cancel_delete_task_flow();
         self.add_project = None;
+        // A board menu left open underneath would reappear when the dialog
+        // closes, reading as a second project chooser.
+        self.board_menu = None;
         self.local_slot_mut().interaction.close_palettes();
     }
 
@@ -37720,6 +39275,8 @@ impl NativeShell {
         let draft_key = Self::fleet_draft_key_for(key.clone(), draft.agent_session_id);
         self.composer_drafts.remove(&draft_key);
         self.composer_images.remove(&draft_key);
+        // An abandoned draft takes its scratch images with it.
+        let _ = std::fs::remove_dir_all(Self::draft_image_staging_root(key));
         self.draft_launch_prefs.remove(key);
         self.task_surfaces.remove_task(key.clone());
         if self.composer_owner.as_ref() == Some(key) {
@@ -37872,7 +39429,18 @@ impl NativeShell {
                 self.composer_drafts.insert(new_draft_key.clone(), draft);
             }
             if let Some(images) = self.composer_images.remove(&old_draft_key) {
-                self.composer_images.insert(new_draft_key, images);
+                self.composer_images.insert(new_draft_key.clone(), images);
+                // The task has a folder on disk now, so anything staged while
+                // it did not have one moves in before the first send.
+                self.restage_draft_images_into_workspace(&key, &new_draft_key);
+                if self.resolved_task_folder(&key).is_none() {
+                    // The create receipt carries no workspace binding, and the
+                    // projection may not carry one until the provider starts.
+                    // Ask the host where this task's files belong -- without
+                    // this nothing ever asks, the image keeps its scratch path,
+                    // and the first message is refused for it.
+                    self.request_image_staging_root(&key);
+                }
             }
             if let Some((provider, options)) = launch_preferences {
                 self.draft_launch_prefs
@@ -37993,6 +39561,7 @@ impl NativeShell {
             return;
         }
         self.pending_automatic_titles.remove(&owner);
+        self.applied_automatic_titles.remove(&owner);
         self.rename_task = None;
     }
 
@@ -38082,7 +39651,7 @@ impl NativeShell {
                 }
             }
             crate::ui::board::topbar::SETTINGS_ELEMENT_ID => self.settings_open = true,
-            "board-header-new" => self.open_board_menu(BoardMenu::NewTask),
+            "board-header-new" => self.begin_new_task(),
             "board-header-menu" => self.open_board_menu(BoardMenu::Options),
             "board-group-done" => {
                 self.board_done_expanded = !self.board_done_expanded;
@@ -38106,9 +39675,9 @@ impl NativeShell {
             "native-delete-task-submit" => self.confirm_task_delete(),
             "native-delete-task-cancel" => self.cancel_delete_task_flow(),
             "native-task-composer-input" => self.request_composer_accessibility_focus(),
-            "native-composer-model" => self.open_composer_model_selector(),
-            "native-composer-reasoning" => self.open_composer_reasoning_selector(),
-            "native-composer-access" => self.open_composer_access_selector(),
+            "native-composer-model" => self.open_model_picker(None),
+            "native-composer-reasoning" => self.open_composer_reasoning_selector(None),
+            "native-composer-access" => self.open_composer_access_selector(None),
             "native-task-composer-attach" => {
                 if let Some(reason) = self.remote_image_attach_blocked_reason() {
                     if let Some(owner) = self.composer_draft_owner() {
@@ -38761,6 +40330,9 @@ impl NativeShell {
         if self.delete_task.is_some() {
             return Some(self.render_delete_task_overlay(tokens, viewport, cx));
         }
+        if self.remove_project.is_some() {
+            return Some(self.render_remove_project_overlay(tokens, viewport, cx));
+        }
         if self.settings_open {
             return Some(self.render_settings_overlay(tokens, viewport, cx));
         }
@@ -38788,6 +40360,19 @@ impl NativeShell {
         }
         if self.pane_menu.is_some() {
             return Some(self.render_pane_menu_overlay(tokens, viewport, cx));
+        }
+        // A picture opened from the stream covers everything: it is the one
+        // thing the person just asked to look at.
+        if self.image_lightbox.is_some() {
+            return Some(self.render_image_lightbox_overlay(tokens, viewport, cx));
+        }
+        if self.model_picker.is_some() {
+            return Some(self.render_model_picker_overlay(tokens, viewport, cx));
+        }
+        if self.composer_selector.is_some() {
+            if let Some(menu) = self.render_composer_selector_overlay(tokens, viewport, cx) {
+                return Some(menu);
+            }
         }
         if self.task_search.open()
             || self
@@ -39044,6 +40629,7 @@ impl NativeShell {
         let draft = self.add_project.as_ref().expect("overlay is open");
         let error = draft.error.clone();
         let has_folder = !draft.path.trim().is_empty();
+        let editing = draft.editing.is_some();
         let submitting = draft.submitting;
         deferred(
             anchored()
@@ -39068,7 +40654,9 @@ impl NativeShell {
                         overlay_chrome::dialog_surface("native-add-project-dialog", tokens)
                             .w(px(440.0))
                             .child(overlay_chrome::heading(
-                                if has_folder {
+                                if editing {
+                                    "Edit project"
+                                } else if has_folder {
                                     "Add this project?"
                                 } else {
                                     "Add a project"
@@ -39079,7 +40667,9 @@ impl NativeShell {
                                 div()
                                     .text_size(px(overlay_chrome::CAPTION_FONT_SIZE))
                                     .text_color(tokens.text.muted.to_gpui())
-                                    .child(if has_folder {
+                                    .child(if editing {
+                                        "Rename it, or point it at a different folder. Files and tasks stay as they are."
+                                    } else if has_folder {
                                         "You can change the name. Nothing is added until you confirm."
                                     } else {
                                         "Choose a folder on this computer. Nothing is added until you confirm."
@@ -39132,13 +40722,15 @@ impl NativeShell {
                                                     })
                                                     .child(if has_folder {
                                                         draft.path.clone()
+                                                    } else if editing {
+                                                        "Keep the current folder".to_string()
                                                     } else {
                                                         "No folder chosen yet".to_string()
                                                     }),
                                             )
                                             .child(
                                                 Button::new("native-add-project-browse").disabled(submitting)
-                                                    .label(if has_folder {
+                                                    .label(if has_folder || editing {
                                                         "Choose a different folder"
                                                     } else {
                                                         "Choose folder"
@@ -39180,7 +40772,9 @@ impl NativeShell {
                                     .child(
                                         Button::new("native-add-project-submit").disabled(submitting)
                                             .label(if submitting {
-                                                "Adding…"
+                                                if editing { "Saving…" } else { "Adding…" }
+                                            } else if editing {
+                                                "Save changes"
                                             } else if has_folder {
                                                 "Add project"
                                             } else {
@@ -42233,6 +43827,116 @@ impl NativeShell {
         .into_any_element()
     }
 
+    fn render_remove_project_overlay(
+        &self,
+        tokens: crate::ui::tokens::ThemeTokens,
+        viewport: Size<Pixels>,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let draft = self.remove_project.as_ref().expect("overlay is open");
+        let label = draft.label.clone();
+        let error = draft.error.clone();
+        let submitting = draft.submitting;
+        let open_tasks = draft.open_tasks;
+        let blocked = open_tasks > 0;
+        let explanation = if blocked {
+            format!(
+                "It still has {open_tasks} {} on the board. Archive {} first, then remove the project.",
+                if open_tasks == 1 { "task" } else { "tasks" },
+                if open_tasks == 1 { "it" } else { "them" },
+            )
+        } else {
+            "Its folder and files stay exactly where they are, and you can add the folder again at any time."
+                .to_string()
+        };
+        deferred(
+            anchored()
+                .position(point(px(0.0), px(0.0)))
+                .snap_to_window()
+                .child(
+                    div()
+                        .id("native-remove-project-backdrop")
+                        .occlude()
+                        .w(viewport.width)
+                        .h(viewport.height)
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .bg(Self::modal_backdrop())
+                        .on_key_down(cx.listener(
+                            move |shell, event: &KeyDownEvent, _window, cx| {
+                                cx.stop_propagation();
+                                match event.keystroke.key.as_str() {
+                                    "escape" => shell.remove_project = None,
+                                    "enter" if !submitting && !blocked => {
+                                        shell.confirm_remove_project()
+                                    }
+                                    _ => {}
+                                }
+                                cx.notify();
+                            },
+                        ))
+                        .child(
+                            overlay_chrome::dialog_surface("native-remove-project-dialog", tokens)
+                                .w(px(440.0))
+                                .child(overlay_chrome::heading(
+                                    format!("Remove “{label}” from DevManager?"),
+                                    tokens,
+                                ))
+                                .child(
+                                    div()
+                                        .text_size(px(overlay_chrome::BODY_FONT_SIZE))
+                                        .text_color(tokens.text.secondary.to_gpui())
+                                        .child(explanation),
+                                )
+                                .children(error.map(|message| {
+                                    div()
+                                        .text_size(px(overlay_chrome::CAPTION_FONT_SIZE))
+                                        .text_color(tokens.status.destructive.to_gpui())
+                                        .child(message)
+                                }))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .justify_end()
+                                        .gap(px(tokens.density.spacing.sm))
+                                        .child(
+                                            Button::new("native-remove-project-cancel")
+                                                .label(if submitting { "Close" } else { "Cancel" })
+                                                .ghost()
+                                                .on_click(cx.listener(
+                                                    |shell, _event: &ClickEvent, _window, cx| {
+                                                        cx.stop_propagation();
+                                                        shell.remove_project = None;
+                                                        cx.notify();
+                                                    },
+                                                )),
+                                        )
+                                        .child(
+                                            Button::new("native-remove-project-submit")
+                                                .label(if submitting {
+                                                    "Removing…"
+                                                } else {
+                                                    "Remove project"
+                                                })
+                                                .primary()
+                                                .disabled(submitting || blocked)
+                                                .on_click(cx.listener(
+                                                    move |shell, _event: &ClickEvent, _window, cx| {
+                                                        cx.stop_propagation();
+                                                        shell.confirm_remove_project();
+                                                        cx.notify();
+                                                    },
+                                                )),
+                                        ),
+                                ),
+                        ),
+                ),
+        )
+        .with_priority(2)
+        .into_any_element()
+    }
+
     fn render_new_task_overlay(
         &self,
         tokens: crate::ui::tokens::ThemeTokens,
@@ -42603,6 +44307,456 @@ impl NativeShell {
         .into_any_element()
     }
 
+    /// A pasted image at full size.
+    ///
+    /// The transcript can only afford a thumbnail, and a screenshot is usually
+    /// the whole point of the message -- so clicking one fills the window with
+    /// it. Nothing else is on this surface: click anywhere, or press Escape, to
+    /// go back to the conversation.
+    fn render_image_lightbox_overlay(
+        &self,
+        tokens: crate::ui::tokens::ThemeTokens,
+        viewport: Size<Pixels>,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        const LIGHTBOX_MARGIN: f32 = 24.0;
+        let Some(path) = self.image_lightbox.as_ref() else {
+            return div().into_any_element();
+        };
+        let width = (f32::from(viewport.width) - LIGHTBOX_MARGIN * 2.0).max(120.0);
+        let height = (f32::from(viewport.height) - LIGHTBOX_MARGIN * 2.0).max(120.0);
+        let caption = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("image")
+            .to_string();
+        deferred(
+            anchored()
+                .position(point(px(0.0), px(0.0)))
+                .snap_to_window()
+                .child(
+                    div()
+                        .id("native-image-lightbox-backdrop")
+                        .occlude()
+                        .w(viewport.width)
+                        .h(viewport.height)
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .justify_center()
+                        .gap(px(overlay_chrome::ROW_PADDING_Y))
+                        .bg(Self::modal_backdrop())
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|shell, _event: &MouseDownEvent, _window, cx| {
+                                cx.stop_propagation();
+                                shell.image_lightbox = None;
+                                cx.notify();
+                            }),
+                        )
+                        .child(
+                            img(ImageSource::Resource(gpui::Resource::Path(
+                                path.clone().into(),
+                            )))
+                            .max_w(px(width))
+                            .max_h(px(height))
+                            .object_fit(ObjectFit::Contain),
+                        )
+                        .child(overlay_chrome::caption(caption, tokens)),
+                ),
+        )
+        .with_priority(4)
+        .into_any_element()
+    }
+
+    /// The glyph a rail entry paints for a driver.
+    fn model_picker_driver_icon(driver: &str) -> &'static str {
+        match driver {
+            "claude" => crate::icons::PROVIDER_CLAUDE,
+            "codex" => crate::icons::PROVIDER_CODEX,
+            "cursor" => crate::icons::PROVIDER_CURSOR,
+            _ => crate::icons::PROVIDER_OTHER,
+        }
+    }
+
+    /// One rail entry: favourites, or a provider instance.
+    fn model_picker_rail_entry(
+        &self,
+        index: usize,
+        icon: Option<&'static str>,
+        rail: crate::ui::model_picker::ModelPickerRail,
+        selected: bool,
+        size: f32,
+        tokens: crate::ui::tokens::ThemeTokens,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let colour = if selected {
+            tokens.text.emphasis
+        } else {
+            tokens.text.muted
+        };
+        let glyph: AnyElement = match icon {
+            Some(path) => {
+                crate::icons::app_icon(path, size * 0.5, colour.to_u32()).into_any_element()
+            }
+            // Favourites: the same star the rows carry, so the tab and the
+            // toggle that fills it read as one idea.
+            None => div().child("\u{2605}").into_any_element(),
+        };
+        div()
+            .id(("native-model-picker-rail-entry", index))
+            .flex_none()
+            .w(px(size))
+            .h(px(size))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(px(overlay_chrome::INPUT_RADIUS))
+            .cursor_pointer()
+            .when(selected, |entry| {
+                entry.bg(tokens.surfaces.selection.to_gpui())
+            })
+            .when(!selected, |entry| {
+                entry.hover(move |style| style.bg(tokens.surfaces.hover.to_gpui()))
+            })
+            .text_size(px(overlay_chrome::BODY_FONT_SIZE))
+            .text_color(colour.to_gpui())
+            .child(glyph)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |shell, _event: &MouseDownEvent, _window, cx| {
+                    cx.stop_propagation();
+                    if let Some(state) = shell.model_picker.as_mut() {
+                        state.set_rail(rail.clone());
+                    }
+                    cx.notify();
+                }),
+            )
+            .into_any_element()
+    }
+
+    /// The composer's model picker.
+    ///
+    /// A popover rather than a modal: it hangs off the chip that opened it,
+    /// and `anchored`'s own fit mode flips it above or below and snaps it back
+    /// inside the window, so a short or narrow pane cannot crop it. The panel
+    /// takes its size from the window rather than a constant, and the list is
+    /// the only part that grows, so the rail and the search field survive at
+    /// every size. The old menu lived inside the composer's clipped meta strip,
+    /// which is what cut it off.
+    fn render_model_picker_overlay(
+        &self,
+        tokens: crate::ui::tokens::ThemeTokens,
+        viewport: Size<Pixels>,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        const RAIL_SIZE: f32 = 36.0;
+        let window_margin = crate::ui::model_picker::WINDOW_MARGIN;
+
+        let Some(state) = self.model_picker.as_ref() else {
+            return div().into_any_element();
+        };
+        let rows = self.model_picker_rows();
+        let visible = crate::ui::model_picker::visible_rows(&rows, state.query(), state.rail());
+        let highlight = state.highlight_within(visible.len());
+        let searching = !state.query().trim().is_empty();
+        let viewport_width = f32::from(viewport.width);
+        let viewport_height = f32::from(viewport.height);
+        let (panel_width, panel_height) =
+            crate::ui::model_picker::panel_size(viewport_width, viewport_height);
+
+        let mut rail = div()
+            .id("native-model-picker-rail")
+            .flex_none()
+            .w(px(RAIL_SIZE + overlay_chrome::ROW_PADDING_Y * 2.0))
+            .h_full()
+            .flex()
+            .flex_col()
+            .gap(px(overlay_chrome::ROW_PADDING_Y))
+            .p(px(overlay_chrome::ROW_PADDING_Y))
+            .overflow_hidden()
+            .bg(tokens.surfaces.sunken.to_gpui())
+            .child(self.model_picker_rail_entry(
+                0,
+                None,
+                crate::ui::model_picker::ModelPickerRail::Favorites,
+                matches!(
+                    state.rail(),
+                    crate::ui::model_picker::ModelPickerRail::Favorites
+                ),
+                RAIL_SIZE,
+                tokens,
+                cx,
+            ))
+            // Favourites is a view across providers, not a provider: a hairline
+            // keeps its star from reading as one more logo in the stack.
+            .child(
+                div()
+                    .flex_none()
+                    .w_full()
+                    .h(px(overlay_chrome::OVERLAY_BORDER_WIDTH))
+                    .bg(tokens.borders.default.to_gpui()),
+            );
+        for (index, instance) in self.model_picker_instances().into_iter().enumerate() {
+            let selected = matches!(
+                state.rail(),
+                crate::ui::model_picker::ModelPickerRail::Instance(id)
+                    if id == &instance.instance_id
+            );
+            rail = rail.child(self.model_picker_rail_entry(
+                index + 1,
+                Some(Self::model_picker_driver_icon(&instance.driver)),
+                crate::ui::model_picker::ModelPickerRail::Instance(instance.instance_id.clone()),
+                selected,
+                RAIL_SIZE,
+                tokens,
+                cx,
+            ));
+        }
+
+        let mut list = div()
+            .id("native-model-picker-results")
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap(px(overlay_chrome::ROW_GAP));
+        if visible.is_empty() {
+            list = list.child(overlay_chrome::quiet_sentence(
+                if searching {
+                    "No models match that search."
+                } else {
+                    "No models here yet. Star one to keep it handy."
+                },
+                tokens,
+            ));
+        } else {
+            for (index, row) in visible.iter().enumerate() {
+                let row_state = OverlayRowState::selected_when(index == highlight);
+                let chosen = (*row).clone();
+                let favorite_instance = row.instance_id.clone();
+                let favorite_slug = row.slug.clone();
+                let is_favorite = row.is_favorite;
+                let star = div()
+                    .id(("native-model-picker-favorite", index))
+                    .flex_none()
+                    .cursor_pointer()
+                    .text_size(px(overlay_chrome::BODY_FONT_SIZE))
+                    .text_color(if is_favorite {
+                        tokens.text.emphasis.to_gpui()
+                    } else {
+                        overlay_chrome::row_meta_colour(row_state, tokens).to_gpui()
+                    })
+                    .child(if is_favorite { "\u{2605}" } else { "\u{2606}" })
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |shell, _event: &MouseDownEvent, _window, cx| {
+                            // The row underneath would otherwise launch this
+                            // model instead of starring it.
+                            cx.stop_propagation();
+                            shell.toggle_model_picker_favorite(&favorite_instance, &favorite_slug);
+                            cx.notify();
+                        }),
+                    );
+                let mut line = div()
+                    .w_full()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(overlay_chrome::CHIP_GAP))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .flex()
+                            .flex_col()
+                            .child(overlay_chrome::row_title(
+                                row.label.clone(),
+                                row_state,
+                                tokens,
+                            ))
+                            .child(overlay_chrome::row_meta(
+                                row.provider_label.clone(),
+                                row_state,
+                                tokens,
+                            )),
+                    );
+                if row.is_current {
+                    line = line.child(
+                        div()
+                            .flex_none()
+                            .text_size(px(overlay_chrome::ROW_META_FONT_SIZE))
+                            .text_color(
+                                overlay_chrome::row_meta_colour(row_state, tokens).to_gpui(),
+                            )
+                            .child("\u{2713}"),
+                    );
+                }
+                if let Some(label) = crate::ui::model_picker::jump_shortcut_label(index) {
+                    line = line.child(overlay_chrome::kbd_chip(label, tokens));
+                }
+                list = list.child(
+                    overlay_chrome::overlay_row(
+                        ("native-model-picker-row", index),
+                        row_state,
+                        tokens,
+                    )
+                    .child(line.child(star))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |shell, _event: &MouseDownEvent, _window, cx| {
+                            cx.stop_propagation();
+                            shell.apply_model_picker_row(chosen.clone());
+                            cx.notify();
+                        }),
+                    ),
+                );
+            }
+        }
+
+        let search = div()
+            .id("native-model-picker-input")
+            .relative()
+            .track_focus(&self.root_editor_focus_handle)
+            .tab_stop(true)
+            .cursor_text()
+            .flex_none()
+            .mx(px(overlay_chrome::ROW_PADDING_X))
+            .my(px(overlay_chrome::ROW_PADDING_Y))
+            .px(px(overlay_chrome::INPUT_PADDING_X))
+            .py(px(overlay_chrome::INPUT_PADDING_Y))
+            .rounded(px(overlay_chrome::INPUT_RADIUS))
+            .border(px(overlay_chrome::OVERLAY_BORDER_WIDTH))
+            .border_color(tokens.borders.default.to_gpui())
+            .bg(tokens.surfaces.sunken.to_gpui())
+            .text_size(px(overlay_chrome::BODY_FONT_SIZE))
+            .text_color(if state.query().is_empty() {
+                tokens.text.muted.to_gpui()
+            } else {
+                tokens.text.primary.to_gpui()
+            })
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|shell, _event: &MouseDownEvent, window, cx| {
+                    cx.stop_propagation();
+                    shell.root_editor_focus_handle.focus(window);
+                    cx.notify();
+                }),
+            )
+            .child(if state.query().is_empty() {
+                "Search models\u{2026}".to_string()
+            } else {
+                state.query().to_string()
+            })
+            .child(self.root_editor_input_registration());
+
+        // Say why the other providers are missing, rather than leaving a rail
+        // that silently lost its entries.
+        let lock_note = self
+            .model_picker_locked_instance()
+            .and_then(|locked| {
+                self.model_picker_instances()
+                    .into_iter()
+                    .find(|instance| instance.instance_id == locked)
+                    .map(|instance| instance.display_name)
+            })
+            .map(|label| {
+                div()
+                    .flex_none()
+                    .w_full()
+                    .px(px(overlay_chrome::ROW_PADDING_X))
+                    .pb(px(overlay_chrome::ROW_PADDING_Y))
+                    .child(overlay_chrome::caption(
+                        format!(
+                            "This task runs on {label}. Start a new task to use another provider."
+                        ),
+                        tokens,
+                    ))
+            });
+
+        let notice = state.notice().map(|notice| {
+            div()
+                .flex_none()
+                .w_full()
+                .px(px(overlay_chrome::ROW_PADDING_X))
+                .pb(px(overlay_chrome::ROW_PADDING_Y))
+                .child(overlay_chrome::caption(notice.to_string(), tokens))
+        });
+
+        let column = div()
+            .id("native-model-picker-column")
+            .flex_1()
+            .min_w(px(0.0))
+            .flex()
+            .flex_col()
+            .min_h(px(0.0))
+            .child(search)
+            .children(lock_note)
+            .children(notice)
+            .child(
+                div()
+                    .id("native-model-picker-scroll")
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .app_scroll_y(tokens)
+                    .child(list),
+            )
+            // Three pairs is what one line holds at this width; the Ctrl+1..9
+            // chords are already spelled out on the rows themselves.
+            .child(overlay_chrome::kbd_hint_row(
+                [
+                    ("\u{2191}\u{2193}".to_string(), "move".to_string()),
+                    ("Enter".to_string(), "use".to_string()),
+                    ("Esc".to_string(), "close".to_string()),
+                ],
+                tokens,
+            ));
+
+        let panel = overlay_chrome::overlay_surface("native-model-picker-panel", tokens)
+            .occlude()
+            .flex_row()
+            .py(px(0.0))
+            .w(px(panel_width))
+            .h(px(panel_height))
+            .overflow_hidden()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|_shell, _event: &MouseDownEvent, _window, cx| {
+                    // The shell-wide outside-click dismiss must not fire for a
+                    // click on the picker's own surface.
+                    cx.stop_propagation();
+                }),
+            )
+            .child(rail)
+            .child(column);
+
+        // A pointer opens the picker against the chip and it grows upward; the
+        // keyboard has no pointer, so it opens centred instead.
+        let (position, corner) = match state.anchor() {
+            Some((x, y)) => (
+                point(px(x), px(y - overlay_chrome::OVERLAY_ANCHOR_DROP)),
+                gpui::Corner::BottomLeft,
+            ),
+            None => (
+                point(
+                    px(((viewport_width - panel_width) / 2.0).max(window_margin)),
+                    px(((viewport_height - panel_height) / 2.0).max(window_margin)),
+                ),
+                gpui::Corner::TopLeft,
+            ),
+        };
+        deferred(
+            anchored()
+                .position(position)
+                .anchor(corner)
+                .snap_to_window_with_margin(px(window_margin))
+                .child(panel),
+        )
+        .with_priority(3)
+        .into_any_element()
+    }
+
     fn render_composer_trigger_overlay(
         &self,
         tokens: crate::ui::tokens::ThemeTokens,
@@ -42713,17 +44867,25 @@ impl NativeShell {
         viewport: Size<Pixels>,
         cx: &Context<Self>,
     ) -> AnyElement {
+        // Each project with its config id (what Edit and Remove act on) and
+        // its workspace id (what the scope filters by and tasks point at).
         let configured = self
             .local_slot()
             .config_sidebar
             .projects
             .iter()
             .filter_map(|project| {
-                ProjectId::parse(&project.workspace_id)
-                    .ok()
-                    .map(|id| (id, project.label.clone()))
+                ProjectId::parse(&project.workspace_id).ok().map(|id| {
+                    (
+                        id,
+                        project.label.clone(),
+                        project.config_id.clone(),
+                        project.workspace_id.clone(),
+                    )
+                })
             })
             .collect::<Vec<_>>();
+        let can_manage = self.shows_add_project_plus();
         let selected = self.project_scope_menu.selected_index();
         let mut list = div()
             .id("native-project-scope-menu")
@@ -42731,18 +44893,87 @@ impl NativeShell {
             .flex()
             .flex_col()
             .gap(px(overlay_chrome::ROW_GAP));
-        let options = std::iter::once((None, "All projects".to_string()))
+        let options = std::iter::once((None, "All projects".to_string(), None))
             .chain(
                 configured
                     .iter()
-                    .map(|(id, label)| (Some(*id), label.clone())),
+                    .map(|(id, label, config_id, workspace_id)| {
+                        (
+                            Some(*id),
+                            label.clone(),
+                            Some((config_id.clone(), workspace_id.clone())),
+                        )
+                    }),
             )
             .enumerate();
-        for (index, (project_id, label)) in options {
+        for (index, (project_id, label, manage)) in options {
             let state = OverlayRowState::selected_when(index == selected);
+            let actions = manage
+                .filter(|_| can_manage)
+                .map(|(config_id, workspace_id)| {
+                    let edit_id = config_id.clone();
+                    let edit_label = label.clone();
+                    let remove_label = label.clone();
+                    div()
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .gap(px(overlay_chrome::CHIP_GAP))
+                        // The row selects its scope on mouse-down; these must not.
+                        .on_mouse_down(MouseButton::Left, |_event: &MouseDownEvent, _window, cx| {
+                            cx.stop_propagation()
+                        })
+                        .child(
+                            crate::ui::task_cockpit::panel::panel_button_shell(tokens, true)
+                                .id(("native-project-edit", index))
+                                .child("Edit")
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(
+                                        move |shell, _event: &MouseDownEvent, _window, cx| {
+                                            cx.stop_propagation();
+                                            shell.project_scope_menu.close_menu();
+                                            shell.open_edit_project(
+                                                edit_id.clone(),
+                                                edit_label.clone(),
+                                            );
+                                            cx.notify();
+                                        },
+                                    ),
+                                ),
+                        )
+                        .child(
+                            crate::ui::task_cockpit::panel::panel_button_shell(tokens, true)
+                                .id(("native-project-remove", index))
+                                .child("Remove")
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(
+                                        move |shell, _event: &MouseDownEvent, _window, cx| {
+                                            cx.stop_propagation();
+                                            shell.project_scope_menu.close_menu();
+                                            shell.open_remove_project(
+                                                config_id.clone(),
+                                                remove_label.clone(),
+                                                workspace_id.clone(),
+                                            );
+                                            cx.notify();
+                                        },
+                                    ),
+                                ),
+                        )
+                });
             list = list.child(
                 overlay_chrome::overlay_row(("native-project-scope-option", index), state, tokens)
-                    .child(overlay_chrome::row_title(label, state, tokens))
+                    .child(
+                        div()
+                            .w_full()
+                            .flex()
+                            .items_center()
+                            .gap(px(overlay_chrome::CONTROL_GAP))
+                            .child(overlay_chrome::row_title(label, state, tokens))
+                            .children(actions),
+                    )
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |shell, _event: &MouseDownEvent, _window, cx| {
@@ -42784,7 +45015,8 @@ impl NativeShell {
                         )
                         .child(
                             overlay_chrome::overlay_surface("native-project-scope-panel", tokens)
-                                .w(px(280.0))
+                                // Wide enough for a name beside Edit and Remove.
+                                .w(px(360.0))
                                 .child(overlay_chrome::section_label("Scope", tokens))
                                 .child(
                                     div()
@@ -43894,6 +46126,8 @@ impl NativeShell {
             let _ = cx.open_window(
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    // The layout adapts below 1100 px, but not indefinitely.
+                    window_min_size: Some(size(px(640.0), px(420.0))),
                     titlebar: Some(gpui::TitlebarOptions {
                         title: Some("Git — DevManager".into()),
                         ..Default::default()
@@ -44005,6 +46239,8 @@ impl NativeShell {
             || self.new_task.is_some()
             || self.rename_task.is_some()
             || self.delete_task.is_some()
+            || self.remove_project.is_some()
+            || self.model_picker.is_some()
             || self.settings_open
             || matches!(
                 self.header_commit.phase,
@@ -44704,11 +46940,23 @@ impl NativeShell {
             window.prevent_default();
             cx.notify();
             true
+        } else if self.image_lightbox.is_some() {
+            if matches!(event.keystroke.key.as_str(), "escape" | "enter" | "space") {
+                window.prevent_default();
+                self.image_lightbox = None;
+            }
+            true
+        } else if self.model_picker.is_some() {
+            self.handle_model_picker_key(event, window);
+            true
         } else if self.browser_address_focused {
             self.handle_browser_address_key(event, window, cx);
             true
         } else if self.add_project.is_some() {
             self.handle_add_project_key(event, window, cx);
+            true
+        } else if self.remove_project.is_some() {
+            self.handle_remove_project_key(event, window);
             true
         } else if self.new_task.is_some() {
             self.handle_new_task_key(event, window, cx);
@@ -45791,7 +48039,7 @@ impl NativeShell {
         }
         .into_iter()
         .filter(|key| {
-            if self.pane_view(key) != PaneView::Terminal && !self.ssh_terminal_is_visible(key) {
+            if self.pane_view(key) != PaneView::Terminal {
                 return false;
             }
             let target = self.focused_terminal_target(key).surface_target();
@@ -46318,7 +48566,12 @@ impl NativeShell {
                 .to_gpui()
                 .into();
             component.accent_foreground = tokens.text.primary.to_gpui().into();
-            component.selection = tokens.surfaces.selection.to_gpui().into();
+            // gpui-component paints the selection quad OVER the glyphs, so an
+            // opaque fill hides the very words being selected -- selected text
+            // read as a black bar. Alpha keeps the text legible under it.
+            let mut selection: gpui::Hsla = tokens.surfaces.selection.to_gpui().into();
+            selection.a = 0.35;
+            component.selection = selection;
             // Rule 4's three button looks. Secondary is gpui-component's
             // DEFAULT variant, so this is the button the whole app shows unless
             // a call site says otherwise: unfilled, a text.primary label, a
@@ -46996,7 +49249,7 @@ impl NativeShell {
                     move |_window: &mut Window, app: &mut gpui::App| {
                         let _ = shell.update(app, |shell, cx| {
                             cx.stop_propagation();
-                            shell.open_board_menu(BoardMenu::NewTask);
+                            shell.begin_new_task();
                             shell.refresh_accessibility_tree();
                             cx.notify();
                         });
@@ -47530,6 +49783,12 @@ impl NativeShell {
                         shell.dismiss_composer_selector();
                         cx.notify();
                     }
+                    // The model picker is a popover, not a modal: a click
+                    // anywhere outside its own surface puts it away.
+                    if shell.model_picker.is_some() {
+                        shell.close_model_picker();
+                        cx.notify();
+                    }
                 }),
             )
             .on_key_down(cx.listener(|shell, event: &KeyDownEvent, window, cx| {
@@ -47578,11 +49837,10 @@ impl NativeShell {
                 if shell.composer_focus_handle.is_focused(window) {
                     return;
                 }
-                let center_terminal_visible =
-                    shell.selected_task_key.clone().is_some_and(|owner| {
-                        shell.pane_view(&owner) == PaneView::Terminal
-                            || shell.ssh_terminal_is_visible(&owner)
-                    });
+                let center_terminal_visible = shell
+                    .selected_task_key
+                    .clone()
+                    .is_some_and(|owner| shell.pane_view(&owner) == PaneView::Terminal);
                 if root_routes_key_to_terminal(
                     event.keystroke.key.as_str(),
                     shell.terminal_focus_handle.is_focused(window),
@@ -47857,6 +50115,17 @@ impl NativeShell {
                     return Err(NativeActionDispatchFailure::after_capture_unretained(
                         record,
                         "Projects can only be added on the local host.",
+                    ));
+                }
+                NativeHostCommand::TaskCockpitQuery {
+                    query:
+                        TaskCockpitQuery::ConfigUpdateProject { .. }
+                        | TaskCockpitQuery::ConfigArchiveProject { .. },
+                    ..
+                } => {
+                    return Err(NativeActionDispatchFailure::after_capture_unretained(
+                        record,
+                        "Projects can only be changed on the local host.",
                     ));
                 }
                 _ => {}
@@ -48994,7 +51263,14 @@ impl Render for NativeGitWindow {
                             .child(format!("↑{}  ↓{}", status.ahead, status.behind))
                             .into_any_element()
                     }))
-                    .child(Button::new("native-git-refresh").label("Refresh").on_click(refresh)),
+                    .child(Button::new("native-git-refresh").label("Refresh").on_click(refresh))
+                    // No system title bar is guaranteed on Linux, so the
+                    // window always carries its own way out.
+                    .child(
+                        Button::new("native-git-close")
+                            .label("Close")
+                            .on_click(cx.listener(|_, _, window, _| window.remove_window())),
+                    ),
             )
             .child(
                 div()
@@ -49286,6 +51562,9 @@ impl Render for NativeGitWindow {
 impl Render for NativeShell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.tick_ssh_requests();
+        if self.ssh_ui.take_focus_request() {
+            window.focus(self.ssh_ui.focus_handle());
+        }
         if let Some(owner) = self.pending_git_window.take() {
             if self.selected_task_key.as_ref() == Some(&owner) {
                 self.open_native_git_window(window, cx);
@@ -49334,7 +51613,11 @@ impl Render for NativeShell {
             self.root_editor_focus_handle.focus(window);
             self.pending_root_overlay_focus = false;
         } else if !root_editor_mounted {
-            self.pending_root_overlay_focus = false;
+            // A confirmation without an editor, such as Remove project, still
+            // takes its Escape/Enter through the root's key routing.
+            if std::mem::take(&mut self.pending_root_overlay_focus) {
+                self.focus_handle.focus(window);
+            }
             // Host replies and pointer actions can remove an editor without an
             // Escape gesture. Its detached focus handle no longer routes keys.
             if self.root_editor_focus_handle.is_focused(window) {
@@ -49550,6 +51833,93 @@ fn launch_native_shell(
 fn bounded_host_error(message: impl Into<String>) -> String {
     const MAX_HOST_ERROR_CHARS: usize = 256;
     message.into().chars().take(MAX_HOST_ERROR_CHARS).collect()
+}
+
+/// The Add project dialog shows this text verbatim. The host answers a
+/// rejected folder with a bare `InvalidRequest`, so name what the user can
+/// check instead of the wire variant.
+fn add_project_failure_message(error: &crate::domain::query::QueryError) -> String {
+    use crate::domain::query::QueryError;
+    match error {
+        QueryError::InvalidRequest => "DevManager can't use this folder. Check that it still \
+            exists, is a real folder (not a symbolic link), and that you can open it."
+            .to_string(),
+        QueryError::Unavailable { .. } => {
+            "Couldn't save this project right now. Try again.".to_string()
+        }
+        other => format!("Couldn't add this project ({other:?})."),
+    }
+}
+
+/// The Edit project dialog shows this text verbatim.
+fn project_edit_failure_message(error: &crate::domain::query::QueryError) -> String {
+    use crate::domain::query::QueryError;
+    match error {
+        QueryError::InvalidRequest => "DevManager can't save this. Check the name, and that the \
+            folder still exists, is a real folder (not a symbolic link), and that you can open it."
+            .to_string(),
+        QueryError::Unavailable { .. } => {
+            "Couldn't save this project right now. Try again.".to_string()
+        }
+        other => format!("Couldn't save this project ({other:?})."),
+    }
+}
+
+/// The Remove project dialog shows this text verbatim.
+fn project_remove_failure_message(error: &crate::domain::query::QueryError) -> String {
+    use crate::domain::query::QueryError;
+    match error {
+        QueryError::InvalidRequest => {
+            "This project is no longer in the list. Close this and check the project list."
+                .to_string()
+        }
+        QueryError::Unavailable { .. } => {
+            "Couldn't remove this project right now. Try again.".to_string()
+        }
+        other => format!("Couldn't remove this project ({other:?})."),
+    }
+}
+
+/// The SSH editor shows this text verbatim when a save is refused.
+fn ssh_save_failure_message(error: &crate::domain::query::QueryError) -> String {
+    use crate::domain::query::QueryError;
+    match error {
+        QueryError::Unavailable {
+            reason: "ssh_credential_store",
+        } => "Couldn't save the password or key. Unlock the system keyring (KWallet or GNOME \
+            Keyring) and try again."
+            .to_string(),
+        QueryError::InvalidRequest => {
+            "Check the connection name, hostname, username and port.".to_string()
+        }
+        other => format!("Couldn't save this SSH connection ({other:?})."),
+    }
+}
+
+#[cfg(test)]
+mod add_project_failure_message_tests {
+    use super::{add_project_failure_message, bounded_host_error};
+    use crate::domain::query::QueryError;
+
+    #[test]
+    fn rejected_folder_names_what_to_check_not_the_wire_variant() {
+        let message = add_project_failure_message(&QueryError::InvalidRequest);
+        assert!(!message.contains("InvalidRequest"));
+        assert!(message.contains("still exists"));
+        assert_eq!(
+            bounded_host_error(message.clone()),
+            message,
+            "fits the host error bound"
+        );
+    }
+
+    #[test]
+    fn unavailable_config_store_asks_for_a_retry() {
+        let message = add_project_failure_message(&QueryError::Unavailable {
+            reason: "config_create",
+        });
+        assert!(message.contains("Try again"));
+    }
 }
 
 /// `reason` alone, or `reason: detail` when the host named one.
@@ -49893,6 +52263,49 @@ fn fetch_idle_conversation_photo() -> Option<Arc<RenderImage>> {
 fn idle_conversation_photo_url(seed: u64) -> String {
     // Cache-bust each idle admission so returning to the canvas is a fresh image.
     format!("https://picsum.photos/1920/1080?random={seed}")
+}
+
+/// Re-stage one already-staged image under `workspace`, keeping its bytes
+/// byte-for-byte: the host re-checks length and digest against the new path.
+fn restage_native_composer_image(
+    workspace: &Path,
+    image: &mut NativeComposerImage,
+) -> Result<(), String> {
+    let bytes = std::fs::read(&image.path)
+        .map_err(|error| format!("Failed to read the staged image: {error}"))?;
+    let mime_type = match image
+        .path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| extension.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("png") => "image/png",
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        _ => return Err("Unsupported pasted image type. Try PNG or JPEG.".to_string()),
+    };
+    let attachment = RemoteImageAttachment {
+        mime_type: mime_type.to_string(),
+        file_name: Some(image.label.clone()),
+        bytes,
+    };
+    let staged = stage_image_for_workspace(workspace, &attachment)?;
+    use sha2::Digest;
+    let identity = crate::domain::ProviderImageAttachment::try_new(
+        staged
+            .path
+            .to_str()
+            .ok_or("Image path must be valid Unicode")?
+            .to_string(),
+        sha2::Sha256::digest(&attachment.bytes).into(),
+        attachment.bytes.len(),
+    )
+    .map_err(|error| error.to_string())?;
+    let previous = std::mem::replace(&mut image.path, staged.path);
+    let _ = std::fs::remove_file(previous);
+    image.prompt_reference = staged.prompt_reference;
+    image.attachment = identity;
+    Ok(())
 }
 
 fn prepare_native_composer_image(
@@ -51291,7 +53704,6 @@ mod "
         // through the ids the accessibility tree publishes and
         // `dispatch_named_accessibility_action` routes.
         for segment in [
-            "native-composer-provider",
             "native-composer-model",
             "native-composer-reasoning",
             "native-composer-access",
@@ -53000,13 +55412,15 @@ mod "
     /// The list is the denominator. A painter that is renamed or split leaves
     /// the list and the slicing panics rather than passing silently, which is
     /// the failure mode a bare `source.contains("overlay_chrome")` would have.
-    const OVERLAY_PAINTERS: [&str; 21] = [
+    const OVERLAY_PAINTERS: [&str; 23] = [
         "render_command_palette",
         "render_task_search_overlay",
+        "render_model_picker_overlay",
+        "render_image_lightbox_overlay",
         "render_project_scope_overlay",
         "render_composer_trigger_overlay",
         "render_terminal_chip_menu_overlay",
-        "composer_selector_menu",
+        "render_composer_selector_overlay",
         "render_settings_overlay",
         "render_appearance_settings_content",
         "render_provider_settings_content",
@@ -54568,6 +56982,835 @@ mod "
                 let draft = shell.add_project.as_ref().unwrap();
                 assert!(draft.error.is_none());
                 assert_eq!(draft.name.value(), "Replacement");
+            });
+            drop(entity);
+            crate::ui::finish_headless_test(cx);
+        });
+    }
+
+    #[test]
+    fn edit_project_dispatches_an_update_that_keeps_the_folder() {
+        if rerun_headless_shell_test_in_child(
+            "ui::native_shell::tests::edit_project_dispatches_an_update_that_keeps_the_folder",
+        ) {
+            return;
+        }
+        let (runtime, shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
+        let workspace = tempfile::tempdir().unwrap();
+        let profile = isolated_dev_profile(workspace.path()).unwrap();
+        gpui::Application::headless().run(move |cx| {
+            crate::ui::init(cx);
+            let entity = cx.new(|cx| {
+                NativeShell::new_with_host_runtime_port(
+                    profile,
+                    Box::new(runtime),
+                    crate::ui::tokens::RuntimePreferencesSnapshot::default(),
+                    cx,
+                )
+            });
+            entity.update(cx, |shell, _cx| {
+                shell.install_idle_conversation_photo_for_test();
+                let (model, _) = terminal_bound_client_model();
+                shell.apply_client_model(Arc::new(model)).unwrap();
+                shell.open_edit_project("project-1".into(), "Launch".into());
+                let draft = shell.add_project.as_mut().unwrap();
+                assert_eq!(draft.name.value(), "Launch", "the dialog opens on the current name");
+                draft.name.set_value("Launch acceptance").unwrap();
+                shell.commit_add_project();
+                assert!(
+                    !shell.pending_folder_prompt,
+                    "editing without a new folder keeps the current one"
+                );
+                let action = shared.lock().unwrap().accepted.last().unwrap().clone();
+                assert!(matches!(
+                    &action.command,
+                    NativeHostCommand::TaskCockpitQuery {
+                        query: TaskCockpitQuery::ConfigUpdateProject { project_id, name, root_path: None },
+                        ..
+                    } if project_id == "project-1" && name == "Launch acceptance"
+                ));
+                assert!(shell.add_project.as_ref().unwrap().submitting);
+                shell.apply_epoch_fenced_action_outcome(NativeHostActionOutcome::Queried {
+                    action,
+                    detail: "project saved".into(),
+                    body: NativeHostQueryBody::TaskCockpit(
+                        crate::domain::TaskCockpitResult::Config(
+                            crate::domain::ConfigSidebarSnapshot {
+                                revision: 2,
+                                projects: Vec::new(),
+                                servers: Vec::new(),
+                                ssh_connections: Vec::new(),
+                                providers: Vec::new(),
+                            },
+                        ),
+                    ),
+                });
+                assert!(shell.add_project.is_none(), "the host's reply closes the dialog");
+            });
+            drop(entity);
+            crate::ui::finish_headless_test(cx);
+        });
+    }
+
+    /// The complaint the picker answers: changing models meant knowing which
+    /// provider owned the model first. One list has to carry all of them.
+    #[test]
+    fn the_model_picker_offers_every_provider_and_searches_across_them() {
+        if rerun_headless_shell_test_in_child(
+            "ui::native_shell::tests::the_model_picker_offers_every_provider_and_searches_across_them",
+        ) { return; }
+        let (runtime, _shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
+        let workspace = tempfile::tempdir().unwrap();
+        let profile = isolated_dev_profile(workspace.path()).unwrap();
+        gpui::Application::headless().run(move |cx| {
+            crate::ui::init(cx);
+            let entity = cx.new(|cx| {
+                NativeShell::new_with_host_runtime_port(
+                    profile,
+                    Box::new(runtime),
+                    crate::ui::tokens::RuntimePreferencesSnapshot::default(),
+                    cx,
+                )
+            });
+            entity.update(cx, |shell, _cx| {
+                shell.install_idle_conversation_photo_for_test();
+                let rows = shell.model_picker_rows();
+                assert!(
+                    rows.iter().any(|row| row.driver == "claude"),
+                    "Claude models are on offer"
+                );
+                assert!(
+                    rows.iter().any(|row| row.driver == "codex"),
+                    "and so are Codex models, without switching provider first"
+                );
+                assert!(
+                    rows.iter()
+                        .all(|row| !provider_default_model_slug(&row.slug)),
+                    "symbolic defaults are not choosable models"
+                );
+                // One query reaches a model the current provider does not own.
+                let hits = crate::ui::model_picker::visible_rows(
+                    &rows,
+                    "sonnet",
+                    &crate::ui::model_picker::ModelPickerRail::Instance("codex".into()),
+                );
+                assert!(
+                    hits.iter().any(|row| row.slug == "sonnet"),
+                    "a search crosses providers instead of obeying the rail"
+                );
+            });
+            drop(entity);
+            crate::ui::finish_headless_test(cx);
+        });
+    }
+
+    /// A model-written name replaces the stand-in this app invented, and never
+    /// a name the person chose.
+    #[test]
+    fn a_suggested_title_replaces_our_own_name_but_never_the_users() {
+        // The provider placeholders this app writes at create time.
+        for placeholder in [
+            "New task",
+            "New Claude task",
+            "New Codex task",
+            "New Cursor task",
+            "   ",
+        ] {
+            assert!(
+                super::suggested_title_is_replaceable(placeholder, None),
+                "{placeholder:?} is our stand-in, not a name anyone chose"
+            );
+        }
+
+        // The shortened first message this app put there a moment ago.
+        assert!(super::suggested_title_is_replaceable(
+            "fix the failing probe test and report",
+            Some("fix the failing probe test and report"),
+        ));
+
+        // A name the person typed, or one that is simply not ours.
+        assert!(!super::suggested_title_is_replaceable(
+            "Ticket density work",
+            None
+        ));
+        assert!(!super::suggested_title_is_replaceable(
+            "Ticket density work",
+            Some("fix the failing probe test and report"),
+        ));
+    }
+
+    /// The complaint: the typed message sat in the box for seconds before
+    /// moving to the chat. It has to leave at the gesture, and come back if the
+    /// send cannot go through.
+    #[test]
+    fn a_sent_first_message_leaves_the_box_at_once_and_returns_if_it_fails() {
+        if rerun_headless_shell_test_in_child(
+            "ui::native_shell::tests::a_sent_first_message_leaves_the_box_at_once_and_returns_if_it_fails",
+        ) { return; }
+        let (runtime, _shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
+        let workspace = tempfile::tempdir().unwrap();
+        let profile = isolated_dev_profile(workspace.path()).unwrap();
+        gpui::Application::headless().run(move |cx| {
+            crate::ui::init(cx);
+            let entity = cx.new(|cx| {
+                NativeShell::new_with_host_runtime_port(
+                    profile,
+                    Box::new(runtime),
+                    crate::ui::tokens::RuntimePreferencesSnapshot::default(),
+                    cx,
+                )
+            });
+            entity.update(cx, |shell, _cx| {
+                shell.install_idle_conversation_photo_for_test();
+                let (model, task_id) = terminal_bound_client_model();
+                shell.apply_client_model(Arc::new(model)).unwrap();
+                let owner = shell.local_task_key(task_id);
+                let _ = shell.select_fleet_task_key(owner.clone(), FleetSelectMode::Replace);
+                let epoch = shell.rearm_composer_focus().expect("composer focus");
+                shell
+                    .composer
+                    .as_mut()
+                    .expect("composer")
+                    .replace_draft("summarise the failing test", epoch)
+                    .expect("draft");
+
+                let (echo, draft_key) =
+                    shell.consume_draft_for_first_send(&owner, "summarise the failing test");
+                let echo = echo.expect("the gesture takes the message");
+                assert_eq!(
+                    shell.composer.as_ref().expect("composer").draft_text(),
+                    "",
+                    "the box is empty the moment the message is sent"
+                );
+                assert!(
+                    shell.task_surfaces.conversation_turn_pending(owner.clone()),
+                    "and the message is already in the transcript"
+                );
+
+                // The send cannot go through: the words are the person's, and
+                // they come back rather than vanishing with the attempt.
+                let pending = super::PendingDraftFirstSend {
+                    owner: owner.clone(),
+                    task_id,
+                    start_command_id: None,
+                    control: ComposerControl::SendNow,
+                    attachment_only: false,
+                    provider_kind: ProviderKind::Codex,
+                    launch_options: crate::providers::ProviderLaunchOptions::default(),
+                    stage: super::PendingDraftFirstSendStage::AwaitingRuntimeProbe,
+                    captured_draft: "summarise the failing test".into(),
+                    captured_artifact_ids: Vec::new(),
+                    captured_image_ids: Vec::new(),
+                    fleet_admission: None,
+                    connection_epoch: 0,
+                    resource_generation: 0,
+                    runtime_generation: 0,
+                    started_at: Instant::now(),
+                    readiness_request_id: None,
+                    readiness_requested_at: None,
+                    ready_without_conversation_id: false,
+                    echo_command_id: Some(echo),
+                    echo_draft_key: draft_key.clone(),
+                };
+                shell.restore_consumed_first_send_draft(&pending);
+                assert_eq!(
+                    shell.composer.as_ref().expect("composer").draft_text(),
+                    "summarise the failing test",
+                    "a refused send gives the words back"
+                );
+                let cached = draft_key
+                    .and_then(|key| shell.composer_drafts.get(&key))
+                    .map(|draft| draft.text.clone());
+                assert_eq!(cached.as_deref(), Some("summarise the failing test"));
+            });
+            drop(entity);
+            crate::ui::finish_headless_test(cx);
+        });
+    }
+
+    /// An image on the first message used to be impossible: staging asked for
+    /// a workspace folder the task did not have yet. It stages in scratch space
+    /// now, and this is the move that puts it where the host will accept it.
+    #[test]
+    fn a_first_message_image_moves_from_scratch_into_the_project() {
+        let scratch = tempfile::tempdir().expect("scratch dir");
+        let workspace = tempfile::tempdir().expect("workspace dir");
+        let bytes = super::tiny_png_bytes_for_test();
+        let prepared = super::prepare_native_composer_image(
+            scratch.path(),
+            crate::remote::RemoteImageAttachment {
+                mime_type: "image/png".into(),
+                file_name: Some("screenshot.png".into()),
+                bytes: bytes.clone(),
+            },
+        )
+        .expect("stage into scratch");
+        let scratch_path = prepared.staged.path.clone();
+        let mut image = super::NativeComposerImage {
+            id: 1,
+            path: prepared.staged.path.clone(),
+            prompt_reference: prepared.staged.prompt_reference.clone(),
+            attachment: prepared.attachment.clone(),
+            label: prepared.label.clone(),
+            preview: prepared.preview.clone(),
+        };
+        assert!(image.path.starts_with(scratch.path()));
+        let digest = *image.attachment.sha256();
+        let byte_len = image.attachment.byte_len();
+
+        super::restage_native_composer_image(workspace.path(), &mut image).expect("restage");
+
+        assert!(
+            image
+                .path
+                .starts_with(workspace.path().join(".devmanager").join("pasted-images")),
+            "the host admits an image only from the task's own workspace"
+        );
+        assert_eq!(std::fs::read(&image.path).expect("moved bytes"), bytes);
+        assert!(!scratch_path.exists(), "no scratch copy is left behind");
+        assert_eq!(
+            *image.attachment.sha256(),
+            digest,
+            "the digest the host re-checks at send time is unchanged"
+        );
+        assert_eq!(image.attachment.byte_len(), byte_len);
+        assert_eq!(image.attachment.path(), image.path.to_str().unwrap());
+        assert!(image
+            .prompt_reference
+            .starts_with("@.devmanager/pasted-images/"));
+    }
+
+    /// The regression that broke chat: a first message carried an image still
+    /// at its scratch path, the host refused it, the turn never settled, and
+    /// every later message was rejected. The move into the workspace is what
+    /// has to be reliable, so it is asserted on the caller, not just the mover.
+    #[test]
+    fn a_draft_image_is_moved_into_the_workspace_before_it_can_be_sent() {
+        if rerun_headless_shell_test_in_child(
+            "ui::native_shell::tests::a_draft_image_is_moved_into_the_workspace_before_it_can_be_sent",
+        ) { return; }
+        let (runtime, shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
+        let workspace = tempfile::tempdir().unwrap();
+        let profile = isolated_dev_profile(workspace.path()).unwrap();
+        gpui::Application::headless().run(move |cx| {
+            crate::ui::init(cx);
+            let entity = cx.new(|cx| {
+                NativeShell::new_with_host_runtime_port(
+                    profile,
+                    Box::new(runtime),
+                    crate::ui::tokens::RuntimePreferencesSnapshot::default(),
+                    cx,
+                )
+            });
+            entity.update(cx, |shell, _cx| {
+                shell.install_idle_conversation_photo_for_test();
+                let (model, task_id) = terminal_bound_client_model();
+                shell.apply_client_model(Arc::new(model)).unwrap();
+                let owner = shell.local_task_key(task_id);
+                // This fixture's task has no host-bound folder, which is the
+                // case that used to pass the scratch path straight through.
+                assert!(shell.workspace_root_for_key(&owner).is_err());
+
+                // Exactly the shape that broke: staged while the task did not
+                // exist yet, so the path is scratch, not project.
+                let scratch = tempfile::tempdir().expect("scratch");
+                let prepared = super::prepare_native_composer_image(
+                    scratch.path(),
+                    crate::remote::RemoteImageAttachment {
+                        mime_type: "image/png".into(),
+                        file_name: Some("shot.png".into()),
+                        bytes: super::tiny_png_bytes_for_test(),
+                    },
+                )
+                .expect("stage into scratch");
+                let _ = shell.select_fleet_task_key(owner.clone(), FleetSelectMode::Replace);
+                let draft_key = shell
+                    .current_composer_draft_key()
+                    .expect("the selected task has a draft key");
+                shell.composer_images.insert(
+                    draft_key.clone(),
+                    vec![super::NativeComposerImage {
+                        id: 1,
+                        path: prepared.staged.path.clone(),
+                        prompt_reference: prepared.staged.prompt_reference.clone(),
+                        attachment: prepared.attachment.clone(),
+                        label: prepared.label.clone(),
+                        preview: prepared.preview.clone(),
+                    }],
+                );
+
+                let staged_path = std::path::PathBuf::from(prepared.attachment.path());
+                assert!(staged_path.starts_with(scratch.path()));
+
+                let before = shared.lock().unwrap().accepted.len();
+                shell.activate_composer_control(ComposerControl::SendNow);
+                assert_eq!(
+                    shared.lock().unwrap().accepted.len(),
+                    before,
+                    "a message whose image cannot be proved to live in the project must not be \
+                     sent: the host refuses it, the turn never settles, and every later message \
+                     is then rejected"
+                );
+                assert!(
+                    shell
+                        .local_slot()
+                        .composer_error
+                        .as_deref()
+                        .is_some_and(|error| error.contains("image")),
+                    "and the refusal says why, rather than failing silently"
+                );
+            });
+            drop(entity);
+            crate::ui::finish_headless_test(cx);
+        });
+    }
+
+    /// The bug the user hit: a first message with a pasted image never left the
+    /// box. Its image was staged before the task existed, and once the task was
+    /// created nothing ever asked the host where that task's files belong -- so
+    /// the image kept its scratch path and the send was refused for it.
+    ///
+    /// The send waits for the folder now instead, and goes out when it lands.
+    #[test]
+    fn a_first_message_image_waits_for_the_task_folder_instead_of_being_refused() {
+        if rerun_headless_shell_test_in_child(
+            "ui::native_shell::tests::a_first_message_image_waits_for_the_task_folder_instead_of_being_refused",
+        ) { return; }
+        let (runtime, shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
+        let workspace = tempfile::tempdir().unwrap();
+        let profile = isolated_dev_profile(workspace.path()).unwrap();
+        let project = tempfile::tempdir().unwrap();
+        gpui::Application::headless().run(move |cx| {
+            crate::ui::init(cx);
+            let entity = cx.new(|cx| {
+                NativeShell::new_with_host_runtime_port(
+                    profile,
+                    Box::new(runtime),
+                    crate::ui::tokens::RuntimePreferencesSnapshot::default(),
+                    cx,
+                )
+            });
+            entity.update(cx, |shell, _cx| {
+                shell.install_idle_conversation_photo_for_test();
+                let task_id = TaskId::new();
+                let model =
+                    unstarted_task_client_model_for(task_id, ProjectId::new(), ProviderKind::Codex);
+                shell.apply_client_model(Arc::new(model)).unwrap();
+                let owner = shell.local_task_key(task_id);
+                let _ = shell.select_fleet_task_key(owner.clone(), FleetSelectMode::Replace);
+                assert!(
+                    shell.resolved_task_folder(&owner).is_none(),
+                    "a task created moments ago carries no folder yet"
+                );
+
+                let scratch = tempfile::tempdir().expect("scratch");
+                let prepared = super::prepare_native_composer_image(
+                    scratch.path(),
+                    crate::remote::RemoteImageAttachment {
+                        mime_type: "image/png".into(),
+                        file_name: Some("shot.png".into()),
+                        bytes: super::tiny_png_bytes_for_test(),
+                    },
+                )
+                .expect("stage into scratch");
+                let draft_key = shell
+                    .current_composer_draft_key()
+                    .expect("the selected task has a draft key");
+                shell.composer_images.insert(
+                    draft_key.clone(),
+                    vec![super::NativeComposerImage {
+                        id: 7,
+                        path: prepared.staged.path.clone(),
+                        prompt_reference: prepared.staged.prompt_reference.clone(),
+                        attachment: prepared.attachment.clone(),
+                        label: prepared.label.clone(),
+                        preview: prepared.preview.clone(),
+                    }],
+                );
+
+                let text = "what colour is this";
+                let epoch = shell.rearm_composer_focus().expect("composer focus");
+                shell
+                    .composer
+                    .as_mut()
+                    .expect("composer")
+                    .replace_draft(text, epoch)
+                    .expect("draft");
+
+                let epochs = shell.local_slot_mut().interaction.action_epochs();
+                shell.local_slot_mut().pending_draft_first_send =
+                    Some(super::PendingDraftFirstSend {
+                        owner: owner.clone(),
+                        task_id,
+                        start_command_id: Some(CommandId::new()),
+                        control: ComposerControl::SendNow,
+                        attachment_only: false,
+                        provider_kind: ProviderKind::Codex,
+                        launch_options: crate::providers::ProviderLaunchOptions::default(),
+                        stage: super::PendingDraftFirstSendStage::StartAcceptedAwaitingReady,
+                        captured_draft: text.into(),
+                        captured_artifact_ids: Vec::new(),
+                        captured_image_ids: vec![7],
+                        echo_command_id: None,
+                        echo_draft_key: None,
+                        fleet_admission: None,
+                        connection_epoch: epochs.connection_epoch,
+                        resource_generation: epochs.resource_generation,
+                        runtime_generation: epochs.runtime_generation,
+                        started_at: Instant::now(),
+                        readiness_request_id: None,
+                        readiness_requested_at: None,
+                        ready_without_conversation_id: true,
+                    });
+
+                let before = shared.lock().unwrap().accepted.len();
+                shell.try_advance_pending_draft_first_send();
+                assert!(
+                    shell.local_slot().pending_draft_first_send.is_some(),
+                    "the send waits for the folder rather than being cancelled"
+                );
+                let held = shared.lock().unwrap().accepted.len();
+                assert_eq!(
+                    held,
+                    before + 1,
+                    "the only thing that goes out is the question about the folder -- never the \
+                     message, whose scratch path the host would refuse"
+                );
+                assert!(
+                    shell.local_slot().composer_error.is_none(),
+                    "waiting is not a failure, so nothing is said about it"
+                );
+                assert!(
+                    shell.image_staging_root_requests.contains_key(&owner),
+                    "waiting also means asking: the host is the only one that knows"
+                );
+
+                shell.apply_image_staging_root(task_id, project.path().to_path_buf());
+
+                let moved = shell.composer_images.get(&draft_key).expect("image kept");
+                assert!(
+                    moved[0]
+                        .path
+                        .starts_with(project.path().join(".devmanager").join("pasted-images")),
+                    "the answer moves the file where the host will admit it"
+                );
+                assert!(
+                    shell.local_slot().pending_draft_first_send.is_none(),
+                    "and the held first message goes out on the same answer"
+                );
+                assert!(
+                    shared.lock().unwrap().accepted.len() > held,
+                    "the send reaches the host"
+                );
+                assert!(shell.local_slot().composer_error.is_none());
+            });
+            drop(entity);
+            crate::ui::finish_headless_test(cx);
+        });
+    }
+
+    /// The refusal the user hit: a task that exists only in this shell has no
+    /// folder to stage into, so attaching was declined before the file dialog
+    /// or the paste ever ran.
+    #[test]
+    fn an_unsent_task_can_still_stage_an_image() {
+        if rerun_headless_shell_test_in_child(
+            "ui::native_shell::tests::an_unsent_task_can_still_stage_an_image",
+        ) {
+            return;
+        }
+        let (runtime, _shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
+        let workspace = tempfile::tempdir().unwrap();
+        let profile = isolated_dev_profile(workspace.path()).unwrap();
+        gpui::Application::headless().run(move |cx| {
+            crate::ui::init(cx);
+            let entity = cx.new(|cx| {
+                NativeShell::new_with_host_runtime_port(
+                    profile,
+                    Box::new(runtime),
+                    crate::ui::tokens::RuntimePreferencesSnapshot::default(),
+                    cx,
+                )
+            });
+            entity.update(cx, |shell, _cx| {
+                shell.install_idle_conversation_photo_for_test();
+                let key = HostTaskKey::new(shell.local_host_id(), TaskId::new());
+                shell.ephemeral_tasks.insert(
+                    key.clone(),
+                    super::EphemeralTaskDraft {
+                        key: key.clone(),
+                        project_key: crate::ui::native_host_state::HostProjectKey::new(
+                            shell.local_host_id(),
+                            crate::domain::id::ProjectId::new(),
+                        ),
+                        environment_id: crate::domain::id::EnvironmentId::new(),
+                        agent_session_id: AgentSessionId::new(),
+                        provider_kind: ProviderKind::Codex,
+                        create_command_id: None,
+                        pending_control: None,
+                        pending_launch_preferences: None,
+                    },
+                );
+                shell.selected_task_key = Some(key.clone());
+                assert!(
+                    shell.selected_task_workspace_root().is_err(),
+                    "the host has no folder for this task yet"
+                );
+
+                let root = shell
+                    .composer_image_staging_root()
+                    .expect("an unsent task still takes an image");
+                assert_eq!(root, NativeShell::draft_image_staging_root(&key));
+                assert!(root.is_dir(), "the scratch folder is ready to write into");
+
+                shell.drop_ephemeral_task(&key);
+                assert!(
+                    !root.exists(),
+                    "abandoning the draft takes its scratch images with it"
+                );
+            });
+            drop(entity);
+            crate::ui::finish_headless_test(cx);
+        });
+    }
+
+    /// A started task is its provider's process. Offering another provider's
+    /// models there would only produce a refusal, so the picker stops offering
+    /// them and says why.
+    #[test]
+    fn a_started_task_only_offers_the_provider_it_is_running_on() {
+        if rerun_headless_shell_test_in_child(
+            "ui::native_shell::tests::a_started_task_only_offers_the_provider_it_is_running_on",
+        ) {
+            return;
+        }
+        let (runtime, _shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
+        let workspace = tempfile::tempdir().unwrap();
+        let profile = isolated_dev_profile(workspace.path()).unwrap();
+        gpui::Application::headless().run(move |cx| {
+            crate::ui::init(cx);
+            let entity = cx.new(|cx| {
+                NativeShell::new_with_host_runtime_port(
+                    profile,
+                    Box::new(runtime),
+                    crate::ui::tokens::RuntimePreferencesSnapshot::default(),
+                    cx,
+                )
+            });
+            entity.update(cx, |shell, _cx| {
+                shell.install_idle_conversation_photo_for_test();
+                let (model, task_id) = terminal_bound_client_model();
+                shell.apply_client_model(Arc::new(model)).unwrap();
+                assert!(
+                    shell.model_picker_locked_instance().is_none(),
+                    "with nothing selected the picker offers every provider"
+                );
+                let providers_before = shell.model_picker_instances().len();
+                assert!(providers_before > 1, "more than one provider is configured");
+
+                let owner = shell.local_task_key(task_id);
+                let _ = shell.select_fleet_task_key(owner, FleetSelectMode::Replace);
+                assert!(
+                    !shell.selected_task_is_unstarted_draft(),
+                    "this task is already running"
+                );
+                let locked = shell
+                    .model_picker_locked_instance()
+                    .expect("a running task pins its provider");
+                let instances = shell.model_picker_instances();
+                assert_eq!(instances.len(), 1, "the rail drops the other providers");
+                assert_eq!(instances[0].instance_id, locked);
+                let rows = shell.model_picker_rows();
+                assert!(!rows.is_empty(), "its own models are still switchable");
+                assert!(
+                    rows.iter().all(|row| row.instance_id == locked),
+                    "no row can be chosen that would be refused"
+                );
+            });
+            drop(entity);
+            crate::ui::finish_headless_test(cx);
+        });
+    }
+
+    /// The search field is a root editor, so platform text has to land in the
+    /// picker's query rather than in the composer behind it.
+    #[test]
+    fn typing_in_the_model_picker_reaches_its_search_field() {
+        if rerun_headless_shell_test_in_child(
+            "ui::native_shell::tests::typing_in_the_model_picker_reaches_its_search_field",
+        ) {
+            return;
+        }
+        let (runtime, _shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
+        let workspace = tempfile::tempdir().unwrap();
+        let profile = isolated_dev_profile(workspace.path()).unwrap();
+        gpui::Application::headless().run(move |cx| {
+            crate::ui::init(cx);
+            let entity = cx.new(|cx| {
+                NativeShell::new_with_host_runtime_port(
+                    profile,
+                    Box::new(runtime),
+                    crate::ui::tokens::RuntimePreferencesSnapshot::default(),
+                    cx,
+                )
+            });
+            entity.update(cx, |shell, _cx| {
+                shell.install_idle_conversation_photo_for_test();
+                shell.model_picker = Some(crate::ui::model_picker::ModelPickerState::new(
+                    crate::ui::model_picker::ModelPickerRail::Favorites,
+                    None,
+                ));
+                assert_eq!(shell.root_editor_value().as_deref(), Some(""));
+                shell.replace_root_platform_text(None, "son").unwrap();
+                assert_eq!(
+                    shell.model_picker.as_ref().unwrap().query(),
+                    "son",
+                    "typed text filters the picker"
+                );
+                shell.replace_root_platform_text(None, "net").unwrap();
+                assert_eq!(shell.model_picker.as_ref().unwrap().query(), "sonnet");
+                shell.close_model_picker();
+                assert!(
+                    shell.root_editor_value().is_none(),
+                    "closing hands text back to the composer"
+                );
+            });
+            drop(entity);
+            crate::ui::finish_headless_test(cx);
+        });
+    }
+
+    /// A star writes to provider settings. Before those load there is nothing
+    /// to write to, and the picker says so rather than dropping the click.
+    #[test]
+    fn starring_a_model_before_provider_settings_load_explains_itself() {
+        if rerun_headless_shell_test_in_child(
+            "ui::native_shell::tests::starring_a_model_before_provider_settings_load_explains_itself",
+        ) { return; }
+        let (runtime, shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
+        let workspace = tempfile::tempdir().unwrap();
+        let profile = isolated_dev_profile(workspace.path()).unwrap();
+        gpui::Application::headless().run(move |cx| {
+            crate::ui::init(cx);
+            let entity = cx.new(|cx| {
+                NativeShell::new_with_host_runtime_port(
+                    profile,
+                    Box::new(runtime),
+                    crate::ui::tokens::RuntimePreferencesSnapshot::default(),
+                    cx,
+                )
+            });
+            entity.update(cx, |shell, _cx| {
+                shell.install_idle_conversation_photo_for_test();
+                shell.provider_settings = None;
+                shell.model_picker = Some(crate::ui::model_picker::ModelPickerState::new(
+                    crate::ui::model_picker::ModelPickerRail::Favorites,
+                    None,
+                ));
+                let before = shared.lock().unwrap().accepted.len();
+                shell.toggle_model_picker_favorite("claude", "sonnet");
+                assert_eq!(
+                    shell.model_picker.as_ref().unwrap().notice(),
+                    Some("Provider settings are still loading."),
+                );
+                assert_eq!(
+                    shared.lock().unwrap().accepted.len(),
+                    before,
+                    "nothing is sent to the host"
+                );
+                // Typing clears the refusal: it described that click, not the list.
+                shell.model_picker.as_mut().unwrap().set_query("son");
+                assert!(shell.model_picker.as_ref().unwrap().notice().is_none());
+            });
+            drop(entity);
+            crate::ui::finish_headless_test(cx);
+        });
+    }
+
+    #[test]
+    fn remove_project_waits_for_board_tasks_and_archives_after_confirming() {
+        if rerun_headless_shell_test_in_child(
+            "ui::native_shell::tests::remove_project_waits_for_board_tasks_and_archives_after_confirming",
+        ) { return; }
+        let (runtime, shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
+        let workspace = tempfile::tempdir().unwrap();
+        let profile = isolated_dev_profile(workspace.path()).unwrap();
+        gpui::Application::headless().run(move |cx| {
+            crate::ui::init(cx);
+            let entity = cx.new(|cx| {
+                NativeShell::new_with_host_runtime_port(
+                    profile,
+                    Box::new(runtime),
+                    crate::ui::tokens::RuntimePreferencesSnapshot::default(),
+                    cx,
+                )
+            });
+            entity.update(cx, |shell, _cx| {
+                shell.install_idle_conversation_photo_for_test();
+                let (model, _) = terminal_bound_client_model();
+                shell.apply_client_model(Arc::new(model)).unwrap();
+                shell.open_remove_project(
+                    "project-1".into(),
+                    "Launch".into(),
+                    ProjectId::new().to_string(),
+                );
+                let before = shared.lock().unwrap().accepted.len();
+                shell.dispatch_keyboard_for_test(crate::ui::actions::KeyboardShortcut::escape());
+                assert!(
+                    shell.remove_project.is_none(),
+                    "Escape closes the confirmation"
+                );
+                assert_eq!(shared.lock().unwrap().accepted.len(), before);
+                shell.open_remove_project(
+                    "project-1".into(),
+                    "Launch".into(),
+                    ProjectId::new().to_string(),
+                );
+                shell.remove_project.as_mut().unwrap().open_tasks = 2;
+                shell.confirm_remove_project();
+                assert_eq!(
+                    shared.lock().unwrap().accepted.len(),
+                    before,
+                    "a project with tasks on the board is not removed"
+                );
+                shell.remove_project.as_mut().unwrap().open_tasks = 0;
+                shell.confirm_remove_project();
+                let action = shared.lock().unwrap().accepted.last().unwrap().clone();
+                assert!(matches!(
+                    &action.command,
+                    NativeHostCommand::TaskCockpitQuery {
+                        query: TaskCockpitQuery::ConfigArchiveProject { project_id },
+                        ..
+                    } if project_id == "project-1"
+                ));
+                shell.apply_epoch_fenced_action_outcome(NativeHostActionOutcome::Failed {
+                    action: action.clone(),
+                    error: "config store busy".into(),
+                });
+                let draft = shell.remove_project.as_ref().unwrap();
+                assert!(!draft.submitting, "a failure stops the pending state");
+                assert_eq!(draft.error.as_deref(), Some("config store busy"));
+                shell.confirm_remove_project();
+                let retry = shared.lock().unwrap().accepted.last().unwrap().clone();
+                shell.apply_epoch_fenced_action_outcome(NativeHostActionOutcome::Queried {
+                    action: retry,
+                    detail: "project removed".into(),
+                    body: NativeHostQueryBody::TaskCockpit(
+                        crate::domain::TaskCockpitResult::Config(
+                            crate::domain::ConfigSidebarSnapshot {
+                                revision: 3,
+                                projects: Vec::new(),
+                                servers: Vec::new(),
+                                ssh_connections: Vec::new(),
+                                providers: Vec::new(),
+                            },
+                        ),
+                    ),
+                });
+                assert!(
+                    shell.remove_project.is_none(),
+                    "the host's reply closes the dialog"
+                );
             });
             drop(entity);
             crate::ui::finish_headless_test(cx);
@@ -60167,8 +63410,8 @@ mod "
                     "the board header's New task control replaces the project +Claude/+Codex pair"
                 );
 
-                // The + New menu reaches the project even though the board has
-                // no project rows, and Escape closes it.
+                // + New reaches the project even though the board has no
+                // project rows.
                 assert_eq!(
                     shell
                         .board_new_task_targets()
@@ -60177,32 +63420,18 @@ mod "
                         .collect::<Vec<_>>(),
                     vec![(project_id, "DevManager".to_string())]
                 );
-                // The "+Claude"/"+Codex" pair the project headers carried is
-                // now one row per signed-in provider in this one menu.
-
-                let entries: Vec<_> = shell
-                    .board_new_task_menu_entries()
-                    .into_iter()
-                    .map(|entry| (entry.label, entry.action))
-                    .collect();
-                assert!(
-                    entries.iter().any(|(label, action)| label
-                        == "DevManager · Claude Code"
-                        && *action
-                            == BoardMenuAction::StartAgentIn(
-                                project_id,
-                                ProviderKind::ClaudeCode
-                            )),
-                    "the + New menu still starts a local task straight onto a provider: {entries:?}"
-                );
-                shell.open_board_menu(BoardMenu::NewTask);
-                assert_eq!(shell.board_menu, Some(BoardMenu::NewTask));
+                // + New opens only the Create task dialog, and it closes a
+                // board menu left open so no second chooser reappears later.
                 shell.open_board_menu(BoardMenu::Options);
-                assert_eq!(
-                    shell.board_menu,
-                    Some(BoardMenu::Options),
-                    "one field holds both menus, so opening one closes the other"
+                shell.begin_new_task();
+                assert!(
+                    shell.new_task.is_some(),
+                    "+ New opens the Create task dialog"
                 );
+                assert_eq!(shell.board_menu, None, "+ New never leaves a menu open");
+                shell.new_task = None;
+                shell.open_board_menu(BoardMenu::Options);
+                assert_eq!(shell.board_menu, Some(BoardMenu::Options));
                 shell.handle_board_menu_key(&KeyDownEvent {
                     keystroke: Keystroke {
                         modifiers: gpui::Modifiers::default(),
@@ -61072,6 +64301,8 @@ mod "
                 captured_draft: "keep my first message".into(),
                 captured_artifact_ids: Vec::new(),
                 captured_image_ids: Vec::new(),
+                echo_command_id: None,
+                echo_draft_key: None,
                 fleet_admission: None,
                 connection_epoch: epochs.connection_epoch,
                 resource_generation: epochs.resource_generation,
@@ -61101,6 +64332,59 @@ mod "
         });
     }
 
+    /// The model's name always lost a race it should have won. Two seconds
+    /// after the first message this app renames the task to a shortened copy
+    /// of it; that name is not a placeholder, so when the model's real name
+    /// arrived seconds later it was refused as if the person had typed it --
+    /// which is why every task stayed named after its own first sentence.
+    fn a_model_written_title_replaces_the_stand_in_name_this_app_applied(cx: &mut gpui::App) {
+        let (runtime, shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
+        let (model, task_id) = terminal_bound_client_model();
+        with_test_shell_in_app(cx, runtime, |shell| {
+            shell
+                .local_slot_mut()
+                .interaction
+                .sync_selected_task(Some(task_id));
+            shell.apply_client_model(Arc::new(model)).unwrap();
+            let owner = shell.local_task_key(task_id);
+            let _ = shell.select_fleet_task_key(owner.clone(), FleetSelectMode::Replace);
+            let renames = |shared: &std::sync::Arc<std::sync::Mutex<TestRuntimeState>>| {
+                shared
+                    .lock()
+                    .expect("runtime state")
+                    .accepted
+                    .iter()
+                    .filter(|record| matches!(record.command, NativeHostCommand::TaskRename { .. }))
+                    .count()
+            };
+
+            // A name this app did not write outranks any suggestion.
+            let before = renames(&shared);
+            shell.apply_suggested_task_title(task_id, Some("Identify image colour".into()));
+            assert_eq!(
+                renames(&shared),
+                before,
+                "a name the person may have typed is never overwritten"
+            );
+
+            // The stand-in this app applied is ours, and the model's name
+            // replaces it.
+            shell
+                .applied_automatic_titles
+                .insert(owner.clone(), "Bound terminal task".into());
+            shell.apply_suggested_task_title(task_id, Some("Identify image colour".into()));
+            assert_eq!(
+                renames(&shared),
+                before + 1,
+                "the name we invented gives way to the one that was asked for"
+            );
+            assert!(
+                !shell.applied_automatic_titles.contains_key(&owner),
+                "and the claim is spent, so a later suggestion cannot reuse it"
+            );
+        });
+    }
+
     fn started_composer_keeps_provider_and_access_launch_only(cx: &mut gpui::App) {
         let (runtime, _shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
         let (model, task_id) = terminal_bound_client_model();
@@ -61114,7 +64398,7 @@ mod "
             assert!(!shell.composer_launch_preferences_editable());
             assert!(shell.composer_model_reasoning_editable());
             shell.set_composer_access(crate::providers::ProviderAccessMode::ReadOnly);
-            shell.open_composer_access_selector();
+            shell.open_composer_access_selector(None);
             assert!(shell.composer_selector.is_none());
             assert_eq!(shell.layout.composer_launch_options, before);
         });
@@ -63423,6 +66707,7 @@ mod "
             selected_task_composer_waits_for_durable_provider_identity(cx);
             selected_codex_task_composer_allows_first_prompt_without_provider_identity(cx);
             cancelled_first_send_readiness_preserves_startup_error(cx);
+            a_model_written_title_replaces_the_stand_in_name_this_app_applied(cx);
             started_composer_keeps_provider_and_access_launch_only(cx);
             selected_task_composer_rebinds_after_focus_epoch_advances(cx);
             task_switch_parks_and_restores_unsent_composer_draft(cx);
@@ -68786,8 +72071,12 @@ mod "
     }
 
     #[test]
-    fn ssh_panel_accepts_exact_open_after_projection_and_keeps_conversation_visible() {
-        if rerun_headless_shell_test_in_child("ui::native_shell::tests::ssh_panel_accepts_exact_open_after_projection_and_keeps_conversation_visible") { return; }
+    fn ssh_opens_a_host_terminal_without_a_task_and_types_into_it() {
+        if rerun_headless_shell_test_in_child(
+            "ui::native_shell::tests::ssh_opens_a_host_terminal_without_a_task_and_types_into_it",
+        ) {
+            return;
+        }
         gpui::Application::headless().run(|cx| {
             crate::ui::init(cx);
             let (runtime, shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
@@ -68796,14 +72085,10 @@ mod "
                 let (model, task_id) = terminal_bound_client_model();
                 let model = Arc::new(model);
                 shell.apply_client_model(model.clone()).unwrap();
-                let owner = shell.local_task_key(task_id);
-                shell
-                    .select_fleet_task_key(owner.clone(), FleetSelectMode::Replace)
-                    .unwrap();
                 shared.lock().unwrap().accepted.clear();
                 shell.open_ssh_connection("saved-server".into());
                 shell.open_ssh_connection("saved-server".into());
-                let requests = shared
+                let opens = shared
                     .lock()
                     .unwrap()
                     .accepted
@@ -68812,45 +72097,50 @@ mod "
                         matches!(
                             a.command,
                             NativeHostCommand::TaskCockpitQuery {
-                                query: TaskCockpitQuery::OpenSshTerminal { .. },
+                                query: TaskCockpitQuery::HostSshOpen { .. },
                                 ..
                             }
                         )
                     })
                     .cloned()
                     .collect::<Vec<_>>();
-                assert_eq!(
-                    requests.len(),
-                    1,
-                    "duplicate connect while the owned request is pending"
-                );
-                let action = requests[0].clone();
-                shell
-                    .local_slot_mut()
-                    .interaction
-                    .set_client_model(Some(model.clone()));
-                let resource = ResourceId::new();
-                let provider =
-                    provider_terminal_projection_for_test(&model, task_id, 1).resource_id;
-                let strip = shell_strip_for_test(task_id, provider, &[resource], Some(resource));
+                assert_eq!(opens.len(), 1, "one open while it is pending");
+                assert_eq!(opens[0].task_id, None, "SSH is never attached to a task");
+                let mut projection = provider_terminal_projection_for_test(&model, task_id, 1);
+                projection.task_id = TaskId::new();
+                projection.resource_id = ResourceId::new();
+                projection.agent_session_id = crate::domain::AgentSessionId::nil();
+                projection.runtime_generation = 0;
+                projection.action_epoch = 0;
+                projection.is_provider = false;
                 shell.apply_epoch_fenced_action_outcome(NativeHostActionOutcome::Queried {
-                    action,
+                    action: opens[0].clone(),
                     detail: "SSH opened".into(),
                     body: NativeHostQueryBody::TaskCockpit(
-                        crate::domain::TaskCockpitResult::TaskTerminals(strip),
+                        crate::domain::TaskCockpitResult::HostTerminal(projection.clone()),
                     ),
                 });
                 assert!(shell.ssh_ui.pending.is_none());
-                assert_eq!(
-                    shell.ssh_ui.active.as_ref().map(|(_, _, id)| *id),
-                    Some(resource)
-                );
-                assert_eq!(shell.pane_view(&owner), PaneView::Conversation);
-                assert!(shell.ssh_terminal_is_visible(&owner));
-                let wide = shell.ssh_workspace_size(size(px(1200.0), px(800.0)));
-                assert_eq!(wide, size(px(596.0), px(800.0)));
-                let narrow = shell.ssh_workspace_size(size(px(700.0), px(800.0)));
-                assert_eq!(narrow, size(px(700.0), px(396.0)));
+                assert_eq!(shell.ssh_active_terminal(), Some(projection.resource_id));
+
+                shared.lock().unwrap().accepted.clear();
+                assert!(shell.send_ssh_input(b"ls\r".to_vec()));
+                let inputs = shared
+                    .lock()
+                    .unwrap()
+                    .accepted
+                    .iter()
+                    .filter(|a| {
+                        matches!(
+                            &a.command,
+                            NativeHostCommand::TerminalInput(request)
+                                if request.context.resource_id == projection.resource_id
+                                    && request.context.task_id == projection.task_id
+                                    && request.bytes == b"ls\r"
+                        )
+                    })
+                    .count();
+                assert_eq!(inputs, 1, "typing reaches the host terminal directly");
             });
             crate::ui::finish_headless_test(cx);
         });
@@ -69154,12 +72444,23 @@ mod "
                         matches!(record.command, NativeHostCommand::ProviderInput { .. })
                     })
                     .count();
+                // The gesture takes the message out of the box and paints it in
+                // the transcript, so the held send -- not the field -- is what
+                // still carries the exact text to deliver once trust is given.
+                assert!(
+                    shell
+                        .composer
+                        .as_ref()
+                        .expect("composer")
+                        .draft_text()
+                        .is_empty(),
+                    "a sent message must not sit in the box waiting for trust"
+                );
                 let draft = shell
-                    .composer
-                    .as_ref()
-                    .expect("composer")
-                    .draft_text()
-                    .to_string();
+                    .host_slot(&remote_host)
+                    .and_then(|slot| slot.pending_draft_first_send.as_ref())
+                    .map(|pending| pending.captured_draft.clone())
+                    .unwrap_or_default();
                 let error = shell
                     .host_slot(&remote_host)
                     .and_then(|slot| slot.composer_error.clone());
@@ -69657,12 +72958,22 @@ mod "
                         matches!(record.command, NativeHostCommand::ProviderInput { .. })
                     })
                     .count();
+                // The message left the box at the gesture and is in the
+                // transcript; the parked send is what still holds the words.
+                assert!(
+                    shell
+                        .composer
+                        .as_ref()
+                        .expect("composer")
+                        .draft_text()
+                        .is_empty(),
+                    "a sent message must not sit in the box during a setup hold"
+                );
                 let draft_after_hold = shell
-                    .composer
-                    .as_ref()
-                    .expect("composer")
-                    .draft_text()
-                    .to_string();
+                    .host_slot(&remote_host)
+                    .and_then(|slot| slot.pending_draft_first_send.as_ref())
+                    .map(|pending| pending.captured_draft.clone())
+                    .unwrap_or_default();
                 (
                     sends_after_hold,
                     draft_after_hold,

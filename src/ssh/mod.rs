@@ -17,6 +17,9 @@ pub(crate) use supervisor::{
     SshRuntimeSnapshot, SshSupervisor, SshTaskIdentity,
 };
 
+pub mod askpass;
 mod terminal;
+pub(crate) mod vault;
+pub(crate) use askpass::AskpassSecretFile;
 pub(crate) use credentials::RetainedKey;
 pub(crate) use terminal::prepare_interactive_terminal;

@@ -253,6 +253,13 @@ impl ProviderSettingsController {
         self.mutation_in_flight
     }
 
+    /// The instance an unsaved draft belongs to. A model-policy edit for any
+    /// other instance is refused, so callers outside Settings -- the composer's
+    /// model picker -- have to ask before they toggle a favourite.
+    pub fn dirty_instance_id(&self) -> Option<&str> {
+        self.dirty_instance_id.as_deref()
+    }
+
     pub fn expected_revision(&self) -> u64 {
         self.snapshot.revision
     }

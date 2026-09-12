@@ -160,6 +160,9 @@ pub struct ConfigSshRow {
     pub host: String,
     pub port: u16,
     pub username: String,
+    /// A password / private key is saved for this connection (presence only).
+    pub has_password: bool,
+    pub has_private_key: bool,
     pub action: ConfigSidebarAction,
     pub accessibility: AccessibilityMetadata,
 }
@@ -355,6 +358,8 @@ impl ConfigSidebarProjection {
                     host: bounded(&connection.host, MAX_CONFIG_HOST_SCALARS),
                     port: connection.port,
                     username: bounded(&connection.username, MAX_CONFIG_LABEL_SCALARS),
+                    has_password: connection.has_password,
+                    has_private_key: connection.has_private_key,
                     action: ConfigSidebarAction::enabled(ConfigSidebarActionRequest::SelectSsh {
                         config_id,
                     }),
@@ -658,12 +663,20 @@ fn ssh_row(connection: &SSHConnection) -> ConfigSshRow {
     let host = bounded(&connection.host, MAX_CONFIG_HOST_SCALARS);
     let username = bounded(&connection.username, MAX_CONFIG_LABEL_SCALARS);
     let accessibility = accessibility(AccessibleRole::Button, &format!("Remote {label}"));
+    let (has_password, has_private_key) = connection
+        .auth
+        .as_ref()
+        .and_then(|auth| auth.credential_ref.as_ref())
+        .map(|reference| crate::ssh::vault::presence(reference))
+        .unwrap_or((false, false));
     ConfigSshRow {
         config_id: config_id.clone(),
         label,
         host,
         port: connection.port,
         username,
+        has_password,
+        has_private_key,
         action: ConfigSidebarAction::enabled(ConfigSidebarActionRequest::SelectSsh { config_id }),
         accessibility,
     }

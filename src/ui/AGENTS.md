@@ -32,6 +32,9 @@
 
 # Native component architecture
 
+- Read [Native UI System](../../docs/native-ui-system.md) before changing a native
+  screen or shared control. It owns the maintained design vocabulary, reference
+  preparation, and capture/interaction completion contract; keep those rules there.
 - Keep the application and terminal on GPUI. The terminal data path stays
   in-process (`PTY -> terminal parser/state -> GPUI renderer`); do not insert a
   WebView, JavaScript bridge, or a second GUI event loop into that path.

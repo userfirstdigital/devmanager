@@ -26,6 +26,66 @@ impl ConfiguredDesktopRepository {
     }
 }
 
+/// How far below each configured root or folder nested repositories are found.
+const SCAN_DEPTH: usize = 4;
+/// Folders examined below one configured path before its scan stops.
+const SCAN_FOLDERS_PER_START: usize = 4096;
+/// Entries read from one folder; the rest of a huge folder is not descended.
+const MAX_FOLDER_ENTRIES: usize = 4096;
+const MAX_REPOSITORIES: usize = 512;
+
+/// Build output, dependency trees and hidden folders hold thousands of
+/// directories and never a project's own repository.
+fn skip_scan_folder(name: &str) -> bool {
+    name.starts_with('.')
+        || name.starts_with("target")
+        || matches!(
+            name,
+            "node_modules" | "vendor" | "dist" | "build" | "coverage" | "__pycache__" | "venv"
+        )
+}
+
+/// A folder holding a usable repository: a `.git` directory with a `HEAD`, or
+/// a `.git` file (worktree or submodule). A leftover empty `.git` directory is
+/// not one, and listing it would only show an error row.
+fn is_repository(dir: &Path) -> bool {
+    let marker = dir.join(".git");
+    match std::fs::symlink_metadata(&marker) {
+        Ok(metadata) if metadata.is_dir() => marker.join("HEAD").is_file(),
+        Ok(metadata) => metadata.is_file(),
+        Err(_) => false,
+    }
+}
+
+/// A configured path that is a real directory (never a symlink), canonical.
+fn usable_directory(path: &Path) -> Option<PathBuf> {
+    let metadata = std::fs::symlink_metadata(path).ok()?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return None;
+    }
+    path.canonicalize().ok()
+}
+
+/// Pin one repository and list it. A repository that cannot be pinned (it
+/// moved, or its filesystem has no stable identity) is left out, never fatal.
+fn push_repository(repos: &mut Vec<ConfiguredDesktopRepository>, label: &str, canonical: &Path) {
+    let Ok(validated) = crate::workspace::service::validate_host_workspace_path(canonical, true)
+    else {
+        return;
+    };
+    let mut digest = Sha256::new();
+    digest.update(canonical.to_string_lossy().as_bytes());
+    digest.update([0]);
+    digest.update(validated.identity.as_bytes());
+    repos.push(ConfiguredDesktopRepository {
+        pin: validated,
+        entry: DesktopRepositoryEntry {
+            id: format!("{:x}", digest.finalize()),
+            label: label.chars().take(160).collect(),
+        },
+    });
+}
+
 fn catalog(config: &AppConfig) -> Result<Vec<ConfiguredDesktopRepository>, String> {
     let mut roots = Vec::new();
     for project in &config.projects {
@@ -53,81 +113,70 @@ fn catalog(config: &AppConfig) -> Result<Vec<ConfiguredDesktopRepository>, Strin
     {
         roots.push(("Projects".into(), PathBuf::from(base)));
     }
-    let mut seen = std::collections::BTreeSet::new();
+    // 1. Every configured root and folder is checked itself first -- exactly
+    //    what 0.4.1 listed -- so no scan limit can drop a repository the user
+    //    configured.
+    let mut repo_paths = std::collections::BTreeSet::new();
     let mut repos = Vec::new();
-    let mut remaining = 4096usize;
-    // Breadth-first search gives configured root/folder labels precedence over
-    // automatically discovered names. Do not walk symlinks or generated trees.
-    let mut queue: std::collections::VecDeque<_> = roots
-        .into_iter()
-        .map(|(label, path)| (label, path, 0))
-        .collect();
-    while let Some((label, path, depth)) = queue.pop_front() {
-        let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+    let mut starts = Vec::new();
+    for (label, path) in roots {
+        let Some(canonical) = usable_directory(&path) else {
             continue;
         };
-        if !metadata.is_dir() || metadata.file_type().is_symlink() {
-            continue;
+        if is_repository(&canonical) && repo_paths.insert(canonical.clone()) {
+            push_repository(&mut repos, &label, &canonical);
         }
-        let canonical = path
-            .canonicalize()
-            .map_err(|_| "Could not resolve a configured project folder.".to_string())?;
-        if !seen.insert(canonical.clone()) {
-            continue;
-        }
-        if remaining == 0 {
-            return Err("Repository scan reached 4,096 folders. Add specific repository folders to narrow the scan.".into());
-        }
-        remaining -= 1;
-        if canonical.join(".git").exists() {
-            let validated =
-                crate::workspace::service::validate_host_workspace_path(&canonical, true)
-                    .map_err(|e| format!("Could not open {label}: {e}"))?;
-            let mut digest = Sha256::new();
-            digest.update(canonical.to_string_lossy().as_bytes());
-            digest.update([0]);
-            digest.update(validated.identity.as_bytes());
-            repos.push(ConfiguredDesktopRepository {
-                pin: validated,
-                entry: DesktopRepositoryEntry {
-                    id: format!("{:x}", digest.finalize()),
-                    label: label.chars().take(160).collect(),
-                },
-            });
-            if repos.len() > 256 {
-                return Err(
-                    "More than 256 repositories found. Narrow the configured project folders."
-                        .into(),
-                );
+        starts.push((label, canonical));
+    }
+    // 2. Nested repositories below each configured path, breadth-first. Each
+    //    start gets its own folder budget so one large tree cannot starve the
+    //    rest, a folder is scanned once however many starts reach it, and a
+    //    limit or an unreadable folder ends that part of the scan instead of
+    //    discarding everything already found.
+    let mut visited = std::collections::BTreeSet::new();
+    'starts: for (label, start) in starts {
+        let mut budget = SCAN_FOLDERS_PER_START;
+        let mut queue = std::collections::VecDeque::from([(label, start, 0usize)]);
+        while let Some((label, dir, depth)) = queue.pop_front() {
+            if depth > 0 {
+                if !visited.insert(dir.clone()) {
+                    continue;
+                }
+                if budget == 0 {
+                    break;
+                }
+                budget -= 1;
+                if is_repository(&dir) && repo_paths.insert(dir.clone()) {
+                    if repos.len() >= MAX_REPOSITORIES {
+                        break 'starts;
+                    }
+                    push_repository(&mut repos, &label, &dir);
+                }
             }
-        }
-        if depth >= 4 {
-            continue;
-        }
-        let mut children = std::fs::read_dir(&canonical)
-            .map_err(|_| format!("Could not read project folder {label}."))?
-            .take(4097)
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|_| format!("Could not read project folder {label}."))?;
-        if children.len() > 4096 {
-            return Err(format!("Project folder {label} has more than 4,096 entries; configure narrower repository folders."));
-        }
-        children.sort_by_key(|entry| entry.file_name());
-        for child in children {
-            let name = child.file_name().to_string_lossy().into_owned();
-            if name.starts_with('.')
-                || matches!(
-                    name.as_str(),
-                    "node_modules" | "target" | "vendor" | "dist" | "build"
-                )
-            {
+            if depth >= SCAN_DEPTH {
                 continue;
             }
-            if child
-                .file_type()
-                .is_ok_and(|kind| kind.is_dir() && !kind.is_symlink())
-            {
-                queue.push_back((format!("{label} / {name}"), child.path(), depth + 1));
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            let mut children: Vec<_> = entries
+                .filter_map(Result::ok)
+                .take(MAX_FOLDER_ENTRIES)
+                .collect();
+            children.sort_by_key(|entry| entry.file_name());
+            for child in children {
+                let name = child.file_name().to_string_lossy().into_owned();
+                if skip_scan_folder(&name) {
+                    continue;
+                }
+                // `dir` is canonical and the child is not a symlink, so the
+                // joined path is canonical too.
+                if child
+                    .file_type()
+                    .is_ok_and(|kind| kind.is_dir() && !kind.is_symlink())
+                {
+                    queue.push_back((format!("{label} / {name}"), dir.join(&name), depth + 1));
+                }
             }
         }
     }
@@ -201,6 +250,13 @@ pub(super) fn serve(dispatch: &TaskCockpitDispatch<'_>) -> QueryOutcome {
                     A::Publish { branch } => Some(branch.as_str()),
                     _ => None,
                 },
+                matches!(
+                    action,
+                    A::SwitchBranch { .. }
+                        | A::CreateBranch { .. }
+                        | A::DeleteBranch { .. }
+                        | A::Publish { .. }
+                ),
             )
             .and_then(|binding| {
                 crate::git::command::GitRepository::from_host_binding(
@@ -218,9 +274,20 @@ pub(super) fn serve(dispatch: &TaskCockpitDispatch<'_>) -> QueryOutcome {
                     response(
                         repository_id,
                         super::cockpit::execute_desktop_action(&repository, action, false)
+                            .map(fit_payload_for_wire)
+                            .map(explain_error_payload)
                             .unwrap_or_else(|outcome| {
                                 P::Error(format!("Git operation was not accepted: {outcome:?}"))
                             }),
+                    )
+                }
+                // The reason names the Git rule that refused the repository
+                // and carries no path; without it every refusal reads the
+                // same and cannot be acted on.
+                Err(crate::git::command::GitError::InvalidRepositoryRoot { reason, .. }) => {
+                    response(
+                        repository_id,
+                        P::Error(format!("Git could not open this repository: {reason}")),
                     )
                 }
                 Err(error) => response(repository_id, P::Error(error.to_string())),
@@ -229,6 +296,56 @@ pub(super) fn serve(dispatch: &TaskCockpitDispatch<'_>) -> QueryOutcome {
         _ => QueryOutcome::Err(QueryError::InvalidRequest),
     }
 }
+/// Service errors often carry Git's raw stderr. A known failure is replaced
+/// by its plain explanation; one already explained is left as it is.
+fn explain_error_payload(payload: P) -> P {
+    match payload {
+        P::Error(message) => match crate::git::command::explain_git_failure(&message) {
+            Some(explanation) if !message.contains(explanation) => {
+                P::Error(explanation.to_string())
+            }
+            _ => P::Error(message),
+        },
+        other => other,
+    }
+}
+
+/// A status reply has to fit one bounded host page (512 KiB, less envelope
+/// headroom). A repository with thousands of untracked files -- e.g. agent
+/// worktrees under `.claude/` -- would otherwise fail its whole status.
+const MAX_STATUS_REPLY_BYTES: usize = 448 * 1024;
+
+/// Keep as many status entries as fit and count the rest, so the window can
+/// say how many were left out instead of showing an error.
+fn fit_payload_for_wire(payload: P) -> P {
+    let P::Status(mut status) = payload else {
+        return payload;
+    };
+    let encoded_len = |status: &crate::git::git_service::GitStatusResult| {
+        rmp_serde::to_vec_named(status)
+            .map(|bytes| bytes.len())
+            .unwrap_or(usize::MAX)
+    };
+    if encoded_len(&status) <= MAX_STATUS_REPLY_BYTES {
+        return P::Status(status);
+    }
+    let total = status.entries.len();
+    let (mut keep, mut too_many) = (0usize, total);
+    while keep + 1 < too_many {
+        let mid = keep + (too_many - keep) / 2;
+        let mut candidate = status.clone();
+        candidate.entries.truncate(mid);
+        if encoded_len(&candidate) <= MAX_STATUS_REPLY_BYTES {
+            keep = mid;
+        } else {
+            too_many = mid;
+        }
+    }
+    status.entries.truncate(keep);
+    status.omitted_entries = u32::try_from(total - keep).unwrap_or(u32::MAX);
+    P::Status(status)
+}
+
 fn response(repository_id: &str, payload: P) -> QueryOutcome {
     QueryOutcome::Ok(QueryResult::TaskCockpit(
         TaskCockpitResult::DesktopRepositoryAction {
@@ -459,9 +576,68 @@ mod tests {
             P::Commit(_)
         ));
         assert!(matches!(action(&cfg,&bus,a,A::Status,false),P::Status(s) if s.ahead==1));
+        // History marks exactly the commit a push would send.
+        let history = action(&cfg, &bus, a, A::History { limit: 10, skip: 0 }, false);
+        let P::History(entries) = history else {
+            panic!("{history:?}")
+        };
+        assert_eq!(entries[0].subject, "Push me");
+        assert!(entries[0].unpushed, "{:?}", entries[0]);
+        assert!(
+            entries[1..].iter().all(|entry| !entry.unpushed),
+            "{entries:?}"
+        );
         let pushed = action(&cfg, &bus, a, A::Sync, true);
         assert!(matches!(pushed, P::Done(_)), "{pushed:?}");
         assert_eq!(git(&remote, &["log", "-1", "--format=%s"]), "Push me");
+        let history = action(&cfg, &bus, a, A::History { limit: 10, skip: 0 }, false);
+        let P::History(entries) = history else {
+            panic!("{history:?}")
+        };
+        assert!(entries.iter().all(|entry| !entry.unpushed), "{entries:?}");
+        // A branch that has diverged from its remote pulls as a merge, like
+        // GitHub Desktop, instead of Git refusing for want of `pull.rebase`.
+        git(&peer, &["pull", "--no-rebase"]);
+        std::fs::write(peer.join("peer.txt"), "second remote change\n").unwrap();
+        git(&peer, &["commit", "-am", "Peer second change"]);
+        git(&peer, &["push"]);
+        std::fs::write(first.join("local.txt"), "local change\n").unwrap();
+        assert!(matches!(
+            action(&cfg, &bus, a, A::StageAll, true),
+            P::Done(_)
+        ));
+        assert!(matches!(
+            action(
+                &cfg,
+                &bus,
+                a,
+                A::Commit {
+                    summary: "Local diverged".into(),
+                    description: None
+                },
+                true
+            ),
+            P::Commit(_)
+        ));
+        let fetched = action(&cfg, &bus, a, A::Fetch, true);
+        assert!(matches!(fetched, P::Done(_)), "{fetched:?}");
+        assert!(
+            matches!(action(&cfg,&bus,a,A::Status,false),P::Status(s) if s.ahead==1 && s.behind==1)
+        );
+        let merged = action(&cfg, &bus, a, A::Pull, true);
+        assert!(matches!(merged, P::Done(_)), "{merged:?}");
+        assert_eq!(
+            git(&first, &["log", "-1", "--format=%P"])
+                .split_whitespace()
+                .count(),
+            2,
+            "the pull made a merge commit"
+        );
+        assert!(first.join("local.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(first.join("peer.txt")).unwrap(),
+            "second remote change\n"
+        );
         // An opaque selector cannot be replaced by a path or reused after config removal.
         assert!(matches!(
             action(&cfg, &bus, &first.to_string_lossy(), A::Status, false),
@@ -498,5 +674,116 @@ mod tests {
             std::os::unix::fs::symlink(outside.path(), temp.path().join("linked-outside")).unwrap();
             assert_eq!(catalog(&cfg).unwrap().len(), 1);
         }
+    }
+
+    #[test]
+    fn desktop_git_keeps_configured_folders_when_the_scan_hits_its_limits() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("big");
+        // More folders than one start may scan: the budget runs out before
+        // the configured folder, which sorts last, is ever reached.
+        for index in 0..(SCAN_FOLDERS_PER_START + 50) {
+            std::fs::create_dir_all(root.join(format!("d{index:05}"))).unwrap();
+        }
+        let fake_repo = |path: &Path| {
+            std::fs::create_dir_all(path.join(".git")).unwrap();
+            std::fs::write(path.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        };
+        fake_repo(&root.join("zzzz-app"));
+        fake_repo(&root.join("a-nested"));
+        fake_repo(&root.join("target-watch/debug/generated"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let locked = root.join("b-locked");
+            std::fs::create_dir_all(&locked).unwrap();
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        }
+        let cfg: AppConfig = serde_json::from_value(serde_json::json!({
+            "version": 1,
+            "projects": [{
+                "id": "desktop-project", "name": "Base folder",
+                "rootPath": root.to_string_lossy(),
+                "folders": [{
+                    "id": "app", "name": "App",
+                    "folderPath": root.join("zzzz-app").to_string_lossy(),
+                    "commands": []
+                }],
+                "createdAt": "2026-09-08T00:00:00Z", "updatedAt": "2026-09-08T00:00:00Z"
+            }],
+            "settings": {}, "sshConnections": []
+        }))
+        .unwrap();
+        let labels: Vec<String> = catalog(&cfg)
+            .expect("a scan limit or unreadable folder never fails the catalog")
+            .into_iter()
+            .map(|repo| repo.entry.label)
+            .collect();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                root.join("b-locked"),
+                std::fs::Permissions::from_mode(0o755),
+            )
+            .unwrap();
+        }
+        assert!(
+            labels.iter().any(|label| label == "Base folder / App"),
+            "a configured folder repository is always listed: {labels:?}"
+        );
+        assert!(
+            labels.iter().any(|label| label == "Base folder / a-nested"),
+            "nested repositories are still found: {labels:?}"
+        );
+        assert!(
+            !labels.iter().any(|label| label.contains("target-watch")),
+            "build output is never scanned: {labels:?}"
+        );
+    }
+
+    #[test]
+    fn oversized_status_replies_are_trimmed_to_fit_and_count_the_rest() {
+        use crate::git::git_service::{GitFileStatus, GitStatusEntry, GitStatusResult};
+        let entry = |index: usize| GitStatusEntry {
+            path: format!(
+                ".claude/worktrees/agent-{index:05}/some/deeply/nested/generated/file-{index}.txt"
+            ),
+            status: GitFileStatus::Untracked,
+            staged: false,
+            original_path: None,
+        };
+        let small = GitStatusResult {
+            branch: Some("main".into()),
+            upstream: None,
+            ahead: 0,
+            behind: 0,
+            entries: (0..10).map(entry).collect(),
+            is_detached: false,
+            is_merging: false,
+            is_rebasing: false,
+            omitted_entries: 0,
+        };
+        let P::Status(kept) = fit_payload_for_wire(P::Status(small.clone())) else {
+            panic!("status payload");
+        };
+        assert_eq!(kept, small, "a status that fits is sent untouched");
+        let big = GitStatusResult {
+            entries: (0..20_000).map(entry).collect(),
+            ..small
+        };
+        let P::Status(trimmed) = fit_payload_for_wire(P::Status(big)) else {
+            panic!("status payload");
+        };
+        assert!(
+            !trimmed.entries.is_empty(),
+            "as many entries as fit are kept"
+        );
+        assert_eq!(
+            trimmed.entries.len() + trimmed.omitted_entries as usize,
+            20_000,
+            "every left-out entry is counted"
+        );
+        assert!(rmp_serde::to_vec_named(&trimmed).unwrap().len() <= MAX_STATUS_REPLY_BYTES);
     }
 }

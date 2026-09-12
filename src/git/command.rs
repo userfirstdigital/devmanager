@@ -126,7 +126,10 @@ const HARD_MAX_LOG_ENTRIES: usize = 8192;
 // node cap. A busy but healthy multi-worktree repository can exceed 1,024
 // metadata files long before it approaches that overall bound.
 const HARD_MAX_WORKTREE_ENTRIES: usize = HARD_MAX_GRAPH_NODES;
-const HARD_MAX_GRAPH_BYTES: u64 = 256 * 1024 * 1024;
+// Summed from file sizes the graph walk already stats; it never reads these
+// bytes, so a busy real-world repository (large packs) fits without cost. The
+// node and pack-count caps bound the walk itself.
+const HARD_MAX_GRAPH_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 // Windows repository graph validation deliberately pins and revalidates every
 // relevant handle around each Git child. Under Defender or sustained build
 // load, a healthy local operation can occasionally exceed ten seconds. Keep
@@ -462,12 +465,21 @@ pub(crate) fn issue_desktop_repository_git_host_binding(
     connection_id: Uuid,
     request_id: crate::domain::RequestId,
     publish_branch: Option<&str>,
+    strict_worktree_descriptors: bool,
 ) -> Result<GitHostBinding, GitError> {
+    // Reads of the current worktree only need its own metadata; sibling
+    // worktree backlinks are authorized only for branch/worktree shapes that
+    // consume them. A stale sibling (e.g. one registered from another
+    // machine) must not make the whole repository unreadable.
     let mut root = RepositoryRoot::open_with_approved_external_roots_deadline_and_admission(
         admission.path(),
         &[],
         OperationDeadline::from_now(HARD_MAX_TIMEOUT),
-        WorktreeDescriptorAdmission::Strict,
+        if strict_worktree_descriptors {
+            WorktreeDescriptorAdmission::Strict
+        } else {
+            WorktreeDescriptorAdmission::CurrentOnly
+        },
     )
     .map_err(|reason| GitError::InvalidRepositoryRoot {
         path: "<configured-desktop-root>".to_string(),
@@ -1406,12 +1418,16 @@ pub enum GitError {
 impl fmt::Display for GitError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::InvalidRepositoryRoot {
-                reason: _reason, ..
-            } => {
+            Self::InvalidRepositoryRoot { reason, .. } => {
                 #[cfg(test)]
-                eprintln!("Git test repository validation: {_reason}");
-                formatter.write_str("invalid Git repository root")
+                eprintln!("Git test repository validation: {reason}");
+                // The rule that fired and the file it fired on, so a refusal
+                // can be acted on; the absolute path stays out of the message.
+                write!(
+                    formatter,
+                    "Git stopped to keep this repository safe: {}",
+                    describe_repository_refusal(reason)
+                )
             }
             Self::InvalidPath { .. } => formatter.write_str("invalid repository path"),
             Self::InvalidRequest { .. } => formatter.write_str("invalid Git request"),
@@ -1423,6 +1439,11 @@ impl fmt::Display for GitError {
                     "Git operation failed{}",
                     code.map_or_else(String::new, |code| format!(" (exit {code})")),
                 )?;
+                // The sanitizer keeps only paths and URLs, which says nothing;
+                // a known failure is named in plain words instead.
+                if let Some(explanation) = explain_git_failure(stderr) {
+                    return write!(formatter, ": {explanation}");
+                }
                 let safe_details = sanitize_command_output(stderr);
                 if !safe_details.is_empty() {
                     write!(formatter, ": {safe_details}")?;
@@ -1806,6 +1827,17 @@ fn test_file_identity_with_deadline(
     stable_file_identity(path, false, Some(deadline), false, true, true)
 }
 
+/// `objects/pack/pack-<checksum>.pack`: written once, never modified in place.
+fn is_immutable_pack_file(path: &Path) -> bool {
+    path.parent()
+        .and_then(Path::file_name)
+        .is_some_and(|name| name == OsStr::new("pack"))
+        && path
+            .file_name()
+            .and_then(OsStr::to_str)
+            .is_some_and(|name| name.starts_with("pack-") && name.ends_with(".pack"))
+}
+
 fn stable_file_identity(
     path: &Path,
     require_native_image: bool,
@@ -1847,7 +1879,14 @@ fn stable_file_identity_with_index_retry(
     if !metadata.is_file() {
         return Err("Git executable is not a regular file".to_string());
     }
-    if !require_native_image && metadata.len() > HARD_MAX_GRAPH_FILE_BYTES {
+    // Pack files are immutable and named for their own checksum, which Git
+    // verifies whenever it reads them. Pin them by filesystem identity (inode,
+    // size, mtime, single link) instead of re-hashing hundreds of megabytes on
+    // every operation -- which also made any pack over the per-file cap refuse
+    // the whole repository.
+    let immutable_pack = is_immutable_pack_file(path);
+    let digest_content = digest_content && !immutable_pack;
+    if !require_native_image && !immutable_pack && metadata.len() > HARD_MAX_GRAPH_FILE_BYTES {
         return Err("Git graph file exceeds the immutable size limit".to_string());
     }
     if require_native_image {
@@ -3020,7 +3059,11 @@ impl GraphTransition {
                         | Self::Pull
                 ),
                 "ORIG_HEAD" => matches!(self, Self::Commit | Self::Reset | Self::Pull),
-                "MERGE_HEAD" | "CHERRY_PICK_HEAD" | "REVERT_HEAD" => {
+                // Git's merge state, all of it: MERGE_MODE (how the merge was
+                // run), MERGE_RR (rerere) and AUTO_MERGE (the merge-ort result
+                // Git 2.42+ records) come and go with MERGE_HEAD.
+                "MERGE_HEAD" | "MERGE_MODE" | "MERGE_RR" | "AUTO_MERGE" | "CHERRY_PICK_HEAD"
+                | "REVERT_HEAD" => {
                     matches!(self, Self::Commit | Self::Reset | Self::Pull)
                 }
                 "COMMIT_EDITMSG" | "MERGE_MSG" | "SQUASH_MSG" => {
@@ -3037,6 +3080,7 @@ impl GraphTransition {
                             | Self::Pull
                     )
                 }
+                _ if is_merge_stash_index(name) => self == Self::Pull,
                 _ => false,
             };
         }
@@ -3068,7 +3112,11 @@ impl GraphTransition {
                         | Self::Pull
                 ),
                 "ORIG_HEAD" => matches!(self, Self::Commit | Self::Reset | Self::Pull),
-                "MERGE_HEAD" | "CHERRY_PICK_HEAD" | "REVERT_HEAD" => {
+                // Git's merge state, all of it: MERGE_MODE (how the merge was
+                // run), MERGE_RR (rerere) and AUTO_MERGE (the merge-ort result
+                // Git 2.42+ records) come and go with MERGE_HEAD.
+                "MERGE_HEAD" | "MERGE_MODE" | "MERGE_RR" | "AUTO_MERGE" | "CHERRY_PICK_HEAD"
+                | "REVERT_HEAD" => {
                     matches!(self, Self::Commit | Self::Reset | Self::Pull)
                 }
                 "COMMIT_EDITMSG" | "MERGE_MSG" | "SQUASH_MSG" => {
@@ -3085,6 +3133,7 @@ impl GraphTransition {
                             | Self::Pull
                     )
                 }
+                _ if is_merge_stash_index(name) => self == Self::Pull,
                 _ => false,
             };
         }
@@ -3139,7 +3188,8 @@ impl GraphTransition {
                     Self::Commit | Self::Reset | Self::Branch | Self::Switch | Self::Pull
                 ),
                 "FETCH_HEAD" => matches!(self, Self::Fetch | Self::Pull),
-                "MERGE_HEAD" | "ORIG_HEAD" | "CHERRY_PICK_HEAD" | "REVERT_HEAD" => {
+                "MERGE_HEAD" | "MERGE_MODE" | "MERGE_RR" | "AUTO_MERGE" | "ORIG_HEAD"
+                | "CHERRY_PICK_HEAD" | "REVERT_HEAD" => {
                     matches!(self, Self::Commit | Self::Reset | Self::Pull)
                 }
                 "packed-refs" | "shallow" => {
@@ -3152,10 +3202,19 @@ impl GraphTransition {
                     matches!(self, Self::Commit | Self::Pull)
                 }
                 _ if name.starts_with("BISECT_") => matches!(self, Self::Commit | Self::Pull),
+                _ if is_merge_stash_index(name) => self == Self::Pull,
                 _ => false,
             }
         })
     }
+}
+
+/// `index.stash.<pid>`: the temporary index `git merge` writes, through
+/// `git stash create`, to save a working tree with uncommitted changes
+/// before it merges. It exists only while the pull runs.
+fn is_merge_stash_index(name: &str) -> bool {
+    name.strip_prefix("index.stash.")
+        .is_some_and(|pid| !pid.is_empty() && pid.bytes().all(|byte| byte.is_ascii_digit()))
 }
 
 fn valid_git_ref_component(component: &OsStr) -> bool {
@@ -3738,6 +3797,9 @@ impl RepositoryGraph {
         )?;
         for (input, is_file) in [
             (gitdir.join("MERGE_HEAD"), true),
+            (gitdir.join("MERGE_MODE"), true),
+            (gitdir.join("MERGE_RR"), true),
+            (gitdir.join("AUTO_MERGE"), true),
             (gitdir.join("rebase-merge"), false),
             (gitdir.join("rebase-apply"), false),
         ] {
@@ -5543,6 +5605,28 @@ fn mutable_directory_identity_from_snapshot(
     Ok(identity)
 }
 
+/// Sort a directory snapshot by name and keep each name once.
+///
+/// A directory enumerated while Git writes into it can report an entry twice:
+/// the ntfs3 driver restarts its index walk when the directory changes, and
+/// then lists every name again. A directory cannot hold two entries with one
+/// name, so the duplicates are an artefact of the walk; left in, each one
+/// reads as a newly added entry and the transition check refuses the first
+/// that is not Git's own (`config`). The later sighting is kept, being the
+/// more recent; the comparison still judges it against the baseline.
+fn dedup_snapshot_entries(entries: &mut MutableDirectorySnapshot) {
+    // Stable, so equal names stay in the order they were seen.
+    entries.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut unique: MutableDirectorySnapshot = Vec::with_capacity(entries.len());
+    for entry in entries.drain(..) {
+        match unique.last_mut() {
+            Some(last) if last.0 == entry.0 => *last = entry,
+            _ => unique.push(entry),
+        }
+    }
+    *entries = unique;
+}
+
 fn mutable_directory_snapshot_with_deadline(
     path: &Path,
     deadline: Option<OperationDeadline>,
@@ -5557,7 +5641,7 @@ fn mutable_directory_snapshot_with_file_mode(
 ) -> Result<MutableDirectorySnapshot, String> {
     let mut entries = Vec::new();
     collect_mutable_directory_entries(path, path, 0, &mut entries, deadline, hash_file_content)?;
-    entries.sort_by(|left, right| left.0.cmp(&right.0));
+    dedup_snapshot_entries(&mut entries);
     Ok(entries)
 }
 
@@ -5645,7 +5729,7 @@ fn mutable_directory_snapshot_for_node(
             return Err("mutable Git graph contains a non-regular entry".to_string());
         }
     }
-    entries.sort_by(|left, right| left.0.cmp(&right.0));
+    dedup_snapshot_entries(&mut entries);
     Ok(entries)
 }
 
@@ -6820,6 +6904,235 @@ fn apply_git_policy(
     }
 }
 
+/// A repository-guard refusal without the absolute path: the rule that fired
+/// and, when the reason names one, the file it fired on -- from `.git` down
+/// when it is inside it, otherwise just the file's name.
+fn describe_repository_refusal(reason: &str) -> String {
+    let (rule, subject) = match reason.split_once(": ") {
+        Some((rule, subject)) => (rule, Some(subject.trim())),
+        None => (reason, None),
+    };
+    let place = subject
+        .map(|subject| {
+            match subject
+                .rfind("/.git/")
+                .or_else(|| subject.rfind("\\.git\\"))
+            {
+                Some(index) => subject[index + 1..].replace('\\', "/"),
+                None => Path::new(subject)
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+            }
+        })
+        .filter(|place| !place.is_empty());
+    match place {
+        Some(place) => format!("{rule} ({place})"),
+        None => rule.to_string(),
+    }
+}
+
+/// A plain-language reading of a failed Git command's stderr, for the failures
+/// a person can act on. `None` for anything else.
+pub(crate) fn explain_git_failure(stderr: &str) -> Option<&'static str> {
+    let text = stderr.to_ascii_lowercase();
+    let any = |needles: &[&str]| needles.iter().any(|needle| text.contains(needle));
+    Some(
+        if any(&[
+            "could not read username",
+            "could not read password",
+            "authentication failed",
+            "invalid username or password",
+            "terminal prompts disabled",
+            "permission denied (publickey)",
+            "returned error: 401",
+            "returned error: 403",
+        ]) {
+            "The remote refused the sign-in. Sign in with the GitHub CLI (gh auth login) or set up a Git credential helper, then try again."
+        } else if any(&["repository not found"]) {
+            "The remote repository was not found, or this account has no access to it."
+        } else if any(&[
+            "[rejected]",
+            "fetch first",
+            "non-fast-forward",
+            "failed to push some refs",
+        ]) {
+            "The remote has commits you don't have yet. Pull first, then push."
+        } else if any(&[
+            "would be overwritten by merge",
+            "local changes to the following files would be overwritten",
+            "untracked working tree files would be overwritten",
+        ]) {
+            "Pulling would overwrite files you have changed. Commit or discard those changes first."
+        } else if any(&["cannot pull with rebase", "you have unstaged changes"]) {
+            "Git can't rebase while there are uncommitted changes. Commit or discard them first."
+        } else if any(&[
+            "automatic merge failed",
+            "merge conflict",
+            "conflict (content)",
+        ]) {
+            "The pull stopped on merge conflicts. Resolve them in your editor, then commit the merge."
+        } else if any(&["divergent branches", "not possible to fast-forward"]) {
+            "Your branch and the remote have both changed and Git would not merge them automatically."
+        } else if any(&["has no upstream branch", "no tracking information"]) {
+            "This branch isn't published yet. Use Publish branch."
+        } else if any(&[
+            "could not resolve host",
+            "failed to connect",
+            "connection timed out",
+            "operation timed out",
+            "network is unreachable",
+        ]) {
+            "The remote could not be reached. Check the network connection."
+        } else if any(&["nothing to commit", "no changes added to commit"]) {
+            "There is nothing to commit."
+        } else if any(&[
+            "author identity unknown",
+            "please tell me who you are",
+            "unable to auto-detect email",
+        ]) {
+            "Git doesn't know your name and email. Set user.name and user.email for this repository."
+        } else {
+            return None;
+        },
+    )
+}
+
+/// An HTTPS credential the host resolved for one remote operation. It is
+/// never formatted: `Debug` is redacted and nothing logs it.
+struct HttpsCredential {
+    username: String,
+    password: String,
+}
+
+impl fmt::Debug for HttpsCredential {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("HttpsCredential(<redacted>)")
+    }
+}
+
+/// The longest the user's credential helpers may take to answer.
+const CREDENTIAL_FILL_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// The only credential source a sandboxed child sees: a fixed helper that
+/// answers `get` from two variables set on that one child and ignores `store`
+/// and `erase`, so Git can neither persist nor discard anything.
+const SANDBOX_CREDENTIAL_HELPER: &str = "credential.helper=!f() { test \"$1\" = get && printf 'username=%s\\npassword=%s\\n' \"$DEVMANAGER_GIT_USERNAME\" \"$DEVMANAGER_GIT_PASSWORD\"; }; f";
+
+fn https_remote_endpoint(policy: &GitExecutionPolicy) -> Option<&str> {
+    match policy {
+        GitExecutionPolicy::AuthorizedMutation {
+            remote: Some(remote),
+            ..
+        }
+        | GitExecutionPolicy::ServiceMutation {
+            remote: Some(remote),
+            ..
+        } if remote.transport() == RemoteTransport::Https => Some(remote.endpoint()),
+        _ => None,
+    }
+}
+
+/// Ask the user's own Git credential configuration for an HTTPS remote's
+/// credential, the way Git in their terminal would.
+///
+/// The sandboxed child cannot: it sees no ambient config, prompts or askpass,
+/// by design. So the host runs `git credential fill` once, outside any
+/// repository -- from the filesystem root, with GIT_DIR and config overrides
+/// removed -- so only the user's global and system configuration can name a
+/// helper, never the repository's own config, which the sandbox treats as
+/// untrusted. Prompts and askpass stay off: when no helper has a credential
+/// this returns `None` and the operation fails with Git's sign-in error.
+fn resolve_https_credential(
+    executable: &Path,
+    endpoint: &str,
+    deadline: OperationDeadline,
+) -> Option<HttpsCredential> {
+    let rest = endpoint.strip_prefix("https://")?;
+    let (host, path) = rest.split_once('/').unwrap_or((rest, ""));
+    if host.is_empty()
+        || host.contains('@')
+        || [host, path]
+            .iter()
+            .any(|part| part.contains(['\n', '\r', '\0']))
+    {
+        return None;
+    }
+    let mut command = Command::new(executable);
+    command
+        .args(["-c", "core.askPass=", "credential", "fill"])
+        .current_dir(if cfg!(windows) {
+            env::temp_dir()
+        } else {
+            PathBuf::from("/")
+        })
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env_remove("GIT_ASKPASS")
+        .env_remove("SSH_ASKPASS")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_CONFIG")
+        .env_remove("GIT_CONFIG_PARAMETERS")
+        .env_remove("GIT_CONFIG_COUNT")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    #[cfg(unix)]
+    command.process_group(0);
+    let mut child = command.spawn().ok()?;
+    let request = format!("protocol=https\nhost={host}\npath={path}\n\n");
+    let written = child
+        .stdin
+        .take()
+        .is_some_and(|mut stdin| std::io::Write::write_all(&mut stdin, request.as_bytes()).is_ok());
+    let give_up_at = Instant::now() + deadline.remaining().min(CREDENTIAL_FILL_TIMEOUT);
+    let exited = written
+        && loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status.success(),
+                Ok(None) if Instant::now() < give_up_at => thread::sleep(Duration::from_millis(20)),
+                _ => break false,
+            }
+        };
+    if !exited {
+        let _ = child.kill();
+        let _ = child.wait();
+        return None;
+    }
+    let mut output = String::new();
+    let mut stdout = child.stdout.take()?;
+    std::io::Read::read_to_string(
+        &mut std::io::Read::take(&mut stdout, 16 * 1024),
+        &mut output,
+    )
+    .ok()?;
+    let mut username = None;
+    let mut password = None;
+    for line in output.lines() {
+        if let Some(value) = line.strip_prefix("username=") {
+            username = Some(value.to_string());
+        } else if let Some(value) = line.strip_prefix("password=") {
+            password = Some(value.to_string());
+        }
+    }
+    match (username, password) {
+        (Some(username), Some(password)) if !username.is_empty() && !password.is_empty() => {
+            Some(HttpsCredential { username, password })
+        }
+        _ => None,
+    }
+}
+
+fn apply_https_credential(command: &mut Command, credential: &HttpsCredential) {
+    command
+        .env("DEVMANAGER_GIT_USERNAME", &credential.username)
+        .env("DEVMANAGER_GIT_PASSWORD", &credential.password)
+        .args([
+            OsString::from("-c"),
+            OsString::from(SANDBOX_CREDENTIAL_HELPER),
+        ]);
+}
+
 fn explicit_child_path(executable: &Path) -> OsString {
     let mut directories = Vec::new();
     if let Some(parent) = executable.parent() {
@@ -6872,6 +7185,19 @@ fn apply_git_options(command: &mut Command, sandbox: &GitSandbox, policy: &GitEx
         OsString::from("protocol.ext.allow=never"),
         OsString::from("-c"),
         OsString::from("protocol.file.allow=never"),
+        // No automatic housekeeping from a guarded command. After a fetch,
+        // pull or commit Git runs `maintenance run --auto`, which takes
+        // `.git/objects/maintenance.lock` (and may gc or rewrite the
+        // commit-graph, possibly detached, after the command has returned).
+        // None of that is part of the operation the graph guard admitted, so
+        // it refused the fetch whenever it caught the lock. The user's own
+        // Git still maintains the repository as usual.
+        OsString::from("-c"),
+        OsString::from("maintenance.auto=false"),
+        OsString::from("-c"),
+        OsString::from("gc.auto=0"),
+        OsString::from("-c"),
+        OsString::from("gc.autoDetach=false"),
     ]);
 
     if matches!(
@@ -7165,7 +7491,10 @@ fn service_remote_binding_matches(
         } else if argument.starts_with('-') {
             let allowed = match command {
                 Some("push") => argument == "--set-upstream",
-                Some("pull") => argument == "--rebase",
+                // `--no-rebase` makes the merge explicit: the sandbox hides the
+                // user's `pull.rebase`, and without either flag Git refuses to
+                // pull a branch that has diverged.
+                Some("pull") => argument == "--rebase" || argument == "--no-rebase",
                 Some("fetch") => false,
                 _ => false,
             };
@@ -8656,11 +8985,34 @@ impl GitRepository {
         remote: Option<&str>,
         branch: Option<&str>,
     ) -> Result<PushPlan, GitError> {
+        let status = self.status()?;
+        self.plan_push_with_status(status, remote, branch)
+    }
+
+    /// The desktop service seam's push plan. That seam runs `push` through
+    /// `run_service_mutation`, which never compares a plan's fingerprint, and
+    /// a push sends commits, not working-tree content -- so this reads the
+    /// porcelain summary instead of the full content fingerprint, whose binary
+    /// diff overflows the output cap on a large working tree.
+    pub(crate) fn plan_service_push(
+        &self,
+        remote: Option<&str>,
+        branch: Option<&str>,
+    ) -> Result<PushPlan, GitError> {
+        let status = self.status_summary()?;
+        self.plan_push_with_status(status, remote, branch)
+    }
+
+    fn plan_push_with_status(
+        &self,
+        status: RepositoryStatus,
+        remote: Option<&str>,
+        branch: Option<&str>,
+    ) -> Result<PushPlan, GitError> {
         if let Some(remote) = remote {
             validate_remote(remote, "push remote")?;
             validate_remote_name(remote)?;
         }
-        let status = self.status()?;
         let branch = branch
             .map(|branch| {
                 BranchName::new(branch).map_err(|message| GitError::InvalidRequest { message })
@@ -9021,7 +9373,10 @@ impl GitRepository {
     }
 
     pub(crate) fn validate_service_paths(&self, paths: &[RepoPath]) -> Result<(), GitError> {
-        let status = self.status()?;
+        // `validate_files` reads the entries only (to recognise submodules),
+        // never the content fingerprint, whose binary diff overflows the
+        // output cap on a large working tree and would block staging there.
+        let status = self.status_summary()?;
         self.with_read_permit(|permit| {
             if permit.deadline.is_expired() {
                 return Err(GitError::TimedOut {
@@ -9396,6 +9751,10 @@ impl GitRepository {
                 timeout: deadline.timeout,
             });
         }
+        // An HTTPS remote needs the user's credential. Resolve it before the
+        // graph proof, so the proof stays the last boundary before the spawn.
+        let https_credential = https_remote_endpoint(&policy)
+            .and_then(|endpoint| resolve_https_credential(&executable.path, endpoint, deadline));
         // Perform the complete graph proof once, at the last boundary before
         // the trusted child is spawned. An earlier identical proof would be
         // stale again after executable/sandbox binding and only halves the
@@ -9424,6 +9783,10 @@ impl GitRepository {
         apply_git_policy(&mut command, &policy, &sandbox, &executable.path);
         if apply_global_options {
             apply_git_options(&mut command, &sandbox, &policy);
+        }
+        // After the options: their `credential.helper=` reset comes first.
+        if let Some(credential) = &https_credential {
+            apply_https_credential(&mut command, credential);
         }
         command.args(arguments);
         #[cfg(unix)]
@@ -11065,6 +11428,121 @@ mod tests {
     }
 
     #[test]
+    fn sandbox_credential_helper_answers_get_from_its_own_environment_only() {
+        let _guard = process_test_guard();
+        let sandbox = GitSandbox::new().expect("create Git sandbox");
+        let executable = TrustedExecutable::resolve_git().expect("resolve installed Git");
+        let mut command = Command::new(&executable.path);
+        apply_git_policy(
+            &mut command,
+            &GitExecutionPolicy::ReadOnly,
+            &sandbox,
+            &executable.path,
+        );
+        apply_git_options(&mut command, &sandbox, &GitExecutionPolicy::ReadOnly);
+        apply_https_credential(
+            &mut command,
+            &HttpsCredential {
+                username: "robot".into(),
+                password: "s3cret value".into(),
+            },
+        );
+        command
+            .args(["credential", "fill"])
+            .current_dir(&sandbox.root)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command.spawn().expect("run git credential fill");
+        std::io::Write::write_all(
+            child.stdin.as_mut().expect("credential stdin"),
+            b"protocol=https\nhost=example.invalid\npath=org/repo.git\n\n",
+        )
+        .expect("write credential request");
+        let output = child.wait_with_output().expect("credential fill output");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let text = String::from_utf8_lossy(&output.stdout);
+        assert!(text.contains("username=robot\n"), "{text}");
+        assert!(text.contains("password=s3cret value\n"), "{text}");
+    }
+
+    #[test]
+    fn sandboxed_git_never_starts_automatic_maintenance() {
+        let sandbox = GitSandbox::new().expect("create Git sandbox");
+        let mut command = Command::new("git");
+        apply_git_options(&mut command, &sandbox, &GitExecutionPolicy::ReadOnly);
+        let arguments: Vec<String> = command
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect();
+        for setting in ["maintenance.auto=false", "gc.auto=0", "gc.autoDetach=false"] {
+            assert!(
+                arguments
+                    .windows(2)
+                    .any(|pair| pair[0] == "-c" && pair[1] == setting),
+                "missing -c {setting} in {arguments:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn repository_refusals_name_the_rule_and_file_without_the_absolute_path() {
+        assert_eq!(
+            describe_repository_refusal(
+                "repository graph mutation is outside the operation transition: /run/media/x/Code/web/.git/config"
+            ),
+            "repository graph mutation is outside the operation transition (.git/config)"
+        );
+        assert_eq!(
+            describe_repository_refusal(
+                r"repository graph file identity changed: C:\Code\web\.git\refs\heads\main"
+            ),
+            "repository graph file identity changed (.git/refs/heads/main)"
+        );
+        assert_eq!(
+            describe_repository_refusal("repository graph path changed"),
+            "repository graph path changed"
+        );
+        assert_eq!(
+            describe_repository_refusal(
+                "repository object content was replaced: /tmp/work/notes.txt"
+            ),
+            "repository object content was replaced (notes.txt)"
+        );
+        let shown = GitError::InvalidRepositoryRoot {
+            path: "<repository>".to_string(),
+            reason: "repository graph mutation is outside the operation transition: /home/u/r/.git/objects/incoming-abc".to_string(),
+        }
+        .to_string();
+        assert!(!shown.contains("/home/u"), "{shown}");
+        assert!(shown.ends_with("(.git/objects/incoming-abc)"), "{shown}");
+    }
+
+    #[test]
+    fn known_git_failures_are_explained_in_plain_words() {
+        let sign_in = explain_git_failure(
+            "fatal: could not read Username for 'https://github.com': terminal prompts disabled",
+        );
+        assert!(sign_in.is_some_and(|text| text.starts_with("The remote refused the sign-in")));
+        let rejected = explain_git_failure(
+            " ! [rejected]        master -> master (fetch first)\nerror: failed to push some refs",
+        );
+        assert!(rejected.is_some_and(|text| text.contains("Pull first")));
+        let overwrite = explain_git_failure(
+            "error: Your local changes to the following files would be overwritten by merge:",
+        );
+        assert!(overwrite.is_some_and(|text| text.contains("overwrite")));
+        assert_eq!(
+            explain_git_failure("fatal: something nobody has seen"),
+            None
+        );
+    }
+
+    #[test]
     fn read_only_policy_blocks_interactive_git_surfaces_without_removing_mutation_helpers() {
         let sandbox = GitSandbox::new().expect("create Git sandbox");
         let mut command = Command::new("git");
@@ -12038,6 +12516,64 @@ mod tests {
         );
         swap.join().expect("swap thread");
         assert!(result.is_err(), "a transient graph swap must fail closed");
+    }
+
+    #[test]
+    fn a_directory_listed_twice_during_a_write_keeps_each_name_once() {
+        let fixture = tempfile::tempdir().expect("create snapshot fixture");
+        let first = fixture.path().join("first");
+        let second = fixture.path().join("second");
+        fs::write(&first, b"one").expect("write first");
+        fs::write(&second, b"two").expect("write second");
+        let old = data_file_identity(&first).expect("identity of first");
+        let new = data_file_identity(&second).expect("identity of second");
+        // What ntfs3 returns when its walk restarts: every name again.
+        let mut entries: MutableDirectorySnapshot = vec![
+            (OsString::from("config"), true, old.clone()),
+            (OsString::from("HEAD"), true, old.clone()),
+            (OsString::from("config"), true, new.clone()),
+            (OsString::from("HEAD"), true, old.clone()),
+        ];
+        dedup_snapshot_entries(&mut entries);
+        let names: Vec<_> = entries.iter().map(|entry| entry.0.clone()).collect();
+        assert_eq!(
+            names,
+            vec![OsString::from("HEAD"), OsString::from("config")]
+        );
+        // `FileIdentity` has no `Debug` (it carries a content digest), so
+        // compare it directly.
+        assert!(entries[1].2 == new, "the later sighting is kept");
+    }
+
+    #[test]
+    fn pull_transition_admits_git_merge_state_but_stage_does_not() {
+        let fixture = tempfile::tempdir().expect("create merge-state fixture");
+        let repository = test_repository(fixture.path(), GitLimits::default());
+        // The files a merge leaves while it runs: merge-ort's AUTO_MERGE
+        // (Git 2.42+), MERGE_MODE and rerere's MERGE_RR.
+        // And the temporary index a merge into a dirty tree saves it with.
+        for (name, contents) in [
+            (
+                "AUTO_MERGE",
+                &b"0123456789012345678901234567890123456789\n"[..],
+            ),
+            ("MERGE_MODE", &b""[..]),
+            ("MERGE_RR", &b""[..]),
+            ("index.stash.12345", &b"DIRC"[..]),
+        ] {
+            fs::write(fixture.path().join(".git").join(name), contents).expect("write merge state");
+        }
+        let error = repository
+            .root
+            .graph
+            .revalidate_after_transition(GraphTransition::Stage)
+            .expect_err("staging must not adopt merge state");
+        assert!(error.contains("outside the operation transition"));
+        repository
+            .root
+            .graph
+            .revalidate_after_transition(GraphTransition::Pull)
+            .expect("a pull may leave Git's AUTO_MERGE behind");
     }
 
     #[test]

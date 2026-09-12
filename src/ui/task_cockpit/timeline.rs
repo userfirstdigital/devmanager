@@ -83,8 +83,16 @@ const STREAM_ALIGNMENT: ListAlignment = ListAlignment::Top;
 pub enum ActivityAction {
     Toggle(String),
     OpenSubagent(String),
+    /// Show a pasted image from the transcript at full size.
+    OpenImage(String),
 }
 pub type ActivityToggleHandler = Rc<dyn Fn(ActivityAction, &mut App)>;
+
+/// A pasted picture in the stream: big enough to recognise, small enough that
+/// several do not push the conversation off screen. Click opens it full size.
+const CONVERSATION_IMAGE_THUMBNAIL: f32 = 120.0;
+const CONVERSATION_IMAGE_RADIUS: f32 = 6.0;
+const CONVERSATION_IMAGE_GAP: f32 = 6.0;
 
 #[cfg(debug_assertions)]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -105,10 +113,64 @@ fn timeline_row_element(
     row: &ConversationRow,
     tokens: ThemeTokens,
     activity_toggle: Option<ActivityToggleHandler>,
+    sent_images: &[crate::ui::conversation::rows::SentMessageImages],
     window: &mut Window,
     cx: &mut App,
 ) -> AnyElement {
     let visual = conversation_row_element(row, tokens, window, cx);
+    // A pasted image travels as a path inside the message text. The message
+    // painter drops the path; the picture is painted here, where the row's
+    // click handler lives, and opens full size when clicked.
+    if let (ConversationRow::Message { role, .. }, Some(handler)) = (row, activity_toggle.as_ref())
+    {
+        let user = matches!(role, crate::ui::renderers::MessageRole::User);
+        let images = conversation_images_for_row(row, sent_images);
+        if !images.is_empty() {
+            let mut strip = div()
+                .w_full()
+                .flex()
+                .flex_row()
+                .flex_wrap()
+                .gap(px(CONVERSATION_IMAGE_GAP))
+                .pb(px(CONVERSATION_IMAGE_GAP));
+            if user {
+                strip = strip.justify_end();
+            }
+            for (index, path) in images.into_iter().enumerate() {
+                let handler = handler.clone();
+                let open_path = path.clone();
+                strip = strip.child(
+                    div()
+                        .id(("native-conversation-image", index))
+                        .cursor_pointer()
+                        .flex_none()
+                        .w(px(CONVERSATION_IMAGE_THUMBNAIL))
+                        .h(px(CONVERSATION_IMAGE_THUMBNAIL))
+                        .rounded(px(CONVERSATION_IMAGE_RADIUS))
+                        .overflow_hidden()
+                        .on_click(move |_event, _window, app| {
+                            handler(ActivityAction::OpenImage(open_path.clone()), app)
+                        })
+                        .child({
+                            use gpui::StyledImage;
+                            gpui::img(gpui::ImageSource::Resource(gpui::Resource::Path(
+                                std::path::PathBuf::from(path).into(),
+                            )))
+                            .w(px(CONVERSATION_IMAGE_THUMBNAIL))
+                            .h(px(CONVERSATION_IMAGE_THUMBNAIL))
+                            .object_fit(gpui::ObjectFit::Cover)
+                        }),
+                );
+            }
+            return div()
+                .w_full()
+                .flex()
+                .flex_col()
+                .child(visual)
+                .child(strip)
+                .into_any_element();
+        }
+    }
     if let (ConversationRow::Activity { entries, .. }, Some(handler)) =
         (row, activity_toggle.as_ref())
     {
@@ -165,6 +227,32 @@ fn timeline_row_element(
         })
         .child(visual)
         .into_any_element()
+}
+
+/// Resolve the pictures painted beneath one message. This is shared by paint
+/// and height estimation: a persisted image may arrive after the list first
+/// measured the text row, and the list must then reserve room for the picture.
+fn conversation_images_for_row(
+    row: &ConversationRow,
+    sent_images: &[crate::ui::conversation::rows::SentMessageImages],
+) -> Vec<String> {
+    let ConversationRow::Message { text, role, .. } = row else {
+        return Vec::new();
+    };
+    let (_, images) = crate::ui::conversation::rows::split_pasted_images(text);
+    if !images.is_empty() {
+        return images;
+    }
+    if !matches!(role, crate::ui::renderers::MessageRole::User) {
+        return Vec::new();
+    }
+    // Codex and Claude both rewrite the path out of the message they echo
+    // back, so the text alone cannot name the picture. What this shell sent is
+    // the fallback, matched on the words that were typed. Only a message of
+    // ours can borrow it; an assistant reply that quotes the prompt cannot.
+    crate::ui::conversation::rows::images_for_message(text, sent_images)
+        .map(<[String]>::to_vec)
+        .unwrap_or_default()
 }
 
 /// Row heights are estimated at a fixed baseline density/scale, never the
@@ -285,6 +373,18 @@ pub struct Timeline {
     paint_start: usize,
     paint_end: usize,
     captured_target: CapturedActionTarget,
+    /// What the provider is doing right now, painted as the tail row. The shell
+    /// owns the question -- it is the only layer that sees task status, the
+    /// pending send and the board's "doing now" verb.
+    working: Option<crate::ui::conversation::rows::WorkingIndicator>,
+    /// The label last painted for `working`, so a per-second tick can tell a
+    /// changed second from an unchanged one without rebuilding rows.
+    working_label: Option<String>,
+    working_now_ms: i64,
+    /// What this shell sent with a picture attached. A provider rewrites the
+    /// path out of the message it echoes back, so the transcript on its own
+    /// cannot say which picture a message carried.
+    sent_images: Rc<Vec<crate::ui::conversation::rows::SentMessageImages>>,
 }
 
 impl Timeline {
@@ -365,6 +465,10 @@ impl Timeline {
             paint_start: 0,
             paint_end: 0,
             captured_target,
+            working: None,
+            working_label: None,
+            working_now_ms: 0,
+            sent_images: Rc::new(Vec::new()),
         };
         timeline.rebuild_heights();
         timeline.following.set(true);
@@ -522,6 +626,7 @@ impl Timeline {
         let list_state = self.list_state.clone();
         let scrollbar_state = self.list_state.clone();
         let activity_toggle_for_rows = activity_toggle.clone();
+        let sent_images = Rc::clone(&self.sent_images);
         let task_key = self.task_element_key();
         // Fix wave 1, F3: the stream is the panel's `flex_1` region, not a
         // `height: 100%` box. A percentage height resolves against a parent
@@ -601,6 +706,7 @@ impl Timeline {
                                                             row,
                                                             tokens,
                                                             activity_toggle_for_rows.clone(),
+                                                            &sent_images,
                                                             window,
                                                             cx,
                                                         )
@@ -683,6 +789,14 @@ impl Timeline {
         anchor_key: Option<ConversationRowKey>,
         offset_in_item: gpui::Pixels,
     ) {
+        // Every path that rebuilds rows lands here, so the working row is
+        // applied once rather than at each derivation site.
+        let mut new_rows = new_rows;
+        crate::ui::conversation::rows::apply_working_indicator(
+            &mut new_rows,
+            self.working.as_ref(),
+            self.working_now_ms,
+        );
         let old_len = self.list_state.item_count();
         let prefix = self
             .rows
@@ -738,6 +852,75 @@ impl Timeline {
         }
         self.following.set(false);
         self.capture_anchor_from_list();
+    }
+
+    /// Set (or clear) the working row at the tail of the transcript.
+    ///
+    /// Returns true when the painted label changed, which is the caller's cue
+    /// to repaint -- a per-second tick that does not change the text must not
+    /// cost a frame.
+    pub fn set_working_indicator(
+        &mut self,
+        working: Option<crate::ui::conversation::rows::WorkingIndicator>,
+        now_ms: i64,
+    ) -> bool {
+        let next_label = working.as_ref().map(|indicator| indicator.label(now_ms));
+        if self.working == working && self.working_label == next_label {
+            return false;
+        }
+        self.working = working;
+        self.working_label = next_label;
+        self.working_now_ms = now_ms;
+        let scroll = self.list_state.logical_scroll_top();
+        let anchor_key = self.rows.get(scroll.item_ix).map(conversation_row_key);
+        let following = self.following.get();
+        let next_rows = apply_activity_collapse(
+            derive_conversation_rows(&self.items, ConversationVerbosity::Calm),
+            &self.expanded_activity,
+        );
+        self.replace_rows(next_rows, following, anchor_key, scroll.offset_in_item);
+        true
+    }
+
+    /// Tell the transcript which pictures went out with which message.
+    ///
+    /// Returns true when this changed, which is the caller's cue to repaint.
+    pub fn set_sent_message_images(
+        &mut self,
+        sent: Vec<crate::ui::conversation::rows::SentMessageImages>,
+    ) -> bool {
+        if *self.sent_images == sent {
+            return false;
+        }
+        let following = self.following.get();
+        let scroll = self.list_state.logical_scroll_top();
+        let anchor_key = self.rows.get(scroll.item_ix).map(conversation_row_key);
+        self.sent_images = Rc::new(sent);
+        // ListState caches measured item heights. On restart the transcript is
+        // projected before this client-local image index is attached, so the
+        // same-count text rows are already measured too short. Reinsert them
+        // to invalidate those measurements, then restore the reader's anchor.
+        let row_count = self.rows.len();
+        if row_count > 0 {
+            self.list_state.splice(0..row_count, row_count);
+        }
+        self.rebuild_heights();
+        if following {
+            self.scroll_to_end();
+            self.following.set(true);
+        } else if let Some(key) = anchor_key {
+            if let Some(index) = self
+                .rows
+                .iter()
+                .position(|row| conversation_row_key(row) == key)
+            {
+                self.list_state.scroll_to(ListOffset {
+                    item_ix: index,
+                    offset_in_item: scroll.offset_in_item,
+                });
+            }
+        }
+        true
     }
 
     pub fn toggle_activity_group(&mut self, group: &str) -> bool {
@@ -998,7 +1181,12 @@ impl Timeline {
         let tokens = height_estimation_tokens();
         for row in self.rows.iter() {
             self.prefix.push(total);
-            total = total.saturating_add(conversation_row_height(row, tokens));
+            let image_height = (!conversation_images_for_row(row, &self.sent_images).is_empty())
+                .then_some((CONVERSATION_IMAGE_THUMBNAIL + CONVERSATION_IMAGE_GAP) as u32)
+                .unwrap_or_default();
+            total = total
+                .saturating_add(conversation_row_height(row, tokens))
+                .saturating_add(image_height);
         }
         self.content_height = total;
         self.clamp_scroll();
@@ -1164,10 +1352,13 @@ fn assert_task_projection(
 mod tests {
     use super::{
         conversation_activity_summary, ActivityCounts, ListAlignment, ListState, Timeline,
-        CONVERSATION_CONTENT_MAX_WIDTH, FOLLOW_REARM_THRESHOLD_PX, STREAM_ALIGNMENT,
+        CONVERSATION_CONTENT_MAX_WIDTH, CONVERSATION_IMAGE_GAP, CONVERSATION_IMAGE_THUMBNAIL,
+        FOLLOW_REARM_THRESHOLD_PX, STREAM_ALIGNMENT,
     };
     use crate::ui::conversation::fixtures::{generic_item, message_item, tool_item};
-    use crate::ui::conversation::rows::{derive_conversation_rows, ConversationVerbosity};
+    use crate::ui::conversation::rows::{
+        derive_conversation_rows, ConversationVerbosity, SentMessageImages,
+    };
     use crate::ui::renderers::MessageRole;
 
     /// Fix wave 1, F3: the stream FILLS the panel body.
@@ -1258,6 +1449,30 @@ mod tests {
             timeline.content_height(),
             0,
             "suppressed kinds must reserve no scroll space"
+        );
+    }
+
+    #[test]
+    fn a_late_persisted_image_invalidates_the_text_only_row_height() {
+        let mut timeline = Timeline::for_test_items(vec![message_item(
+            MessageRole::User,
+            "[Image #1] persisted picture",
+        )]);
+        let text_height = timeline.content_height();
+        let sent = vec![SentMessageImages {
+            text: "persisted picture".into(),
+            paths: vec!["/repo/.devmanager/pasted-images/picture.png".into()],
+        }];
+
+        assert!(timeline.set_sent_message_images(sent.clone()));
+        assert_eq!(
+            timeline.content_height(),
+            text_height + (CONVERSATION_IMAGE_THUMBNAIL + CONVERSATION_IMAGE_GAP) as u32,
+            "attaching the restart-restored picture must reserve its thumbnail row"
+        );
+        assert!(
+            !timeline.set_sent_message_images(sent),
+            "an unchanged index does not churn the list measurements"
         );
     }
 

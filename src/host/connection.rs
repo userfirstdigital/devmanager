@@ -685,6 +685,8 @@ mod workspace_security_tests {
             host: "localhost".into(),
             port: 2222,
             username: "deploy".into(),
+            password: Default::default(),
+            private_key: Default::default(),
         };
         admission.apply_project_action(&query).unwrap();
         let mut saved = admission.store.snapshot().config.ssh_connections[0].clone();
@@ -709,6 +711,8 @@ mod workspace_security_tests {
                 host: "example.test".into(),
                 port: 22,
                 username: "deploy".into(),
+                password: Default::default(),
+                private_key: Default::default(),
             })
             .unwrap();
         let updated = &admission.store.snapshot().config.ssh_connections[0];
@@ -753,6 +757,103 @@ mod workspace_security_tests {
             reopened.snapshot().config.projects[0].root_path,
             std::fs::canonicalize(&project).unwrap().to_str().unwrap()
         );
+    }
+
+    #[test]
+    fn user_project_edit_and_removal_persist_without_touching_the_folder() {
+        use super::{Nullable, QueryError, QueryOutcome, TaskCockpitQuery};
+        let root = tempfile::tempdir().unwrap();
+        let first = root.path().join("first");
+        let second = root.path().join("second");
+        std::fs::create_dir(&first).unwrap();
+        std::fs::create_dir(&second).unwrap();
+        std::fs::create_dir(root.path().join("com.userfirst.devmanager-native-next-dev")).unwrap();
+        let config_path = root
+            .path()
+            .join("com.userfirst.devmanager-native-next-dev/config.json");
+        let store = super::ConfigStore::open_test_fixture(config_path.clone()).unwrap();
+        let mut admission = super::HostWorkspaceAdmission::new(store, 1, 1).unwrap();
+        admission
+            .create_user_project("Launch acceptance", first.to_str().unwrap())
+            .unwrap();
+        let project_id = admission.store.snapshot().config.projects[0].id.clone();
+        let update = |name: &str, root_path: Option<&std::path::Path>| {
+            TaskCockpitQuery::ConfigUpdateProject {
+                project_id: project_id.clone(),
+                name: name.into(),
+                root_path: root_path.map(|path| path.to_str().unwrap().into()),
+            }
+        };
+
+        // Rename only: the folder stays.
+        assert!(matches!(
+            admission.change_user_project_outcome(&update("  Renamed  ", None)),
+            QueryOutcome::Ok(_)
+        ));
+        let project = admission.store.snapshot().config.projects[0].clone();
+        assert_eq!(project.name, "Renamed");
+        assert_eq!(
+            project.root_path,
+            std::fs::canonicalize(&first).unwrap().to_str().unwrap()
+        );
+
+        // A new folder is validated like on create, then adopted.
+        assert!(matches!(
+            admission.change_user_project_outcome(&update("Renamed", Some(&second))),
+            QueryOutcome::Ok(_)
+        ));
+        assert_eq!(
+            admission.store.snapshot().config.projects[0].root_path,
+            std::fs::canonicalize(&second).unwrap().to_str().unwrap()
+        );
+        admission.validate_current().unwrap();
+
+        // An empty name or a missing folder is refused and changes nothing.
+        let missing = root.path().join("missing");
+        for refused in [update("   ", None), update("Other", Some(&missing))] {
+            assert!(matches!(
+                admission.change_user_project_outcome(&refused),
+                QueryOutcome::Err(QueryError::InvalidRequest)
+            ));
+        }
+        assert_eq!(
+            admission.store.snapshot().config.projects[0].name,
+            "Renamed"
+        );
+
+        // Removal archives the project and leaves its folder alone.
+        let archive = TaskCockpitQuery::ConfigArchiveProject {
+            project_id: project_id.clone(),
+        };
+        assert!(matches!(
+            admission.change_user_project_outcome(&archive),
+            QueryOutcome::Ok(_)
+        ));
+        assert!(matches!(
+            admission.store.snapshot().config.projects[0].archived,
+            Nullable::Value(true)
+        ));
+        assert!(
+            second.is_dir(),
+            "removing a project never deletes its folder"
+        );
+        admission.validate_current().unwrap();
+        // It has left the list: removing or editing it again is refused.
+        assert!(matches!(
+            admission.change_user_project_outcome(&archive),
+            QueryOutcome::Err(QueryError::InvalidRequest)
+        ));
+        assert!(matches!(
+            admission.change_user_project_outcome(&update("Again", None)),
+            QueryOutcome::Err(QueryError::InvalidRequest)
+        ));
+
+        let reopened = super::ConfigStore::open_test_fixture(config_path).unwrap();
+        assert_eq!(reopened.snapshot().config.projects[0].name, "Renamed");
+        assert!(matches!(
+            reopened.snapshot().config.projects[0].archived,
+            Nullable::Value(true)
+        ));
     }
 
     #[test]
@@ -2673,6 +2774,12 @@ impl HostWorkspaceAdmission {
         let revision = self.store.snapshot().revision;
         self.store
             .execute(revision, ConfigCommand::CreateProject { project })?;
+        self.reissue_after_project_change()
+    }
+
+    /// Re-issue workspace authority from the saved config after a project is
+    /// added, changed or removed, so task roots follow the project list.
+    fn reissue_after_project_change(&mut self) -> Result<(), ConfigError> {
         let revision = self.store.snapshot().revision;
         let issuer = self.store.issue_workspace_authority(
             revision,
@@ -2697,6 +2804,96 @@ impl HostWorkspaceAdmission {
         Ok(())
     }
 
+    /// Rename a project or point it at another folder (`root_path: None`
+    /// keeps the current one), or archive it out of the project list. The
+    /// folder on disk is never touched; archiving keeps the record, so tasks
+    /// that name the project keep their history.
+    fn change_user_project(&mut self, query: &TaskCockpitQuery) -> Result<(), ConfigError> {
+        fn active_project(projects: &[Project], project_id: &str) -> Result<Project, ConfigError> {
+            projects
+                .iter()
+                .find(|project| {
+                    project.id == project_id && !matches!(project.archived, Nullable::Value(true))
+                })
+                .cloned()
+                .ok_or_else(|| {
+                    ConfigError::new(ConfigErrorKind::Validation, "project is unavailable")
+                })
+        }
+        let revision = self.store.snapshot().revision;
+        match query {
+            TaskCockpitQuery::ConfigUpdateProject {
+                project_id,
+                name,
+                root_path,
+            } => {
+                let name = name.trim();
+                if name.is_empty() {
+                    return Err(ConfigError::new(
+                        ConfigErrorKind::Validation,
+                        "project name is empty",
+                    ));
+                }
+                let mut project =
+                    active_project(&self.store.snapshot().config.projects, project_id)?;
+                project.name = name.to_string();
+                if let Some(root_path) = root_path
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|path| !path.is_empty())
+                {
+                    let validated = crate::workspace::service::validate_host_workspace_path(
+                        std::path::Path::new(root_path),
+                        true,
+                    )
+                    .map_err(|_| {
+                        ConfigError::new(
+                            ConfigErrorKind::Validation,
+                            "project folder is unavailable",
+                        )
+                    })?;
+                    project.root_path = validated.path.to_string_lossy().into_owned();
+                }
+                project.updated_at = SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .map(|duration| duration.as_secs().to_string())
+                    .unwrap_or_else(|_| "0".to_string());
+                self.store
+                    .execute(revision, ConfigCommand::UpdateProject { project })?;
+            }
+            TaskCockpitQuery::ConfigArchiveProject { project_id } => {
+                active_project(&self.store.snapshot().config.projects, project_id)?;
+                self.store.execute(
+                    revision,
+                    ConfigCommand::ArchiveProject {
+                        project_id: project_id.clone(),
+                    },
+                )?;
+            }
+            _ => {
+                return Err(ConfigError::new(
+                    ConfigErrorKind::Validation,
+                    "not a project change",
+                ))
+            }
+        }
+        self.reissue_after_project_change()
+    }
+
+    fn change_user_project_outcome(&mut self, query: &TaskCockpitQuery) -> QueryOutcome {
+        match self.change_user_project(query) {
+            Ok(()) => QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Config(
+                super::cockpit::config_sidebar_snapshot(&self.store.snapshot().config),
+            ))),
+            Err(error) if error.kind() == ConfigErrorKind::Validation => {
+                QueryOutcome::Err(QueryError::InvalidRequest)
+            }
+            Err(_) => QueryOutcome::Err(QueryError::Unavailable {
+                reason: "config_update",
+            }),
+        }
+    }
+
     fn create_user_project_outcome(&mut self, name: &str, root_path: &str) -> QueryOutcome {
         match self.create_user_project(name, root_path) {
             Ok(()) => QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Config(
@@ -2719,6 +2916,11 @@ impl HostWorkspaceAdmission {
             Err(error) if error.kind() == ConfigErrorKind::Validation => {
                 QueryOutcome::Err(QueryError::InvalidRequest)
             }
+            Err(error) if error.kind() == ConfigErrorKind::SecretMaterial => {
+                QueryOutcome::Err(QueryError::Unavailable {
+                    reason: "ssh_credential_store",
+                })
+            }
             Err(_) => QueryOutcome::Err(QueryError::Unavailable {
                 reason: "config_mutate",
             }),
@@ -2734,6 +2936,8 @@ impl HostWorkspaceAdmission {
                 host,
                 port,
                 username,
+                password,
+                private_key,
             } => {
                 let mut connection = if let Some(id) = connection_id {
                     self.store
@@ -2759,12 +2963,52 @@ impl HostWorkspaceAdmission {
                 connection.host = host.trim().to_string();
                 connection.username = username.trim().to_string();
                 connection.port = *port;
+                // Untouched credentials never open the keyring; the saved auth
+                // rides through unchanged.
+                let mut stale_credential = None;
+                if !matches!(
+                    (password, private_key),
+                    (
+                        crate::domain::cockpit::SshSecretEdit::Keep,
+                        crate::domain::cockpit::SshSecretEdit::Keep
+                    )
+                ) {
+                    let config_dir = self
+                        .store
+                        .path()
+                        .parent()
+                        .ok_or_else(|| {
+                            ConfigError::new(
+                                ConfigErrorKind::SecretMaterial,
+                                "SSH credential store is unavailable",
+                            )
+                        })?
+                        .to_path_buf();
+                    let (auth, stale) = crate::ssh::vault::apply_edit(
+                        &config_dir,
+                        &connection.auth,
+                        password,
+                        private_key,
+                    )
+                    .map_err(|reason| {
+                        host_log!("devmanager-host: SSH credentials were not saved: {reason}");
+                        ConfigError::new(
+                            ConfigErrorKind::SecretMaterial,
+                            "SSH credentials could not be saved",
+                        )
+                    })?;
+                    connection.auth = auth;
+                    stale_credential = stale.map(|reference| (config_dir, reference));
+                }
                 let command = if connection_id.is_some() {
                     ConfigCommand::UpdateSsh { connection }
                 } else {
                     ConfigCommand::CreateSsh { connection }
                 };
                 self.store.execute(revision, command)?;
+                if let Some((config_dir, reference)) = stale_credential {
+                    crate::ssh::vault::remove(&config_dir, &reference);
+                }
             }
             TaskCockpitQuery::ConfigArchiveSsh { connection_id } => {
                 self.store.execute(
@@ -3038,12 +3282,30 @@ pub struct HostRequestExecutor {
     /// Live plain shell terminals this host spawned, keyed by their durable
     /// resource. The fact pump samples exactly these.
     shell_sessions: HashMap<ResourceId, ShellSessionLink>,
+    /// SSH terminals opened without a Task. Kept apart from `shell_sessions`
+    /// so the durable fact pump and orphan sweep never see them.
+    host_terminals: HashMap<ResourceId, HostTerminalLink>,
+    /// Owner id for `host_terminals` inside the terminal engine. Never a
+    /// registered Task, and new every host run, so input aimed at a previous
+    /// run's terminal cannot land.
+    host_lane_task: TaskId,
 }
 
 /// One live plain shell terminal: the durable identity, the manager session
 /// behind it, and the sampling state the fact pump carries between ticks.
+/// A host-owned SSH terminal (opened without a Task). Its key file and saved
+/// password exist exactly as long as the link does.
+struct HostTerminalLink {
+    session_id: crate::terminal::protocol::TerminalSessionId,
+    endpoint: String,
+    _ssh_key: Option<crate::ssh::RetainedKey>,
+    _ssh_password: Option<crate::ssh::AskpassSecretFile>,
+}
+
 struct ShellSessionLink {
     ssh_key: Option<crate::ssh::RetainedKey>,
+    /// Saved password for this terminal's askpass bridge; removed with the link.
+    ssh_password: Option<crate::ssh::AskpassSecretFile>,
     ssh_endpoint: Option<String>,
     task_id: TaskId,
     session_id: crate::terminal::protocol::TerminalSessionId,
@@ -3420,6 +3682,8 @@ impl HostRequestExecutor {
             arm_tx: Some(arm_tx),
             workspace_coordinator: WorkspaceResourceCoordinator::new(),
             shell_sessions: HashMap::new(),
+            host_terminals: HashMap::new(),
+            host_lane_task: TaskId::new(),
         };
         let join = tokio::spawn(async move {
             executor
@@ -3522,6 +3786,8 @@ impl HostRequestExecutor {
             arm_tx: None,
             workspace_coordinator: WorkspaceResourceCoordinator::new(),
             shell_sessions: HashMap::new(),
+            host_terminals: HashMap::new(),
+            host_lane_task: TaskId::new(),
         };
         let join = tokio::spawn(async move {
             executor.run(schedule_automatic_maintenance).await;
@@ -3549,6 +3815,8 @@ impl HostRequestExecutor {
                     let lane_started = Instant::now();
                     let result = if is_agent_connection_query(&job.request) {
                         self.dispatch_agent_connection(job.negotiated, job.request, job.output_id).await
+                    } else if is_task_title_query(&job.request) {
+                        self.dispatch_task_title(job.negotiated, job.request).await
                     } else if is_task_create_with_primary_provider(&job.request) {
                         self.dispatch_task_create_with_primary_provider(job.negotiated, job.request, job.output_id).await
                     } else if is_provider_start_request(&job.request) {
@@ -3659,6 +3927,8 @@ impl HostRequestExecutor {
                     let lane_started = Instant::now();
                     let result = if is_agent_connection_query(&job.request) {
                         self.dispatch_agent_connection(job.negotiated, job.request, job.output_id).await
+                    } else if is_task_title_query(&job.request) {
+                        self.dispatch_task_title(job.negotiated, job.request).await
                     } else if is_task_create_with_primary_provider(&job.request) {
                         self.dispatch_task_create_with_primary_provider(job.negotiated, job.request, job.output_id).await
                     } else if is_provider_start_request(&job.request) {
@@ -4537,6 +4807,110 @@ impl HostRequestExecutor {
         }
     }
 
+    /// Answer a naming query on the async lane.
+    async fn dispatch_task_title(
+        &mut self,
+        negotiated: NegotiatedParameters,
+        request: ClientRequest,
+    ) -> Result<DuplexExecuteCompletion, IpcError> {
+        let ClientRequest::Query(envelope) = request else {
+            return Err(IpcError::Unavailable);
+        };
+        if envelope.client_id != negotiated.client_id {
+            return Err(IpcError::Unauthorized);
+        }
+        let outcome = if !negotiated.capabilities.grants_task_cockpit() {
+            QueryOutcome::Err(QueryError::UnsupportedCapability)
+        } else {
+            let seed = match &envelope.query {
+                Query::TaskCockpit(TaskCockpitQuery::SuggestTaskTitle { seed }) => seed.clone(),
+                _ => return Err(IpcError::Unavailable),
+            };
+            // Advisory by construction: a title that cannot be produced is
+            // `None`, never an error, because a task keeping its old name is a
+            // smaller problem than an error raised over a nicety.
+            let title = self.suggest_task_title(envelope.task_id, &seed).await;
+            QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::TaskTitle(
+                title,
+            )))
+        };
+        Ok(DuplexExecuteCompletion::CallerMustWrite(
+            ServerMessage::QueryReply(QueryReply {
+                request_id: envelope.request_id,
+                outcome,
+            }),
+        ))
+    }
+
+    /// Name a task with one short model call.
+    ///
+    /// Advisory throughout: every failure is `None`, because a task that keeps
+    /// its old name is a smaller problem than one that reports an error for a
+    /// title nobody asked to see. The run itself is bounded in
+    /// [`crate::providers::title`], which also records why a non-interactive
+    /// Codex run is permitted here and nowhere else.
+    async fn suggest_task_title(&mut self, task_id: Option<TaskId>, seed: &str) -> Option<String> {
+        let task_id = task_id?;
+        let snapshot = self.bus.task_snapshot(task_id).ok().flatten()?;
+        // A task is named from its first message, which is sent before the
+        // durable binding lands -- so fall back to resolving the folder from the
+        // project, exactly as the image staging root does. Without this every
+        // new task kept its placeholder name.
+        let workspace_root = snapshot
+            .task
+            .workspace
+            .host_binding()
+            .map(|binding| binding.workspace_root().path().to_path_buf())
+            .or_else(|| {
+                crate::workspace::WorkspaceService::from_durable(
+                    snapshot.task.project_id,
+                    &self.workspace_projects,
+                    &snapshot.task.workspace,
+                )
+                .ok()
+                .and_then(|service| {
+                    service
+                        .current()
+                        .map(|binding| binding.path().to_path_buf())
+                })
+            })?;
+        if !workspace_root.is_dir() {
+            return None;
+        }
+        let authority = self.provider_settings.clone()?;
+        let document = authority.profile().settings.snapshot();
+        let instance = document.instances.iter().find(|instance| {
+            instance.enabled
+                && matches!(
+                    instance.driver,
+                    crate::providers::settings::ProviderDriverKind::Codex
+                )
+        })?;
+        let scope = authority
+            .profile()
+            .settings
+            .custody_scope_for_instance(instance.instance_id.as_str());
+        let resolved =
+            crate::providers::settings::resolve_launch_config(instance, &scope, None).ok()?;
+        let registry = crate::providers::startup::stock_provider_registry().ok()?;
+        let executable = registry
+            .resolve_executable(resolved.provider_kind, &resolved.discovery)
+            .await
+            .ok()?;
+        let environment = resolved
+            .environment
+            .iter()
+            .map(|(key, value)| (key.clone().into(), value.clone().into()))
+            .collect::<Vec<_>>();
+        crate::providers::title::suggest_task_title(
+            executable.canonical_path(),
+            &workspace_root,
+            environment,
+            seed,
+        )
+        .await
+    }
+
     fn dispatch_provider_settings_query(
         &mut self,
         request: &crate::providers::settings::ProviderSettingsHostRequest,
@@ -4969,12 +5343,7 @@ impl HostRequestExecutor {
                 crate::ssh::prepare_interactive_terminal(
                     &admission.store.snapshot().config,
                     endpoint,
-                    &admission
-                        .store
-                        .path()
-                        .parent()
-                        .expect("config parent")
-                        .join("ssh-terminal-keys"),
+                    admission.store.path().parent().expect("config parent"),
                 )
                 .map_err(|reason| {
                     shell_open_unavailable_named(
@@ -5101,6 +5470,7 @@ impl HostRequestExecutor {
         self.open_shell_terminal_after_accept(task_id, resource_id);
         if let Some(link) = self.shell_sessions.get_mut(&resource_id) {
             link.ssh_key = ssh.as_mut().and_then(|ssh| ssh.key.take());
+            link.ssh_password = ssh.as_mut().and_then(|ssh| ssh.password.take());
             link.ssh_endpoint = ssh_endpoint.map(str::to_owned);
         }
         if ssh_endpoint.is_some() {
@@ -5410,6 +5780,7 @@ impl HostRequestExecutor {
             resource_id,
             ShellSessionLink {
                 ssh_key: None,
+                ssh_password: None,
                 ssh_endpoint: None,
                 task_id,
                 session_id,
@@ -5842,6 +6213,216 @@ impl HostRequestExecutor {
     /// (`src/services/process_manager.rs:7533`), takes the idempotent path, and
     /// removes the session from its store. Manager-first would work equally,
     /// but only this order guarantees the client-visible Exit delta.
+    /// The task-less host terminal lane: SSH opened without a Task, the way
+    /// 0.4.1 did. None of these terminals is a durable resource; membership in
+    /// `host_terminals` is the fence for every request after the open.
+    fn serve_host_terminal_query(
+        &mut self,
+        client_id: ClientId,
+        request_id: RequestId,
+        query: &TaskCockpitQuery,
+        max_response_bytes: u32,
+    ) -> QueryOutcome {
+        let resource_id = match query {
+            TaskCockpitQuery::HostSshOpen { endpoint_id } => {
+                match self.open_host_ssh_terminal(endpoint_id) {
+                    Ok(resource_id) => resource_id,
+                    Err(reason) => {
+                        return shell_open_unavailable_named(
+                            self.host_lane_task,
+                            crate::domain::TaskCockpitUnavailableReason::SshOperationUnsupported,
+                            reason,
+                        )
+                    }
+                }
+            }
+            TaskCockpitQuery::HostTerminal { resource_id } => *resource_id,
+            TaskCockpitQuery::HostTerminalScroll {
+                resource_id,
+                delta_lines,
+            } => {
+                if *delta_lines == 0 || delta_lines.unsigned_abs() > 256 {
+                    return QueryOutcome::Err(QueryError::InvalidRequest);
+                }
+                if self.host_terminals.contains_key(resource_id) {
+                    let _ = self.terminal_service.scroll_task_terminal_for(
+                        self.host_lane_task,
+                        Some(*resource_id),
+                        *delta_lines,
+                    );
+                }
+                *resource_id
+            }
+            TaskCockpitQuery::HostTerminalResize {
+                resource_id,
+                cols,
+                rows,
+            } => {
+                let Ok(size) = crate::terminal::protocol::TerminalSize::new(*cols, *rows) else {
+                    return QueryOutcome::Err(QueryError::InvalidRequest);
+                };
+                if self.host_terminals.contains_key(resource_id) {
+                    let _ = self.terminal_service.resize_task_terminal_for(
+                        self.host_lane_task,
+                        Some(*resource_id),
+                        size,
+                    );
+                }
+                *resource_id
+            }
+            TaskCockpitQuery::HostTerminalClose { resource_id } => {
+                self.close_host_terminal(*resource_id);
+                return QueryOutcome::Ok(QueryResult::TaskCockpit(
+                    TaskCockpitResult::HostTerminalClosed {
+                        resource_id: *resource_id,
+                    },
+                ));
+            }
+            _ => return QueryOutcome::Err(QueryError::InvalidRequest),
+        };
+        if !self.host_terminals.contains_key(&resource_id) {
+            return QueryOutcome::Err(QueryError::NotFound);
+        }
+        match self
+            .terminal_service
+            .task_terminal_view_for(self.host_lane_task, Some(resource_id))
+        {
+            Ok(Some(view)) => super::cockpit::host_terminal_projection(
+                &self.terminal_service,
+                client_id,
+                request_id,
+                self.host_lane_task,
+                view,
+                max_response_bytes,
+            ),
+            Ok(None) | Err(_) => QueryOutcome::Err(QueryError::Unavailable {
+                reason: "host_terminal",
+            }),
+        }
+    }
+
+    /// Spawn ssh for a saved connection with no Task and no durable resource,
+    /// or return the live terminal already open for it. Errors are user-facing.
+    fn open_host_ssh_terminal(&mut self, endpoint: &str) -> Result<ResourceId, String> {
+        const MAX_HOST_TERMINALS: usize = 16;
+        let live = self
+            .host_terminals
+            .iter()
+            .find_map(|(id, link)| (link.endpoint == endpoint).then_some((*id, link.session_id)));
+        if let Some((existing, session_id)) = live {
+            let exited = self
+                .configured_service_runtime
+                .as_ref()
+                .is_none_or(|runtime| runtime.manager.shell_session_exit(session_id).is_some());
+            if !exited {
+                return Ok(existing);
+            }
+            // The last session ended (logout, dropped link): a click reconnects.
+            self.close_host_terminal(existing);
+        }
+        if self.host_terminals.len() >= MAX_HOST_TERMINALS {
+            return Err("Too many SSH terminals are open. Disconnect one first.".into());
+        }
+        let manager = self
+            .configured_service_runtime
+            .as_ref()
+            .map(|runtime| runtime.manager.clone())
+            .ok_or("This host has no terminal runtime to run SSH in.")?;
+        let (mut ssh, cwd) = {
+            let admission = self
+                .config_admission
+                .as_ref()
+                .ok_or("SSH is unavailable on this host.")?;
+            crate::ssh::accept_exact_endpoint(&admission.redacted_ssh_endpoints(), endpoint)
+                .map_err(|_| "This saved SSH connection is unavailable.")?;
+            let config_dir = admission
+                .store
+                .path()
+                .parent()
+                .ok_or("The DevManager profile is unavailable.")?;
+            let ssh = crate::ssh::prepare_interactive_terminal(
+                &admission.store.snapshot().config,
+                endpoint,
+                config_dir,
+            )?;
+            // ssh ignores its working directory; home keeps a local `~C`
+            // escape or ProxyCommand's relative paths sensible.
+            let cwd = std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .filter(|home| home.is_dir())
+                .unwrap_or_else(|| config_dir.to_path_buf());
+            (ssh, cwd)
+        };
+        let launch = crate::domain::resource::TerminalLaunch {
+            cwd,
+            program: ssh.program.clone(),
+            args: ssh.args.clone(),
+        };
+        let resource_id = ResourceId::new();
+        let dimensions = SessionDimensions {
+            cols: 120,
+            rows: 40,
+            cell_width: crate::terminal::view::FALLBACK_TERMINAL_CELL_WIDTH.round() as u16,
+            cell_height: 16,
+        };
+        let session_id = manager
+            .spawn_task_shell_session(self.host_lane_task, resource_id, 1, 1, &launch, dimensions)
+            .map_err(|error| {
+                host_log!(
+                    "devmanager-host: host SSH terminal spawn failed endpoint={endpoint}: {error}"
+                );
+                "The SSH terminal could not be started.".to_string()
+            })?;
+        let attached = (|| -> Result<(), String> {
+            let runtime = manager
+                .task_shell_runtime(session_id)
+                .map_err(|error| format!("shell runtime unavailable: {error}"))?;
+            let size = crate::terminal::protocol::TerminalSize::new(120, 40)
+                .map_err(|error| format!("size rejected: {error}"))?;
+            let spec = TerminalSpec::new(session_id, size)
+                .map_err(|error| format!("spec rejected: {error}"))?;
+            let runtime: Arc<dyn AttachedTerminalRuntime> = runtime;
+            self.terminal_service
+                .attach_plain_shell(self.host_lane_task, resource_id, 1, spec, runtime)
+                .map(|_| ())
+                .map_err(|error| format!("attach failed: {error}"))
+        })();
+        if let Err(reason) = attached {
+            host_log!(
+                "devmanager-host: host SSH terminal attach failed endpoint={endpoint}: {reason}"
+            );
+            let _ = manager.close_task_shell_session(session_id);
+            return Err("The SSH terminal could not be started.".into());
+        }
+        self.host_terminals.insert(
+            resource_id,
+            HostTerminalLink {
+                session_id,
+                endpoint: endpoint.to_string(),
+                _ssh_key: ssh.key.take(),
+                _ssh_password: ssh.password.take(),
+            },
+        );
+        Ok(resource_id)
+    }
+
+    fn close_host_terminal(&mut self, resource_id: ResourceId) {
+        let Some(link) = self.host_terminals.remove(&resource_id) else {
+            return;
+        };
+        if let Ok(Some(terminal_id)) = self.terminal_service.shell_terminal_id(resource_id) {
+            let _ = self
+                .terminal_service
+                .close(terminal_id, CloseReason::ExplicitServiceClose);
+        }
+        let _ = self.terminal_service.remove_closed(resource_id);
+        if let Some(runtime) = self.configured_service_runtime.as_ref() {
+            if let Err(error) = runtime.manager.close_task_shell_session(link.session_id) {
+                host_log!("devmanager-host: host SSH terminal {resource_id} close failed: {error}");
+            }
+        }
+    }
+
     fn close_shell_terminal(&mut self, resource_id: ResourceId) {
         let Some(link) = self.shell_sessions.remove(&resource_id) else {
             return;
@@ -7802,6 +8383,31 @@ impl HostRequestExecutor {
                 // Opening a shell is a host-authority mutation admitted as a
                 // typed query. Serve it here, then answer with the Task's
                 // refreshed strip so one round trip both opens and shows it.
+                if query.is_host_terminal_query() {
+                    // Host terminals belong to the local owner session only,
+                    // and never to a Task.
+                    if !negotiated.capabilities.grants_task_cockpit()
+                        || envelope.client_id != negotiated.client_id
+                        || envelope.task_id.is_some()
+                    {
+                        return Ok(QueryReply {
+                            request_id: envelope.request_id,
+                            outcome: QueryOutcome::Err(QueryError::Unauthorized),
+                        });
+                    }
+                    let max_response_bytes =
+                        page_limits_from_negotiated(negotiated)?.max_encoded_bytes;
+                    let outcome = self.serve_host_terminal_query(
+                        envelope.client_id,
+                        envelope.request_id,
+                        &query,
+                        max_response_bytes,
+                    );
+                    return Ok(QueryReply {
+                        request_id: envelope.request_id,
+                        outcome,
+                    });
+                }
                 let query = if let TaskCockpitQuery::OpenSshTerminal {
                     endpoint_id,
                     expected_task_revision,
@@ -7911,6 +8517,16 @@ impl HostRequestExecutor {
                         outcome,
                     });
                 }
+                if matches!(&query, TaskCockpitQuery::SuggestTaskTitle { .. }) {
+                    // Naming runs a provider and takes seconds; it is answered
+                    // on the async lane so it can never hold the dispatcher.
+                    return Ok(QueryReply {
+                        request_id: envelope.request_id,
+                        outcome: QueryOutcome::Err(QueryError::Unavailable {
+                            reason: "task_title_async_lane",
+                        }),
+                    });
+                }
                 if let TaskCockpitQuery::ConfigCreateProject { name, root_path } = &query {
                     if !negotiated.capabilities.grants_task_cockpit() {
                         return Ok(QueryReply {
@@ -7921,6 +8537,34 @@ impl HostRequestExecutor {
                     let outcome = match self.config_admission.as_mut() {
                         Some(admission) => {
                             let outcome = admission.create_user_project_outcome(name, root_path);
+                            if matches!(outcome, QueryOutcome::Ok(_)) {
+                                self.workspace_projects = admission.roots().clone();
+                            }
+                            outcome
+                        }
+                        None => QueryOutcome::Err(QueryError::Unavailable {
+                            reason: "config_store",
+                        }),
+                    };
+                    return Ok(QueryReply {
+                        request_id: envelope.request_id,
+                        outcome,
+                    });
+                }
+                if matches!(
+                    &query,
+                    TaskCockpitQuery::ConfigUpdateProject { .. }
+                        | TaskCockpitQuery::ConfigArchiveProject { .. }
+                ) {
+                    if !negotiated.capabilities.grants_task_cockpit() {
+                        return Ok(QueryReply {
+                            request_id: envelope.request_id,
+                            outcome: QueryOutcome::Err(QueryError::UnsupportedCapability),
+                        });
+                    }
+                    let outcome = match self.config_admission.as_mut() {
+                        Some(admission) => {
+                            let outcome = admission.change_user_project_outcome(&query);
                             if matches!(outcome, QueryOutcome::Ok(_)) {
                                 self.workspace_projects = admission.roots().clone();
                             }
@@ -9208,6 +9852,18 @@ fn is_agent_connection_query(request: &ClientRequest) -> bool {
         ClientRequest::Query(envelope) if matches!(
             &envelope.query,
             Query::TaskCockpit(TaskCockpitQuery::AgentConnection)
+        )
+    )
+}
+
+/// Naming a task runs a provider binary for a few seconds, so it belongs on
+/// the async lane beside the other slow queries rather than in the dispatcher.
+fn is_task_title_query(request: &ClientRequest) -> bool {
+    matches!(
+        request,
+        ClientRequest::Query(envelope) if matches!(
+            &envelope.query,
+            Query::TaskCockpit(TaskCockpitQuery::SuggestTaskTitle { .. })
         )
     )
 }
@@ -16534,6 +17190,7 @@ mod output_tests {
     fn shell_link_for_test() -> ShellSessionLink {
         ShellSessionLink {
             ssh_key: None,
+            ssh_password: None,
             ssh_endpoint: None,
             task_id: TaskId::new(),
             session_id: crate::terminal::protocol::TerminalSessionId::new(),

@@ -1573,7 +1573,16 @@ impl PlatformWindow for X11Window {
     fn set_client_inset(&self, inset: Pixels) {
         let mut state = self.0.state.borrow_mut();
 
-        let dp = (inset.0 * state.scale_factor) as u32;
+        // DevManager: a server-decorated window draws no shadow of its own, so
+        // it must not advertise one. gpui-component's `Root` sets an inset on
+        // every render; published before the window is mapped, KWin reads it as
+        // client-side decoration and gives the window no frame, no move and no
+        // resize, and tiles it short by the inset on every side.
+        let dp = if matches!(state.decorations, WindowDecorations::Server) {
+            0
+        } else {
+            (inset.0 * state.scale_factor) as u32
+        };
 
         let insets = if state.fullscreen {
             [0, 0, 0, 0]

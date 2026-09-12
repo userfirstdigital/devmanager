@@ -353,10 +353,29 @@ pub(crate) fn provider_composer_submit_plan_for_mode(
         } else {
             50
         });
+    // An image paste restarts that burst window, and the text paste that
+    // follows restarts it again, so the single 250 ms budget above is spent
+    // before the submit is due. Observed: with an image attached the text
+    // arrived in Codex's composer and the Enter behind it was swallowed as a
+    // newline, leaving the message typed but never sent and the turn open
+    // forever. Images buy the submit its own settle.
+    let submit_settle = if images.is_empty() {
+        paste_settle
+    } else {
+        paste_settle * 3
+    };
     let mut steps = Vec::new();
     for image in images {
+        // A paste-frame boundary is not a text-token boundary. Without this
+        // delimiter Codex receives `<path>.pngcaption`, still happens to open
+        // the image by its recognizable prefix, and echoes the whole local
+        // path into the transcript. Keep the path in its own paste frame while
+        // making the following image or caption a distinct token.
+        let mut delimited_path = String::with_capacity(image.path().len() + 1);
+        delimited_path.push_str(image.path());
+        delimited_path.push(' ');
         steps.push(ProviderComposerWriteStep {
-            bytes: encode_provider_paste_payload(image.path(), bracketed_paste)?,
+            bytes: encode_provider_paste_payload(&delimited_path, bracketed_paste)?,
             delay_after: Some(paste_settle),
         });
     }
@@ -411,7 +430,7 @@ pub(crate) fn provider_composer_submit_plan_for_mode(
             };
             steps.push(ProviderComposerWriteStep {
                 bytes,
-                delay_after: Some(paste_settle),
+                delay_after: Some(submit_settle),
             });
         }
 
@@ -997,7 +1016,7 @@ mod tests {
     }
 
     #[test]
-    fn composer_submit_plan_pastes_each_image_path_before_text() {
+    fn composer_submit_plan_delimits_each_image_path_before_text() {
         let absolute_a = if cfg!(windows) {
             r"C:\repo\.devmanager\pasted-images\a.png"
         } else {
@@ -1024,8 +1043,8 @@ mod tests {
             .iter()
             .map(ProviderComposerWriteStep::bytes)
             .collect();
-        let expected_a = format!("\x1b[200~{absolute_a}\x1b[201~");
-        let expected_b = format!("\x1b[200~{absolute_b}\x1b[201~");
+        let expected_a = format!("\x1b[200~{absolute_a} \x1b[201~");
+        let expected_b = format!("\x1b[200~{absolute_b} \x1b[201~");
         assert_eq!(steps[0], expected_a.as_bytes());
         assert_eq!(steps[1], expected_b.as_bytes());
         assert_eq!(steps[2], b"\x1b[200~caption\x1b[201~");
@@ -1034,6 +1053,31 @@ mod tests {
         for paste in &bracketed.steps()[..3] {
             assert!(paste.delay_after().unwrap() > std::time::Duration::from_millis(120));
         }
+        // The settle before the submit has to clear Codex's paste-burst window
+        // twice over, because the image paste restarts it and the text paste
+        // restarts it again. Observed when this was one budget: the message was
+        // typed into Codex and the Enter behind it became a newline, so nothing
+        // was ever sent and the turn stayed open.
+        let text_settle = bracketed.steps()[2].delay_after().expect("text settle");
+        let without_images = provider_composer_submit_plan_for_mode(
+            ProviderKind::Codex,
+            &ProviderInputAction::SendNow {
+                text: "caption".into(),
+                wait: false,
+                images: Vec::new(),
+            },
+            true,
+        )
+        .expect("codex text only");
+        let plain_text_settle = without_images.steps()[0]
+            .delay_after()
+            .expect("text settle");
+        assert!(
+            text_settle > plain_text_settle,
+            "a send carrying images needs longer before Enter than one without: \
+             {text_settle:?} vs {plain_text_settle:?}"
+        );
+        assert!(text_settle >= std::time::Duration::from_millis(600));
 
         let plain = provider_composer_submit_plan_for_mode(ProviderKind::Codex, &action, false)
             .expect("codex images plain");
@@ -1042,8 +1086,8 @@ mod tests {
             .iter()
             .map(ProviderComposerWriteStep::bytes)
             .collect();
-        assert_eq!(plain_steps[0], absolute_a.as_bytes());
-        assert_eq!(plain_steps[1], absolute_b.as_bytes());
+        assert_eq!(plain_steps[0], format!("{absolute_a} ").as_bytes());
+        assert_eq!(plain_steps[1], format!("{absolute_b} ").as_bytes());
         assert_eq!(plain_steps[2], b"caption");
         assert_eq!(plain_steps[3], b"\r");
 

@@ -272,6 +272,36 @@ pub enum TaskCockpitQuery {
         name: String,
         root_path: String,
     },
+    /// Host-owned project edit: rename a project, or point it at another
+    /// folder (`root_path: None` keeps the current one). A new folder is
+    /// validated exactly as on create, and workspace authority is re-issued.
+    ConfigUpdateProject {
+        project_id: String,
+        name: String,
+        #[serde(default)]
+        root_path: Option<String>,
+    },
+    /// Host-owned project removal: archive the project in ConfigStore so it
+    /// leaves the project list. Its folder and files are never touched, and
+    /// the archived record keeps its tasks' history resolvable.
+    ConfigArchiveProject {
+        project_id: String,
+    },
+    /// Where this task's files live, resolved live by the host.
+    ///
+    /// A task's own projection carries no path, and its durable binding is not
+    /// always present yet, so a client that must put a file inside the task's
+    /// folder -- a pasted image -- has no way to know where that is. The host
+    /// resolves it from the project the same way the browser surface does.
+    ImageStagingRoot,
+    /// Ask a small model to name this task from its first message.
+    ///
+    /// Host-owned because only the host may resolve and run a provider binary.
+    /// The reply is advisory: a failed or nonsense answer leaves the task's
+    /// existing title alone. See `providers::title` for the run's bounds.
+    SuggestTaskTitle {
+        seed: String,
+    },
     /// Create or update one project RunCommand through ConfigStore.
     ConfigUpsertCommand {
         project_id: String,
@@ -395,12 +425,45 @@ pub enum TaskCockpitQuery {
         endpoint_id: String,
         expected_task_revision: u64,
     },
+    /// Open (or reuse) a host-owned SSH terminal for a saved connection. No
+    /// Task is involved -- the way 0.4.1 opened SSH -- so the envelope carries
+    /// no task. The host keeps the terminal until it is closed or the host
+    /// exits; it is never a durable resource.
+    HostSshOpen {
+        endpoint_id: String,
+    },
+    /// One bounded screen of a host-owned terminal.
+    HostTerminal {
+        resource_id: ResourceId,
+    },
+    /// [`Self::TerminalScrollFor`] for a host-owned terminal.
+    HostTerminalScroll {
+        resource_id: ResourceId,
+        delta_lines: i32,
+    },
+    /// [`Self::TerminalResizeFor`] for a host-owned terminal.
+    HostTerminalResize {
+        resource_id: ResourceId,
+        cols: u16,
+        rows: u16,
+    },
+    /// Close a host-owned terminal and end its process.
+    HostTerminalClose {
+        resource_id: ResourceId,
+    },
     ConfigUpsertSsh {
         connection_id: Option<String>,
         label: String,
         host: String,
         port: u16,
         username: String,
+        /// Saved password change. The host encrypts it; it never reaches
+        /// `config.json` or any projection.
+        #[serde(default)]
+        password: SshSecretEdit,
+        /// Saved private key change (OpenSSH or PEM text).
+        #[serde(default)]
+        private_key: SshSecretEdit,
     },
     ConfigArchiveSsh {
         connection_id: String,
@@ -893,6 +956,39 @@ pub struct ConfigSidebarSsh {
     pub host: String,
     pub port: u16,
     pub username: String,
+    /// Whether a password / private key is saved. Presence only, never the secret.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub has_password: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub has_private_key: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+/// One credential field of an SSH connection save. `Debug` never prints the
+/// secret, so an action record or log line cannot leak it.
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum SshSecretEdit {
+    /// Leave whatever is saved.
+    #[default]
+    Keep,
+    /// Remove the saved secret.
+    Clear,
+    /// Replace the saved secret.
+    Set(String),
+}
+
+impl std::fmt::Debug for SshSecretEdit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Keep => f.write_str("Keep"),
+            Self::Clear => f.write_str("Clear"),
+            Self::Set(_) => f.write_str("Set(<redacted>)"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -955,6 +1051,11 @@ pub enum TaskCockpitResult {
         payload: crate::git::desktop::DesktopGitPayload,
     },
     ConfigCommandDetail(ConfigCommandDetailProjection),
+    /// A model-written task name, or `None` when the run produced nothing
+    /// usable. Never an error: a title is a nicety, not a result to report.
+    TaskTitle(Option<String>),
+    /// The folder this task's files live in, resolved live by the host.
+    ImageStagingRoot(std::path::PathBuf),
     AgentConnection(AgentConnectionSnapshot),
     ProviderSettings(crate::providers::settings::ProviderSettingsReply),
     RemoteAccess(crate::host::remote_setup::RemoteSetupReply),
@@ -974,6 +1075,12 @@ pub enum TaskCockpitResult {
         subscription_id: SubscriptionId,
     },
     Terminal(TaskTerminalProjection),
+    /// A host-owned terminal's screen. Distinct from `Terminal` so nothing
+    /// that routes task terminals by `task_id` can mistake it for one.
+    HostTerminal(TaskTerminalProjection),
+    HostTerminalClosed {
+        resource_id: ResourceId,
+    },
     TaskTerminals(TaskTerminalsProjection),
     Workspace(TaskWorkspaceProjection),
     GitRepositories(TaskGitRepositoriesProjection),
@@ -1186,6 +1293,8 @@ pub fn cockpit_surface(query: &TaskCockpitQuery) -> TaskCockpitSurface {
         TaskCockpitQuery::ConfigSnapshot
         | TaskCockpitQuery::AgentConnection
         | TaskCockpitQuery::ConfigCreateProject { .. }
+        | TaskCockpitQuery::ConfigUpdateProject { .. }
+        | TaskCockpitQuery::ConfigArchiveProject { .. }
         | TaskCockpitQuery::ConfigUpsertSsh { .. }
         | TaskCockpitQuery::ConfigArchiveSsh { .. }
         | TaskCockpitQuery::ConfigUpsertCommand { .. }
@@ -1200,6 +1309,9 @@ pub fn cockpit_surface(query: &TaskCockpitQuery) -> TaskCockpitSurface {
         TaskCockpitQuery::Conversation { .. }
         | TaskCockpitQuery::OpenConversationSubscription { .. }
         | TaskCockpitQuery::ReleaseConversationSubscription { .. }
+        // Naming reads the task's first message: it belongs to the
+        // conversation, and it is scoped to one task rather than the host.
+        | TaskCockpitQuery::SuggestTaskTitle { .. }
         | TaskCockpitQuery::ProviderInputState => TaskCockpitSurface::Conversation,
         TaskCockpitQuery::Terminal
         | TaskCockpitQuery::TerminalScroll { .. }
@@ -1211,8 +1323,15 @@ pub fn cockpit_surface(query: &TaskCockpitQuery) -> TaskCockpitSurface {
         | TaskCockpitQuery::TerminalReadinessFor { .. }
         | TaskCockpitQuery::TaskTerminals
         | TaskCockpitQuery::OpenShellTerminal { .. }
-        | TaskCockpitQuery::OpenSshTerminal { .. } => TaskCockpitSurface::Terminal,
-        TaskCockpitQuery::WorkspaceStatus => TaskCockpitSurface::Workspace,
+        | TaskCockpitQuery::OpenSshTerminal { .. }
+        | TaskCockpitQuery::HostSshOpen { .. }
+        | TaskCockpitQuery::HostTerminal { .. }
+        | TaskCockpitQuery::HostTerminalScroll { .. }
+        | TaskCockpitQuery::HostTerminalResize { .. }
+        | TaskCockpitQuery::HostTerminalClose { .. } => TaskCockpitSurface::Terminal,
+        TaskCockpitQuery::WorkspaceStatus | TaskCockpitQuery::ImageStagingRoot => {
+            TaskCockpitSurface::Workspace
+        }
         TaskCockpitQuery::DesktopRepositories
         | TaskCockpitQuery::DesktopRepositoryAction { .. }
         | TaskCockpitQuery::GitRepositories
@@ -1931,12 +2050,31 @@ impl TaskCockpitQuery {
                 | Self::DesktopRepositoryAction { .. }
                 | Self::AgentConnection
                 | Self::ConfigCreateProject { .. }
+                | Self::ConfigUpdateProject { .. }
+                | Self::ConfigArchiveProject { .. }
                 | Self::ConfigUpsertSsh { .. }
                 | Self::ConfigArchiveSsh { .. }
                 | Self::ConfigUpsertCommand { .. }
                 | Self::ConfigArchiveCommand { .. }
                 | Self::ConfigRunCommand { .. }
                 | Self::ConfigCommandDetail { .. }
+                | Self::HostSshOpen { .. }
+                | Self::HostTerminal { .. }
+                | Self::HostTerminalScroll { .. }
+                | Self::HostTerminalResize { .. }
+                | Self::HostTerminalClose { .. }
+        )
+    }
+
+    /// The task-less host terminal lane (SSH opened without a Task).
+    pub fn is_host_terminal_query(&self) -> bool {
+        matches!(
+            self,
+            Self::HostSshOpen { .. }
+                | Self::HostTerminal { .. }
+                | Self::HostTerminalScroll { .. }
+                | Self::HostTerminalResize { .. }
+                | Self::HostTerminalClose { .. }
         )
     }
 }

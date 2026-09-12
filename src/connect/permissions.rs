@@ -69,6 +69,8 @@ pub fn action_for_client_request(request: &ClientRequest) -> Option<(ActionId, O
                 Query::PromptLibrary(_) => ActionId::READ_PERSONAL_PROMPTS,
                 Query::TaskCockpit(
                     crate::domain::cockpit::TaskCockpitQuery::ConfigCreateProject { .. }
+                    | crate::domain::cockpit::TaskCockpitQuery::ConfigUpdateProject { .. }
+                    | crate::domain::cockpit::TaskCockpitQuery::ConfigArchiveProject { .. }
                     | crate::domain::cockpit::TaskCockpitQuery::DesktopRepositories
                     | crate::domain::cockpit::TaskCockpitQuery::DesktopRepositoryAction { .. }
                     | crate::domain::cockpit::TaskCockpitQuery::GitDesktopTargeted { .. }
@@ -80,6 +82,11 @@ pub fn action_for_client_request(request: &ClientRequest) -> Option<(ActionId, O
                     | crate::domain::cockpit::TaskCockpitQuery::RemoteAccess(_)
                     | crate::domain::cockpit::TaskCockpitQuery::OpenShellTerminal { .. }
                     | crate::domain::cockpit::TaskCockpitQuery::OpenSshTerminal { .. }
+                    | crate::domain::cockpit::TaskCockpitQuery::HostSshOpen { .. }
+                    | crate::domain::cockpit::TaskCockpitQuery::HostTerminal { .. }
+                    | crate::domain::cockpit::TaskCockpitQuery::HostTerminalScroll { .. }
+                    | crate::domain::cockpit::TaskCockpitQuery::HostTerminalResize { .. }
+                    | crate::domain::cockpit::TaskCockpitQuery::HostTerminalClose { .. }
                     | crate::domain::cockpit::TaskCockpitQuery::ConfigUpsertSsh { .. }
                     | crate::domain::cockpit::TaskCockpitQuery::ConfigArchiveSsh { .. }
                     | crate::domain::cockpit::TaskCockpitQuery::OpenBrowserSession { .. }
@@ -615,6 +622,8 @@ mod tests {
                 host: "localhost".into(),
                 port: 22,
                 username: "user".into(),
+                password: Default::default(),
+                private_key: Default::default(),
             },
             TaskCockpitQuery::ConfigArchiveSsh {
                 connection_id: "server".into(),
