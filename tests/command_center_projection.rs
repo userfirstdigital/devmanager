@@ -8,8 +8,9 @@ use std::{cell::Cell, rc::Rc};
 use devmanager::{
     client::{
         action::{
-            catalog, ACTION_HOST_ACTIONS, ACTION_HOST_STATUS, ACTION_TASK_CREATE, ACTION_TASK_LIST,
-            ACTION_TASK_RENAME, ACTION_TASK_SHOW,
+            catalog, ACTION_HOST_ACTIONS, ACTION_HOST_STATUS, ACTION_SERVICE_START,
+            ACTION_TASK_CREATE, ACTION_TASK_CREATE_V2, ACTION_TASK_LIST, ACTION_TASK_RENAME,
+            ACTION_TASK_SHOW,
         },
         command_center::{
             collect_unique, project_command_center, request_action, CanonicalProcessLabel,
@@ -154,8 +155,10 @@ fn service_catalog_config_cannot_imply_health_ports_process_or_action_availabili
     );
     assert!(snapshot.actions().ready().is_none());
     assert_eq!(
-        request_action(Some(catalog()), "service.start").unwrap_err(),
-        UnavailableReason::HostFactMissing
+        request_action(Some(catalog()), ACTION_SERVICE_START).unwrap_err(),
+        UnavailableReason::Hold {
+            dependency: HoldDependency::ActionCatalog,
+        }
     );
     assert_eq!(
         request_action(Some(catalog()), "git.commit").unwrap_err(),
@@ -241,12 +244,19 @@ fn request_action_without_catalog_or_action_id_is_unavailable() {
         UnavailableReason::HostFactMissing
     );
     assert_eq!(
-        request_action(Some(catalog()), "service.start").unwrap_err(),
-        UnavailableReason::HostFactMissing
+        request_action(Some(catalog()), ACTION_SERVICE_START).unwrap_err(),
+        UnavailableReason::Hold {
+            dependency: HoldDependency::ActionCatalog,
+        }
     );
     assert_eq!(
         request_action(Some(catalog()), "git.commit").unwrap_err(),
         UnavailableReason::HostFactMissing
+    );
+    assert_eq!(
+        request_action(Some(catalog()), ACTION_TASK_CREATE).unwrap_err(),
+        UnavailableReason::HostFactMissing,
+        "the frozen V1 task-create codec must remain absent from the public catalog"
     );
 
     for id in [
@@ -254,7 +264,7 @@ fn request_action_without_catalog_or_action_id_is_unavailable() {
         ACTION_HOST_STATUS,
         ACTION_TASK_LIST,
         ACTION_TASK_SHOW,
-        ACTION_TASK_CREATE,
+        ACTION_TASK_CREATE_V2,
         ACTION_TASK_RENAME,
     ] {
         assert_eq!(
