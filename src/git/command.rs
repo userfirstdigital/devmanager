@@ -1866,6 +1866,28 @@ fn stable_file_identity_with_index_retry(
     validate_path_components: bool,
     retry_unlinked_index: bool,
 ) -> Result<FileIdentity, String> {
+    stable_file_identity_with_index_retry_attempt(
+        path,
+        require_native_image,
+        deadline,
+        reject_hard_links,
+        digest_content,
+        validate_path_components,
+        retry_unlinked_index,
+        0,
+    )
+}
+
+fn stable_file_identity_with_index_retry_attempt(
+    path: &Path,
+    require_native_image: bool,
+    deadline: Option<OperationDeadline>,
+    reject_hard_links: bool,
+    digest_content: bool,
+    validate_path_components: bool,
+    retry_unlinked_index: bool,
+    retry_attempt: usize,
+) -> Result<FileIdentity, String> {
     if deadline.is_some_and(OperationDeadline::is_expired) {
         return Err("Git executable identity exceeded the operation deadline".to_string());
     }
@@ -1914,6 +1936,31 @@ fn stable_file_identity_with_index_retry(
         }
         let information = unsafe { information.assume_init() };
         if reject_hard_links
+            && should_retry_unlinked_index(
+                retry_unlinked_index,
+                u64::from(information.number_of_links),
+                retry_attempt,
+            )
+        {
+            // Git replaces the index atomically. A handle opened just before
+            // the rename can report zero links even though the path already
+            // names the admitted replacement. Reopen that exact path under
+            // the same operation deadline; a fourth zero-link observation is
+            // still rejected below.
+            drop(file);
+            std::thread::sleep(Duration::from_millis(1));
+            return stable_file_identity_with_index_retry_attempt(
+                path,
+                require_native_image,
+                deadline,
+                reject_hard_links,
+                digest_content,
+                validate_path_components,
+                retry_unlinked_index,
+                retry_attempt + 1,
+            );
+        }
+        if reject_hard_links
             && information.number_of_links != 1
             && (!require_native_image || !is_explicitly_trusted_git_path(path))
         {
@@ -1957,11 +2004,19 @@ fn stable_file_identity_with_index_retry(
     }
 }
 
-/// Linux stat can observe an old inode after Git's atomic rename unlinks it.
-/// Callers enable this bounded zero-link retry only for an admitted in-flight
-/// replacement, including parent-directory snapshots of that same file.
-/// Hard links and strict reads retain their rejection; the post-effect proof
-/// is always strict.
+fn should_retry_unlinked_index(
+    retry_unlinked_index: bool,
+    number_of_links: u64,
+    attempt: usize,
+) -> bool {
+    retry_unlinked_index && number_of_links == 0 && attempt < 3
+}
+
+/// A filesystem observation can retain the old index identity after Git's
+/// atomic rename unlinks it. Callers enable this bounded zero-link retry only
+/// for an admitted in-flight replacement, including parent-directory
+/// snapshots of that same file. Hard links and strict reads retain their
+/// rejection; the post-effect proof is always strict.
 fn graph_metadata_with_index_retry<F>(
     path: &Path,
     deadline: Option<OperationDeadline>,
@@ -1980,7 +2035,9 @@ where
         }
         let metadata = stat(path)?;
         #[cfg(unix)]
-        if retry_unlinked_index && metadata.is_file() && metadata.nlink() == 0 && attempt < 3 {
+        if metadata.is_file()
+            && should_retry_unlinked_index(retry_unlinked_index, metadata.nlink(), attempt)
+        {
             // Let the admitted Git child finish the rename before taking the
             // next stat. Four immediate polls can all hit the same window.
             std::thread::sleep(Duration::from_millis(1));
@@ -12985,6 +13042,16 @@ mod tests {
             .is_err(),
             "a missing path must not become a synthetic identity"
         );
+    }
+
+    #[test]
+    fn unlinked_index_retry_policy_is_exact_and_bounded_on_every_platform() {
+        assert!(!should_retry_unlinked_index(false, 0, 0));
+        assert!(should_retry_unlinked_index(true, 0, 0));
+        assert!(should_retry_unlinked_index(true, 0, 2));
+        assert!(!should_retry_unlinked_index(true, 0, 3));
+        assert!(!should_retry_unlinked_index(true, 1, 0));
+        assert!(!should_retry_unlinked_index(true, 2, 0));
     }
 
     #[test]
