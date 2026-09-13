@@ -2925,6 +2925,10 @@ fn current_repository_produces_deterministic_hold_report() {
     assert!(!second.status.success());
     assert_eq!(first_report, second_report);
     assert_eq!(first_report["contractStatus"], "HOLD");
+    if strings_at(&first_report, &["blockers"]).contains(&"audit[process_deadline_exceeded]") {
+        assert_eq!(first_report["contractId"], "untrusted-contract-id");
+        assert_eq!(first_report["trackedFileCount"], 0);
+    }
     let completed = expected_completed_deletion_ids();
     for report_row in first_report["rows"].as_array().expect("current rows") {
         let id = report_row["id"].as_str().expect("report row id");

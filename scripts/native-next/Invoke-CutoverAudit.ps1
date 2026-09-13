@@ -6130,8 +6130,15 @@ if ($null -eq $rootPath -or $null -eq $evidenceRoot -or $null -eq $reportPath -o
 if ($boundedPublicationRequired) {
     $boundedPublicationBlockers = New-Object 'System.Collections.Generic.List[string]'
     $boundedPublicationBlockers.Add($safetyDiagnostic)
+    $boundedPublicationContractId = Get-ContractProperty -Object $contract -Name 'contractId'
+    $boundedPublicationTrackedFileCount = @($trackedFiles).Count
     if ($fatalDiagnosticCategory -eq 'process_deadline_exceeded') {
         $boundedPublicationBlockers.Add('audit[process_deadline_exceeded]')
+        # A deadline can interrupt the audit before or after either value is
+        # collected. Do not let scheduler timing change the authoritative HOLD
+        # report or imply that a partial repository scan was complete.
+        $boundedPublicationContractId = $null
+        $boundedPublicationTrackedFileCount = 0
     }
     if ($remoteChangeAttribution.classification -eq 'protected-or-unclassified-change') {
         $boundedPublicationBlockers.Add('audit[remote_change_protected]')
@@ -6140,9 +6147,9 @@ if ($boundedPublicationRequired) {
         $boundedPublicationBlockers.Add('audit[remote_change_unattributed]')
     }
     $report = New-BoundedAuditReport -Report ([pscustomobject]([ordered]@{
-                contractId = Get-ContractProperty -Object $contract -Name 'contractId'
+                contractId = $boundedPublicationContractId
                 mode = $Mode
-                trackedFileCount = @($trackedFiles).Count
+                trackedFileCount = $boundedPublicationTrackedFileCount
                 blockers = @($boundedPublicationBlockers.ToArray())
             }))
     $contractStatus = 'HOLD'
