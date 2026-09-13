@@ -214,7 +214,7 @@ function Get-ExternalSourceTreeState {
         )
         foreach ($entry in Get-ChildItem -LiteralPath $CurrentPath -Force -ErrorAction Stop) {
             $name = [string]$entry.Name
-            if ($name -eq '.git' -or $name -eq '.devmanager-next' -or $name -eq 'target' -or
+            if ($name -eq '.git' -or $name -eq '.devmanager-next' -or $name -eq 'launch-evidence' -or $name -eq 'target' -or
                 $name -eq 'target-native-next' -or $name.StartsWith('.tmp', [StringComparison]::Ordinal)) {
                 continue
             }

@@ -113,6 +113,7 @@ fn current_source_tree_state() -> String {
             let name = entry.file_name().to_string_lossy().to_string();
             if name == ".git"
                 || name == ".devmanager-next"
+                || name == "launch-evidence"
                 || name == "target"
                 || name == "target-native-next"
                 || name.starts_with(".tmp")
@@ -147,6 +148,23 @@ fn current_source_tree_state() -> String {
         hasher.update(fs::read(root.join(relative)).expect("read source tree file"));
     }
     format!("sha256:{:x}", hasher.finalize())
+}
+
+#[cfg(windows)]
+#[test]
+fn source_tree_attestation_excludes_generated_launch_evidence() {
+    let before = current_source_tree_state();
+    let evidence_root = std::env::current_dir()
+        .expect("current worktree")
+        .join("launch-evidence");
+    fs::create_dir_all(&evidence_root).expect("create generated evidence root");
+    let generated = tempfile::tempdir_in(evidence_root).expect("generated evidence directory");
+    fs::write(
+        generated.path().join("large-ci-log.txt"),
+        b"generated CI output",
+    )
+    .expect("write generated evidence");
+    assert_eq!(before, current_source_tree_state());
 }
 
 #[cfg(windows)]
@@ -837,6 +855,7 @@ fn process_soak_script_uses_bounded_io_and_restored_default_interface() {
     assert!(!source.contains("ManifestPath"));
     assert!(!source.contains("Kill($true)"));
     assert!(!source.contains("target\\debug"));
+    assert!(source.contains("$name -eq 'launch-evidence'"));
     assert!(
         phase_gate.find("$deadline =").expect("bounded deadline")
             < phase_gate
@@ -868,6 +887,7 @@ fn rust_supervisor_does_not_reset_cleanup_deadline_on_launch_failure() {
     assert!(!source.contains("terminate_and_wait(Instant::now()"));
     assert!(!source.contains("Duration::from_secs(5)"));
     assert!(source.contains("name == \"target\""));
+    assert!(source.contains("name == \"launch-evidence\""));
 }
 
 #[test]

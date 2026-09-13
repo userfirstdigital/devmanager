@@ -48,6 +48,7 @@ serviceAccountKey.json
 /target-live-dev
 /.devmanager-next/
 /target-native-next/
+/launch-evidence/
 /target-live-native-next/
 /.cargo-target-06-09/
 /.codex-target-connect-review6

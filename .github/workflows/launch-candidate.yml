@@ -89,6 +89,18 @@ jobs:
       - name: Run Windows integration and binary tests serially
         shell: pwsh
         run: |
+          cargo test --locked --bins --examples --test '*' --no-run --target-dir "$env:CARGO_TARGET_DIR" -j 2 2>&1 | Tee-Object launch-evidence/tests-compile.log
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $fixedDebug = Join-Path $PWD 'target-native-next\debug'
+          $fixedDeps = Join-Path $fixedDebug 'deps'
+          New-Item -ItemType Directory -Force $fixedDeps | Out-Null
+          Copy-Item -LiteralPath (Join-Path $env:CARGO_TARGET_DIR 'debug\devmanager-process-test-helper.exe') -Destination (Join-Path $fixedDebug 'devmanager-process-test-helper.exe') -Force
+          $soakHarness = Get-ChildItem -LiteralPath (Join-Path $env:CARGO_TARGET_DIR 'debug\deps') -Filter 'process_soak_infrastructure-*.exe' -File |
+            Where-Object { $_.Name -notmatch '\.d\.exe$' } |
+            Sort-Object LastWriteTimeUtc -Descending |
+            Select-Object -First 1
+          if ($null -eq $soakHarness) { throw 'Compiled Windows process-soak harness is unavailable' }
+          Copy-Item -LiteralPath $soakHarness.FullName -Destination (Join-Path $fixedDeps $soakHarness.Name) -Force
           cargo test --locked --bins --examples --test '*' --target-dir "$env:CARGO_TARGET_DIR" -j 2 -- --test-threads=1 2>&1 | Tee-Object launch-evidence/tests.log
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
 

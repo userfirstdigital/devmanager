@@ -1682,6 +1682,7 @@ fn source_tree_digest(root: &std::path::Path) -> Result<String, String> {
             let name = entry.file_name().to_string_lossy().to_string();
             if name == ".git"
                 || name == ".devmanager-next"
+                || name == "launch-evidence"
                 || name == "target"
                 || name == "target-native-next"
                 || name.starts_with(".tmp")
