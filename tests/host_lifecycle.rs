@@ -1732,13 +1732,21 @@ async fn two_clients_assemble_same_initial_model_and_converge_live() {
 
     let (live_create, live_command_id, live_task_id) =
         create_task_named(writer_id, 0xf0, 0xf1, 0xf2, &project, "Live converge task");
-    assert!(matches!(
-        writer
-            .execute_command(live_create.clone())
-            .await
-            .expect("create live converge task"),
-        CommandReceipt::Accepted { .. }
-    ));
+    let live_operation_id = match writer
+        .execute_command(live_create.clone())
+        .await
+        .expect("create live converge task")
+    {
+        CommandReceipt::Accepted {
+            command_id,
+            operation_id,
+            ..
+        } => {
+            assert_eq!(command_id, live_command_id);
+            operation_id
+        }
+        other => panic!("expected Accepted live create receipt, got {other:?}"),
+    };
 
     let probe = writer
         .open_event_replay(sync_sequence)
@@ -1789,7 +1797,17 @@ async fn two_clients_assemble_same_initial_model_and_converge_live() {
     assert_eq!(converged_a.last_applied_sequence(), high_water);
     assert!(converged_a.tasks().contains_key(&live_task_id));
     assert_eq!(converged_a.tasks().len(), 4);
-    assert!(converged_a.operations().is_empty());
+    assert_eq!(converged_a.operations().len(), 1);
+    let live_operation = converged_a
+        .operations()
+        .get(&live_operation_id)
+        .expect("live replay retains the operation it observed");
+    assert_eq!(live_operation.command_id, live_command_id);
+    assert_eq!(live_operation.task_id, Some(live_task_id));
+    assert!(matches!(
+        &live_operation.state,
+        OperationState::Settled { .. }
+    ));
 
     let retry = writer
         .execute_command(live_create)
@@ -2024,11 +2042,15 @@ async fn artifact_content_pages_are_scoped_resumable_and_side_effect_free() {
         .await
         .expect("release artifact content transport")
         .expect("release artifact content");
-    owner
+    let stale_release = owner
         .release_artifact_content(task_id, subscription_id)
         .await
-        .expect("idempotent release transport")
-        .expect("idempotent release");
+        .expect("stale release transport");
+    assert_eq!(
+        stale_release,
+        Err(QueryError::NotFound),
+        "an already-released authorization scope must not produce a fresh success acknowledgement"
+    );
 
     let after = owner
         .snapshot_page(SnapshotSection::Artifacts, None, None)
@@ -2599,7 +2621,7 @@ async fn slow_durable_reader_does_not_delay_other_client_command_receipt() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn begin_close_rejects_new_runtime_registration_with_closing_before_drain() {
+async fn begin_close_drains_existing_resources_before_rejecting_new_runtime_registration() {
     let config_base = TempDir::new().expect("process-unique config base");
     let profile = unique_profile();
     let paths = isolated_paths(&config_base, &profile);
@@ -2726,9 +2748,22 @@ async fn begin_close_rejects_new_runtime_registration_with_closing_before_drain(
         .expect("refresh close operation transport")
         .expect("known close operation");
     assert!(
-        matches!(close_state, OperationState::Accepted),
-        "close must remain Accepted while Task-owned resources block drain; got {close_state:?}"
+        matches!(close_state, OperationState::Settled { .. }),
+        "host-owned close dispatch must drain the registered terminal and settle; got {close_state:?}"
     );
+
+    let archived = client_b
+        .task_snapshot(task_id)
+        .await
+        .expect("archived task snapshot transport")
+        .expect("archived task snapshot query");
+    assert_eq!(archived.task.lifecycle, TaskLifecycle::Archived);
+    assert_eq!(archived.task.action_epoch, 1);
+    assert!(
+        archived.task.revision > close_revision,
+        "maintenance archive must advance beyond the BeginClose receipt revision"
+    );
+    let archived_revision = archived.task.revision;
 
     let rejected_resource_id =
         ResourceId::from_bytes(fixed_uuid_v7(0xe9)).expect("rejected resource id");
@@ -2737,7 +2772,7 @@ async fn begin_close_rejects_new_runtime_registration_with_closing_before_drain(
         client_id: client_b_id,
         task_id: Some(task_id),
         issued_at_ms: 1_725_000_000_300,
-        expected_task_revision: Some(close_revision),
+        expected_task_revision: Some(archived_revision),
         command: Command::RegisterResource {
             resource: ResourceFacts {
                 id: rejected_resource_id,
@@ -2759,8 +2794,8 @@ async fn begin_close_rejects_new_runtime_registration_with_closing_before_drain(
         rejected,
         CommandReceipt::Rejected {
             command_id: CommandId::from_bytes(fixed_uuid_v7(0xea)).expect("register command id"),
-            code: RejectionCode::Closing,
-            current_revision: Some(close_revision),
+            code: RejectionCode::InvalidTransition,
+            current_revision: Some(archived_revision),
             resolution: None,
         }
     );
@@ -2770,12 +2805,12 @@ async fn begin_close_rejects_new_runtime_registration_with_closing_before_drain(
         .await
         .expect("task snapshot transport")
         .expect("task snapshot query");
-    assert_eq!(snapshot.task.lifecycle, TaskLifecycle::Closing);
+    assert_eq!(snapshot.task.lifecycle, TaskLifecycle::Archived);
     assert_eq!(snapshot.task.action_epoch, 1);
-    assert_eq!(snapshot.task.revision, close_revision);
+    assert_eq!(snapshot.task.revision, archived_revision);
 
     let resources = client_b
-        .snapshot_page(SnapshotSection::Resources, None, None)
+        .snapshot_page_scoped(SnapshotSection::Resources, Some(task_id), None, None)
         .await
         .expect("resources snapshot transport")
         .expect("resources snapshot query");
@@ -2784,10 +2819,10 @@ async fn begin_close_rejects_new_runtime_registration_with_closing_before_drain(
             item,
             SnapshotItem::Resource(facts)
                 if facts.id == existing_resource_id
-                    && facts.lifecycle == ResourceLifecycle::Active
+                    && facts.lifecycle == ResourceLifecycle::Released
                     && facts.owner_kind == OwnerKind::Task
         )),
-        "pre-existing Active Task-owned terminal must remain while teardown stays pending"
+        "pre-existing Task-owned terminal must be durably Released before archive"
     );
     assert!(
         !resources.items.iter().any(|item| matches!(
@@ -2797,7 +2832,7 @@ async fn begin_close_rejects_new_runtime_registration_with_closing_before_drain(
         "rejected resource must be absent from durable resources"
     );
     client_b
-        .release_snapshot(resources.snapshot_id)
+        .release_snapshot_scoped(resources.snapshot_id, Some(task_id))
         .await
         .expect("release resources snapshot transport")
         .expect("release resources snapshot");
@@ -2808,8 +2843,8 @@ async fn begin_close_rejects_new_runtime_registration_with_closing_before_drain(
         .expect("refresh close operation after rejection")
         .expect("known close operation after rejection");
     assert!(
-        matches!(close_state_after, OperationState::Accepted),
-        "close must remain Accepted after rejected registration; got {close_state_after:?}"
+        matches!(close_state_after, OperationState::Settled { .. }),
+        "rejected registration must not disturb the settled close; got {close_state_after:?}"
     );
 
     let final_identity = read_identity(&lock_path).expect("final host identity");
