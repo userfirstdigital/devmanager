@@ -101,7 +101,22 @@ jobs:
             Select-Object -First 1
           if ($null -eq $soakHarness) { throw 'Compiled Windows process-soak harness is unavailable' }
           Copy-Item -LiteralPath $soakHarness.FullName -Destination (Join-Path $fixedDeps $soakHarness.Name) -Force
-          cargo test --locked --bins --examples --test '*' --target-dir "$env:CARGO_TARGET_DIR" -j 2 -- --test-threads=1 2>&1 | Tee-Object launch-evidence/tests.log
+          $metadataJson = & cargo metadata --locked --no-deps --format-version 1
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $package = @($metadataJson | ConvertFrom-Json).packages | Where-Object { $_.name -eq 'devmanager' }
+          if ($package.Count -ne 1) { throw 'Expected exactly one devmanager package' }
+          $testTargets = @(
+            $package[0].targets |
+              Where-Object { $_.kind -contains 'test' -and $_.name -ne 'ui_preview_capture' } |
+              Sort-Object name |
+              ForEach-Object { $_.name }
+          )
+          if ($testTargets.Count -eq 0) { throw 'No Windows integration test targets were discovered' }
+          $cargoArgs = @('test', '--locked', '--bins', '--examples')
+          foreach ($testTarget in $testTargets) { $cargoArgs += @('--test', $testTarget) }
+          $cargoArgs += @('--target-dir', $env:CARGO_TARGET_DIR, '-j', '2', '--', '--test-threads=1')
+          Write-Output 'ui_preview_capture is compile-only because it tests retired preview tooling and interactive desktop capture.'
+          & cargo @cargoArgs 2>&1 | Tee-Object launch-evidence/tests.log
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
 
       - name: Build desktop acceptance archive
