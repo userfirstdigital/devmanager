@@ -42,12 +42,16 @@ fn capabilities_from(raw: &str) -> ProviderCapabilities {
 }
 
 fn executable(label: &str) -> ProviderExecutable {
-    ProviderExecutable::new(PathBuf::from(format!("C:/fixture/{label}")), {
-        let mut digest = [0_u8; 32];
-        digest[0] = label.as_bytes()[0];
-        digest
-    })
-    .unwrap()
+    let root = Box::leak(Box::new(
+        tempfile::tempdir().expect("provider fixture root"),
+    ));
+    let path = root.path().join(format!("provider-{label}.exe"));
+    std::fs::copy(
+        std::env::current_exe().expect("current test executable"),
+        &path,
+    )
+    .expect("copy provider executable fixture");
+    ProviderExecutable::from_path(path).expect("attested provider executable fixture")
 }
 
 #[test]
@@ -444,7 +448,7 @@ fn fixture_authenticity_pins_schema_hash_and_declared_metrics() {
         interrupted.fixture_sha256(),
         manifest["payload"]["fixture_sha256"].as_str().unwrap()
     );
-    assert_eq!(manifest["payload"]["provider"], "claude_code");
+    assert_eq!(manifest["payload"]["provider"], "claude");
     assert_eq!(manifest["payload"]["version"], "1.0.0");
     assert_eq!(
         manifest["payload"]["correlation"]["nonce"],
@@ -507,10 +511,14 @@ fn identity_and_exact_resume_results_stay_independent() {
     let mut incompatible = fixture(RESUME_FAILURE);
     incompatible["nonce"] = json!("nonce-incompatible");
     incompatible["capabilities"]["evidence"] = json!([{
+        "schema_version": 1,
         "source": "capability_probe",
         "observed_at": 1,
+        "expires_at": null,
+        "confidence": "unknown",
+        "auth_source": null,
         "status": "failed",
-        "diagnostic": { "code": "version_malformed" }
+        "diagnostic": { "code": "version_malformed", "digest": null }
     }]);
     let root = tempfile::tempdir().unwrap();
     let lab = ProviderConformanceLab::open(root.path()).unwrap();
@@ -646,11 +654,8 @@ fn resume_rejects_huge_physical_fixture_without_unbounded_read() {
 
 #[test]
 fn authenticate_rejects_provider_kind_and_version_inconsistency() {
-    let kind_mismatch = BASELINE.replacen(
-        "\"provider\": \"claude_code\"",
-        "\"provider\": \"cursor\"",
-        1,
-    );
+    let kind_mismatch =
+        BASELINE.replacen("\"provider\": \"claude\"", "\"provider\": \"cursor\"", 1);
     assert!(matches!(
         authenticate_fixture(&kind_mismatch),
         Err(ConformanceError::InconsistentProviderIdentity)
@@ -779,17 +784,16 @@ fn auth_failure_keeps_identity_independent_of_exact_resume() {
     auth_failure["case_id"] = json!("strict_resume_failure");
     auth_failure["nonce"] = json!("nonce-auth-failure");
     auth_failure["provider_session_id"] = json!("sess_auth_failure");
-    auth_failure["capabilities"]["auth_state"] = json!("auth_required");
     auth_failure["capabilities"]["evidence"] = json!([
         {
+            "schema_version": 1,
             "source": "capability_probe",
             "observed_at": 1,
-            "status": "supported"
-        },
-        {
-            "source": "auth_status_probe",
-            "observed_at": 1,
-            "status": "auth_required"
+            "expires_at": null,
+            "confidence": "unknown",
+            "auth_source": null,
+            "status": "failed",
+            "diagnostic": { "code": "authentication_required", "digest": null }
         }
     ]);
     let root = tempfile::tempdir().unwrap();

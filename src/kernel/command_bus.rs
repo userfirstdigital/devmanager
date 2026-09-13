@@ -222,7 +222,7 @@ impl CommandBus {
     /// Execute a command through the owned store.
     pub fn execute(&mut self, envelope: CommandEnvelope) -> Result<CommandReceipt, StoreError> {
         if matches!(
-            envelope.command,
+            &envelope.command,
             Command::PromptLibrary(_) | Command::PromptChain(_)
         ) {
             return self
@@ -476,6 +476,14 @@ impl CommandBus {
         if receipt_payload_digest != Some(expected_payload_digest) {
             return Err(StoreError::CommandIdConflict);
         }
+        let receipt = if matches!(
+            &envelope.command,
+            Command::PromptLibrary(_) | Command::PromptChain(_)
+        ) {
+            replay_prompt_library_receipt(&tx, envelope, receipt)?
+        } else {
+            receipt
+        };
         tx.commit()?;
         Ok(Some(receipt))
     }
@@ -1544,15 +1552,12 @@ pub(crate) fn execute_authorized_with_context(
     })
 }
 
-/// Test-only fixture adapter. It resolves the fixed Main workspace against
-/// the checked-out repository before using the same opaque authority as the
-/// host. Tests for paging, replay, and maintenance can therefore exercise
-/// ordinary command behavior without reopening the production raw-command
-/// seam.
-#[cfg(test)]
-pub(crate) fn execute_for_test(
+pub(crate) fn execute_configured_task_create(
     store: &mut KernelStore,
     envelope: CommandEnvelope,
+    workspace_projects: &WorkspaceProjectRoots,
+    request_id: RequestId,
+    connection_id: Uuid,
 ) -> Result<CommandReceipt, StoreError> {
     let CommandEnvelope {
         command,
@@ -1563,41 +1568,18 @@ pub(crate) fn execute_for_test(
         expected_task_revision,
     } = envelope;
     let Command::CreateTask(mut intent) = command else {
-        return execute(
-            store,
-            CommandEnvelope {
-                command,
-                command_id,
-                client_id,
-                task_id,
-                issued_at_ms,
-                expected_task_revision,
-            },
-        );
+        return Err(StoreError::HostAuthorityRequired);
     };
     if !matches!(intent.workspace, crate::domain::task::WorkspaceRef::Main) {
         return Err(StoreError::HostAuthorityRequired);
     }
-    let project = tempfile::tempdir().map_err(|error| StoreError::Io(error.to_string()))?;
-    std::fs::create_dir(project.path().join(".git"))
-        .map_err(|error| StoreError::Io(error.to_string()))?;
-    std::fs::write(
-        project.path().join(".git").join("HEAD"),
-        "ref: refs/heads/main\n",
-    )
-    .map_err(|error| StoreError::Io(error.to_string()))?;
-    let workspace_projects =
-        WorkspaceProjectRoots::try_from_pairs([(intent.project_id, project.path().to_path_buf())])
-            .map_err(|_| StoreError::HostAuthorityRequired)?;
     let mut service = WorkspaceService::with_task_coordinator(
         intent.project_id,
         intent.id,
-        &workspace_projects,
+        workspace_projects,
         WorkspaceResourceCoordinator::new(),
     )
     .map_err(|_| StoreError::HostAuthorityRequired)?;
-    let request_id = RequestId::new();
-    let connection_id = Uuid::now_v7();
     let (binding, authorization) = service
         .bind_authorized(
             crate::workspace::WorkspaceRequest::main(),
@@ -1622,6 +1604,40 @@ pub(crate) fn execute_for_test(
         authorization,
         request_id,
         connection_id,
+    )
+}
+
+/// Test-only fixture adapter. It resolves the fixed Main workspace against
+/// the checked-out repository before using the same opaque authority as the
+/// host. Tests for paging, replay, and maintenance can therefore exercise
+/// ordinary command behavior without reopening the production raw-command
+/// seam.
+#[cfg(test)]
+pub(crate) fn execute_for_test(
+    store: &mut KernelStore,
+    envelope: CommandEnvelope,
+) -> Result<CommandReceipt, StoreError> {
+    let project_id = match &envelope.command {
+        Command::CreateTask(intent) => intent.project_id,
+        _ => return execute(store, envelope),
+    };
+    let project = tempfile::tempdir().map_err(|error| StoreError::Io(error.to_string()))?;
+    std::fs::create_dir(project.path().join(".git"))
+        .map_err(|error| StoreError::Io(error.to_string()))?;
+    std::fs::write(
+        project.path().join(".git").join("HEAD"),
+        "ref: refs/heads/main\n",
+    )
+    .map_err(|error| StoreError::Io(error.to_string()))?;
+    let workspace_projects =
+        WorkspaceProjectRoots::try_from_pairs([(project_id, project.path().to_path_buf())])
+            .map_err(|_| StoreError::HostAuthorityRequired)?;
+    execute_configured_task_create(
+        store,
+        envelope,
+        &workspace_projects,
+        RequestId::new(),
+        Uuid::now_v7(),
     )
 }
 
@@ -8013,6 +8029,16 @@ fn validate_accepted_receipt_correlation(
     }
 
     if receipt_task_id.is_none() && receipt_task_revision.is_none() {
+        if has_prompt_mutation_receipt(tx, command_id)? {
+            return validate_prompt_mutation_accepted_receipt(
+                tx,
+                command_id,
+                expected_operation_id,
+                event_ids,
+                committed_sequence,
+                &operation,
+            );
+        }
         return validate_host_admission_accepted_receipt(
             tx,
             command_id,
@@ -8062,6 +8088,100 @@ fn validate_accepted_receipt_correlation(
         committed_sequence,
         &operation,
     )
+}
+
+fn has_prompt_mutation_receipt(tx: &Connection, command_id: CommandId) -> Result<bool, StoreError> {
+    let count: i64 = tx.query_row(
+        "SELECT
+            (SELECT COUNT(*) FROM prompt_command_receipts WHERE command_id = ?1)
+          + (SELECT COUNT(*) FROM prompt_chain_command_receipts WHERE command_id = ?1)",
+        [command_id.as_bytes().as_slice()],
+        |row| row.get(0),
+    )?;
+    match count {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => Err(StoreError::Corruption),
+    }
+}
+
+fn validate_prompt_mutation_accepted_receipt(
+    tx: &Connection,
+    command_id: CommandId,
+    expected_operation_id: OperationId,
+    event_ids: &[EventId],
+    committed_sequence: u64,
+    operation: &OperationProjectionRow,
+) -> Result<(), StoreError> {
+    if event_ids.len() != 1
+        || operation.task_id.is_some()
+        || operation.action_epoch.is_some()
+        || operation.resource_id.is_some()
+        || operation.runtime_generation.is_some()
+        || operation.state != "settled"
+        || operation.outcome_code.is_some()
+    {
+        return Err(StoreError::Corruption);
+    }
+    let projected_result = unpack_projection_blob::<Vec<EventId>>(
+        "operations.result",
+        operation.result.as_deref().ok_or(StoreError::Corruption)?,
+    )?;
+    if projected_result.as_slice() != event_ids {
+        return Err(StoreError::Corruption);
+    }
+
+    let accepted_sequence = committed_sequence
+        .checked_sub(1)
+        .ok_or(StoreError::Corruption)?;
+    let accepted_row = load_event_row_at_sequence(tx, accepted_sequence)?;
+    if accepted_row.event_id != event_ids[0] {
+        return Err(StoreError::Corruption);
+    }
+    let empty_fence = OperationFence {
+        action_epoch: None,
+        resource_id: None,
+        runtime_generation: None,
+    };
+    validate_accepted_fact_row(
+        &accepted_row,
+        command_id,
+        expected_operation_id,
+        None,
+        operation.accepted_at_ms,
+        empty_fence,
+    )?;
+    ensure_unique_operation_accepted_fact(
+        tx,
+        command_id,
+        expected_operation_id,
+        None,
+        operation.accepted_at_ms,
+        accepted_sequence,
+        &accepted_row,
+        empty_fence,
+    )?;
+
+    let terminal =
+        require_exact_host_cleanup_settled_terminal(tx, command_id, expected_operation_id)?;
+    let outcome_at_ms = operation.outcome_at_ms.ok_or(StoreError::Corruption)?;
+    if terminal.sequence != committed_sequence
+        || terminal.task_id.is_some()
+        || terminal.task_revision.is_some()
+        || terminal.occurred_at_ms != operation.accepted_at_ms
+        || terminal.occurred_at_ms != outcome_at_ms
+        || terminal.fact.settled_at_ms != outcome_at_ms
+        || terminal.fact.command_id != command_id
+        || terminal.fact.operation_id != expected_operation_id
+        || terminal.fact.result_event_ids.as_slice() != event_ids
+        || terminal.fact.action_epoch.is_some()
+        || terminal.fact.resource_id.is_some()
+        || terminal.fact.runtime_generation.is_some()
+        || !terminal.fact.source.is_dispatch()
+    {
+        return Err(StoreError::Corruption);
+    }
+    Ok(())
 }
 
 fn validate_host_admission_accepted_receipt(
@@ -10826,25 +10946,52 @@ fn validate_primary_agent_set_ownership(
     agent_session_id: AgentSessionId,
     scope: TaskId,
 ) -> Result<(), StoreError> {
-    let row: Option<(Vec<u8>, Vec<u8>)> = tx
-        .query_row(
-            "SELECT task_id, role FROM agent_sessions WHERE agent_session_id = ?1",
-            [agent_session_id.as_bytes().as_slice()],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .optional()?;
-    let Some((task_id_bytes, role_bytes)) = row else {
-        return Err(StoreError::Corruption);
-    };
-    let agent_task_id = id16::<TaskId>("agent_sessions.task_id", &task_id_bytes)?;
-    if agent_task_id != scope {
-        return Err(StoreError::Corruption);
+    // Validate the immutable registration lineage. The current projection may
+    // legitimately show this agent demoted after a later primary promotion,
+    // so it cannot prove an earlier PrimaryAgentSet receipt.
+    let mut stmt = tx.prepare(
+        "SELECT task_id, task_revision, schema_version, payload
+         FROM events
+         WHERE event_type = 'agent_session.registered'
+         ORDER BY sequence ASC",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, Option<Vec<u8>>>(0)?,
+            row.get::<_, Option<i64>>(1)?,
+            row.get::<_, i64>(2)?,
+            row.get::<_, Vec<u8>>(3)?,
+        ))
+    })?;
+    let mut matched = false;
+    for row in rows {
+        let (task_bytes, task_revision, schema_version, payload) = row?;
+        let decoded = crate::kernel::store::decode_stored_event(
+            "agent_session.registered",
+            schema_version,
+            &payload,
+        )?;
+        let Event::AgentSessionRegistered { agent } = decoded else {
+            return Err(StoreError::Corruption);
+        };
+        if agent.id != agent_session_id {
+            continue;
+        }
+        if matched
+            || parse_optional_task_scope("events.task_id", task_bytes)? != Some(scope)
+            || task_revision.is_none()
+            || agent.task_id != scope
+            || agent.role != AgentRole::Primary
+        {
+            return Err(StoreError::Corruption);
+        }
+        matched = true;
     }
-    let role: AgentRole = unpack_projection_blob("agent_sessions.role", &role_bytes)?;
-    if role != AgentRole::Primary {
-        return Err(StoreError::Corruption);
+    if matched {
+        Ok(())
+    } else {
+        Err(StoreError::Corruption)
     }
-    Ok(())
 }
 
 fn ensure_unique_task_revision(

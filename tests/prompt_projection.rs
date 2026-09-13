@@ -912,9 +912,9 @@ fn one_action_catalog_includes_prompt_library_and_truthful_disabled_reasons() {
     );
     assert_eq!(
         disabled_reason(ACTION_PROMPT_METADATA_PAGE, granted_library()),
-        Some("owner_device_session unavailable until Phase 9 authenticated pairing")
+        None
     );
-    assert!(!devmanager::client::action::action_enabled(
+    assert!(devmanager::client::action::action_enabled(
         ACTION_PROMPT_METADATA_PAGE,
         granted_library()
     ));
@@ -1264,8 +1264,9 @@ fn host_metadata_page_and_mutation_use_query_result_and_command_receipt() {
     let mut granted_intent = create_intent;
     granted_intent.command_id = command_id(0x42);
     let create = bus
-        .execute_with_owner_grant(&grant, granted_intent)
+        .execute_with_owner_grant(&grant, granted_intent.clone())
         .expect("create prompt");
+    let expected_receipt = create.clone();
     let CommandReceipt::Accepted {
         command_id: accepted_id,
         operation_id,
@@ -1301,28 +1302,32 @@ fn host_metadata_page_and_mutation_use_query_result_and_command_receipt() {
             request_id: request_id(0x98),
             client_id: client_id(0x91),
             task_id: None,
-            query: Query::OperationStatus { operation_id },
+            query: Query::CommandReceiptStatus {
+                command: granted_intent,
+            },
         }),
     )
     .expect("operation status");
     let ServerMessage::QueryReply(status_reply) = status else {
         panic!("expected operation status reply");
     };
-    let QueryOutcome::Ok(QueryResult::OperationStatus {
-        operation_id: status_id,
-        state,
+    let QueryOutcome::Ok(QueryResult::CommandReceiptStatus {
+        receipt: Some(recovered),
     }) = status_reply.outcome
     else {
-        panic!("expected operation status, got {:?}", status_reply.outcome);
+        panic!(
+            "expected command receipt status, got {:?}",
+            status_reply.outcome
+        );
     };
-    assert_eq!(status_id, operation_id);
-    assert!(
-        matches!(
-            state,
-            devmanager::domain::operation::OperationState::Settled { .. }
-        ),
-        "prompt mutation must settle on the kernel receipt, got {state:?}"
-    );
+    assert_eq!(recovered, expected_receipt);
+    assert!(matches!(
+        recovered,
+        CommandReceipt::Accepted {
+            operation_id: recovered_operation_id,
+            ..
+        } if recovered_operation_id == operation_id
+    ));
 
     let stale = bus
         .execute_with_owner_grant(
@@ -1465,7 +1470,7 @@ fn host_metadata_page_and_mutation_use_query_result_and_command_receipt() {
         .execute_with_owner_grant(&grant, conflict_intent)
         .expect("digest mismatch");
     let CommandReceipt::Rejected {
-        code: RejectionCode::AlreadyExists,
+        code: RejectionCode::IdempotencyConflict,
         ..
     } = conflict
     else {

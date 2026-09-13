@@ -3,9 +3,11 @@
 use std::cell::Cell;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Barrier};
+use std::sync::{Arc, Barrier, OnceLock};
 use std::time::Duration;
 
+use devmanager::config::paths::ResolvedAppPaths;
+use devmanager::config::{ConfigCommand, ConfigStore, Project};
 use devmanager::domain::agent::{AgentRole, AgentSessionFacts, AgentSessionLifecycle};
 use devmanager::domain::artifact::ArtifactContentRef;
 use devmanager::domain::command::{
@@ -19,7 +21,7 @@ use devmanager::domain::event::{
 };
 use devmanager::domain::id::{
     AgentSessionId, ArtifactId, ClientId, CommandId, EnvironmentId, EventId, OperationId, OutboxId,
-    ProjectId, ResourceId, TaskId,
+    ProjectId, RequestId, ResourceId, TaskId,
 };
 use devmanager::domain::operation::{
     CancellationReason, OperationErrorCode, OperationState, OutcomeSource, ResourceFence,
@@ -37,6 +39,7 @@ use devmanager::kernel::{
     ReconciliationOrigin, ReplayPolicy, RuntimePresence, RuntimeRegistry, StoreError,
 };
 use devmanager::providers::ProviderKind;
+use devmanager::workspace::WorkspaceProjectRoots;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -80,6 +83,82 @@ fn client_id(tail: u8) -> ClientId {
     ClientId::from_bytes(fixed_uuid_v7(tail)).expect("client id")
 }
 
+struct KernelStoreWorkspaceFixture {
+    _project_root: TempDir,
+    _config_root: TempDir,
+    roots: WorkspaceProjectRoots,
+    project_id: ProjectId,
+}
+
+fn kernel_store_workspace_fixture() -> &'static KernelStoreWorkspaceFixture {
+    static FIXTURE: OnceLock<KernelStoreWorkspaceFixture> = OnceLock::new();
+    FIXTURE.get_or_init(|| {
+        let project_root = TempDir::new().expect("kernel-store project root");
+        fs::create_dir(project_root.path().join(".git")).expect("create project git directory");
+        fs::write(
+            project_root.path().join(".git").join("HEAD"),
+            "ref: refs/heads/main\n",
+        )
+        .expect("write project git head");
+        let config_root = TempDir::new().expect("kernel-store config root");
+        let paths = ResolvedAppPaths {
+            root: config_root.path().to_path_buf(),
+            config: config_root.path().join("config.json"),
+            remote: config_root.path().join("remote.json"),
+            database: config_root.path().join("kernel.sqlite3"),
+            browser_root: config_root.path().join("browser"),
+            logs: config_root.path().join("logs"),
+        };
+        let mut store = ConfigStore::open_host(&paths).expect("open host config");
+        let configured_id = project_id(0x11).to_string();
+        store
+            .execute(
+                store.snapshot().revision,
+                ConfigCommand::CreateProject {
+                    project: Project {
+                        id: configured_id.clone(),
+                        name: "Kernel store fixture".into(),
+                        root_path: project_root.path().to_string_lossy().into_owned(),
+                        created_at: "now".into(),
+                        updated_at: "now".into(),
+                        ..Project::default()
+                    },
+                },
+            )
+            .expect("configure kernel-store project");
+        let revision = store.snapshot().revision;
+        let roots = WorkspaceProjectRoots::from_host_config_store(&mut store, revision, 1, 1)
+            .expect("issue kernel-store workspace roots");
+        let project_id = roots
+            .project_id_for_config_id(&configured_id)
+            .expect("issued kernel-store project id");
+        KernelStoreWorkspaceFixture {
+            _project_root: project_root,
+            _config_root: config_root,
+            roots,
+            project_id,
+        }
+    })
+}
+
+fn host_test_project_id() -> ProjectId {
+    kernel_store_workspace_fixture().project_id
+}
+
+fn execute_host_task_create(
+    store: &mut KernelStore,
+    envelope: CommandEnvelope,
+) -> Result<CommandReceipt, StoreError> {
+    let request_id = RequestId::from_bytes(*envelope.command_id.as_bytes())
+        .expect("command id is a valid request id");
+    store.execute_configured_task_create(
+        envelope,
+        &kernel_store_workspace_fixture().roots,
+        request_id,
+        uuid::Uuid::from_bytes(fixed_uuid_v7(0xFE)),
+    )
+}
+
 fn temp_db_path(dir: &TempDir) -> std::path::PathBuf {
     dir.path().join("kernel.sqlite3")
 }
@@ -97,7 +176,7 @@ fn sample_task(task: TaskId) -> TaskFacts {
         environment_id: env_id(0x10),
         title: "Ship kernel".into(),
         description: Some("Phase 1 domain".into()),
-        project_id: project_id(0x11),
+        project_id: host_test_project_id(),
         workspace: WorkspaceRef::Main,
         assignment: TaskAssignment::LocalOwner,
         lifecycle: TaskLifecycle::Open,
@@ -217,7 +296,7 @@ fn index_names(conn: &Connection) -> Vec<String> {
 }
 
 #[test]
-fn schema_open_applies_v1_tables_indexes_and_settings() {
+fn schema_open_applies_current_tables_indexes_and_settings() {
     let dir = TempDir::new().expect("tempdir");
     let path = temp_db_path(&dir);
 
@@ -231,6 +310,7 @@ fn schema_open_applies_v1_tables_indexes_and_settings() {
             "agent_sessions".to_string(),
             "artifacts".to_string(),
             "command_receipts".to_string(),
+            "connect_identity".to_string(),
             "event_retention".to_string(),
             "events".to_string(),
             "host_admission".to_string(),
@@ -243,24 +323,43 @@ fn schema_open_applies_v1_tables_indexes_and_settings() {
             "prompt_chains".to_string(),
             "prompt_command_receipts".to_string(),
             "prompt_events".to_string(),
+            "prompt_history".to_string(),
+            "prompt_history_policy".to_string(),
             "prompt_lineage_migration_commitment".to_string(),
             "prompt_lineage_migration_state".to_string(),
             "prompt_lineage_quarantine".to_string(),
             "prompt_lineage_quarantine_creation".to_string(),
             "prompt_lineage_quarantine_ledger".to_string(),
             "prompt_lineage_quarantine_repair_audit".to_string(),
+            "prompt_search".to_string(),
+            "prompt_search_config".to_string(),
+            "prompt_search_content".to_string(),
+            "prompt_search_data".to_string(),
+            "prompt_search_docsize".to_string(),
+            "prompt_search_idx".to_string(),
+            "prompt_search_pending".to_string(),
+            "prompt_search_state".to_string(),
             "prompt_tags".to_string(),
             "prompt_version_variables".to_string(),
             "prompt_versions".to_string(),
+            "provider_input_state".to_string(),
             "resources".to_string(),
             "saved_prompts".to_string(),
             "schema_migrations".to_string(),
+            "semantic_journal_facts".to_string(),
+            "semantic_journal_sessions".to_string(),
+            "task_terminal_strip".to_string(),
             "tasks".to_string(),
+            "terminal_facts".to_string(),
         ]
     );
     assert_eq!(
         index_names(&conn),
         vec![
+            "idx_agent_provider_resource".to_string(),
+            "idx_command_receipts_scope".to_string(),
+            "idx_events_command".to_string(),
+            "idx_events_operation".to_string(),
             "idx_events_task_revision".to_string(),
             "idx_events_task_sequence".to_string(),
             "idx_operations_state".to_string(),
@@ -270,10 +369,13 @@ fn schema_open_applies_v1_tables_indexes_and_settings() {
             "idx_prompt_chain_events_chain_sequence".to_string(),
             "idx_prompt_chain_links_chain_position".to_string(),
             "idx_prompt_events_prompt_sequence".to_string(),
+            "idx_prompt_history_submitted".to_string(),
             "idx_prompt_tags_prompt_position".to_string(),
             "idx_prompt_version_variables_version_position".to_string(),
             "idx_prompt_versions_prompt_version".to_string(),
             "idx_resources_active".to_string(),
+            "idx_semantic_journal_facts_sequence".to_string(),
+            "idx_terminal_facts_task".to_string(),
         ]
     );
 
@@ -294,7 +396,7 @@ fn schema_open_applies_v1_tables_indexes_and_settings() {
             .map(|r| r.unwrap())
             .collect()
     };
-    assert_eq!(rows.len(), 13);
+    assert_eq!(rows.len(), 17);
     assert_eq!(rows[0].0, 1);
     assert_eq!(rows[0].1, "v1_initial");
     assert_eq!(rows[0].2.len(), 32);
@@ -334,6 +436,18 @@ fn schema_open_applies_v1_tables_indexes_and_settings() {
     assert_eq!(rows[12].0, 13);
     assert_eq!(rows[12].1, "phase07-prompt-history-v1");
     assert_eq!(rows[12].2.len(), 32);
+    assert_eq!(rows[13].0, 14);
+    assert_eq!(rows[13].1, "connect-identity-v1");
+    assert_eq!(rows[13].2.len(), 32);
+    assert_eq!(rows[14].0, 15);
+    assert_eq!(rows[14].1, "v15_agent_provider_resource_binding");
+    assert_eq!(rows[14].2.len(), 32);
+    assert_eq!(rows[15].0, 16);
+    assert_eq!(rows[15].1, "v16_terminal_facts_and_strip");
+    assert_eq!(rows[15].2.len(), 32);
+    assert_eq!(rows[16].0, 17);
+    assert_eq!(rows[16].1, "v17_events_operation_identity_index");
+    assert_eq!(rows[16].2.len(), 32);
 
     let compacted_digest_column: (String, i64) = conn
         .query_row(
@@ -416,7 +530,7 @@ fn schema_rejects_newer_changed_and_gapped_migrations() {
         let conn = open_raw(&path);
         conn.execute(
             "INSERT INTO schema_migrations(version, name, applied_at_ms, sha256)
-             VALUES (10, 'v10_future', 1, ?1)",
+             VALUES (18, 'v18_future', 1, ?1)",
             rusqlite::params![vec![0u8; 32]],
         )
         .expect("insert newer");
@@ -1132,7 +1246,7 @@ fn create_task_intent(task: TaskId) -> CreateTaskIntent {
         environment_id: env_id(0x10),
         title: "Ship kernel".into(),
         description: Some("Phase 1 domain".into()),
-        project_id: project_id(0x11),
+        project_id: host_test_project_id(),
         workspace: WorkspaceRef::Main,
         assignment: TaskAssignment::LocalOwner,
         created_at_ms: 1_725_000_000_000,
@@ -1200,7 +1314,7 @@ fn command_pure_create_persists_decision_operation_receipt_and_sequence() {
         Command::CreateTask(create_task_intent(task)),
     );
 
-    let receipt = store.execute(envelope).expect("create execute");
+    let receipt = execute_host_task_create(&mut store, envelope).expect("create execute");
     let CommandReceipt::Accepted {
         command_id,
         operation_id,
@@ -1278,14 +1392,16 @@ fn command_pure_rename_settles_with_decision_event_ids_only() {
     let mut store = KernelStore::open(&path).expect("open");
 
     let task = task_id(0xC3);
-    store
-        .execute(command_envelope(
+    execute_host_task_create(
+        &mut store,
+        command_envelope(
             command_id(0xC4),
             None,
             None,
             Command::CreateTask(create_task_intent(task)),
-        ))
-        .expect("create");
+        ),
+    )
+    .expect("create");
 
     let rename_cmd = command_id(0xC5);
     let receipt = store
@@ -1386,7 +1502,7 @@ fn command_pure_retry_returns_byte_equivalent_receipt() {
         None,
         Command::CreateTask(create_task_intent(task)),
     );
-    let first = store.execute(envelope.clone()).expect("first execute");
+    let first = execute_host_task_create(&mut store, envelope.clone()).expect("first execute");
     drop(store);
 
     let conn = open_raw(&path);
@@ -1402,9 +1518,8 @@ fn command_pure_retry_returns_byte_equivalent_receipt() {
     drop(conn);
 
     let mut store = KernelStore::open(&path).expect("reopen");
-    let second = store
-        .execute(envelope.clone())
-        .expect("retry same connection");
+    let second =
+        execute_host_task_create(&mut store, envelope.clone()).expect("retry same connection");
     assert_eq!(second, first);
 
     drop(store);
@@ -1422,7 +1537,7 @@ fn command_pure_retry_returns_byte_equivalent_receipt() {
     drop(conn);
 
     let mut store = KernelStore::open(&path).expect("reopen again");
-    let third = store.execute(envelope).expect("retry after reopen");
+    let third = execute_host_task_create(&mut store, envelope).expect("retry after reopen");
     assert_eq!(third, first);
     drop(store);
 
@@ -1438,14 +1553,16 @@ fn command_pure_revision_conflict_persists_rejected_receipt() {
     let mut store = KernelStore::open(&path).expect("open");
 
     let task = task_id(0xC8);
-    store
-        .execute(command_envelope(
+    execute_host_task_create(
+        &mut store,
+        command_envelope(
             command_id(0xC9),
             None,
             None,
             Command::CreateTask(create_task_intent(task)),
-        ))
-        .expect("create");
+        ),
+    )
+    .expect("create");
 
     let conflict_cmd = command_id(0xCA);
     let conflict_envelope = command_envelope(
@@ -1537,7 +1654,7 @@ fn command_pure_create_derives_scope_from_intent_id() {
     );
     assert_eq!(envelope.task_id, None, "CreateTask envelope stays unscoped");
 
-    let receipt = store.execute(envelope).expect("create");
+    let receipt = execute_host_task_create(&mut store, envelope).expect("create");
     let CommandReceipt::Accepted { .. } = receipt else {
         panic!("expected accepted, got {receipt:?}");
     };
@@ -1588,14 +1705,16 @@ fn command_pure_effectful_empty_decision_stays_unsupported() {
     let mut store = KernelStore::open(&path).expect("open");
 
     let task = task_id(0xCE);
-    store
-        .execute(command_envelope(
+    execute_host_task_create(
+        &mut store,
+        command_envelope(
             command_id(0xCF),
             None,
             None,
             Command::CreateTask(create_task_intent(task)),
-        ))
-        .expect("create");
+        ),
+    )
+    .expect("create");
     drop(store);
 
     let conn = open_raw(&path);
@@ -1640,14 +1759,16 @@ fn command_pure_effectful_empty_decision_stays_unsupported() {
 }
 
 fn create_open_task(store: &mut KernelStore, task: TaskId, cmd: CommandId) {
-    store
-        .execute(command_envelope(
+    execute_host_task_create(
+        store,
+        command_envelope(
             cmd,
             None,
             None,
             Command::CreateTask(create_task_intent(task)),
-        ))
-        .expect("create task");
+        ),
+    )
+    .expect("create task");
 }
 
 #[test]
@@ -1657,14 +1778,16 @@ fn operation_status_survives_reopen() {
     let task = task_id(0xB7);
     let create_command = command_id(0xB8);
     let mut store = KernelStore::open(&path).expect("open");
-    let operation = match store
-        .execute(command_envelope(
+    let operation = match execute_host_task_create(
+        &mut store,
+        command_envelope(
             create_command,
             None,
             None,
             Command::CreateTask(create_task_intent(task)),
-        ))
-        .expect("create task")
+        ),
+    )
+    .expect("create task")
     {
         CommandReceipt::Accepted { operation_id, .. } => operation_id,
         other => panic!("expected accepted create, got {other:?}"),
@@ -1775,14 +1898,16 @@ fn operation_status_rejects_missing_projection_with_durable_lineage() {
     let path = temp_db_path(&dir);
     let task = task_id(0xBA);
     let mut store = KernelStore::open(&path).expect("open");
-    let operation = match store
-        .execute(command_envelope(
+    let operation = match execute_host_task_create(
+        &mut store,
+        command_envelope(
             command_id(0xBB),
             None,
             None,
             Command::CreateTask(create_task_intent(task)),
-        ))
-        .expect("create task")
+        ),
+    )
+    .expect("create task")
     {
         CommandReceipt::Accepted { operation_id, .. } => operation_id,
         other => panic!("expected accepted create, got {other:?}"),
@@ -1881,14 +2006,16 @@ fn command_pure_corrupt_accepted_missing_operation() {
     drop(conn);
 
     let mut store = KernelStore::open(&path).expect("reopen");
-    let err = store
-        .execute(command_envelope(
+    let err = execute_host_task_create(
+        &mut store,
+        command_envelope(
             cmd,
             None,
             None,
             Command::CreateTask(create_task_intent(task)),
-        ))
-        .expect_err("missing operation must fail closed");
+        ),
+    )
+    .expect_err("missing operation must fail closed");
     assert_store_error_integrity(err);
 }
 
@@ -1925,14 +2052,16 @@ fn command_pure_corrupt_accepted_operation_id_mismatch() {
     drop(conn);
 
     let mut store = KernelStore::open(&path).expect("reopen");
-    let err = store
-        .execute(command_envelope(
+    let err = execute_host_task_create(
+        &mut store,
+        command_envelope(
             cmd,
             None,
             None,
             Command::CreateTask(create_task_intent(task)),
-        ))
-        .expect_err("operation_id mismatch must fail closed");
+        ),
+    )
+    .expect_err("operation_id mismatch must fail closed");
     assert_store_error_integrity(err);
 }
 
@@ -1955,14 +2084,16 @@ fn command_pure_corrupt_accepted_missing_committed_sequence() {
     drop(conn);
 
     let mut store = KernelStore::open(&path).expect("reopen");
-    let err = store
-        .execute(command_envelope(
+    let err = execute_host_task_create(
+        &mut store,
+        command_envelope(
             cmd,
             None,
             None,
             Command::CreateTask(create_task_intent(task)),
-        ))
-        .expect_err("accepted receipt without committed_sequence must fail");
+        ),
+    )
+    .expect_err("accepted receipt without committed_sequence must fail");
     assert_store_error_integrity(err);
 }
 
@@ -1989,14 +2120,16 @@ fn command_pure_corrupt_accepted_missing_committed_event() {
     drop(conn);
 
     let mut store = KernelStore::open(&path).expect("reopen");
-    let err = store
-        .execute(command_envelope(
+    let err = execute_host_task_create(
+        &mut store,
+        command_envelope(
             cmd,
             None,
             None,
             Command::CreateTask(create_task_intent(task)),
-        ))
-        .expect_err("missing committed event must fail");
+        ),
+    )
+    .expect_err("missing committed event must fail");
     assert_store_error_integrity(err);
 }
 
@@ -2020,14 +2153,16 @@ fn command_pure_corrupt_accepted_task_scope_mismatch() {
     drop(conn);
 
     let mut store = KernelStore::open(&path).expect("reopen");
-    let err = store
-        .execute(command_envelope(
+    let err = execute_host_task_create(
+        &mut store,
+        command_envelope(
             cmd,
             None,
             None,
             Command::CreateTask(create_task_intent(task)),
-        ))
-        .expect_err("task scope mismatch must fail");
+        ),
+    )
+    .expect_err("task scope mismatch must fail");
     assert_store_error_integrity(err);
 }
 
@@ -2039,22 +2174,27 @@ fn invalid_uuid_bytes() -> [u8; 16] {
     ]
 }
 
+fn retry_create_error(path: &Path, task: TaskId, cmd: CommandId) -> StoreError {
+    let mut store = KernelStore::open(path).expect("reopen");
+    execute_host_task_create(
+        &mut store,
+        command_envelope(
+            cmd,
+            None,
+            None,
+            Command::CreateTask(create_task_intent(task)),
+        ),
+    )
+    .expect_err("corrupt receipt correlation must fail closed")
+}
+
 fn assert_retry_create_fails_closed(path: &Path, task: TaskId, cmd: CommandId) {
     let events_before = {
         let conn = open_raw(path);
         count_table(&conn, "events")
     };
-    let mut store = KernelStore::open(path).expect("reopen");
-    let err = store
-        .execute(command_envelope(
-            cmd,
-            None,
-            None,
-            Command::CreateTask(create_task_intent(task)),
-        ))
-        .expect_err("corrupt receipt correlation must fail closed");
+    let err = retry_create_error(path, task, cmd);
     assert_store_error_integrity(err);
-    drop(store);
     let conn = open_raw(path);
     assert_eq!(count_table(&conn, "events"), events_before);
 }
@@ -2254,14 +2394,16 @@ fn command_pure_corrupt_decision_event_at_committed_sequence() {
     let mut store = KernelStore::open(&path).expect("open");
     let task = task_id(0x21);
     let cmd = command_id(0x22);
-    let receipt = store
-        .execute(command_envelope(
+    let receipt = execute_host_task_create(
+        &mut store,
+        command_envelope(
             cmd,
             None,
             None,
             Command::CreateTask(create_task_intent(task)),
-        ))
-        .expect("create");
+        ),
+    )
+    .expect("create");
     let CommandReceipt::Accepted {
         operation_id,
         task_revision,
@@ -2317,14 +2459,16 @@ fn command_pure_corrupt_forged_task_revision() {
     let mut store = KernelStore::open(&path).expect("open");
     let task = task_id(0x31);
     let cmd = command_id(0x32);
-    let receipt = store
-        .execute(command_envelope(
+    let receipt = execute_host_task_create(
+        &mut store,
+        command_envelope(
             cmd,
             None,
             None,
             Command::CreateTask(create_task_intent(task)),
-        ))
-        .expect("create");
+        ),
+    )
+    .expect("create");
     let CommandReceipt::Accepted {
         operation_id,
         event_ids,
@@ -2532,7 +2676,10 @@ fn command_pure_corrupt_accepted_scopes_all_null() {
     .unwrap();
     drop(conn);
 
-    assert_retry_create_fails_closed(&path, task, cmd);
+    assert_eq!(
+        retry_create_error(&path, task, cmd),
+        StoreError::CommandIdConflict
+    );
 }
 
 #[test]
@@ -2565,7 +2712,10 @@ fn command_pure_corrupt_alternate_scope_keeps_created_payload() {
     // TaskCreated payload still embeds the original task id.
     drop(conn);
 
-    assert_retry_create_fails_closed(&path, task, cmd);
+    assert_eq!(
+        retry_create_error(&path, task, cmd),
+        StoreError::CommandIdConflict
+    );
 }
 
 #[test]
@@ -2575,14 +2725,16 @@ fn command_pure_corrupt_create_revisions_forged_away_from_projection() {
     let mut store = KernelStore::open(&path).expect("open");
     let task = task_id(0x46);
     let cmd = command_id(0x47);
-    let receipt = store
-        .execute(command_envelope(
+    let receipt = execute_host_task_create(
+        &mut store,
+        command_envelope(
             cmd,
             None,
             None,
             Command::CreateTask(create_task_intent(task)),
-        ))
-        .expect("create");
+        ),
+    )
+    .expect("create");
     let CommandReceipt::Accepted {
         operation_id,
         event_ids,
@@ -3317,14 +3469,15 @@ fn command_pure_corrupt_noncanonical_resource_recipe_rolls_back() {
 
 fn seed_active_resource(path: &Path, task: TaskId, resource: ResourceId, generation: u64) {
     let conn = open_raw(path);
-    let current_revision: i64 = conn
+    let (current_revision, current_updated_at): (i64, i64) = conn
         .query_row(
-            "SELECT revision FROM tasks WHERE task_id = ?1",
+            "SELECT revision, updated_at_ms FROM tasks WHERE task_id = ?1",
             [task.as_bytes().as_slice()],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
-        .expect("task revision");
+        .expect("active-resource fixture task state");
     let next_revision = current_revision + 1;
+    let occurred_at_ms = current_updated_at + 1;
     let resource_facts = ResourceFacts {
         id: resource,
         task_id: Some(task),
@@ -3333,7 +3486,7 @@ fn seed_active_resource(path: &Path, task: TaskId, resource: ResourceId, generat
         recipe: ResourceRecipe::terminal(80, 24),
         lifecycle: ResourceLifecycle::Active,
         runtime_generation: generation,
-        updated_at_ms: 1,
+        updated_at_ms: occurred_at_ms,
     };
     insert_event(
         &conn,
@@ -3342,30 +3495,43 @@ fn seed_active_resource(path: &Path, task: TaskId, resource: ResourceId, generat
         Some(next_revision as u64),
         "resource.registered",
         i64::from(EVENT_SCHEMA_VERSION),
-        1,
+        occurred_at_ms,
         &rmp_serde::to_vec(&ResourceRegisteredPayload {
             resource: resource_facts,
         })
         .unwrap(),
     );
     conn.execute(
-        "UPDATE tasks SET revision = ?1, updated_at_ms = 1 WHERE task_id = ?2",
-        rusqlite::params![next_revision, task.as_bytes().as_slice()],
+        "UPDATE tasks SET revision = ?1, updated_at_ms = ?2 WHERE task_id = ?3",
+        rusqlite::params![next_revision, occurred_at_ms, task.as_bytes().as_slice()],
     )
     .expect("bump task revision for seeded resource");
     conn.execute(
         "INSERT INTO resources(
             resource_id, task_id, owner_kind, resource_kind, recipe, lifecycle,
             runtime_generation, updated_at_ms
-         ) VALUES (?1, ?2, 'task', 'terminal', ?3, 'active', ?4, 1)",
+         ) VALUES (?1, ?2, 'task', 'terminal', ?3, 'active', ?4, ?5)",
         rusqlite::params![
             resource.as_bytes().as_slice(),
             task.as_bytes().as_slice(),
             rmp_serde::to_vec(&ResourceRecipe::terminal(80, 24)).unwrap(),
             generation as i64,
+            occurred_at_ms,
         ],
     )
     .expect("seed active resource");
+    conn.execute(
+        "INSERT INTO terminal_facts(
+            resource_id, task_id, title, live_cwd, exit_code, exit_summary,
+            exited_at_ms, created_at_ms, last_activity_at_ms
+         ) VALUES (?1, ?2, NULL, NULL, NULL, NULL, NULL, ?3, ?3)",
+        rusqlite::params![
+            resource.as_bytes().as_slice(),
+            task.as_bytes().as_slice(),
+            occurred_at_ms,
+        ],
+    )
+    .expect("seed terminal facts projection");
 }
 
 #[test]
@@ -5834,7 +6000,7 @@ fn command_outcome_interleaved_task_events_do_not_break_settle_or_retries() {
         .execute(command_envelope(
             release_cmd,
             Some(task),
-            Some(1),
+            Some(2),
             Command::ReleaseResource {
                 resource_id: resource,
             },
@@ -6043,6 +6209,7 @@ fn command_outcome_terminal_outbox_dispatch_metadata_rules() {
         conn.execute(
             "UPDATE outbox
              SET attempts = 2,
+                 lease_generation = 2,
                  available_at_ms = ?1,
                  dispatch_started_at_ms = ?2
              WHERE operation_id = ?3",
@@ -6466,6 +6633,7 @@ fn command_outcome_dispatch_available_must_not_follow_started() {
         conn.execute(
             "UPDATE outbox
              SET attempts = 3,
+                 lease_generation = 3,
                  available_at_ms = ?1,
                  dispatch_started_at_ms = ?2
              WHERE operation_id = ?3",
@@ -6486,6 +6654,7 @@ fn command_outcome_dispatch_available_must_not_follow_started() {
         conn.execute(
             "UPDATE outbox
              SET attempts = 3,
+                 lease_generation = 3,
                  available_at_ms = ?1,
                  dispatch_started_at_ms = ?2
              WHERE operation_id = ?3",
@@ -7718,6 +7887,11 @@ fn command_outcome_full_snapshot_and_archive_integrity() {
         let conn = open_raw(&path);
         let events_before = count_table(&conn, "events");
         conn.execute(
+            "DELETE FROM terminal_facts WHERE resource_id = ?1",
+            [live.as_bytes().as_slice()],
+        )
+        .unwrap();
+        conn.execute(
             "DELETE FROM resources WHERE resource_id = ?1",
             [live.as_bytes().as_slice()],
         )
@@ -8711,14 +8885,16 @@ fn schema_rebuild_accepts_valid_pure_create_history() {
     let path = temp_db_path(&dir);
     let mut store = KernelStore::open(&path).expect("open");
     let task = task_id(0x39);
-    store
-        .execute(command_envelope(
+    execute_host_task_create(
+        &mut store,
+        command_envelope(
             command_id(0x3A),
             None,
             None,
             Command::CreateTask(create_task_intent(task)),
-        ))
-        .expect("create");
+        ),
+    )
+    .expect("create");
     drop(store);
 
     let mut store = KernelStore::open(&path).expect("reopen");
@@ -9415,7 +9591,7 @@ fn dispatch_claim_begin_rechecks_current_task_fence() {
 }
 
 #[test]
-fn dispatch_claim_skips_superseded_and_prestarted_pending_rows() {
+fn dispatch_claim_skips_superseded_and_reclaims_prestarted_retry_safe_rows() {
     let dir = TempDir::new().expect("tempdir");
     let path = temp_db_path(&dir);
     let mut store = KernelStore::open(&path).expect("open");
@@ -9472,7 +9648,7 @@ fn dispatch_claim_skips_superseded_and_prestarted_pending_rows() {
     let prestarted_at = accepted_at_ms(&conn, prestarted_operation);
     conn.execute(
         "UPDATE outbox
-         SET attempts = 1, dispatch_started_at_ms = ?1
+         SET attempts = 1, lease_generation = 1, dispatch_started_at_ms = ?1
          WHERE operation_id = ?2",
         rusqlite::params![prestarted_at, prestarted_operation.as_bytes().as_slice()],
     )
@@ -9484,7 +9660,19 @@ fn dispatch_claim_skips_superseded_and_prestarted_pending_rows() {
         .claim_next_dispatch(Duration::from_secs(30))
         .expect("scan candidates")
         .expect("later valid work must remain claimable");
-    let permit = store.begin_dispatch(&claim).expect("begin ready work");
+    let permit = store.begin_dispatch(&claim).expect("begin recovered work");
+    assert_eq!(
+        permit.effect(),
+        &Effect::BeginTaskTeardown {
+            task_id: prestarted_task,
+            action_epoch: 1,
+        }
+    );
+    let claim = store
+        .claim_next_dispatch(Duration::from_secs(30))
+        .expect("scan after recovered work")
+        .expect("later fresh work must remain claimable");
+    let permit = store.begin_dispatch(&claim).expect("begin fresh work");
     assert_eq!(
         permit.effect(),
         &Effect::BeginTaskTeardown {
@@ -9495,14 +9683,14 @@ fn dispatch_claim_skips_superseded_and_prestarted_pending_rows() {
     assert_eq!(
         store.claim_next_dispatch(Duration::from_secs(30)),
         Ok(None),
-        "cancelled superseded close leaves no stale claim source; prestarted legacy row stays ineligible/skipped",
+        "cancelled superseded close leaves no stale claim source after retry-safe work is recovered",
     );
     drop(store);
 
     let conn = open_raw(&path);
     for (operation_id, expected) in [
         (superseded_operation, "cancelled"),
-        (prestarted_operation, "pending"),
+        (prestarted_operation, "dispatching"),
         (ready_operation, "dispatching"),
     ] {
         let state: String = conn
@@ -9521,7 +9709,7 @@ fn dispatch_claim_skips_superseded_and_prestarted_pending_rows() {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
-    assert_eq!(prestarted_attempts, 1);
+    assert_eq!(prestarted_attempts, 2);
     assert!(prestarted_started.is_some());
 }
 

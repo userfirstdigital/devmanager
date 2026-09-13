@@ -5,10 +5,11 @@
 //! approval for the missing canonical Task Cockpit shell.
 
 use crate::client::action::{
-    catalog, task_create_command, task_rename_command, ActionArgumentSchema, ActionRequest,
-    ServiceControlArguments, TaskCreateArguments, TaskRenameArguments, ACTION_HOST_ACTIONS,
-    ACTION_HOST_STATUS, ACTION_SERVICE_RESTART, ACTION_SERVICE_START, ACTION_SERVICE_STOP,
-    ACTION_TASK_ARCHIVE, ACTION_TASK_DELETE, ACTION_TASK_LIST, ACTION_TASK_SHOW,
+    catalog, task_create_command, task_create_v2_command, task_rename_command,
+    ActionArgumentSchema, ActionRequest, ServiceControlArguments, TaskCreateArguments,
+    TaskCreateV2Arguments, TaskRenameArguments, ACTION_HOST_ACTIONS, ACTION_HOST_STATUS,
+    ACTION_SERVICE_RESTART, ACTION_SERVICE_START, ACTION_SERVICE_STOP, ACTION_TASK_ARCHIVE,
+    ACTION_TASK_CREATE_V2, ACTION_TASK_DELETE, ACTION_TASK_LIST, ACTION_TASK_SHOW,
 };
 use crate::client::model::{ClientModel, ClientModelBuilder, ClientModelError};
 use crate::domain::command::ServiceControlAction;
@@ -53,6 +54,7 @@ pub enum CatalogInput {
     None,
     TaskId(TaskId),
     Create(TaskCreateArguments),
+    CreateV2(TaskCreateV2Arguments),
     Rename {
         args: TaskRenameArguments,
         expected_revision: u64,
@@ -484,8 +486,22 @@ pub fn request_from_catalog(id: &str, input: CatalogInput) -> Result<ActionReque
                 "task.rename requires TaskRenameArguments".into(),
             )),
         },
-        ActionArgumentSchema::TaskCreateV2
-        | ActionArgumentSchema::ProviderInputV1
+        ActionArgumentSchema::TaskCreateV2 => match (id, input) {
+            (ACTION_TASK_CREATE_V2, CatalogInput::CreateV2(args)) => {
+                task_create_v2_command(
+                    CommandId::new(),
+                    ClientId::new(),
+                    1_725_000_000_100,
+                    args.clone(),
+                )
+                .map_err(|error| QualityError::InvalidControl(error.to_string()))?;
+                Ok(ActionRequest::TaskCreateV2(args))
+            }
+            (other, _) => Err(QualityError::InvalidControl(format!(
+                "{other} requires TaskCreateV2Arguments"
+            ))),
+        },
+        ActionArgumentSchema::ProviderInputV1
         | ActionArgumentSchema::PromptMetadataPageV1
         | ActionArgumentSchema::PromptVersionPageV1
         | ActionArgumentSchema::PromptDiffV1

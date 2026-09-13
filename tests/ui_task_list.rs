@@ -283,7 +283,7 @@ fn inbox_excludes_archived_tasks_and_rejects_their_navigation() {
 }
 
 #[test]
-fn native_task_list_groups_settled_tasks_after_active_and_excludes_archive() {
+fn native_task_list_groups_settled_and_archived_tasks_after_active() {
     let active = task_id_from_index(21);
     let settled = task_id_from_index(22);
     let archived = task_id_from_index(23);
@@ -295,7 +295,7 @@ fn native_task_list_groups_settled_tasks_after_active_and_excludes_archive() {
 
     let list =
         TaskList::from_client_model_with_settled_virtual(&model).expect("bounded native task list");
-    assert_eq!(list.task_ids(), &[active, settled]);
+    assert_eq!(list.task_ids(), &[active, settled, archived]);
     assert_eq!(model.task_projection_index().active_count(), 1);
     assert_eq!(model.task_projection_index().archived_count(), 1);
     assert_eq!(

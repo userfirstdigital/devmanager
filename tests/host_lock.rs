@@ -742,9 +742,20 @@ fn debug_host_rejects_empty_or_production_profile_and_missing_foreground() {
 }
 
 #[test]
-#[cfg(not(windows))]
-fn acquire_is_unsupported_off_windows() {
+#[cfg(target_os = "linux")]
+fn acquire_is_exclusive_on_linux() {
     let root = TempDir::new().expect("temp profile root");
-    let err = HostLock::acquire(root.path(), "unsupported").expect_err("unsupported");
-    assert!(matches!(err, HostLockError::Unsupported));
+    let first = HostLock::acquire(root.path(), "linux-integration").expect("first acquire");
+    let error = HostLock::acquire(root.path(), "linux-integration").expect_err("exclusive lock");
+    assert!(matches!(error, HostLockError::AlreadyRunning { .. }));
+    drop(first);
+    HostLock::acquire(root.path(), "linux-integration").expect("reacquire after release");
+}
+
+#[test]
+#[cfg(not(any(windows, target_os = "linux")))]
+fn acquire_is_unsupported_on_other_platforms() {
+    let root = TempDir::new().expect("temp profile root");
+    let error = HostLock::acquire(root.path(), "unsupported").expect_err("unsupported");
+    assert!(matches!(error, HostLockError::Unsupported));
 }

@@ -2,7 +2,7 @@ use devmanager::domain::ProviderSessionId;
 use devmanager::providers::adapter::{
     LaunchProviderRequest, ProviderAdapter, ProviderProbeKind, ProviderProbeRequest,
 };
-use devmanager::providers::capabilities::{ProviderCapability, ProviderExecutable, ProviderKind};
+use devmanager::providers::capabilities::{ProviderCapability, ProviderExecutable};
 use devmanager::providers::conformance::{
     decide_strict_resume, reject_smoke_sensitive_payload, ResumeOutcome, StrictResumeFailure,
 };
@@ -106,6 +106,11 @@ fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
+fn test_executable() -> ProviderExecutable {
+    ProviderExecutable::from_path(std::env::current_exe().expect("test executable path"))
+        .expect("attested test executable")
+}
+
 fn invoke_provider_smoke(args: &[&str]) -> (i32, String, String) {
     let script = repo_root().join("scripts/native-next/Invoke-ProviderSmoke.ps1");
     let mut command = Command::new("pwsh");
@@ -149,7 +154,7 @@ fn smoke_matrix_probe_argv_matches_public_probe_kind_contract() {
     assert_eq!(document["launchesProvider"], false);
     assert_eq!(document["residueCount"], 0);
 
-    let executable = ProviderExecutable::new(PathBuf::from("C:/bin/claude"), [0x11; 32]).unwrap();
+    let executable = test_executable();
     let handle = executable.open_for_launch().unwrap();
 
     for provider in document["providers"].as_array().unwrap() {
@@ -264,8 +269,7 @@ fn exact_resume_failure_stays_visible_and_never_falls_back_to_fresh() {
     }
 
     let adapter = CursorAdapter::new();
-    let executable =
-        ProviderExecutable::new(PathBuf::from("C:/bin/cursor-agent"), [0x44; 32]).unwrap();
+    let executable = test_executable();
     let session = ProviderSessionId::new("chat-id-must-not-be-inferred").unwrap();
     assert!(matches!(
         adapter.build_launch(LaunchProviderRequest::new(

@@ -34,8 +34,9 @@ mod provider_health_tests;
 pub use crate::updater::handoff::{HostUpdateAdmission, HostUpdateHandoff};
 pub(crate) use connect::serve_host_connect_duplex;
 pub use connection::{
-    dispatch_host_request, HostConnectDuplex, HostExecutorOutcome, HostRequestExecutor,
-    HostRequestHandle, PhysicalExitArmRequest, SupervisedHostExecutor, HOST_REQUEST_QUEUE_CAPACITY,
+    dispatch_host_request, dispatch_host_request_with_workspace_projects, HostConnectDuplex,
+    HostExecutorOutcome, HostRequestExecutor, HostRequestHandle, PhysicalExitArmRequest,
+    SupervisedHostExecutor, HOST_REQUEST_QUEUE_CAPACITY,
 };
 #[cfg(test)]
 pub(crate) use connection::{ConnectionOutputHandle, ConnectionOutputId, OutputInspection};

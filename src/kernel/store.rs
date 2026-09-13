@@ -493,6 +493,26 @@ impl KernelStore {
         command_bus::execute(self, envelope)
     }
 
+    /// Execute a task create against a configured-project authority issued by
+    /// the canonical host config store. The authority is opaque, and the
+    /// command is still rebound to a host-validated durable workspace before
+    /// it enters the transaction.
+    pub fn execute_configured_task_create(
+        &mut self,
+        envelope: CommandEnvelope,
+        workspace_projects: &crate::workspace::WorkspaceProjectRoots,
+        request_id: crate::domain::id::RequestId,
+        connection_id: uuid::Uuid,
+    ) -> Result<CommandReceipt, StoreError> {
+        command_bus::execute_configured_task_create(
+            self,
+            envelope,
+            workspace_projects,
+            request_id,
+            connection_id,
+        )
+    }
+
     /// Execute a host-normalized CreateTask with opaque workspace authority.
     pub(crate) fn execute_authorized(
         &mut self,

@@ -70,7 +70,7 @@ fn durable_settlement_adapter_stays_on_existing_tx_path() {
         "pub struct DurableProviderDeliveryAdapter",
         "pub fn apply_provider_durable_settlement_in_tx",
         "pub fn commit_provider_durable_settlement",
-        "PromptHistoryStore::apply_delivered_in_tx(tx, &proof)",
+        "Self::apply_delivered_in_tx(tx, &proof)",
         "from_provider_durable_settlement",
         "ProviderInputUnavailable",
     ] {

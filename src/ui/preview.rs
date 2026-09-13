@@ -537,7 +537,24 @@ impl ComponentGalleryFixture {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+fn sanitize_gallery_fixture(mut gallery: ComponentGalleryFixture) -> ComponentGalleryFixture {
+    use crate::ui::components::interaction::redact_sensitive_text;
+
+    for value in [
+        &mut gallery.samples.long_text,
+        &mut gallery.samples.unicode,
+        &mut gallery.samples.missing,
+        &mut gallery.samples.error,
+        &mut gallery.samples.loading,
+        &mut gallery.samples.empty,
+        &mut gallery.samples.overflow,
+    ] {
+        *value = redact_sensitive_text(value);
+    }
+    gallery
+}
+
+#[derive(Clone, PartialEq, Eq)]
 pub struct PreviewPathPolicy {
     fixture_root: PathBuf,
     output_root: PathBuf,
@@ -586,12 +603,28 @@ impl PreviewPathPolicy {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+impl std::fmt::Debug for PreviewPathPolicy {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("PreviewPathPolicy(REDACTED)")
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
 pub struct PreviewRequest {
     fixture_path: PathBuf,
     output_path: PathBuf,
     settle_delay_ms: u32,
     trusted_output_authority: Arc<preview_capture::CaptureOutputAuthority>,
+}
+
+impl std::fmt::Debug for PreviewRequest {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PreviewRequest")
+            .field("paths", &"REDACTED")
+            .field("settle_delay_ms", &self.settle_delay_ms)
+            .finish()
+    }
 }
 
 impl PreviewRequest {
@@ -648,10 +681,9 @@ impl PreviewRequest {
             return Err(PreviewError::SensitivePath { path: fixture_path });
         }
         if fixture_path.extension().and_then(OsStr::to_str) != Some("json") {
-            return Err(PreviewError::InvalidArgument(format!(
-                "fixture must use the .json extension: {}",
-                fixture_path.display()
-            )));
+            return Err(PreviewError::InvalidArgument(
+                "fixture must use the .json extension".into(),
+            ));
         }
         match fs::metadata(&fixture_path) {
             Ok(metadata) if metadata.is_file() => {
@@ -697,10 +729,9 @@ impl PreviewRequest {
             });
         }
         if output_path.extension().and_then(OsStr::to_str) != Some("png") {
-            return Err(PreviewError::InvalidArgument(format!(
-                "output must use the .png extension: {}",
-                output_path.display()
-            )));
+            return Err(PreviewError::InvalidArgument(
+                "output must use the .png extension".into(),
+            ));
         }
         if output_path.exists() {
             return Err(PreviewError::OutputAlreadyExists { path: output_path });
@@ -943,7 +974,7 @@ impl PreviewApplication {
                         path: request.fixture_path.clone(),
                         message,
                     })?;
-                Some(gallery)
+                Some(sanitize_gallery_fixture(gallery))
             }
             ("component_gallery", None) => {
                 return Err(PreviewError::MalformedFixture {
@@ -996,19 +1027,22 @@ impl PreviewApplication {
             message,
         })?;
         let is_task_cockpit = fixture.root.kind == "task-cockpit";
+        let safe_title = crate::ui::components::interaction::redact_sensitive_text(&fixture.title);
+        let safe_label =
+            crate::ui::components::interaction::redact_sensitive_text(&fixture.root.label);
         let body = if is_task_cockpit {
             format!(
                 "Task Cockpit\nHeader unavailable\nTask Inbox\nContext Dock\nHost unavailable\n{}",
-                fixture.title
+                safe_title
             )
         } else {
-            format!("{}: {}", fixture.root.label, fixture.title)
+            format!("{safe_label}: {safe_title}")
         };
         let root_snapshot = PreviewRootSnapshot {
             fixture_id: fixture.id,
             root_kind: fixture.root.kind,
             body,
-            title: fixture.title,
+            title: safe_title,
             component_gallery,
             conversation,
             tasks,
@@ -1655,7 +1689,7 @@ impl PreviewError {
         output_path: &Path,
         depth: usize,
     ) -> Self {
-        let reason = error.to_string();
+        let reason = preview_capture::bounded_redacted_diagnostic(&error.to_string());
         match error {
             preview_capture::PreviewCaptureError::UnsupportedPlatform => {
                 Self::VisibleWindowsCaptureUnavailable {
@@ -1703,16 +1737,16 @@ impl PreviewError {
             }
             preview_capture::PreviewCaptureError::CaptureFailed(message) => {
                 Self::WindowsGraphicsCaptureFailed {
-                    reason: message.to_owned(),
+                    reason: preview_capture::bounded_redacted_diagnostic(message),
                 }
             }
             preview_capture::PreviewCaptureError::ApplicationFailed(message) => {
                 Self::ApplicationFailed {
-                    reason: message.to_owned(),
+                    reason: preview_capture::bounded_redacted_diagnostic(message),
                 }
             }
             preview_capture::PreviewCaptureError::PngFailed(message) => Self::PngFailed {
-                reason: message.to_owned(),
+                reason: preview_capture::bounded_redacted_diagnostic(message),
             },
             preview_capture::PreviewCaptureError::OutputAlreadyExists => {
                 Self::OutputAlreadyExists {
@@ -1720,7 +1754,7 @@ impl PreviewError {
                 }
             }
             preview_capture::PreviewCaptureError::OutputFailed(message) => Self::OutputFailed {
-                reason: message.to_owned(),
+                reason: preview_capture::bounded_redacted_diagnostic(message),
             },
             preview_capture::PreviewCaptureError::ForegroundChanged { before, after } => {
                 Self::ForegroundChanged {
@@ -1737,7 +1771,9 @@ impl PreviewError {
                 Self::CaptureCleanupFailed {
                     primary: Box::new(primary),
                     operation: context.operation(),
-                    reason: context.secondary().to_string(),
+                    reason: preview_capture::bounded_redacted_diagnostic(
+                        &context.secondary().to_string(),
+                    ),
                 }
             }
         }
@@ -1746,81 +1782,48 @@ impl PreviewError {
 
 impl Display for PreviewError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Usage(message) => write!(f, "{message}\n{PREVIEW_USAGE}"),
-            Self::InvalidArgument(message) => f.write_str(message),
-            Self::OutsideApprovedRoot { path, root_kind } => {
-                write!(
-                    f,
-                    "{root_kind} path is outside approved roots: {}",
-                    path.display()
-                )
+        let rendered = match self {
+            Self::Usage(message) => format!("{message}\n{PREVIEW_USAGE}"),
+            Self::InvalidArgument(message) => message.clone(),
+            Self::OutsideApprovedRoot { root_kind, .. } => {
+                format!("{root_kind} path is outside approved roots")
             }
-            Self::SensitivePath { path } => {
-                write!(f, "sensitive production path refused: {}", path.display())
-            }
-            Self::FixtureMissing { path } => {
-                write!(f, "fixture does not exist: {}", path.display())
-            }
-            Self::FixtureNotRegular { path } => {
-                write!(f, "fixture is not a regular file: {}", path.display())
-            }
+            Self::SensitivePath { .. } => "sensitive production path refused".into(),
+            Self::FixtureMissing { .. } => "fixture does not exist".into(),
+            Self::FixtureNotRegular { .. } => "fixture is not a regular file".into(),
             Self::FixtureTooLarge {
-                path,
-                bytes,
-                max_bytes,
-            } => write!(
-                f,
-                "fixture is too large ({} bytes; max {}): {}",
-                bytes,
-                max_bytes,
-                path.display()
-            ),
-            Self::FixtureIo { path, message } => {
-                write!(f, "fixture I/O failed for {}: {message}", path.display())
+                bytes, max_bytes, ..
+            } => format!("fixture is too large ({bytes} bytes; max {max_bytes})"),
+            Self::FixtureIo { message, .. } => format!("fixture I/O failed: {message}"),
+            Self::MalformedFixture { message, .. } => format!("malformed fixture: {message}"),
+            Self::UnsupportedSchema { schema, .. } => {
+                format!("unsupported fixture schema {schema}")
             }
-            Self::MalformedFixture { path, message } => {
-                write!(f, "malformed fixture {}: {message}", path.display())
-            }
-            Self::UnsupportedSchema { path, schema } => write!(
-                f,
-                "unsupported fixture schema {schema} in {}",
-                path.display()
-            ),
-            Self::OutputAlreadyExists { path } => write!(
-                f,
-                "refusing to overwrite existing output: {}",
-                path.display()
-            ),
+            Self::OutputAlreadyExists { .. } => "refusing to overwrite existing output".into(),
             Self::HeadlessInitializationFailed => {
-                f.write_str("headless preview initialization did not complete")
+                "headless preview initialization did not complete".into()
             }
             Self::VisibleWindowsCaptureUnavailable { kind, reason } => {
-                write!(
-                    f,
-                    "visible Windows preview capture unavailable ({kind:?}): {reason}"
-                )
+                format!("visible Windows preview capture unavailable ({kind:?}): {reason}")
             }
-            Self::PngFailed { reason } => write!(f, "PNG encoding failed: {reason}"),
-            Self::OutputFailed { reason } => write!(f, "PNG output failed: {reason}"),
-            Self::ForegroundChanged { before, after } => write!(
-                f,
-                "foreground HWND changed during capture (before {before:#x}, after {after:#x})"
-            ),
+            Self::PngFailed { reason } => format!("PNG encoding failed: {reason}"),
+            Self::OutputFailed { reason } => format!("PNG output failed: {reason}"),
+            Self::ForegroundChanged { .. } => "foreground window changed during capture".into(),
             Self::ApplicationFailed { reason } => {
-                write!(f, "GPUI preview application failed: {reason}")
+                format!("GPUI preview application failed: {reason}")
             }
             Self::WindowsGraphicsCaptureFailed { reason } => {
-                write!(f, "Windows Graphics Capture failed: {reason}")
+                format!("Windows Graphics Capture failed: {reason}")
             }
             Self::CaptureCleanupFailed {
                 primary,
                 operation,
                 reason,
             } => {
-                write!(f, "{primary}; cleanup {operation} failed: {reason}")
+                format!("{primary}; cleanup {operation} failed: {reason}")
             }
-        }
+        };
+        f.write_str(&preview_capture::bounded_redacted_diagnostic(&rendered))
     }
 }
 

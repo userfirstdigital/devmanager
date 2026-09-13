@@ -10295,6 +10295,28 @@ pub fn dispatch_host_request(
     dispatch_authenticated_request(authenticated_client_id, capabilities, bus, request)
 }
 
+/// Authenticated host dispatch with a sealed configured-project authority.
+///
+/// Callers cannot construct [`WorkspaceProjectRoots`] from raw paths. The
+/// authority must come from the host's validated [`ConfigStore`], so exposing
+/// this seam does not let a client choose the durable workspace used by task
+/// creation.
+pub fn dispatch_host_request_with_workspace_projects(
+    authenticated_client_id: ClientId,
+    capabilities: CapabilitySet,
+    bus: &mut CommandBus,
+    workspace_projects: &WorkspaceProjectRoots,
+    request: ClientRequest,
+) -> Result<ServerMessage, IpcError> {
+    dispatch_authenticated_request_with_workspace_projects(
+        authenticated_client_id,
+        capabilities,
+        bus,
+        workspace_projects,
+        request,
+    )
+}
+
 /// Authenticated client_id check plus CommandBus execute/query dispatch.
 ///
 /// Used by the exclusive [`super::ipc::HostConnection::serve_request`]

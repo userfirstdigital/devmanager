@@ -2525,6 +2525,7 @@ async fn cursor_public_adapter_registers_without_accepting_desktop_cursor_exe() 
         rejected,
         Err(ProviderError::WrapperCommandNotAllowed { .. })
             | Err(ProviderError::ExecutableNotAllowed { .. })
+            | Err(ProviderError::Executable(_))
     ));
 }
 

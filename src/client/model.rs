@@ -1887,7 +1887,8 @@ impl ClientModel {
                     artifact_summary: None,
                 })
             }
-            Event::ArtifactRegistered { artifact } => {
+            Event::ArtifactRegistered { artifact }
+            | Event::SpecialistHandoffRecorded { artifact, .. } => {
                 if self.artifact_summaries.contains_key(&artifact.id) {
                     return Err(ClientModelError::DuplicateItem);
                 }

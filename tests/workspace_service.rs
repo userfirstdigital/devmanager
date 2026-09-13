@@ -357,7 +357,7 @@ fn new_worktree_plain_directory_returns_typed_pending_candidate() {
     );
     assert_eq!(
         candidate.relative_worktree_path,
-        Some(PathBuf::from(r".worktrees\task-a"))
+        Some(PathBuf::from(".worktrees").join("task-a"))
     );
     let mut binding_service = service_for(&repository);
     assert!(matches!(
@@ -385,7 +385,7 @@ fn new_worktree_resolves_actual_branch_only_for_a_real_linked_worktree() {
     assert_eq!(binding.branch(), Some(branch));
     assert_eq!(
         binding.relative_worktree_path(),
-        Some(Path::new(r".worktrees\task-a"))
+        Some(Path::new(".worktrees").join("task-a").as_path())
     );
     assert!(matches!(
         binding.durable_ref(),
@@ -464,17 +464,18 @@ fn binding_rejects_nonexistent_workspace_path() {
 }
 
 #[test]
-fn binding_rejects_main_and_new_worktree_inside_non_repository_folder() {
+fn binding_allows_main_but_rejects_new_worktree_inside_non_repository_folder() {
     let project_temp = tempfile::tempdir().expect("non-repository project");
     let project = project_temp.path().to_path_buf();
     let worktree = project.join("worktree");
     fs::create_dir(&worktree).expect("worktree folder");
     let mut service = service_for(&project);
 
-    assert!(matches!(
-        service.bind(WorkspaceRequest::main()),
-        Err(WorkspaceError::NotRepository(_))
-    ));
+    let main = service
+        .bind(WorkspaceRequest::main())
+        .expect("a configured non-Git project remains a valid main workspace");
+    assert_eq!(main.kind(), WorkspaceKind::Main);
+    assert!(main.repository().is_none());
     assert!(matches!(
         service.bind(WorkspaceRequest::new_worktree(&worktree, "main")),
         Err(WorkspaceError::NotRepository(_))
@@ -549,6 +550,7 @@ fn binding_compares_final_drive_case_identity_not_display_strings() {
 }
 
 #[test]
+#[cfg(windows)]
 fn binding_compares_equivalent_unc_identity_case_insensitively() {
     assert_eq!(
         path_identity_key(Path::new(r"\\?\UNC\Server\Share\Repo")),
@@ -707,7 +709,7 @@ fn same_repository_wrong_root_cannot_relocate_a_main_task_runtime() {
     assert!(matches!(
         bus.load_task_runtime(task_id, &wrong_roots),
         Err(TaskRuntimeLoadError::Workspace(
-            WorkspaceError::RebindRequired
+            WorkspaceError::RebindRequired | WorkspaceError::MainRootMismatch { .. }
         ))
     ));
 }

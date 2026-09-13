@@ -300,7 +300,7 @@ fn snapshot_listener_endpoints_with_lsof(
     let filter: HashSet<u16> = ports.iter().copied().collect();
     let output = run_bounded_command(
         trusted_lsof_program(),
-        &["-nP", "-iTCP", "-sTCP:LISTEN", "-F", "pn"],
+        &["-nP", "-iTCP", "-sTCP:LISTEN", "-F", "ptn"],
     )?;
     require_listener_command_success(&output)?;
 
@@ -308,6 +308,7 @@ fn snapshot_listener_endpoints_with_lsof(
     let mut current_pid = None;
     let stdout = std::str::from_utf8(&output.stdout)
         .map_err(|_| "listener_probe.invalid_utf8".to_string())?;
+    let mut current_ipv6 = None;
     for line in stdout.lines() {
         if line.is_empty() {
             continue;
@@ -324,12 +325,20 @@ fn snapshot_listener_endpoints_with_lsof(
                         .parse::<u32>()
                         .map_err(|_| "listener_probe.invalid_pid".to_string())?,
                 );
+                current_ipv6 = None;
+            }
+            "t" => {
+                current_ipv6 = match value.trim() {
+                    "IPv4" => Some(false),
+                    "IPv6" => Some(true),
+                    _ => return Err("listener_probe.unsupported_socket_type".to_string()),
+                };
             }
             "n" => {
                 let Some(pid) = current_pid else {
                     return Err("listener_probe.endpoint_without_pid".to_string());
                 };
-                let endpoint = parse_lsof_listener_endpoint(value, pid)
+                let endpoint = parse_lsof_listener_endpoint_with_family(value, pid, current_ipv6)
                     .ok_or_else(|| "listener_probe.malformed_endpoint".to_string())?;
                 if filter.contains(&endpoint.port()) {
                     let rows = listeners.entry(endpoint.port()).or_default();
@@ -494,6 +503,15 @@ fn read_bounded(
 
 #[cfg(not(windows))]
 fn parse_lsof_listener_endpoint(value: &str, pid: u32) -> Option<TcpEndpointRecord> {
+    parse_lsof_listener_endpoint_with_family(value, pid, None)
+}
+
+#[cfg(not(windows))]
+fn parse_lsof_listener_endpoint_with_family(
+    value: &str,
+    pid: u32,
+    ipv6: Option<bool>,
+) -> Option<TcpEndpointRecord> {
     let endpoint = value
         .trim()
         .split("->")
@@ -509,6 +527,7 @@ fn parse_lsof_listener_endpoint(value: &str, pid: u32) -> Option<TcpEndpointReco
     };
     let port = port_text.trim().parse::<u16>().ok()?;
     let address = match address.trim() {
+        "*" if ipv6 == Some(true) => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
         "*" | "0.0.0.0" => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
         "[::]" | "*:*" => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
         address => address.parse().ok()?,
@@ -1431,7 +1450,9 @@ mod tests {
 
 #[cfg(all(test, not(windows)))]
 mod non_windows_tests {
-    use super::{parse_lsof_listener_port, run_bounded_command};
+    use super::{
+        parse_lsof_listener_endpoint_with_family, parse_lsof_listener_port, run_bounded_command,
+    };
 
     #[test]
     fn listener_probe_uses_a_pinned_lsof_path() {
@@ -1450,6 +1471,14 @@ mod non_windows_tests {
         assert_eq!(parse_lsof_listener_port("127.0.0.1:3000"), Some(3000));
         assert_eq!(parse_lsof_listener_port("[::1]:5174"), Some(5174));
         assert_eq!(parse_lsof_listener_port("*:8080 (LISTEN)"), Some(8080));
+    }
+
+    #[test]
+    fn parse_lsof_wildcard_uses_the_reported_socket_family() {
+        let ipv4 = parse_lsof_listener_endpoint_with_family("*:8080", 42, Some(false)).unwrap();
+        let ipv6 = parse_lsof_listener_endpoint_with_family("*:8080", 42, Some(true)).unwrap();
+        assert!(ipv4.bind_address().is_ipv4());
+        assert!(ipv6.bind_address().is_ipv6());
     }
 
     #[test]

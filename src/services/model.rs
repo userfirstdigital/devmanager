@@ -1308,6 +1308,11 @@ impl ServiceCatalog {
             .get(&root)
             .expect("root definition checked by admit");
         let runtime = snapshot.services.get(&root).expect("root checked by admit");
+        if matches!(runtime.state, ServiceState::Unknown) {
+            return AdmissionDecision::Refused(AdmissionRejection::EvidenceUnknown {
+                service: root,
+            });
+        }
         if let Err(rejection) = validate_ownership(
             &root,
             definition,

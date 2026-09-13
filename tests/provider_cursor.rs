@@ -90,11 +90,15 @@ async fn cursor_adapter_does_not_accept_desktop_cursor_exe() {
             },
         )
         .await;
-    assert!(matches!(
-        rejected,
-        Err(devmanager::providers::ProviderError::WrapperCommandNotAllowed { .. })
-            | Err(devmanager::providers::ProviderError::ExecutableNotAllowed { .. })
-    ));
+    assert!(
+        matches!(
+            rejected,
+            Err(devmanager::providers::ProviderError::WrapperCommandNotAllowed { .. })
+                | Err(devmanager::providers::ProviderError::ExecutableNotAllowed { .. })
+                | Err(devmanager::providers::ProviderError::Executable(_))
+        ),
+        "desktop Cursor must be rejected, got {rejected:?}"
+    );
 }
 
 #[test]

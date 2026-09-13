@@ -1930,10 +1930,25 @@ impl TaskComposer {
         let mut metadata =
             AccessibilityMetadata::new(AccessibleRole::Button, control_label(control))?;
         let availability = self.availability(control)?;
+        let empty_submission = match control {
+            ComposerControl::SendNow => {
+                self.field.value().trim().is_empty() && self.attachments.is_empty()
+            }
+            ComposerControl::Steer | ComposerControl::QueueFollowUp => {
+                self.field.value().trim().is_empty()
+            }
+            _ => false,
+        };
         if !availability.is_available() {
             if let Some(reason) = availability.reason() {
-                metadata.set_description(reason)?;
+                metadata.set_description(format!("{reason} ({})", expected_action_id(control)))?;
             }
+            metadata.set_disabled(true);
+        } else if empty_submission {
+            metadata.set_description(format!(
+                "composer draft is empty ({})",
+                expected_action_id(control)
+            ))?;
             metadata.set_disabled(true);
         }
         if let Some(model) = self.controls.get(&control) {

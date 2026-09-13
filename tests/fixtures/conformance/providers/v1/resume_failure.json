@@ -1,6 +1,6 @@
 {
   "case_id": "strict_resume_failure",
-  "provider": "claude_code",
+  "provider": "claude",
   "version": "1.0.0",
   "task_id": "018f0000-0000-7000-8000-000000000001",
   "agent_id": "018f0000-0000-7000-8000-000000000002",
@@ -12,7 +12,7 @@
   "resume_command_proven": true,
   "provider_session_id": "sess_missing_upstream",
   "capabilities": {
-    "kind": "claude_code",
+    "kind": "claude",
     "version": "1.0.0",
     "auth_state": "unknown",
     "exact_resume": "supported",
@@ -27,9 +27,16 @@
         "source": "capability_probe",
         "observed_at": 1,
         "status": "failed",
-        "diagnostic": { "code": "probe_failed" }
+        "diagnostic": {
+          "code": "probe_failed"
+        },
+        "schema_version": 1,
+        "expires_at": null,
+        "confidence": "unknown",
+        "auth_source": null
       }
-    ]
+    ],
+    "schema_version": 1
   },
   "events": [],
   "declared_metrics": [

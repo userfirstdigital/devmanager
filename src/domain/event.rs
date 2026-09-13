@@ -2600,6 +2600,9 @@ fn apply_into(
             if agent.task_id != snap.task.id {
                 return Err(ApplyError::OwnershipConflict);
             }
+            if matches!(agent.role, AgentRole::Specialist { .. }) {
+                return Err(ApplyError::InvalidTransition);
+            }
             agent
                 .validate_for_registration()
                 .map_err(|_| ApplyError::InvalidTransition)?;

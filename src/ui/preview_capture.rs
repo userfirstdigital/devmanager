@@ -478,9 +478,9 @@ impl PublishedOutput {
         #[cfg(unix)]
         {
             let _ = authority;
-            // Unix has no unlink-by-file-descriptor primitive.  A name check
+            // Unix has no unlink-by-file-descriptor primitive. A name check
             // followed by unlinkat would be a TOCTOU deletion primitive: an
-            // attacker can swap the final name after the check.  Leave the
+            // attacker can swap the final name after the check. Leave the
             // exact residue visible rather than risking a replacement.
             Err(PreviewCaptureError::OutputFailed(
                 "output residue is unresolved".into(),
@@ -2079,7 +2079,7 @@ mod publication_tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn atomic_publish_temp_linux_rejects_named_temp_replacement() {
+    fn atomic_publish_temp_linux_refuses_to_replace_an_existing_final_name() {
         let root = tempfile::tempdir().expect("publication test temp root");
         let output = root.path().join("published.png");
         let named = root.path().join(".published.tmp");
@@ -2112,12 +2112,10 @@ mod publication_tests {
         file.sync_all().expect("anonymous source sync");
         match atomic_publish_temp(temp_name.as_deref(), &authority, &file) {
             Err(error) => assert!(
-                error.to_string().contains("HOLD"),
-                "Unix final-name publication must remain an explicit HOLD: {error}"
+                error.kind() == std::io::ErrorKind::AlreadyExists,
+                "Linux publication must preserve an existing final name: {error}"
             ),
-            Ok(_) => panic!(
-                "preview temporary inode identity changed during an unsafe final-name publication"
-            ),
+            Ok(_) => panic!("preview publication replaced an existing final name"),
         }
         drop(file);
 
@@ -3423,9 +3421,9 @@ fn next_temp_name(stem: &str, counter: usize) -> OsString {
 
 /// Publish a fully synced temporary PNG without following a reparse point at
 /// the final file boundary. Windows uses the open temporary-file handle and a
-/// no-follow parent handle. Unix currently fails closed: the tempting
-/// `linkat(AT_EMPTY_PATH)` protocol does not lock the final name through the
-/// identity check and generation commit, so it cannot claim success safely.
+/// no-follow parent handle. Linux links the already-synced anonymous inode
+/// into the retained parent directory and then verifies that the final name
+/// still resolves to that exact inode before the generation can commit.
 #[allow(dead_code)]
 enum AtomicPublishOutcome {
     Published,
@@ -3463,18 +3461,50 @@ fn atomic_publish_temp_unix(
     authority: &CaptureOutputAuthority,
     file: &std::fs::File,
 ) -> std::io::Result<AtomicPublishOutcome> {
-    let _ = (temp, authority, file);
-    // A Linux linkat(AT_EMPTY_PATH) publication is atomic with respect to the
-    // destination lookup, but it does not lock the final name through the
-    // identity check and generation commit.  Without an OS-enforced private
-    // publication directory, a final-name swap can occur after the check and
-    // before success is reported.  Fail closed instead of claiming a barrier
-    // that Unix cannot provide here; the caller retains the inode and exposes
-    // any unresolved residue through its typed cleanup path.
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "Unix final-name publication cannot prove ownership across the final-name swap barrier; visual capture HOLD",
-    ))
+    #[cfg(target_os = "linux")]
+    {
+        use std::ffi::CString;
+        use std::os::fd::AsRawFd;
+        use std::os::unix::ffi::OsStrExt;
+
+        if temp.is_some() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "named preview temporary files cannot cross the Linux publication boundary",
+            ));
+        }
+        let parent = authority
+            .reopen_parent_for_publication()
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        let empty = CString::new("").expect("empty C string");
+        let output_name = CString::new(authority.output_name.as_bytes()).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid output name")
+        })?;
+        if unsafe {
+            libc::linkat(
+                file.as_raw_fd(),
+                empty.as_ptr(),
+                parent.as_raw_fd(),
+                output_name.as_ptr(),
+                libc::AT_EMPTY_PATH,
+            )
+        } != 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        if unsafe { libc::fsync(parent.as_raw_fd()) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        return Ok(AtomicPublishOutcome::Published);
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (temp, authority, file);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "anonymous preview publication is unsupported on this Unix platform",
+        ))
+    }
 }
 
 #[cfg(windows)]

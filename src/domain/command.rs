@@ -2376,7 +2376,11 @@ fn decide_request_specialist(
         return Err(RejectionCode::AlreadyExists);
     }
     match intent.permission {
-        SpecialistPermission::ReadOnly => {}
+        SpecialistPermission::ReadOnly => {
+            if intent.workspace != snap.task.workspace {
+                return Err(RejectionCode::OwnershipConflict);
+            }
+        }
         SpecialistPermission::IsolatedWrite => {
             if !matches!(snap.task.workspace, WorkspaceRef::Worktree { .. })
                 || intent.workspace != snap.task.workspace
@@ -2523,19 +2527,11 @@ fn decide_accept_specialist_handoff(
         return Err(RejectionCode::InvalidTransition);
     }
     let (body, structured) = match (&intent.structured, &intent.raw_inline_utf8) {
+        // Structured specialist output becomes durable provider truth. Until
+        // the command carries a correlated provider-journal receipt, a caller
+        // may persist only the bounded raw fallback.
         (Some(result), _) if result.validate().is_ok() => {
-            for id in result.evidence.iter().chain(&result.artifacts) {
-                let artifact = snap.artifacts.get(id).ok_or(RejectionCode::NotFound)?;
-                if artifact.task_id != snap.task.id {
-                    return Err(RejectionCode::OwnershipConflict);
-                }
-            }
-            let body =
-                serde_json::to_string(result).map_err(|_| RejectionCode::InvalidTransition)?;
-            if body.len() > MAX_SPECIALIST_RAW_ARTIFACT_BYTES {
-                return Err(RejectionCode::InvalidTransition);
-            }
-            (body, true)
+            return Err(RejectionCode::UnsupportedCapability);
         }
         (_, Some(raw)) => {
             if raw.is_empty() || raw.len() > MAX_SPECIALIST_RAW_ARTIFACT_BYTES {

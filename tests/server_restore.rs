@@ -84,7 +84,7 @@ fn reconcile_saved_server_tabs_recovers_live_sessions() {
 }
 
 #[test]
-fn stop_server_and_wait_transitions_to_stopped() {
+fn stop_server_and_wait_fails_closed_without_a_managed_process_owner() {
     let _pid_file_guard = use_isolated_pid_file("stop-server-and-wait");
     let manager = ProcessManager::new();
     let mut session = SessionRuntimeState::new(
@@ -98,8 +98,9 @@ fn stop_server_and_wait_transitions_to_stopped() {
     manager.register_runtime_session(session);
 
     let stopped = manager.stop_server_and_wait("cmd-dev", Duration::from_millis(0));
-    assert!(stopped);
+    assert!(!stopped);
     let runtime = manager.runtime_state();
     let session = runtime.sessions.get("cmd-dev").expect("session present");
-    assert_eq!(session.status, SessionStatus::Stopped);
+    assert_eq!(session.status, SessionStatus::Failed);
+    assert!(session.reap_incomplete);
 }

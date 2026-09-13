@@ -154,13 +154,14 @@ struct PendingOutputQueue {
 impl PendingOutputQueue {
     fn push(&mut self, chunk_len: usize) {
         if self.coalesced {
+            self.bytes = self.bytes.saturating_add(chunk_len);
             return;
         }
         let next_bytes = self.bytes.saturating_add(chunk_len);
         let next_chunks = self.chunks.len().saturating_add(1);
         if next_chunks > MAX_PENDING_OUTPUT_CHUNKS || next_bytes > MAX_PENDING_OUTPUT_BYTES {
             self.chunks.clear();
-            self.bytes = 0;
+            self.bytes = next_bytes;
             self.coalesced = true;
             return;
         }
@@ -170,24 +171,26 @@ impl PendingOutputQueue {
 
     fn take(&mut self) -> PendingOutputDrain {
         if self.coalesced {
+            let bytes = self.bytes;
             *self = Self::default();
-            return PendingOutputDrain::Coalesced;
+            return PendingOutputDrain::Coalesced { bytes };
         }
         let count = self.chunks.len();
+        let bytes = self.bytes;
         self.chunks.clear();
         self.bytes = 0;
         if count == 0 {
             PendingOutputDrain::Empty
         } else {
-            PendingOutputDrain::Notifications(count)
+            PendingOutputDrain::Notifications { count, bytes }
         }
     }
 }
 
 enum PendingOutputDrain {
     Empty,
-    Notifications(usize),
-    Coalesced,
+    Notifications { count: usize, bytes: usize },
+    Coalesced { bytes: usize },
 }
 
 struct HostedTerminal {
@@ -216,6 +219,7 @@ struct HostedTerminal {
     /// Durable terminal not yet reconciled with a live runtime.
     unknown: bool,
     truncated: bool,
+    observed_output_bytes: usize,
     output_pressure_coalesced: bool,
     provider_session_id: Option<String>,
     accepted_input_sequence: u64,
@@ -272,6 +276,7 @@ impl HostedTerminal {
             is_plain_shell: false,
             unknown: false,
             truncated: false,
+            observed_output_bytes: 0,
             output_pressure_coalesced: false,
             provider_session_id: None,
             accepted_input_sequence: 0,
@@ -340,6 +345,7 @@ impl HostedTerminal {
             is_plain_shell: false,
             unknown: false,
             truncated: false,
+            observed_output_bytes: 0,
             output_pressure_coalesced: false,
             provider_session_id: None,
             accepted_input_sequence: 0,
@@ -400,11 +406,22 @@ impl HostedTerminal {
     }
 
     fn session_view(&self) -> Result<TerminalSessionView, TerminalError> {
-        match &self.projection {
+        let mut view = match &self.projection {
             ProjectionSource::Fixture(replica) => {
                 replica.view().ok_or(TerminalError::CanonicalReaderPoisoned)
             }
             ProjectionSource::Attached(runtime) => runtime.session_view(),
+        }?;
+        if view.runtime.title.is_none() {
+            view.runtime.title = self.spec.title.clone();
+        }
+        Ok(view)
+    }
+
+    fn note_observed_output(&mut self, bytes: usize) {
+        self.observed_output_bytes = self.observed_output_bytes.saturating_add(bytes);
+        if self.observed_output_bytes > self.spec.max_scrollback_bytes {
+            self.truncated = true;
         }
     }
 
@@ -479,7 +496,8 @@ impl HostedTerminal {
         };
         match drain {
             PendingOutputDrain::Empty => {}
-            PendingOutputDrain::Coalesced => {
+            PendingOutputDrain::Coalesced { bytes } => {
+                self.note_observed_output(bytes);
                 let screen = {
                     let ProjectionSource::Attached(runtime) = &self.projection else {
                         return Ok(());
@@ -491,7 +509,8 @@ impl HostedTerminal {
                 let sequence = self.bump_sequence()?;
                 self.record_delta_from_screen(terminal_id, sequence, &screen)?;
             }
-            PendingOutputDrain::Notifications(count) => {
+            PendingOutputDrain::Notifications { count, bytes } => {
+                self.note_observed_output(bytes);
                 for _ in 0..count {
                     let screen = {
                         let ProjectionSource::Attached(runtime) = &self.projection else {
@@ -549,6 +568,7 @@ impl HostedTerminal {
         if bytes.len() > MAX_INPUT_BYTES {
             return Err(TerminalError::BoundExceeded);
         }
+        self.note_observed_output(bytes.len());
         let ProjectionSource::Fixture(replica) = &self.projection else {
             return Err(TerminalError::FixtureOnly);
         };
@@ -978,6 +998,7 @@ impl HostedTerminal {
             self.sequence = TerminalSequence::ZERO;
             self.exit_summary = None;
             self.truncated = false;
+            self.observed_output_bytes = 0;
             self.output_pressure_coalesced = false;
             self.accepted_input_sequence = 0;
             self.accepted_input_ids.clear();
@@ -1018,6 +1039,7 @@ impl HostedTerminal {
         self.action_epoch = None;
         self.sequence = TerminalSequence::ZERO;
         self.truncated = false;
+        self.observed_output_bytes = 0;
         self.accepted_input_sequence = 0;
         self.accepted_input_ids.clear();
         self.accepted_bytes.clear();

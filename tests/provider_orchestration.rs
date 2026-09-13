@@ -1,4 +1,6 @@
 use devmanager::client::{ClientModel, ClientModelBuilder};
+use devmanager::config::paths::ResolvedAppPaths;
+use devmanager::config::{ConfigCommand, ConfigStore, Project};
 use devmanager::domain::agent::{AgentRole, AgentSessionFacts, AgentSessionLifecycle};
 use devmanager::domain::artifact::{
     ArtifactContentRef, ArtifactFacts, ArtifactKind, PrivacyClass, MAX_SPECIALIST_ID_REFS,
@@ -13,8 +15,8 @@ use devmanager::domain::event::{
     apply, ApplyError, DomainEvent, Event, SpecialistRequestedPayload,
 };
 use devmanager::domain::id::{
-    AgentSessionId, ArtifactId, ClientId, CommandId, EnvironmentId, EventId, ProjectId, ResourceId,
-    SnapshotId, TaskId,
+    AgentSessionId, ArtifactId, ClientId, CommandId, EnvironmentId, EventId, ProjectId, RequestId,
+    ResourceId, SnapshotId, TaskId,
 };
 use devmanager::domain::resource::{
     OwnerKind, ResourceFacts, ResourceKind, ResourceLifecycle, ResourceRecipe,
@@ -1177,7 +1179,7 @@ fn closed_specialist_handoff_is_rejected() {
 }
 
 #[test]
-fn begin_close_closes_open_specialists() {
+fn begin_close_advances_epoch_and_leaves_specialist_cleanup_to_host() {
     let task = task_id(0x62);
     let primary = agent_id(0x63);
     let specialist = agent_id(0x64);
@@ -1211,13 +1213,12 @@ fn begin_close_closes_open_specialists() {
     .expect("close");
     assert!(matches!(
         events.as_slice(),
-        [Event::SpecialistClosed { specialist_id, .. }, Event::TaskCloseBegun { .. }]
-            if *specialist_id == specialist
+        [Event::TaskCloseBegun { action_epoch: 1 }]
     ));
     let snap = apply_all(Some(snap), task, 5, 0xc3, events);
     assert_eq!(
         snap.agents.get(&specialist).map(|a| a.lifecycle),
-        Some(AgentSessionLifecycle::Closed)
+        Some(AgentSessionLifecycle::Open)
     );
     assert_eq!(snap.task.lifecycle, TaskLifecycle::Closing);
 }
@@ -1354,16 +1355,75 @@ fn command_bus_sqlite_reopen_retry_and_rebuild_covers_orchestration_events() {
     let child = agent_id(0x73);
     let handoff_art = artifact_id(0xa4);
 
-    let mut bus = CommandBus::open(&path).expect("open");
-    accept(
-        &mut bus,
-        envelope(
-            command_id(0x80),
-            None,
-            None,
-            Command::CreateTask(create_intent(task, WorkspaceRef::Main)),
-        ),
+    let project_root = dir.path().join("project");
+    std::fs::create_dir_all(project_root.join(".git")).expect("project git directory");
+    std::fs::write(
+        project_root.join(".git").join("HEAD"),
+        "ref: refs/heads/main\n",
+    )
+    .expect("project git head");
+    let config_root = dir.path().join("profile");
+    let config_paths = ResolvedAppPaths {
+        root: config_root.clone(),
+        config: config_root.join("config.json"),
+        remote: config_root.join("remote.json"),
+        database: config_root.join("kernel.sqlite3"),
+        browser_root: config_root.join("browser"),
+        logs: config_root.join("logs"),
+    };
+    let mut config = ConfigStore::open_host(&config_paths).expect("host config");
+    config
+        .execute(
+            config.snapshot().revision,
+            ConfigCommand::CreateProject {
+                project: Project {
+                    id: project_id(0x11).to_string(),
+                    name: "Orchestration fixture".into(),
+                    root_path: project_root.to_string_lossy().into_owned(),
+                    created_at: "now".into(),
+                    updated_at: "now".into(),
+                    ..Project::default()
+                },
+            },
+        )
+        .expect("configured project");
+    let config_revision = config.snapshot().revision;
+    let roots = devmanager::workspace::WorkspaceProjectRoots::from_host_config_store(
+        &mut config,
+        config_revision,
+        1,
+        1,
+    )
+    .expect("workspace authority");
+    let configured_project_id = roots
+        .project_id_for_config_id(&project_id(0x11).to_string())
+        .expect("configured project id");
+    let mut task_create = create_intent(task, WorkspaceRef::Main);
+    task_create.project_id = configured_project_id;
+    let create = envelope(
+        command_id(0x80),
+        None,
+        None,
+        Command::CreateTask(task_create),
     );
+    let mut store = KernelStore::open(&path).expect("open store");
+    let created = store
+        .execute_configured_task_create(
+            create,
+            &roots,
+            RequestId::from_bytes(fixed_uuid_v7(0x80)).expect("request"),
+            uuid::Uuid::from_bytes(fixed_uuid_v7(0xfe)),
+        )
+        .expect("host-authorized create");
+    assert!(matches!(created, CommandReceipt::Accepted { .. }));
+    drop(store);
+    let mut bus = CommandBus::open(&path).expect("open");
+    let task_workspace = bus
+        .task_snapshot(task)
+        .expect("created task snapshot")
+        .expect("created task")
+        .task
+        .workspace;
     accept(
         &mut bus,
         envelope(
@@ -1395,7 +1455,7 @@ fn command_bus_sqlite_reopen_retry_and_rebuild_covers_orchestration_events() {
             specialist,
             primary,
             SpecialistPermission::ReadOnly,
-            WorkspaceRef::Main,
+            task_workspace.clone(),
         )),
     );
     let first = accept(&mut bus, request_env.clone());
@@ -1411,7 +1471,7 @@ fn command_bus_sqlite_reopen_retry_and_rebuild_covers_orchestration_events() {
         envelope(
             command_id(0x86),
             Some(task),
-            Some(5),
+            Some(4),
             Command::PromotePrimary(PromotePrimaryIntent {
                 agent_session_id: specialist,
                 expected_action_epoch: 0,
@@ -1424,7 +1484,7 @@ fn command_bus_sqlite_reopen_retry_and_rebuild_covers_orchestration_events() {
         envelope(
             command_id(0x87),
             Some(task),
-            Some(6),
+            Some(5),
             Command::CancelSpecialist(CancelSpecialistIntent {
                 agent_session_id: primary,
                 expected_action_epoch: 0,
@@ -1438,13 +1498,13 @@ fn command_bus_sqlite_reopen_retry_and_rebuild_covers_orchestration_events() {
         envelope(
             command_id(0x88),
             Some(task),
-            Some(7),
+            Some(6),
             Command::RequestSpecialist(request_intent(
                 task,
                 extra,
                 specialist,
                 SpecialistPermission::ReadOnly,
-                WorkspaceRef::Main,
+                task_workspace,
             )),
         ),
     );
@@ -1453,7 +1513,7 @@ fn command_bus_sqlite_reopen_retry_and_rebuild_covers_orchestration_events() {
         envelope(
             command_id(0x89),
             Some(task),
-            Some(8),
+            Some(7),
             Command::AcceptSpecialistHandoff(handoff_intent(
                 extra,
                 handoff_art,

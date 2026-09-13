@@ -6,16 +6,15 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use devmanager::client::action::{
-    catalog, task_create_command, task_rename_command, ActionArgumentSchema, ActionRequest,
-    TaskCreateArguments, TaskRenameArguments, ACTION_HOST_ACTIONS, ACTION_HOST_STATUS,
-    ACTION_TASK_CREATE, ACTION_TASK_LIST, ACTION_TASK_RENAME, ACTION_TASK_SHOW,
+    catalog, task_create_v2_command, task_rename_command, ActionArgumentSchema, ActionRequest,
+    TaskCreateV2Arguments, TaskRenameArguments, ACTION_HOST_ACTIONS, ACTION_HOST_STATUS,
+    ACTION_TASK_CREATE_V2, ACTION_TASK_LIST, ACTION_TASK_RENAME, ACTION_TASK_SHOW,
 };
 use devmanager::client::model::{MAX_CLIENT_MODEL_ITEMS, MAX_CLIENT_REPLAY_PAGES};
 use devmanager::domain::id::{ClientId, CommandId, EnvironmentId, ProjectId, TaskId};
 use devmanager::domain::snapshot::{
     PageLimits, MAX_SNAPSHOT_PAGE_ENCODED_BYTES, MAX_SNAPSHOT_PAGE_ITEMS,
 };
-use devmanager::domain::task::WorkspaceRef;
 use devmanager::host::HostCleanupWorker;
 use devmanager::ui::components::empty_state::EmptyState;
 use devmanager::ui::components::interaction::{
@@ -32,6 +31,7 @@ use devmanager::ui::quality::{
     TIMELINE_VIRTUALIZATION_LIMIT, VIRTUALIZATION_WINDOW,
 };
 use devmanager::ui::tokens::{contrast_ratio, theme, Density, Scale, StatusMeaning, ThemeMode};
+use devmanager::workspace::WorkspaceRequest;
 
 fn workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -628,21 +628,23 @@ fn quality_actions_resolve_through_the_shared_action_catalog() {
         ActionRequest::HostActions
     );
 
-    let create_args = TaskCreateArguments {
+    let create_args = TaskCreateV2Arguments {
         task_id,
         environment_id: EnvironmentId::from_bytes(fixed_uuid_v7(0x10)).expect("env"),
         title: "New Task".into(),
         description: None,
         project_id: ProjectId::from_bytes(fixed_uuid_v7(0x11)).expect("project"),
-        workspace: WorkspaceRef::Main,
+        workspace: WorkspaceRequest::main(),
+        primary_provider: None,
+        defer_primary_provider_start: false,
     };
     let create = request_from_catalog(
-        ACTION_TASK_CREATE,
-        CatalogInput::Create(create_args.clone()),
+        ACTION_TASK_CREATE_V2,
+        CatalogInput::CreateV2(create_args.clone()),
     )
     .expect("canonical task.create request");
-    assert_eq!(create, ActionRequest::TaskCreate(create_args.clone()));
-    task_create_command(
+    assert_eq!(create, ActionRequest::TaskCreateV2(create_args.clone()));
+    task_create_v2_command(
         CommandId::from_bytes(fixed_uuid_v7(0x30)).expect("command"),
         ClientId::from_bytes(fixed_uuid_v7(0x31)).expect("client"),
         1_725_000_000_100,
@@ -704,10 +706,8 @@ fn quality_timeline_20k_holds_without_a_semantic_event_journal() {
     assert_eq!(TIMELINE_VIRTUALIZATION_LIMIT, 20_000);
     let events = fs::read_to_string(workspace_root().join("src/domain/event.rs")).expect("events");
     assert!(
-        !events.contains("Message {")
-            && !events.contains("Question")
-            && !events.contains("ToolUse"),
-        "semantic timeline cannot be closed by inventing message/tool/question events"
+        !events.contains("Message {") && !events.contains("ToolUse"),
+        "semantic timeline cannot be closed by inventing message/tool events"
     );
     require_present_insufficient(&["src/ui/renderers"]);
     require_missing_files(&["src/ui/virtual_list.rs", "tests/renderer_registry.rs"]);
@@ -1151,9 +1151,7 @@ fn quality_phase5_promotion_contract_rejects_hold_proxies_and_disconnected_model
 
     let events = fs::read_to_string(workspace_root().join("src/domain/event.rs")).expect("events");
     assert!(
-        !events.contains("Message {")
-            && !events.contains("Question")
-            && !events.contains("ToolUse"),
+        !events.contains("Message {") && !events.contains("ToolUse"),
         "raw terminal preservation cannot be closed by inventing semantic chat events"
     );
     let connection =

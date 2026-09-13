@@ -1,6 +1,6 @@
 {
   "case_id": "launch_success_probe_failure",
-  "provider": "claude_code",
+  "provider": "claude",
   "version": "unknown",
   "task_id": "018f0000-0000-7000-8000-000000000001",
   "agent_id": "018f0000-0000-7000-8000-000000000002",
@@ -11,7 +11,7 @@
   "probe_ok": false,
   "resume_command_proven": false,
   "capabilities": {
-    "kind": "claude_code",
+    "kind": "claude",
     "version": "unknown",
     "auth_state": "unknown",
     "exact_resume": "unknown",
@@ -26,9 +26,16 @@
         "source": "capability_probe",
         "observed_at": 1,
         "status": "failed",
-        "diagnostic": { "code": "probe_failed" }
+        "diagnostic": {
+          "code": "probe_failed"
+        },
+        "schema_version": 1,
+        "expires_at": null,
+        "confidence": "unknown",
+        "auth_source": null
       }
-    ]
+    ],
+    "schema_version": 1
   },
   "events": [],
   "declared_metrics": [

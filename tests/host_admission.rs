@@ -1,11 +1,15 @@
 //! Pure CommandBus admission tests using temporary databases only.
 
+use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
+use devmanager::config::paths::ResolvedAppPaths;
+use devmanager::config::{ConfigCommand, ConfigStore, Project};
 use devmanager::domain::command::{
     Command, CommandEnvelope, CommandReceipt, ConfirmHostQuitIntent, CreateTaskIntent,
-    RejectionCode,
+    CreateTaskRequestIntent, RejectionCode,
 };
 use devmanager::domain::id::{
     ClientId, CommandId, EnvironmentId, OperationId, ProjectId, ResourceId, TaskId,
@@ -18,9 +22,13 @@ use devmanager::domain::task::{
     ReviewReadiness, TaskActivity, TaskAssignment, TaskAttention, TaskConnectivity, TaskLifecycle,
     WorkspaceRef,
 };
-use devmanager::host::{ProcessEmptyTeardown, ProcessEmptyTeardownWorker};
+use devmanager::host::{
+    dispatch_host_request_with_workspace_projects, ProcessEmptyTeardown, ProcessEmptyTeardownWorker,
+};
 use devmanager::kernel::{CommandBus, KernelStore, StoreError};
+use devmanager::protocol::{CapabilitySet, ClientRequest, ServerMessage};
 use devmanager::providers::ProviderKind;
+use devmanager::workspace::{WorkspaceProjectRoots, WorkspaceRequest};
 use rusqlite::{Connection, OptionalExtension};
 use tempfile::TempDir;
 
@@ -80,6 +88,140 @@ fn create_task(task_id: TaskId) -> CreateTaskIntent {
         attention: TaskAttention::None,
         activity: TaskActivity::Idle,
         review_readiness: ReviewReadiness::NotReady,
+    }
+}
+
+struct HostTaskCreateFixture {
+    project_root: TempDir,
+    config_root: TempDir,
+}
+
+fn host_task_create_fixture() -> &'static Mutex<HostTaskCreateFixture> {
+    static FIXTURE: OnceLock<Mutex<HostTaskCreateFixture>> = OnceLock::new();
+    FIXTURE.get_or_init(|| {
+        let project_root = TempDir::new().expect("host admission project root");
+        fs::create_dir(project_root.path().join(".git")).expect("create project git directory");
+        fs::write(
+            project_root.path().join(".git").join("HEAD"),
+            "ref: refs/heads/main\n",
+        )
+        .expect("write project git head");
+        Mutex::new(HostTaskCreateFixture {
+            project_root,
+            config_root: TempDir::new().expect("host admission config root"),
+        })
+    })
+}
+
+fn execute_host_task_create(
+    bus: &mut CommandBus,
+    envelope: CommandEnvelope,
+) -> Result<CommandReceipt, StoreError> {
+    let CommandEnvelope {
+        command_id,
+        client_id,
+        task_id,
+        issued_at_ms,
+        expected_task_revision,
+        command,
+    } = envelope;
+    let Command::CreateTask(intent) = command else {
+        return bus.execute(CommandEnvelope {
+            command_id,
+            client_id,
+            task_id,
+            issued_at_ms,
+            expected_task_revision,
+            command,
+        });
+    };
+    if task_id.is_some() || !matches!(intent.workspace, WorkspaceRef::Main) {
+        return Err(StoreError::HostAuthorityRequired);
+    }
+
+    let fixture = host_task_create_fixture()
+        .lock()
+        .map_err(|_| StoreError::Io("host task-create fixture lock poisoned".into()))?;
+    let project_root = fixture.project_root.path();
+    let config_root = fixture.config_root.path();
+    let paths = ResolvedAppPaths {
+        root: config_root.to_path_buf(),
+        config: config_root.join("config.json"),
+        remote: config_root.join("remote.json"),
+        database: config_root.join("kernel.sqlite3"),
+        browser_root: config_root.join("browser"),
+        logs: config_root.join("logs"),
+    };
+    let mut store =
+        ConfigStore::open_host(&paths).map_err(|error| StoreError::Io(error.to_string()))?;
+    let configured_id = intent.project_id.to_string();
+    if !store
+        .snapshot()
+        .config
+        .projects
+        .iter()
+        .any(|project| project.id == configured_id)
+    {
+        store
+            .execute(
+                store.snapshot().revision,
+                ConfigCommand::CreateProject {
+                    project: Project {
+                        id: configured_id.clone(),
+                        name: "Host admission fixture".into(),
+                        root_path: project_root.to_string_lossy().into_owned(),
+                        created_at: "now".into(),
+                        updated_at: "now".into(),
+                        ..Project::default()
+                    },
+                },
+            )
+            .map_err(|error| StoreError::Io(error.to_string()))?;
+    }
+    let revision = store.snapshot().revision;
+    let workspace_projects =
+        WorkspaceProjectRoots::from_host_config_store(&mut store, revision, 1, 1)
+            .map_err(|error| StoreError::Io(error.to_string()))?;
+    let project_id = workspace_projects
+        .project_id_for_config_id(&configured_id)
+        .ok_or_else(|| StoreError::Io("host project id was not issued".into()))?;
+
+    let request = CommandEnvelope {
+        command_id,
+        client_id,
+        task_id: None,
+        issued_at_ms,
+        expected_task_revision,
+        command: Command::CreateTaskV2(CreateTaskRequestIntent {
+            id: intent.id,
+            environment_id: intent.environment_id,
+            title: intent.title,
+            description: intent.description,
+            project_id,
+            workspace: WorkspaceRequest::main(),
+            primary_provider: None,
+            defer_primary_provider_start: false,
+            assignment: intent.assignment,
+            created_at_ms: intent.created_at_ms,
+            connectivity: intent.connectivity,
+            attention: intent.attention,
+            activity: intent.activity,
+            review_readiness: intent.review_readiness,
+        }),
+    };
+    match dispatch_host_request_with_workspace_projects(
+        client_id,
+        CapabilitySet::empty(),
+        bus,
+        &workspace_projects,
+        ClientRequest::Command(request),
+    )
+    .map_err(|error| StoreError::Io(error.to_string()))?
+    {
+        ServerMessage::CommandReceipt(receipt) => Ok(receipt),
+        _ => Err(StoreError::Projection(
+            "host task-create fixture returned a non-receipt response".into(),
+        )),
     }
 }
 
@@ -182,12 +324,15 @@ fn reopen_atomically_cancels_pending_close() {
     let mut bus = CommandBus::open(&path).expect("open bus");
     let task = task_id(0xA1);
 
-    bus.execute(envelope(
-        command_id(0xA2),
-        None,
-        None,
-        Command::CreateTask(create_task(task)),
-    ))
+    execute_host_task_create(
+        &mut bus,
+        envelope(
+            command_id(0xA2),
+            None,
+            None,
+            Command::CreateTask(create_task(task)),
+        ),
+    )
     .expect("create task");
 
     let close_envelope = envelope(
@@ -289,12 +434,15 @@ fn process_empty_teardown_settles_and_reopen_atomically_cancels_pending_close() 
 
     // --- Task A: empty close settles once ---
     let task_a = task_id(0xB1);
-    bus.execute(envelope(
-        command_id(0xB2),
-        None,
-        None,
-        Command::CreateTask(create_task(task_a)),
-    ))
+    execute_host_task_create(
+        &mut bus,
+        envelope(
+            command_id(0xB2),
+            None,
+            None,
+            Command::CreateTask(create_task(task_a)),
+        ),
+    )
     .expect("create A");
     let close_a = accept_begin_close(&mut bus, task_a, command_id(0xB3), 1);
     assert_eq!(
@@ -322,12 +470,15 @@ fn process_empty_teardown_settles_and_reopen_atomically_cancels_pending_close() 
 
     // --- Task B: reopen cancels untouched close; worker stays Idle ---
     let task_b = task_id(0xB4);
-    bus.execute(envelope(
-        command_id(0xB5),
-        None,
-        None,
-        Command::CreateTask(create_task(task_b)),
-    ))
+    execute_host_task_create(
+        &mut bus,
+        envelope(
+            command_id(0xB5),
+            None,
+            None,
+            Command::CreateTask(create_task(task_b)),
+        ),
+    )
     .expect("create B");
     let close_b = accept_begin_close(&mut bus, task_b, command_id(0xB6), 1);
     let reopen_b = bus
@@ -373,12 +524,15 @@ fn process_empty_teardown_settles_and_reopen_atomically_cancels_pending_close() 
     // --- Task C: live Active resource blocks process-empty ---
     let task_c = task_id(0xB8);
     let resource_c = resource_id(0xB9);
-    bus.execute(envelope(
-        command_id(0xBA),
-        None,
-        None,
-        Command::CreateTask(create_task(task_c)),
-    ))
+    execute_host_task_create(
+        &mut bus,
+        envelope(
+            command_id(0xBA),
+            None,
+            None,
+            Command::CreateTask(create_task(task_c)),
+        ),
+    )
     .expect("create C");
     register_active_terminal(&mut bus, task_c, command_id(0xBB), resource_c, 1);
     let close_c = accept_begin_close(&mut bus, task_c, command_id(0xBC), 2);
@@ -421,12 +575,15 @@ fn process_empty_teardown_settles_and_reopen_atomically_cancels_pending_close() 
     // remains resource-bearing/ineligible.
     let task_r = task_id(0xBD);
     let resource_r = resource_id(0xBE);
-    bus.execute(envelope(
-        command_id(0xBF),
-        None,
-        None,
-        Command::CreateTask(create_task(task_r)),
-    ))
+    execute_host_task_create(
+        &mut bus,
+        envelope(
+            command_id(0xBF),
+            None,
+            None,
+            Command::CreateTask(create_task(task_r)),
+        ),
+    )
     .expect("create R");
     register_active_terminal(&mut bus, task_r, command_id(0xC0), resource_r, 1);
     let release_r = {
@@ -465,12 +622,15 @@ fn process_empty_teardown_settles_and_reopen_atomically_cancels_pending_close() 
     }
 
     let task_t = task_id(0xC2);
-    bus.execute(envelope(
-        command_id(0xC3),
-        None,
-        None,
-        Command::CreateTask(create_task(task_t)),
-    ))
+    execute_host_task_create(
+        &mut bus,
+        envelope(
+            command_id(0xC3),
+            None,
+            None,
+            Command::CreateTask(create_task(task_t)),
+        ),
+    )
     .expect("create T");
     let close_t = accept_begin_close(&mut bus, task_t, command_id(0xC4), 1);
     assert_eq!(
@@ -517,19 +677,25 @@ fn process_empty_teardown_settles_and_reopen_atomically_cancels_pending_close() 
     // --- Two eligible empties: one settle per call, oldest first ---
     let task_d1 = task_id(0xC6);
     let task_d2 = task_id(0xC7);
-    bus.execute(envelope(
-        command_id(0xC8),
-        None,
-        None,
-        Command::CreateTask(create_task(task_d1)),
-    ))
+    execute_host_task_create(
+        &mut bus,
+        envelope(
+            command_id(0xC8),
+            None,
+            None,
+            Command::CreateTask(create_task(task_d1)),
+        ),
+    )
     .expect("create D1");
-    bus.execute(envelope(
-        command_id(0xC9),
-        None,
-        None,
-        Command::CreateTask(create_task(task_d2)),
-    ))
+    execute_host_task_create(
+        &mut bus,
+        envelope(
+            command_id(0xC9),
+            None,
+            None,
+            Command::CreateTask(create_task(task_d2)),
+        ),
+    )
     .expect("create D2");
     let close_d1 = accept_begin_close(&mut bus, task_d1, command_id(0xCA), 1);
     let close_d2 = accept_begin_close(&mut bus, task_d2, command_id(0xCB), 1);
@@ -570,19 +736,25 @@ fn process_empty_teardown_fails_closed_on_corrupt_oldest_resource_fence() {
 
     let task_old = task_id(0xD1);
     let task_new = task_id(0xD2);
-    bus.execute(envelope(
-        command_id(0xD3),
-        None,
-        None,
-        Command::CreateTask(create_task(task_old)),
-    ))
+    execute_host_task_create(
+        &mut bus,
+        envelope(
+            command_id(0xD3),
+            None,
+            None,
+            Command::CreateTask(create_task(task_old)),
+        ),
+    )
     .expect("create oldest");
-    bus.execute(envelope(
-        command_id(0xD4),
-        None,
-        None,
-        Command::CreateTask(create_task(task_new)),
-    ))
+    execute_host_task_create(
+        &mut bus,
+        envelope(
+            command_id(0xD4),
+            None,
+            None,
+            Command::CreateTask(create_task(task_new)),
+        ),
+    )
     .expect("create later");
     let close_old = accept_begin_close(&mut bus, task_old, command_id(0xD5), 1);
     let close_new = accept_begin_close(&mut bus, task_new, command_id(0xD6), 1);
@@ -724,12 +896,15 @@ fn inspect_host_quit_high_water_is_snapshot_consistent() {
     let mut bus = CommandBus::open(&path).expect("open bus");
     let task = task_id(0xB1);
 
-    bus.execute(envelope(
-        command_id(0xB2),
-        None,
-        None,
-        Command::CreateTask(create_task(task)),
-    ))
+    execute_host_task_create(
+        &mut bus,
+        envelope(
+            command_id(0xB2),
+            None,
+            None,
+            Command::CreateTask(create_task(task)),
+        ),
+    )
     .expect("create task");
 
     let first = bus.inspect_host_quit().expect("first inspect");
@@ -786,12 +961,15 @@ fn confirm_host_quit_requires_current_inspection_and_closes_admission_atomically
     let task = task_id(0xC1);
     let resource = resource_id(0xC2);
 
-    bus.execute(envelope(
-        command_id(0xC3),
-        None,
-        None,
-        Command::CreateTask(create_task(task)),
-    ))
+    execute_host_task_create(
+        &mut bus,
+        envelope(
+            command_id(0xC3),
+            None,
+            None,
+            Command::CreateTask(create_task(task)),
+        ),
+    )
     .expect("create task");
     register_active_terminal(&mut bus, task, command_id(0xC4), resource, 1);
 
@@ -906,24 +1084,28 @@ fn confirm_host_quit_requires_current_inspection_and_closes_admission_atomically
     assert_eq!(outbox_count_for_operation(&path, operation_id), 0);
 
     let pre_close_cmd = command_id(0xC3);
-    let pre_close_retry = bus
-        .execute(envelope(
+    let pre_close_retry = execute_host_task_create(
+        &mut bus,
+        envelope(
             pre_close_cmd,
             None,
             None,
             Command::CreateTask(create_task(task)),
-        ))
-        .expect("pre-close accepted retry");
+        ),
+    )
+    .expect("pre-close accepted retry");
     assert!(matches!(pre_close_retry, CommandReceipt::Accepted { .. }));
 
-    let later_create = bus
-        .execute(envelope(
+    let later_create = execute_host_task_create(
+        &mut bus,
+        envelope(
             command_id(0xC8),
             None,
             None,
             Command::CreateTask(create_task(task_id(0xC9))),
-        ))
-        .expect("later create must reject Closing");
+        ),
+    )
+    .expect("later create must reject Closing");
     assert!(
         matches!(
             later_create,
@@ -983,12 +1165,15 @@ fn host_admission_closing_survives_reopen_and_projection_rebuild() {
     let quit_op = {
         let mut bus = CommandBus::open(&path).expect("open bus");
         let task = task_id(0xD1);
-        bus.execute(envelope(
-            command_id(0xD2),
-            None,
-            None,
-            Command::CreateTask(create_task(task)),
-        ))
+        execute_host_task_create(
+            &mut bus,
+            envelope(
+                command_id(0xD2),
+                None,
+                None,
+                Command::CreateTask(create_task(task)),
+            ),
+        )
         .expect("create");
         let inspection = bus.inspect_host_quit().expect("inspect");
         let receipt = bus
@@ -1011,14 +1196,16 @@ fn host_admission_closing_survives_reopen_and_projection_rebuild() {
     let before = host_admission_row(&path).expect("Closing before reopen");
     {
         let mut bus = CommandBus::open(&path).expect("reopen bus");
-        let rejected = bus
-            .execute(envelope(
+        let rejected = execute_host_task_create(
+            &mut bus,
+            envelope(
                 command_id(0xD4),
                 None,
                 None,
                 Command::CreateTask(create_task(task_id(0xD5))),
-            ))
-            .expect("mutation after reopen");
+            ),
+        )
+        .expect("mutation after reopen");
         assert!(matches!(
             rejected,
             CommandReceipt::Rejected {
@@ -1044,14 +1231,16 @@ fn host_admission_closing_survives_reopen_and_projection_rebuild() {
     );
     {
         let mut bus = CommandBus::open(&path).expect("bus after rebuild");
-        let rejected = bus
-            .execute(envelope(
+        let rejected = execute_host_task_create(
+            &mut bus,
+            envelope(
                 command_id(0xD6),
                 None,
                 None,
                 Command::CreateTask(create_task(task_id(0xD7))),
-            ))
-            .expect("mutation after rebuild");
+            ),
+        )
+        .expect("mutation after rebuild");
         assert!(matches!(
             rejected,
             CommandReceipt::Rejected {
@@ -1522,12 +1711,15 @@ fn host_cleanup_reports_agent_resource_and_effect_residue_without_fabricating_cl
     let mut bus = CommandBus::open(&path).expect("open bus");
     let task = task_id(0x91);
     let resource = resource_id(0x92);
-    bus.execute(envelope(
-        command_id(0x93),
-        None,
-        None,
-        Command::CreateTask(create_task(task)),
-    ))
+    execute_host_task_create(
+        &mut bus,
+        envelope(
+            command_id(0x93),
+            None,
+            None,
+            Command::CreateTask(create_task(task)),
+        ),
+    )
     .expect("create");
     register_open_agent(&mut bus, task, command_id(0x94), 1);
     register_active_terminal(&mut bus, task, command_id(0x95), resource, 2);
@@ -1634,19 +1826,25 @@ fn host_cleanup_task_branch_reuses_bounded_process_empty_teardown() {
     let mut bus = CommandBus::open(&path).expect("open bus");
     let task_a = task_id(0xA2);
     let task_b = task_id(0xA5);
-    bus.execute(envelope(
-        command_id(0xA3),
-        None,
-        None,
-        Command::CreateTask(create_task(task_a)),
-    ))
+    execute_host_task_create(
+        &mut bus,
+        envelope(
+            command_id(0xA3),
+            None,
+            None,
+            Command::CreateTask(create_task(task_a)),
+        ),
+    )
     .expect("create A");
-    bus.execute(envelope(
-        command_id(0xA6),
-        None,
-        None,
-        Command::CreateTask(create_task(task_b)),
-    ))
+    execute_host_task_create(
+        &mut bus,
+        envelope(
+            command_id(0xA6),
+            None,
+            None,
+            Command::CreateTask(create_task(task_b)),
+        ),
+    )
     .expect("create B");
     let close_a = accept_begin_close(&mut bus, task_a, command_id(0xA4), 1);
     let close_b = accept_begin_close(&mut bus, task_b, command_id(0xA7), 1);
@@ -1857,12 +2055,15 @@ fn host_cleanup_corrupt_pending_non_teardown_effect_is_corruption_not_failed_out
     let mut bus = CommandBus::open(&path).expect("open bus");
     let task = task_id(0xD1);
     let resource = resource_id(0xD2);
-    bus.execute(envelope(
-        command_id(0xD3),
-        None,
-        None,
-        Command::CreateTask(create_task(task)),
-    ))
+    execute_host_task_create(
+        &mut bus,
+        envelope(
+            command_id(0xD3),
+            None,
+            None,
+            Command::CreateTask(create_task(task)),
+        ),
+    )
     .expect("create");
     register_active_terminal(&mut bus, task, command_id(0xD4), resource, 1);
     let release_op = {
@@ -1937,12 +2138,15 @@ fn host_cleanup_wrong_event_sequence_pending_effect_is_corruption_not_residue() 
     let mut bus = CommandBus::open(&path).expect("open bus");
     let task = task_id(0xE1);
     let resource = resource_id(0xE2);
-    bus.execute(envelope(
-        command_id(0xE3),
-        None,
-        None,
-        Command::CreateTask(create_task(task)),
-    ))
+    execute_host_task_create(
+        &mut bus,
+        envelope(
+            command_id(0xE3),
+            None,
+            None,
+            Command::CreateTask(create_task(task)),
+        ),
+    )
     .expect("create");
     register_active_terminal(&mut bus, task, command_id(0xE4), resource, 1);
     let release_op = {
@@ -2032,12 +2236,15 @@ fn host_cleanup_task_teardown_revalidates_lineage_after_outstanding_effects_cras
     let mut bus = CommandBus::open(&path).expect("open bus");
     let task = task_id(0xF1);
     let resource = resource_id(0xF2);
-    bus.execute(envelope(
-        command_id(0xF3),
-        None,
-        None,
-        Command::CreateTask(create_task(task)),
-    ))
+    execute_host_task_create(
+        &mut bus,
+        envelope(
+            command_id(0xF3),
+            None,
+            None,
+            Command::CreateTask(create_task(task)),
+        ),
+    )
     .expect("create");
     register_active_terminal(&mut bus, task, command_id(0xF4), resource, 1);
     let close_op = accept_begin_close(&mut bus, task, command_id(0xF5), 2);
@@ -2275,12 +2482,15 @@ fn host_cleanup_failed_journal_terminalizes_once_as_cleanup_failed() {
     let path = temp_db_path(&dir);
     let mut bus = CommandBus::open(&path).expect("open");
     let task = task_id(0x11);
-    bus.execute(envelope(
-        command_id(0x12),
-        None,
-        None,
-        Command::CreateTask(create_task(task)),
-    ))
+    execute_host_task_create(
+        &mut bus,
+        envelope(
+            command_id(0x12),
+            None,
+            None,
+            Command::CreateTask(create_task(task)),
+        ),
+    )
     .expect("create");
     register_open_agent(&mut bus, task, command_id(0x13), 1);
     let quit_op = confirm_host_quit(&mut bus);
@@ -2388,12 +2598,15 @@ fn host_cleanup_failed_terminal_resumes_once_across_reopen() {
     let quit_op = {
         let mut bus = CommandBus::open(&path).expect("open");
         let task = task_id(0x21);
-        bus.execute(envelope(
-            command_id(0x22),
-            None,
-            None,
-            Command::CreateTask(create_task(task)),
-        ))
+        execute_host_task_create(
+            &mut bus,
+            envelope(
+                command_id(0x22),
+                None,
+                None,
+                Command::CreateTask(create_task(task)),
+            ),
+        )
         .expect("create");
         register_open_agent(&mut bus, task, command_id(0x23), 1);
         let quit_op = confirm_host_quit(&mut bus);
@@ -2608,12 +2821,15 @@ fn host_cleanup_premature_or_wrong_failure_is_rejected_at_runtime_and_rebuild() 
     let (quit_op3, accepted_at_ms3) = {
         let mut bus = CommandBus::open(&path3).expect("open");
         let task = task_id(0x33);
-        bus.execute(envelope(
-            command_id(0x34),
-            None,
-            None,
-            Command::CreateTask(create_task(task)),
-        ))
+        execute_host_task_create(
+            &mut bus,
+            envelope(
+                command_id(0x34),
+                None,
+                None,
+                Command::CreateTask(create_task(task)),
+            ),
+        )
         .expect("create");
         register_open_agent(&mut bus, task, command_id(0x35), 1);
         let quit_op = confirm_host_quit(&mut bus);
@@ -2883,12 +3099,15 @@ fn host_cleanup_extra_matching_terminal_beside_cleanup_failed_is_runtime_corrupt
     let (quit_op, settled_at_ms) = {
         let mut bus = CommandBus::open(&path).expect("open");
         let task = task_id(0x71);
-        bus.execute(envelope(
-            command_id(0x72),
-            None,
-            None,
-            Command::CreateTask(create_task(task)),
-        ))
+        execute_host_task_create(
+            &mut bus,
+            envelope(
+                command_id(0x72),
+                None,
+                None,
+                Command::CreateTask(create_task(task)),
+            ),
+        )
         .expect("create");
         register_open_agent(&mut bus, task, command_id(0x73), 1);
         let quit_op = confirm_host_quit(&mut bus);
@@ -2970,12 +3189,15 @@ fn host_cleanup_failed_fact_predating_final_branch_rebuild_rolls_back() {
     let (quit_op, final_branch_at, admission_before, ops_before) = {
         let mut bus = CommandBus::open(&path).expect("open");
         let task = task_id(0x52);
-        bus.execute(envelope(
-            command_id(0x53),
-            None,
-            None,
-            Command::CreateTask(create_task(task)),
-        ))
+        execute_host_task_create(
+            &mut bus,
+            envelope(
+                command_id(0x53),
+                None,
+                None,
+                Command::CreateTask(create_task(task)),
+            ),
+        )
         .expect("create");
         register_open_agent(&mut bus, task, command_id(0x54), 1);
         let quit_op = confirm_host_quit(&mut bus);
@@ -3075,12 +3297,15 @@ fn host_cleanup_failed_lineage_survives_later_valid_side_effect_settlement() {
         let mut bus = CommandBus::open(&path).expect("open");
         let task = task_id(0x61);
         let resource = resource_id(0x62);
-        bus.execute(envelope(
-            command_id(0x63),
-            None,
-            None,
-            Command::CreateTask(create_task(task)),
-        ))
+        execute_host_task_create(
+            &mut bus,
+            envelope(
+                command_id(0x63),
+                None,
+                None,
+                Command::CreateTask(create_task(task)),
+            ),
+        )
         .expect("create");
         register_active_terminal(&mut bus, task, command_id(0x64), resource, 1);
         let release_op = {
@@ -3730,12 +3955,15 @@ fn host_restart_disposition_covers_incomplete_failed_ready_and_closed() {
         let path = temp_db_path(&dir);
         let mut bus = CommandBus::open(&path).expect("open");
         let task = task_id(0xD1);
-        bus.execute(envelope(
-            command_id(0xD2),
-            None,
-            None,
-            Command::CreateTask(create_task(task)),
-        ))
+        execute_host_task_create(
+            &mut bus,
+            envelope(
+                command_id(0xD2),
+                None,
+                None,
+                Command::CreateTask(create_task(task)),
+            ),
+        )
         .expect("create");
         register_open_agent(&mut bus, task, command_id(0xD3), 1);
         let quit_op = confirm_host_quit(&mut bus);
@@ -3833,12 +4061,15 @@ fn host_cleanup_settled_must_immediately_follow_task_teardowns_predecessor() {
     let (quit_op, branch_ids, final_at, task) = {
         let mut bus = CommandBus::open(&path).expect("open");
         let task = task_id(0x9A);
-        bus.execute(envelope(
-            command_id(0x9B),
-            None,
-            None,
-            Command::CreateTask(create_task(task)),
-        ))
+        execute_host_task_create(
+            &mut bus,
+            envelope(
+                command_id(0x9B),
+                None,
+                None,
+                Command::CreateTask(create_task(task)),
+            ),
+        )
         .expect("create task before quit");
         let quit_op = confirm_host_quit(&mut bus);
         drive_four_cleanup_branches(&mut bus, quit_op);
@@ -3963,12 +4194,15 @@ fn host_cleanup_settled_survives_later_unrelated_valid_global_event() {
     let path = temp_db_path(&dir);
     let mut bus = CommandBus::open(&path).expect("open");
     let task = task_id(0x97);
-    bus.execute(envelope(
-        command_id(0x98),
-        None,
-        None,
-        Command::CreateTask(create_task(task)),
-    ))
+    execute_host_task_create(
+        &mut bus,
+        envelope(
+            command_id(0x98),
+            None,
+            None,
+            Command::CreateTask(create_task(task)),
+        ),
+    )
     .expect("create task before quit");
     let quit_op = confirm_host_quit(&mut bus);
     drive_four_cleanup_branches(&mut bus, quit_op);
@@ -4223,12 +4457,15 @@ fn host_cleanup_revision_only_terminal_scope_is_projector_corruption() {
         let (quit_op, final_at) = {
             let mut bus = CommandBus::open(&path).expect("open");
             let task = task_id(0x93);
-            bus.execute(envelope(
-                command_id(0x94),
-                None,
-                None,
-                Command::CreateTask(create_task(task)),
-            ))
+            execute_host_task_create(
+                &mut bus,
+                envelope(
+                    command_id(0x94),
+                    None,
+                    None,
+                    Command::CreateTask(create_task(task)),
+                ),
+            )
             .expect("create");
             register_open_agent(&mut bus, task, command_id(0x95), 1);
             let quit_op = confirm_host_quit(&mut bus);

@@ -4,7 +4,7 @@
     {
       "id": "empty",
       "selected_task": false,
-      "disabled_ids": ["task.show", "task.rename"]
+      "disabled_ids": ["task.show", "task.rename", "task.archive"]
     },
     {
       "id": "selected",

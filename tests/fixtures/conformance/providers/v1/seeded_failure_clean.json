@@ -26,9 +26,15 @@
       {
         "source": "capability_probe",
         "observed_at": 1,
-        "status": "unsupported"
+        "status": "unsupported",
+        "schema_version": 1,
+        "expires_at": null,
+        "confidence": "unknown",
+        "auth_source": null,
+        "diagnostic": null
       }
-    ]
+    ],
+    "schema_version": 1
   },
   "events": [],
   "declared_metrics": [

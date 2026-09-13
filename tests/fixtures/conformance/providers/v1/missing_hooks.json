@@ -1,6 +1,6 @@
 {
   "case_id": "missing_hooks",
-  "provider": "claude_code",
+  "provider": "claude",
   "version": "1.4.0",
   "task_id": "018f0000-0000-7000-8000-000000000001",
   "agent_id": "018f0000-0000-7000-8000-000000000002",
@@ -11,7 +11,7 @@
   "probe_ok": true,
   "resume_command_proven": false,
   "capabilities": {
-    "kind": "claude_code",
+    "kind": "claude",
     "version": "1.4.0",
     "auth_state": "unknown",
     "exact_resume": "unsupported",
@@ -25,9 +25,15 @@
       {
         "source": "capability_probe",
         "observed_at": 1,
-        "status": "unsupported"
+        "status": "unsupported",
+        "schema_version": 1,
+        "expires_at": null,
+        "confidence": "unknown",
+        "auth_source": null,
+        "diagnostic": null
       }
-    ]
+    ],
+    "schema_version": 1
   },
   "events": [],
   "declared_metrics": [

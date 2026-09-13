@@ -15,9 +15,57 @@
               "description": "Build the truthful task header.",
               "project_id": "018f60b0-9c1a-7001-8000-000000000011",
               "workspace": {
-                "worktree": {
-                  "path": "C:\\Code\\demo\\worktree",
-                  "branch": "codex/header"
+                "host_bound": {
+                  "binding": {
+                    "kind": "worktree",
+                    "project_root": {
+                      "workspace_id": "project-root-1",
+                      "content_length": null,
+                      "content_fingerprint": null
+                    },
+                    "workspace_root": {
+                      "workspace_id": "workspace-root-1",
+                      "content_length": null,
+                      "content_fingerprint": null
+                    },
+                    "repository_root": {
+                      "workspace_id": "repository-root-1",
+                      "content_length": null,
+                      "content_fingerprint": null
+                    },
+                    "common_git_dir": {
+                      "workspace_id": "common-git-dir-1",
+                      "content_length": null,
+                      "content_fingerprint": null
+                    },
+                    "admin_dir": {
+                      "workspace_id": "admin-dir-1",
+                      "content_length": null,
+                      "content_fingerprint": null
+                    },
+                    "marker": {
+                      "workspace_id": "marker-1",
+                      "content_length": null,
+                      "content_fingerprint": null
+                    },
+                    "commondir": {
+                      "workspace_id": "commondir-1",
+                      "content_length": null,
+                      "content_fingerprint": null
+                    },
+                    "gitdir": {
+                      "workspace_id": "gitdir-1",
+                      "content_length": null,
+                      "content_fingerprint": null
+                    },
+                    "head": {
+                      "workspace_id": "head-1",
+                      "content_length": null,
+                      "content_fingerprint": null
+                    },
+                    "branch": "codex/header",
+                    "binding_fingerprint": "sha256:c71c81564a1590f5a37af41486a3db2b796e4efd3fd6d4d966a116b85596daf1"
+                  }
                 }
               },
               "assignment": "local_owner",

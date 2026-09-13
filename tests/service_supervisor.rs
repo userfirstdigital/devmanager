@@ -941,10 +941,13 @@ fn unknown_and_probe_error_ports_fail_closed_and_port_busy_projects_fence() {
             AdmissionRequester::Host(HostAuthority::new(HostId::new(1))),
         )
         .expect_err("indeterminate port fails closed");
-    assert!(matches!(
-        err,
-        SupervisorError::Refused(SupervisorRefusal::EvidenceUnknown)
-    ));
+    assert!(
+        matches!(
+            err,
+            SupervisorError::Refused(SupervisorRefusal::EvidenceUnknown)
+        ),
+        "indeterminate port must fail closed, got {err:?}"
+    );
     assert_eq!(supervisor.fence(&id("api")).unwrap(), fence_before);
 
     supervisor.observe_port(8080, PortAuthority::Free, None);
@@ -1029,7 +1032,7 @@ fn launch_cwd_resolves_from_configured_workspace_root_not_process_cwd() {
 }
 
 #[test]
-fn services_panel_disables_open_terminal_with_truthful_reason() {
+fn services_panel_enables_logs_and_health_but_disables_unimplemented_terminal_attach() {
     use devmanager::services::health::{
         EvidenceProvenance, EvidenceSource, HealthAxis, LifecycleAxis, OwnershipAxis, PortAxis,
         ProcessAxis, RedactedServiceSnapshot, ServiceEvidence,
@@ -1074,22 +1077,16 @@ fn services_panel_disables_open_terminal_with_truthful_reason() {
         .iter()
         .find(|action| action.action == ServicePanelAction::Logs)
         .expect("Logs affordance");
-    assert!(!logs.enabled);
-    assert_eq!(
-        logs.disabled_reason,
-        Some("Service log query is not available until a typed host operation exists")
-    );
+    assert!(logs.enabled);
+    assert_eq!(logs.disabled_reason, None);
     assert!(ServicePanelAction::Logs.as_supervisor_action().is_none());
     let health = panel.rows[0]
         .actions
         .iter()
         .find(|action| action.action == ServicePanelAction::Health)
         .expect("Health affordance");
-    assert!(!health.enabled);
-    assert_eq!(
-        health.disabled_reason,
-        Some("Service health query is not available until a typed host operation exists")
-    );
+    assert!(health.enabled);
+    assert_eq!(health.disabled_reason, None);
     assert!(ServicePanelAction::Health.as_supervisor_action().is_none());
     assert_eq!(
         ServicePanelAction::Start.as_supervisor_action(),

@@ -840,8 +840,8 @@ fn process_soak_script_uses_bounded_io_and_restored_default_interface() {
     assert!(
         phase_gate.find("$deadline =").expect("bounded deadline")
             < phase_gate
-                .find("$started = $process.Start()")
-                .expect("bounded process start")
+                .find("$launch = [DevManagerPhaseGateJob]::StartSuspended($StartInfo)")
+                .expect("bounded suspended process start")
     );
 }
 

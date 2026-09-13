@@ -902,6 +902,16 @@ fn fixture_repo_files() -> Vec<(&'static str, String)> {
 }
 
 fn retained_git() -> PathBuf {
+    #[cfg(not(windows))]
+    {
+        if let Some(path) = std::env::var_os("PATH").and_then(|paths| {
+            std::env::split_paths(&paths)
+                .map(|directory| directory.join("git"))
+                .find(|candidate| candidate.is_file())
+        }) {
+            return fs::canonicalize(path).expect("canonical retained Git identity");
+        }
+    }
     for candidate in [
         r"C:\Program Files\Git\cmd\git.exe",
         r"C:\Program Files\Git\bin\git.exe",
@@ -2607,15 +2617,20 @@ fn init_initialized_repo(path: &Path) {
 }
 
 fn create_junction(link: &Path, target: &Path) {
-    let status = Command::new("cmd")
-        .args([
-            "/C",
-            "mklink",
-            "/J",
-            link.to_str().unwrap(),
-            target.to_str().unwrap(),
-        ])
-        .status()
-        .expect("mklink");
-    assert!(status.success(), "failed to create junction {link:?}");
+    #[cfg(windows)]
+    {
+        let status = Command::new("cmd")
+            .args([
+                "/C",
+                "mklink",
+                "/J",
+                link.to_str().unwrap(),
+                target.to_str().unwrap(),
+            ])
+            .status()
+            .expect("mklink");
+        assert!(status.success(), "failed to create junction {link:?}");
+    }
+    #[cfg(not(windows))]
+    std::os::unix::fs::symlink(target, link).expect("create fixture directory symlink");
 }
