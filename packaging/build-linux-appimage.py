@@ -102,7 +102,18 @@ def assemble(args):
         shutil.copy2(ROOT / "packaging/icons/devmanager-256.png", icon)
         # WebKit helpers are processes, not ordinary link-time dependencies.
         # Their runtime path must stay inside this AppImage after installation.
-        source_webkit = Path("/usr/lib/x86_64-linux-gnu/webkit2gtk-4.1")
+        source_webkit = next((path.resolve() for path in [
+            Path("/usr/lib/x86_64-linux-gnu/webkit2gtk-4.1"),
+            Path("/usr/lib64/webkit2gtk-4.1"),
+            Path("/usr/lib/webkit2gtk-4.1"),
+        ] if path.is_dir()), None)
+        if source_webkit is None:
+            raise RuntimeError("Required WebKit 4.1 helper directory is missing")
+        if source_webkit != Path("/usr/lib/x86_64-linux-gnu/webkit2gtk-4.1"):
+            # linuxdeploy's pinned binutils predate RELR sections emitted by
+            # current rolling-release distributions. Keep those native files
+            # intact; the shipping Rust binaries are already release-stripped.
+            env["NO_STRIP"] = "1"
         webkit = appdir / "usr/libexec/webkit2gtk-4.1"
         webkit.mkdir(parents=True)
         helpers = []
@@ -117,16 +128,34 @@ def assemble(args):
         # GIO loads TLS/proxy backends dynamically, and WebKit discovers media
         # decoders through GStreamer. Neither appears in the client's DT_NEEDED.
         modules = []
-        for source, relative in [
-            (Path("/usr/lib/x86_64-linux-gnu/gio/modules"), "usr/lib/gio/modules"),
-            (Path("/usr/lib/x86_64-linux-gnu/gstreamer-1.0"), "usr/lib/gstreamer-1.0"),
+        module_sources = []
+        for candidates, relative in [
+            ([Path("/usr/lib/x86_64-linux-gnu/gio/modules"),
+              Path("/usr/lib64/gio/modules"), Path("/usr/lib/gio/modules")],
+             "usr/lib/gio/modules"),
+            ([Path("/usr/lib/x86_64-linux-gnu/gstreamer-1.0"),
+              Path("/usr/lib64/gstreamer-1.0"), Path("/usr/lib/gstreamer-1.0")],
+             "usr/lib/gstreamer-1.0"),
         ]:
+            source = next((path for path in candidates if path.is_dir()), None)
+            if source is None:
+                raise RuntimeError(f"Required runtime module directory is missing: {relative}")
+            module_sources.append((source, relative))
+        for source, relative in module_sources:
             target = appdir / relative
             shutil.copytree(source, target)
             for library in sorted(target.glob("*.so")):
                 modules.extend(["--library", str(library)])
+        scanner_source = next((path for path in [
+            Path("/usr/lib/x86_64-linux-gnu/gstreamer1.0/gstreamer-1.0/gst-plugin-scanner"),
+            Path("/usr/libexec/gstreamer-1.0/gst-plugin-scanner"),
+            Path("/usr/lib64/gstreamer-1.0/gst-plugin-scanner"),
+            Path("/usr/lib/gstreamer-1.0/gst-plugin-scanner"),
+        ] if path.is_file()), None)
+        if scanner_source is None:
+            raise RuntimeError("Required GStreamer plugin scanner is missing")
         scanner = appdir / "usr/libexec/gst-plugin-scanner"
-        shutil.copy2("/usr/lib/x86_64-linux-gnu/gstreamer1.0/gstreamer-1.0/gst-plugin-scanner", scanner)
+        shutil.copy2(scanner_source, scanner)
         helpers.extend(["--executable", str(scanner)])
         for library in sorted((webkit / "injected-bundle").glob("*.so")):
             modules.extend(["--library", str(library)])
@@ -156,6 +185,12 @@ def assemble(args):
         # instead of replacing every /usr occurrence in the library.
         original = str(source_webkit).encode()
         relative = b"./usr/libexec/webkit2gtk-4.1"
+        if len(original) < len(relative):
+            # Some distributions use a shorter compiled prefix such as
+            # /usr/lib. Keep the in-place rewrite length-preserving and route
+            # that compact path to the canonical packaged helper directory.
+            relative = b"./wk"
+            (appdir / "wk").symlink_to("usr/libexec/webkit2gtk-4.1", target_is_directory=True)
         relocated = b"./" + b"/" * (len(original) - len(relative)) + relative[2:]
         assert len(relocated) == len(original)
         changed = 0
