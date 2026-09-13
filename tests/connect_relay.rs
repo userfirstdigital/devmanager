@@ -72,12 +72,15 @@ fn stale_bound_tickets_cannot_forward() {
         )
         .unwrap();
     let route = host.claims().route_id();
-    assert!(relay
-        .admit(route, TicketAudience::HostSocket, sealed(1), 150)
-        .is_ok());
+    for (sequence, now) in [(1, 120), (2, 140), (3, 160), (4, 180)] {
+        assert!(relay
+            .admit(route, TicketAudience::HostSocket, sealed(sequence), now,)
+            .is_ok());
+        relay.take(route, TicketAudience::DeviceSocket).unwrap();
+    }
     assert_eq!(
-        relay.admit(route, TicketAudience::HostSocket, sealed(2), 200),
-        Err(RelayError::ExpiredTicket)
+        relay.admit(route, TicketAudience::HostSocket, sealed(5), 200),
+        Err(RelayError::UnknownRoute)
     );
 }
 
