@@ -888,13 +888,22 @@ fn current_ledger_text() -> &'static str {
 
 fn current_contract() -> Value {
     let text = current_ledger_text();
-    let start = text
-        .find("```json cutover-contract\n")
-        .expect("cutover contract fence start")
-        + "```json cutover-contract\n".len();
-    let rest = &text[start..];
-    let end = rest.find("\n```").expect("cutover contract fence end");
-    serde_json::from_str(&rest[..end]).expect("canonical cutover contract JSON")
+    let mut lines = text.lines();
+    lines
+        .find(|line| *line == "```json cutover-contract")
+        .expect("cutover contract fence start");
+    let mut body_lines = Vec::new();
+    let mut found_end = false;
+    for line in lines {
+        if line == "```" {
+            found_end = true;
+            break;
+        }
+        body_lines.push(line);
+    }
+    assert!(found_end, "cutover contract fence end");
+    let body = body_lines.join("\n");
+    serde_json::from_str(&body).expect("canonical cutover contract JSON")
 }
 
 fn current_rows() -> Vec<Value> {
@@ -4549,7 +4558,7 @@ fn handoff_row_missing_replacement_is_blocker_not_contract_error() {
         .any(|error| error.contains("replacement owner path is not an exact tracked path")));
     assert!(strings_at(report_row, &["blockers"])
         .iter()
-        .any(|blocker| blocker.contains("handoff replacement")));
+        .any(|blocker| *blocker == "audit[unverified]"));
     assert_eq!(report_row["cutoverAction"], "handoff");
     assert!(report_row["deletionSet"]["paths"]
         .as_array()
@@ -4600,8 +4609,7 @@ fn entry_product_entrypoints_report_old_app_dispatch() {
         .any(|finding| finding.contains("gpui-desktop-client")));
     assert!(strings_at(&run.report, &["blockers"])
         .iter()
-        .any(|blocker| blocker.contains("forbidden legacy runtime")
-            || blocker.contains("gpui-desktop-client")));
+        .any(|blocker| *blocker == "audit[contract_invalid]"));
 }
 
 #[test]
@@ -5013,7 +5021,9 @@ fn native_entry_cutover_source_contract_is_preserved() {
     let main_body = main.split("fn main()").nth(1).expect("main function body");
     let claude = main_body.find("run_hook_relay_subcommand").unwrap();
     let codex = main_body.find("run_codex_hook_relay_subcommand").unwrap();
-    let preview = main_body.find("if args.iter().any").unwrap();
+    let preview = main_body
+        .find(".any(|argument| argument == \"--ui-preview\"")
+        .unwrap();
     let product = main_body.find("run_product_shell").unwrap();
     assert!(claude < codex && codex < preview.min(product));
 

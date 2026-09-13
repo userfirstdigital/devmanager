@@ -199,6 +199,7 @@ function Get-CutoverDiagnosticCategory {
     if ($text.Contains('remote change unattributed')) { return 'remote_change_unattributed' }
     if ($text.Contains('unsupported_runtime') -or $text.Contains('powershell 7')) { return 'unsupported_runtime' }
     if ($text.Contains('unverified') -or $text.Contains('not bound')) { return 'unverified' }
+    if ($text.Contains('handoff replacement owner is not yet present')) { return 'unverified' }
     if ($text.Contains('production profile') -or $text.Contains('devmanager_profile')) { return 'production_profile' }
     if ($text.Contains('unauthorized') -or $text.Contains('authenticated fixture')) { return 'root_unauthorized' }
     if ($text.Contains('git identity') -or $text.Contains('git worktree identity') -or $text.Contains('git common directory') -or $text.Contains('git repository identity')) { return 'git_identity_invalid' }
@@ -209,7 +210,7 @@ function Get-CutoverDiagnosticCategory {
     if ($text.Contains('relative evidence directory')) { return 'report_parent_changed' }
     if ($text.Contains('publication handle') -or $text.Contains('parenthandle')) { return 'report_parent_changed' }
     if ($text.Contains('opened-handle identity changed') -or $text.Contains('opened-handle content changed') -or $text.Contains('pathname identity changed') -or $text.Contains('content changed during') -or $text.Contains('handle identity changed')) { return 'file_identity_changed' }
-    if ($text.Contains('legacy path') -or $text.Contains('deletion set') -or $text.Contains('duplicate ledger')) { return 'contract_invalid' }
+    if ($text.Contains('legacy path') -or $text.Contains('legacy entrypoint') -or $text.Contains('legacy runtime') -or $text.Contains('deletion set') -or $text.Contains('duplicate ledger')) { return 'contract_invalid' }
     if ($text.Contains('stdout') -and $text.Contains('overflow')) { return 'process_stdout_overflow' }
     if ($text.Contains('stderr') -and $text.Contains('overflow')) { return 'process_stderr_overflow' }
     if ($text.Contains('stdout-overflow')) { return 'process_stdout_overflow' }
