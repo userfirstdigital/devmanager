@@ -507,6 +507,7 @@ fn launch_handle_retains_file_identity_and_rejects_an_idle_path_replacement() {
         consumed.metadata().unwrap().len(),
         fs::metadata(&path).unwrap().len()
     );
+    drop(consumed);
 
     let replaced = replace_with_native_fixture(&path, b"replacement");
     assert!(
