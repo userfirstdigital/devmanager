@@ -1013,7 +1013,7 @@ $expected = [ordered]@{{
   'phase-03-process-job' = @('test','--test','process_supervisor','job::','--','--nocapture')
   'phase-03-process-registry' = @('test','--test','process_supervisor','registry::','--','--nocapture')
   'phase-03-process-launcher' = @('test','--test','process_supervisor','launcher::','--','--nocapture')
-  'phase-03-process-supervisor' = @('test','--test','process_supervisor','supervisor::','--','--nocapture')
+  'phase-03-process-supervisor' = @('test','--test','process_supervisor','--','--nocapture')
 }}
 $recipes = Get-DevManagerPhaseGateRecipeTable
 foreach ($name in $expected.Keys) {{
@@ -1183,8 +1183,13 @@ try {{
       throw "phase-03 args mismatch $name : got=$($p3.arguments -join ' ') want=$($want -join ' ')"
     }}
     if ($p3.arguments -contains '--exact') {{ throw "phase-03 must not accept caller-provided filters via --exact $name" }}
-    if (@($p3.arguments | Where-Object {{ $_ -like '*::*' }}).Count -ne 1) {{
-      throw "phase-03 must bake exactly one fixed module filter $name"
+    $moduleFilters = @($p3.arguments | Where-Object {{ $_ -like '*::*' }})
+    if ($name -eq 'phase-03-process-supervisor') {{
+      if ($moduleFilters.Count -ne 0) {{
+        throw 'phase-03 process supervisor must run the complete process_supervisor suite'
+      }}
+    }} elseif ($moduleFilters.Count -ne 1) {{
+      throw "phase-03 subset recipe must bake exactly one fixed module filter $name"
     }}
     if ([string]$p3.workingDirectory -ne $expectedWorktree) {{ throw "phase-03 cwd mismatch $name" }}
     if ([string]$p3.cargoTargetDir -ne $expectedCargoTarget) {{ throw "phase-03 target mismatch $name" }}
