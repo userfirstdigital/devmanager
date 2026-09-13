@@ -376,6 +376,8 @@ mod tests {
     fn repo(path: &Path) {
         std::fs::create_dir_all(path).unwrap();
         git(path, &["init", "-b", "main"]);
+        git(path, &["config", "gc.auto", "0"]);
+        git(path, &["config", "maintenance.auto", "false"]);
         git(path, &["config", "user.name", "Desktop Test"]);
         git(path, &["config", "user.email", "desktop@example.invalid"]);
         std::fs::write(path.join("README.md"), "initial\n").unwrap();
