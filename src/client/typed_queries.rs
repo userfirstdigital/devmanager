@@ -23,13 +23,14 @@ use crate::protocol::Capability;
 use super::action::{task_cockpit_query, task_show_query};
 use super::port::AsyncHostRequestPort;
 
-fn unix_time_ms() -> i64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| i64::try_from(duration.as_millis()).unwrap_or(i64::MAX))
-        .unwrap_or(0)
+/// UUIDv7 stores its Unix millisecond timestamp in the first 48 bits. Commands
+/// whose public API accepts a caller-retained CommandId must rebuild the same
+/// envelope on retry, including `issued_at_ms`.
+fn command_issued_at_ms(command_id: CommandId) -> i64 {
+    let bytes = command_id.as_bytes();
+    i64::from_be_bytes([
+        0, 0, bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5],
+    ])
 }
 
 async fn retire_unexpected<P: AsyncHostRequestPort>(port: &mut P, error: IpcError) -> IpcError {
@@ -83,7 +84,7 @@ pub async fn confirm_host_quit<P: AsyncHostRequestPort>(
         command_id,
         client_id: port.client_id(),
         task_id: None,
-        issued_at_ms: unix_time_ms(),
+        issued_at_ms: command_issued_at_ms(command_id),
         expected_task_revision: None,
         command: Command::ConfirmHostQuit(ConfirmHostQuitIntent {
             inspection_id,
@@ -358,6 +359,10 @@ mod tests {
             self.inner.lock().await.queries.clone()
         }
 
+        async fn commands(&self) -> Vec<CommandEnvelope> {
+            self.inner.lock().await.commands.clone()
+        }
+
         async fn retired(&self) -> usize {
             self.inner.lock().await.retired
         }
@@ -417,6 +422,27 @@ mod tests {
             0x00, 0xa2,
         ])
         .expect("task")
+    }
+
+    #[tokio::test]
+    async fn confirm_quit_rebuilds_an_identical_envelope_for_a_retained_command_id() {
+        let command_id = CommandId::from_bytes([
+            0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0xa0,
+        ])
+        .expect("command");
+        let mut port = FakeAsyncPort::new(
+            fixed_client(),
+            CapabilitySet::from_capabilities([Capability::HostShutdown]),
+        );
+
+        let _ = confirm_host_quit(&mut port, command_id, 7, true).await;
+        let _ = confirm_host_quit(&mut port, command_id, 7, true).await;
+
+        let commands = port.commands().await;
+        assert_eq!(commands.len(), 2);
+        assert_eq!(commands[0], commands[1]);
+        assert_eq!(commands[0].issued_at_ms, 1_715_314_138_138);
     }
 
     #[tokio::test]

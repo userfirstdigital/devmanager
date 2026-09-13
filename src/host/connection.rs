@@ -898,6 +898,28 @@ mod workspace_security_tests {
             }),
         };
 
+        let connection_id = Uuid::now_v7();
+        let (_, _, first_request_id) = normalize_task_create_at_host(
+            envelope.clone(),
+            Some(&project_roots),
+            None,
+            connection_id,
+            None,
+        )
+        .expect("first host normalization");
+        let (_, _, retry_request_id) = normalize_task_create_at_host(
+            envelope.clone(),
+            Some(&project_roots),
+            None,
+            connection_id,
+            None,
+        )
+        .expect("retry host normalization");
+        assert_eq!(
+            first_request_id, retry_request_id,
+            "an exact V2 retry must preserve its workspace receipt scope"
+        );
+
         let compatibility_result = dispatch_authenticated_request(
             client_id,
             CapabilitySet::empty(),
@@ -10156,7 +10178,12 @@ fn normalize_task_create_at_host(
                 WorkspaceChoice::External => WorkspaceRequest::confirmed_external(project_root),
                 _ => workspace,
             };
-            let request_id = RequestId::new();
+            // A CreateTaskV2 retry must present the same workspace grant scope
+            // as the first attempt. The command id is already the caller-owned
+            // idempotency key, so derive the otherwise-unrepresented request
+            // identity from it instead of minting a new nonce on every send.
+            let request_id =
+                RequestId::from_bytes(*command_id.as_bytes()).expect("validated command UUIDv7");
             let coordinator = coordinator
                 .cloned()
                 .unwrap_or_else(WorkspaceResourceCoordinator::new);

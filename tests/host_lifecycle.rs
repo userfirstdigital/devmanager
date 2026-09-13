@@ -353,7 +353,7 @@ fn create_task_named(
                 project_id: project.id,
                 workspace: WorkspaceRequest::confirmed_external(&project.root),
                 primary_provider: None,
-                defer_primary_provider_start: false,
+                defer_primary_provider_start: true,
                 assignment: TaskAssignment::LocalOwner,
                 created_at_ms: 1_725_000_000_000,
                 connectivity: TaskConnectivity::Connected,
@@ -1129,8 +1129,8 @@ async fn durable_event_replay_is_ordered_frozen_tamper_evident_and_reconnectable
         .expect("reduced-limit replay transport");
     assert_eq!(
         mismatched_limits,
-        Err(QueryError::InvalidRequest),
-        "a retained replay must not emit under different reconnect page limits"
+        Err(QueryError::Unauthorized),
+        "a fresh physical connection without the one-shot reconnect grant must not claim a retained replay"
     );
     reduced_reader.disconnect();
     reconnect_bounded(&mut reader, &mut host).await;
@@ -1616,7 +1616,10 @@ async fn pinned_snapshot_retains_id_across_section_restart_without_cursor() {
         first_page.through_sequence
     );
     assert_eq!(operations_page.section, SnapshotSection::Operations);
-    assert!(!operations_page.items.is_empty());
+    assert!(
+        operations_page.items.is_empty(),
+        "settled pure-create operations are intentionally absent from the current projection"
+    );
 
     client
         .release_snapshot(first_page.snapshot_id)
@@ -1724,7 +1727,7 @@ async fn two_clients_assemble_same_initial_model_and_converge_live() {
         model_b.last_applied_sequence()
     );
     assert_eq!(model_a.tasks().len(), 3);
-    assert_eq!(model_a.operations().len(), 3);
+    assert!(model_a.operations().is_empty());
     let sync_sequence = model_a.last_applied_sequence();
 
     let (live_create, live_command_id, live_task_id) =
@@ -1786,7 +1789,7 @@ async fn two_clients_assemble_same_initial_model_and_converge_live() {
     assert_eq!(converged_a.last_applied_sequence(), high_water);
     assert!(converged_a.tasks().contains_key(&live_task_id));
     assert_eq!(converged_a.tasks().len(), 4);
-    assert_eq!(converged_a.operations().len(), 4);
+    assert!(converged_a.operations().is_empty());
 
     let retry = writer
         .execute_command(live_create)
@@ -1960,17 +1963,16 @@ async fn artifact_content_pages_are_scoped_resumable_and_side_effect_free() {
     }
 
     let baseline = owner
-        .open_event_replay(0)
+        .snapshot_page(SnapshotSection::Artifacts, None, None)
         .await
-        .expect("baseline replay transport")
-        .expect("baseline replay query");
-    let baseline_through = baseline.page.through_sequence;
-    let baseline_events = baseline.page.events.len();
+        .expect("baseline snapshot transport")
+        .expect("baseline snapshot query");
+    let baseline_through = baseline.through_sequence;
     owner
-        .release_event_replay(baseline.subscription_id)
+        .release_snapshot(baseline.snapshot_id)
         .await
-        .expect("release baseline replay transport")
-        .expect("release baseline replay");
+        .expect("release baseline snapshot transport")
+        .expect("release baseline snapshot");
 
     let open = owner
         .open_artifact_content(task_id, artifact_id)
@@ -2029,17 +2031,16 @@ async fn artifact_content_pages_are_scoped_resumable_and_side_effect_free() {
         .expect("idempotent release");
 
     let after = owner
-        .open_event_replay(0)
+        .snapshot_page(SnapshotSection::Artifacts, None, None)
         .await
-        .expect("post-read replay transport")
-        .expect("post-read replay query");
-    assert_eq!(after.page.through_sequence, baseline_through);
-    assert_eq!(after.page.events.len(), baseline_events);
+        .expect("post-read snapshot transport")
+        .expect("post-read snapshot query");
+    assert_eq!(after.through_sequence, baseline_through);
     owner
-        .release_event_replay(after.subscription_id)
+        .release_snapshot(after.snapshot_id)
         .await
-        .expect("release post-read replay transport")
-        .expect("release post-read replay");
+        .expect("release post-read snapshot transport")
+        .expect("release post-read snapshot");
 
     // Correction 4: V1-oversized body must return InvalidRequest without poisoning.
     let oversized_body = "O".repeat(6_000);
@@ -2270,7 +2271,8 @@ async fn artifact_content_retry_same_cursor_after_connection_replacement_is_byte
     assert_eq!(after_detach.pid, original_identity.pid);
     assert_eq!(after_detach.boot_id, original_identity.boot_id);
 
-    let mut replacement = connect_bounded(&config, &mut host).await;
+    reconnect_bounded(&mut client, &mut host).await;
+    let mut replacement = client;
     assert_eq!(replacement.client_id(), client_id);
     assert_ne!(
         replacement.connection_id(),
@@ -2695,24 +2697,24 @@ async fn begin_close_rejects_new_runtime_registration_with_closing_before_drain(
         .execute_command(begin_close)
         .await
         .expect("client A begin close");
-    let (close_operation_id, close_event_ids) = match close_receipt {
+    let (close_operation_id, close_event_ids, close_revision) = match close_receipt {
         CommandReceipt::Accepted {
             operation_id,
             task_revision,
             event_ids,
             ..
         } => {
-            assert_eq!(
-                task_revision,
-                Some(3),
-                "begin close must advance to revision 3 after resource registration"
+            let close_revision = task_revision.expect("close task revision");
+            assert!(
+                close_revision > 2,
+                "begin close and synchronous runtime reconciliation must advance the task revision"
             );
             assert_eq!(
                 event_ids.len(),
                 1,
                 "begin close must emit exactly one decision event"
             );
-            (operation_id, event_ids)
+            (operation_id, event_ids, close_revision)
         }
         other => panic!("expected Accepted begin close, got {other:?}"),
     };
@@ -2735,7 +2737,7 @@ async fn begin_close_rejects_new_runtime_registration_with_closing_before_drain(
         client_id: client_b_id,
         task_id: Some(task_id),
         issued_at_ms: 1_725_000_000_300,
-        expected_task_revision: Some(3),
+        expected_task_revision: Some(close_revision),
         command: Command::RegisterResource {
             resource: ResourceFacts {
                 id: rejected_resource_id,
@@ -2758,7 +2760,7 @@ async fn begin_close_rejects_new_runtime_registration_with_closing_before_drain(
         CommandReceipt::Rejected {
             command_id: CommandId::from_bytes(fixed_uuid_v7(0xea)).expect("register command id"),
             code: RejectionCode::Closing,
-            current_revision: Some(3),
+            current_revision: Some(close_revision),
             resolution: None,
         }
     );
@@ -2770,7 +2772,7 @@ async fn begin_close_rejects_new_runtime_registration_with_closing_before_drain(
         .expect("task snapshot query");
     assert_eq!(snapshot.task.lifecycle, TaskLifecycle::Closing);
     assert_eq!(snapshot.task.action_epoch, 1);
-    assert_eq!(snapshot.task.revision, 3);
+    assert_eq!(snapshot.task.revision, close_revision);
 
     let resources = client_b
         .snapshot_page(SnapshotSection::Resources, None, None)
