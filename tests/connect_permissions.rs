@@ -76,7 +76,7 @@ fn unknown_actions_and_cross_task_grants_deny() {
             action: ActionId::new(99).unwrap(),
             credential: None,
         }),
-        PermissionDecision::Denied(PermissionDenyReason::ScopedGrantRequired)
+        PermissionDecision::Denied(PermissionDenyReason::UnknownAction)
     );
     let context = AuthoritativePermissionContext::live(4, 5, 6).unwrap();
     let grant = ScopedPermissionGrant::issue(
