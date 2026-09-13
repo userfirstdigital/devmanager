@@ -2,14 +2,13 @@
 
 use std::path::PathBuf;
 
-use devmanager::domain::command::{Command, CommandEnvelope, CommandReceipt, CreateTaskIntent};
+use devmanager::domain::command::{Command, CommandEnvelope, CreateTaskIntent};
 use devmanager::domain::id::{ClientId, CommandId, EnvironmentId, ProjectId, RequestId, TaskId};
-use devmanager::domain::operation::OperationState;
-use devmanager::domain::query::{Query, QueryEnvelope, QueryError, QueryOutcome, QueryResult};
+use devmanager::domain::query::{Query, QueryEnvelope, QueryError, QueryOutcome};
 use devmanager::domain::task::{
     ReviewReadiness, TaskActivity, TaskAssignment, TaskAttention, TaskConnectivity, WorkspaceRef,
 };
-use devmanager::kernel::CommandBus;
+use devmanager::kernel::{CommandBus, StoreError};
 use tempfile::TempDir;
 
 fn fixed_uuid_v7(tail: u8) -> [u8; 16] {
@@ -72,7 +71,7 @@ fn create_task_envelope(cmd: CommandId, task: TaskId) -> CommandEnvelope {
 }
 
 #[test]
-fn command_bus_idempotent_create_survives_reopen() {
+fn public_command_bus_rejects_host_only_create_before_and_after_reopen() {
     let dir = TempDir::new().expect("tempdir");
     let path = temp_db_path(&dir);
     let task = task_id(0xE1);
@@ -80,113 +79,42 @@ fn command_bus_idempotent_create_survives_reopen() {
     let envelope = create_task_envelope(cmd, task);
 
     let mut bus = CommandBus::open(&path).expect("open bus");
-    let first = bus.execute(envelope.clone()).expect("create task");
-    let CommandReceipt::Accepted {
-        operation_id: first_op,
-        ..
-    } = first.clone()
-    else {
-        panic!("expected accepted receipt, got {first:?}");
-    };
-
-    let retry = bus
-        .execute(envelope.clone())
-        .expect("retry identical command");
     assert_eq!(
-        retry, first,
-        "identical command must yield identical receipt"
+        bus.execute(envelope.clone()),
+        Err(StoreError::HostAuthorityRequired)
     );
     assert_eq!(
-        retry.accepted_operation_id(),
-        Some(first_op),
-        "retry must preserve OperationId"
+        bus.execute(envelope.clone()),
+        Err(StoreError::HostAuthorityRequired),
+        "an identical retry must remain outside the host-only boundary"
     );
-
-    let settled = bus
-        .operation_status(first_op)
-        .expect("status before drop")
-        .expect("known operation");
-    assert!(
-        matches!(settled, OperationState::Settled { .. }),
-        "create-task must settle, got {settled:?}"
-    );
-
-    let snapshot_before = bus
+    assert!(bus
         .task_snapshot(task)
         .expect("snapshot before drop")
-        .expect("created task snapshot");
-    assert_eq!(snapshot_before.task.id, task);
-    assert_eq!(snapshot_before.task.title, "Headless boundary");
-    assert_eq!(snapshot_before.task.revision, 1);
+        .is_none());
 
     drop(bus);
 
     let mut reopened = CommandBus::open(&path).expect("reopen bus");
-    let after_retry = reopened
-        .execute(envelope)
-        .expect("retry identical command after reopen");
     assert_eq!(
-        after_retry, first,
-        "post-reopen identical command must yield identical receipt"
+        reopened.execute(envelope),
+        Err(StoreError::HostAuthorityRequired),
+        "reopening must not weaken the host-only boundary"
     );
-    assert_eq!(
-        after_retry.accepted_operation_id(),
-        Some(first_op),
-        "post-reopen retry must preserve OperationId"
-    );
-
-    let after = reopened
-        .operation_status(first_op)
-        .expect("status after reopen")
-        .expect("known operation after reopen");
-    assert_eq!(
-        after, settled,
-        "settled operation state must survive reopen"
-    );
-
-    let snapshot_after = reopened
+    assert!(reopened
         .task_snapshot(task)
         .expect("snapshot after reopen")
-        .expect("created task snapshot after reopen");
-    assert_eq!(snapshot_after.task.id, task);
-    assert_eq!(snapshot_after.task.title, "Headless boundary");
-    assert_eq!(snapshot_after.task.revision, 1);
-    assert_eq!(
-        snapshot_after, snapshot_before,
-        "task snapshot must survive reopen"
-    );
+        .is_none());
 }
 
 #[test]
-fn command_bus_query_task_snapshot_and_missing_scope() {
+fn command_bus_query_rejects_missing_scope_and_reports_unknown_task() {
     let dir = TempDir::new().expect("tempdir");
     let path = temp_db_path(&dir);
     let task = task_id(0xF1);
-    let cmd = command_id(0xF2);
     let client = client_id(0x20);
-    let envelope = create_task_envelope(cmd, task);
 
-    let mut bus = CommandBus::open(&path).expect("open bus");
-    let _ = bus.execute(envelope).expect("create task");
-
-    let request_id = RequestId::from_bytes(fixed_uuid_v7(0xF3)).expect("request id");
-    let reply = bus
-        .query(QueryEnvelope {
-            request_id,
-            client_id: client,
-            task_id: Some(task),
-            query: Query::TaskSnapshot,
-        })
-        .expect("task snapshot query");
-    assert_eq!(reply.request_id, request_id);
-    match reply.outcome {
-        QueryOutcome::Ok(QueryResult::TaskSnapshot { snapshot }) => {
-            assert_eq!(snapshot.task.id, task);
-            assert_eq!(snapshot.task.title, "Headless boundary");
-            assert_eq!(snapshot.task.revision, 1);
-        }
-        other => panic!("expected task snapshot, got {other:?}"),
-    }
+    let bus = CommandBus::open(&path).expect("open bus");
 
     let invalid = bus
         .query(QueryEnvelope {
@@ -205,7 +133,7 @@ fn command_bus_query_task_snapshot_and_missing_scope() {
         .query(QueryEnvelope {
             request_id: RequestId::from_bytes(fixed_uuid_v7(0xF5)).expect("request id"),
             client_id: client,
-            task_id: Some(task_id(0xF6)),
+            task_id: Some(task),
             query: Query::TaskSnapshot,
         })
         .expect("missing task query");
