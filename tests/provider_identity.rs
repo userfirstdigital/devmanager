@@ -377,27 +377,19 @@ fn executable_identity_is_canonical_file_bound_and_checked_on_serde() {
 }
 
 #[test]
-fn executable_identity_rejects_replacement_even_when_the_path_is_unchanged() {
+fn idle_executable_identity_allows_upgrade_but_rejects_the_replacement() {
     let temp = tempdir().unwrap();
     let path = native_fixture(temp.path(), "provider-native.exe", b"provider-a");
     let original = executable(&path);
 
     let replaced = replace_with_native_fixture(&path, b"provider-b");
-    if cfg!(windows) {
-        assert!(
-            !replaced,
-            "the held identity must deny in-place replacement"
-        );
-        assert!(original.validate_current().is_ok());
-    } else {
-        assert!(original.validate_current().is_err());
-    }
+    assert!(replaced, "an idle provider identity must permit an upgrade");
+    assert!(
+        original.validate_current().is_err(),
+        "the old identity must reject the upgraded executable"
+    );
     let replacement = executable(&path);
-    if cfg!(windows) {
-        assert_eq!(replacement, original);
-    } else {
-        assert_ne!(replacement, original);
-    }
+    assert_ne!(replacement, original);
 }
 
 #[test]
@@ -490,7 +482,7 @@ fn plaintext_provider_name_is_not_a_runnable_native_executable() {
 }
 
 #[test]
-fn launch_handle_retains_file_identity_and_rejects_path_replacement() {
+fn launch_handle_retains_file_identity_and_rejects_an_idle_path_replacement() {
     let temp = tempdir().unwrap();
     let name = if cfg!(windows) {
         "claude.exe"
@@ -517,27 +509,30 @@ fn launch_handle_retains_file_identity_and_rejects_path_replacement() {
     );
 
     let replaced = replace_with_native_fixture(&path, b"replacement");
-    if cfg!(windows) {
-        assert!(!replaced, "the held launch graph must deny replacement");
-        assert!(handle.revalidate().is_ok());
-        assert!(identity.validate_current().is_ok());
-    } else {
-        assert!(handle.revalidate().is_err());
-        assert!(identity.validate_current().is_err());
-    }
+    assert!(
+        replaced,
+        "a prepared but idle launch capability must not block provider upgrades"
+    );
+    assert!(handle.revalidate().is_err());
+    assert!(identity.validate_current().is_err());
 }
 
 #[cfg(windows)]
 #[test]
-fn held_launch_graph_handle_denies_write_and_delete_sharing() {
+fn idle_launch_graph_handle_detects_write_and_allows_delete_sharing() {
     let temp = tempdir().unwrap();
     let path = native_fixture(temp.path(), "provider-native.exe", b"held");
     let identity = executable(&path);
     let handle = identity.open_for_launch().unwrap();
 
-    assert!(fs::OpenOptions::new().append(true).open(&path).is_err());
-    assert!(fs::remove_file(&path).is_err());
-    handle.revalidate().unwrap();
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .expect("an idle launch graph must permit provider upgrades")
+        .write_all(b"upgraded")
+        .unwrap();
+    assert!(handle.revalidate().is_err());
+    fs::remove_file(&path).expect("an idle launch graph must permit provider replacement");
 }
 
 #[test]
@@ -1585,27 +1580,19 @@ fn auth_receipt_consumption_is_one_shot_fresh_and_identity_bound() {
     let replacement_receipt =
         accept_trusted_probe(&mut replacement_registry, replacement_invocation);
     let replaced = replace_with_native_fixture(&path, b"provider-replaced");
-    if cfg!(windows) {
-        assert!(!replaced, "the held auth identity must deny replacement");
-        assert!(replacement_registry
-            .consume_at_for(
-                ProviderKind::ClaudeCode,
-                &identity,
-                replacement_receipt,
-                Instant::now(),
-            )
-            .is_ok());
-    } else {
-        assert!(matches!(
-            replacement_registry.consume_at_for(
-                ProviderKind::ClaudeCode,
-                &identity,
-                replacement_receipt,
-                Instant::now(),
-            ),
-            Err(devmanager::providers::ProviderAuthEvidenceError::ExecutableChanged(_))
-        ));
-    }
+    assert!(
+        replaced,
+        "an idle auth receipt must not block provider upgrades"
+    );
+    assert!(matches!(
+        replacement_registry.consume_at_for(
+            ProviderKind::ClaudeCode,
+            &identity,
+            replacement_receipt,
+            Instant::now(),
+        ),
+        Err(devmanager::providers::ProviderAuthEvidenceError::ExecutableChanged(_))
+    ));
 }
 
 #[test]
