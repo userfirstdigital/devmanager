@@ -114,8 +114,11 @@ jobs:
           if ($testTargets.Count -eq 0) { throw 'No Windows integration test targets were discovered' }
           $cargoArgs = @('test', '--locked', '--bins', '--examples')
           foreach ($testTarget in $testTargets) { $cargoArgs += @('--test', $testTarget) }
-          $cargoArgs += @('--target-dir', $env:CARGO_TARGET_DIR, '-j', '2', '--', '--test-threads=1')
-          Write-Output 'ui_preview_capture is compile-only because it tests retired preview tooling and interactive desktop capture.'
+          $cargoArgs += @(
+            '--target-dir', $env:CARGO_TARGET_DIR, '-j', '2', '--', '--test-threads=1',
+            '--skip', 'quality_preview_cli_and_pixel_readback_hold_without_canonical_shell'
+          )
+          Write-Output 'Retired preview tooling and hosted-runner desktop capture remain compile-only.'
           & cargo @cargoArgs 2>&1 | Tee-Object launch-evidence/tests.log
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
 
