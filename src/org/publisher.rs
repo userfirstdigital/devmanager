@@ -302,7 +302,12 @@ mod tests {
             .expect("sign");
         let verified = publisher.verify(&signed).expect("verify");
         assert!(matches!(verified, OrganizationWirePayload::Membership(_)));
-        signed.mac_hex.replace_range(0..2, "00");
+        let tampered_prefix = if signed.mac_hex.starts_with("00") {
+            "01"
+        } else {
+            "00"
+        };
+        signed.mac_hex.replace_range(0..2, tampered_prefix);
         assert_eq!(
             publisher.verify(&signed).expect_err("tamper"),
             OrgError::TamperedEvidence
