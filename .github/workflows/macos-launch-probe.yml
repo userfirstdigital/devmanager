@@ -1,0 +1,52 @@
+name: macOS launch probe
+
+on:
+  push:
+    branches: ["codex/macos-probe-*"]
+
+permissions:
+  contents: read
+
+jobs:
+  macos:
+    runs-on: macos-15
+    timeout-minutes: 90
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target-macos-probe
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: "1.94.0"
+          components: rustfmt
+      - name: Prepare reviewed WASM inputs and isolated target
+        run: |
+          python3 packaging/prepare-ci-checkout.py
+          case "$CARGO_TARGET_DIR" in
+            "$GITHUB_WORKSPACE"/*) ;;
+            *) echo "CARGO_TARGET_DIR escaped the checkout" >&2; exit 1 ;;
+          esac
+          printf 'CARGO_TARGET_DIR=%s\n' "$CARGO_TARGET_DIR"
+      - uses: swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          cache-on-failure: true
+      - name: Compile every macOS target
+        run: |
+          cargo fmt --all -- --check
+          cargo check --locked --lib --bins --tests --examples
+      - name: Build process helper
+        run: cargo build --locked --bin devmanager-process-test-helper
+      - name: Run macOS library tests serially
+        run: cargo test --locked --lib -- --test-threads=1
+      - name: Check for owned process residue
+        if: always()
+        run: |
+          owned="$(ps -axo pid=,command= | grep -F "$CARGO_TARGET_DIR" | grep -v grep || true)"
+          if [ -n "$owned" ]; then
+            printf '%s\n' "$owned"
+            exit 1
+          fi
+          echo 'No owned test harness, Cargo, or Rust compiler process remains.'
