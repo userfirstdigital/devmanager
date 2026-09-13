@@ -3554,23 +3554,28 @@ mod tests {
         wire.dispatch_accepted(accepted_receipt(command_id, operation_id))
             .await
             .expect("dispatch");
-        let mut saw = 0;
-        for _ in 0..100 {
-            tokio::task::yield_now().await;
-            let retained = fleet.retained_outcomes(&host).expect("outcomes");
-            saw = retained
-                .iter()
-                .filter(|owned| match &owned.value {
-                    FleetRetainedCommand::Receipt(receipt) => receipt.command_id() == command_id,
-                    FleetRetainedCommand::Uncertain(uncertain) => {
-                        uncertain.command_id == command_id
-                    }
-                })
-                .count();
-            if saw >= 1 {
-                break;
+        let saw = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let retained = fleet.retained_outcomes(&host).expect("outcomes");
+                let count = retained
+                    .iter()
+                    .filter(|owned| match &owned.value {
+                        FleetRetainedCommand::Receipt(receipt) => {
+                            receipt.command_id() == command_id
+                        }
+                        FleetRetainedCommand::Uncertain(uncertain) => {
+                            uncertain.command_id == command_id
+                        }
+                    })
+                    .count();
+                if count >= 1 {
+                    break count;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
             }
-        }
+        })
+        .await
+        .expect("admitted receipt retained before the test deadline");
         assert_eq!(saw, 1, "receipt retained exactly once");
         assert!(!wire.is_poisoned());
         assert!(!wire.has_command_waiter(command_id));

@@ -5756,6 +5756,17 @@ fn mutable_directory_snapshot_for_node(
             // completed snapshot. A disappeared bound entry remains absent
             // and is rejected by the expected/actual comparison below.
             Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            // Git for Windows can hold an exact merge-state file without
+            // metadata sharing while it is writing a pull. That transient is
+            // confined to a path this transition already authorizes, and the
+            // strict post-child snapshot below must still inspect or observe
+            // the final absence before the new baseline is adopted.
+            Err(error)
+                if retry_inflight_file(&path)
+                    && is_windows_inflight_metadata_sharing_error(&error) =>
+            {
+                continue
+            }
             Err(error) => {
                 return Err(format!(
                     "mutable Git graph entry metadata is unavailable for {}: {error}",
@@ -5808,6 +5819,20 @@ fn mutable_directory_snapshot_for_node(
     }
     dedup_snapshot_entries(&mut entries);
     Ok(entries)
+}
+
+fn is_windows_inflight_metadata_sharing_error(error: &io::Error) -> bool {
+    #[cfg(windows)]
+    {
+        // ERROR_ACCESS_DENIED and ERROR_SHARING_VIOLATION are both emitted by
+        // Windows filesystem drivers when Git owns an exclusive live handle.
+        matches!(error.raw_os_error(), Some(5) | Some(32))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = error;
+        false
+    }
 }
 
 fn graph_identity_matches(expected: &FileIdentity, actual: &FileIdentity) -> bool {
@@ -12651,6 +12676,29 @@ mod tests {
             .graph
             .revalidate_after_transition(GraphTransition::Pull)
             .expect("a pull may leave Git's AUTO_MERGE behind");
+    }
+
+    #[test]
+    fn inflight_metadata_deferral_is_limited_to_windows_sharing_errors() {
+        let access_denied = io::Error::from_raw_os_error(5);
+        let sharing_violation = io::Error::from_raw_os_error(32);
+        let missing = io::Error::from_raw_os_error(2);
+        #[cfg(windows)]
+        {
+            assert!(is_windows_inflight_metadata_sharing_error(&access_denied));
+            assert!(is_windows_inflight_metadata_sharing_error(
+                &sharing_violation
+            ));
+            assert!(!is_windows_inflight_metadata_sharing_error(&missing));
+        }
+        #[cfg(not(windows))]
+        {
+            assert!(!is_windows_inflight_metadata_sharing_error(&access_denied));
+            assert!(!is_windows_inflight_metadata_sharing_error(
+                &sharing_violation
+            ));
+            assert!(!is_windows_inflight_metadata_sharing_error(&missing));
+        }
     }
 
     #[test]
