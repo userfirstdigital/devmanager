@@ -9,6 +9,9 @@ import {
 export const WEB_BUILD_ID = CLIENT_WEB_BUILD_ID;
 const COMPATIBLE_BUILD_RELOAD_GUARD_KEY =
   "devmanager-compatible-build-reload-attempt";
+/** SessionStorage guard for metadata-only fleet document reloads (not SW build). */
+export const FLEET_DOCUMENT_RELOAD_GUARD_KEY =
+  "devmanager-fleet-document-reload.v1" as const;
 
 export interface UpdateSafetyState {
   hasDraft: boolean;
@@ -152,6 +155,94 @@ export function claimCompatibleBuildReloadAttempt(
   }
 }
 
+/**
+ * Claim a fleet document reload attempt. Fail closed when storage is
+ * unavailable. Same document+roster fingerprint cannot reload again.
+ */
+export function claimFleetDocumentReloadAttempt(
+  storage: ReloadGuardStorage,
+  fingerprint: string,
+): boolean {
+  try {
+    const saved = storage.getItem(FLEET_DOCUMENT_RELOAD_GUARD_KEY);
+    if (saved) {
+      const parsed = JSON.parse(saved) as {
+        fingerprint?: unknown;
+        count?: unknown;
+      };
+      if (parsed.fingerprint === fingerprint && parsed.count === 1) {
+        return false;
+      }
+    }
+    storage.setItem(
+      FLEET_DOCUMENT_RELOAD_GUARD_KEY,
+      JSON.stringify({ fingerprint, count: 1 }),
+    );
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Narrow document-reload coordinator for fleet CSP/metadata HTML refresh.
+ * Reuses localReloadGate + canActivateUpdate; does not use SW build-id recovery.
+ * Returns true only when a reload was actually invoked after a successful claim.
+ */
+export function createFleetDocumentReloadCoordinator({
+  readSafetyState,
+  isVisible,
+  reloadPage,
+  claimAttempt,
+}: {
+  readSafetyState: () => UpdateSafetyState;
+  isVisible: () => boolean;
+  reloadPage: () => void;
+  claimAttempt: (fingerprint: string) => boolean;
+}) {
+  let pendingFingerprint: string | null = null;
+  let reloaded = false;
+  const gate = createLocalReloadGate({
+    isVisible,
+    readSafetyState,
+    reload: () => {
+      const fingerprint = pendingFingerprint;
+      pendingFingerprint = null;
+      if (fingerprint === null) return;
+      if (!claimAttempt(fingerprint)) return;
+      reloaded = true;
+      reloadPage();
+    },
+  });
+
+  return {
+    requestReload(fingerprint: string): boolean {
+      reloaded = false;
+      pendingFingerprint = fingerprint;
+      gate.notifyControllerChanged();
+      return reloaded;
+    },
+    notifySafePoint(): boolean {
+      reloaded = false;
+      gate.notifySafePoint();
+      return reloaded;
+    },
+    hasPendingReload: () => gate.hasPendingReload(),
+  };
+}
+
+type FleetDocumentReloadCoordinator = ReturnType<
+  typeof createFleetDocumentReloadCoordinator
+>;
+
+let activeFleetDocumentReload: FleetDocumentReloadCoordinator | null = null;
+
+export function installFleetDocumentReloadCoordinator(
+  coordinator: FleetDocumentReloadCoordinator | null,
+): void {
+  activeFleetDocumentReload = coordinator;
+}
+
 export function createCompatibleBuildRecoveryCoordinator({
   clientBuildId,
   readSafetyState,
@@ -265,6 +356,7 @@ export function requestCompatibleBuild(hostBuildId: string): void {
 
 export function notifyPwaSafetyStateChanged(): void {
   activePwaSafetyStateNotifier?.();
+  activeFleetDocumentReload?.notifySafePoint();
 }
 
 function installCompatibleBuildRecovery(

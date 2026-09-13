@@ -1,0 +1,17 @@
+{
+  "schema": "devmanager.conversation.fixture/v1",
+  "id": "activity-grouping",
+  "events": [
+    { "kind": "user_message", "text": "run the tests" },
+    { "kind": "tool_call", "tool_id": "t1", "name": "Read", "state": "succeeded" },
+    { "kind": "tool_call", "tool_id": "t2", "name": "Read", "state": "succeeded" },
+    { "kind": "tool_call", "tool_id": "t3", "name": "Bash", "state": "succeeded" },
+    { "kind": "assistant_text", "text": "all green" }
+  ],
+  "expected_rows": [
+    { "kind": "message", "role": "user", "text": "run the tests" },
+    { "kind": "activity", "entries": 1, "state": "success" },
+    { "kind": "activity_toggle", "hidden": 2 },
+    { "kind": "message", "role": "assistant", "text": "all green" }
+  ]
+}

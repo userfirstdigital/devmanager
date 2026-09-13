@@ -1,100 +1,137 @@
 import type { StableSessionKey } from "../api/types";
+import type { TaskId, TaskResource } from "../tasks/taskId";
+import {
+  DEFAULT_TASK_RESOURCE,
+  isTaskResource,
+  parseTaskKeyParts,
+  taskIdFromStableSessionKey,
+  taskIdToStableSessionKey,
+} from "../tasks/taskId";
 
-export type AppDestination = "sessions" | "projects" | "settings";
-export type SessionRouteKind = "server" | "tab";
+export type AppDestination = "tasks" | "projects" | "settings";
 
 export type AppRoute =
-  | { name: "sessions" }
+  | { name: "tasks" }
   | { name: "projects" }
   | { name: "project"; projectId: string }
-  | { name: "session"; kind: SessionRouteKind; id: string }
+  | { name: "task"; taskId: TaskId; resource?: TaskResource }
   | { name: "settings" };
 
-export const SESSIONS_ROUTE: AppRoute = { name: "sessions" };
+export const TASKS_ROUTE: AppRoute = { name: "tasks" };
 
 function decodeSegment(value: string | undefined): string | null {
-  if (!value) return null;
+  if (!value || value.length > 3072) return null;
   try {
     const decoded = decodeURIComponent(value);
-    return decoded.length > 0 && !decoded.includes("\0") ? decoded : null;
+    return decoded.length > 0 && validRouteSegment(decoded) ? decoded : null;
   } catch {
     return null;
   }
 }
 
-export function parseRoute(input: string): AppRoute {
-  if (!input.startsWith("/")) return SESSIONS_ROUTE;
-  const pathname = input.split(/[?#]/u, 1)[0] ?? "/";
-  const segments = pathname.split("/").filter(Boolean);
+// Keep the native resume validator (remote/web/routes.rs) in sync. These
+// bounds validate a link only; the host still authorizes its execution target.
+function validRouteSegment(value: string): boolean {
+  return (
+    !/[\u0000-\u001f\u007f-\u009f\ud800-\udfff]/u.test(value) &&
+    new TextEncoder().encode(value).length <= 1024
+  );
+}
 
-  if (segments.length === 1 && segments[0] === "sessions") {
-    return { name: "sessions" };
+function validTaskId(taskId: TaskId): boolean {
+  return validRouteSegment(taskId) && parseTaskKeyParts(taskId) !== null;
+}
+
+export function parseRoute(input: string): AppRoute {
+  if (!input.startsWith("/")) return TASKS_ROUTE;
+  const pathname = input.split(/[?#]/u, 1)[0] ?? "/";
+  const segments = pathname.slice(1).split("/");
+
+  if (segments.length === 1 && segments[0] === "tasks") {
+    return { name: "tasks" };
   }
   if (segments.length === 1 && segments[0] === "projects") {
     return { name: "projects" };
   }
   if (segments.length === 2 && segments[0] === "projects") {
     const projectId = decodeSegment(segments[1]);
-    return projectId ? { name: "project", projectId } : SESSIONS_ROUTE;
+    return projectId ? { name: "project", projectId } : TASKS_ROUTE;
   }
-  if (
-    segments.length === 3 &&
-    segments[0] === "session" &&
-    (segments[1] === "server" || segments[1] === "tab")
-  ) {
-    const id = decodeSegment(segments[2]);
-    return id
-      ? { name: "session", kind: segments[1], id }
-      : SESSIONS_ROUTE;
+  if (segments.length >= 2 && segments[0] === "tasks") {
+    const taskId = decodeSegment(segments[1]);
+    if (!taskId || !validTaskId(taskId)) return TASKS_ROUTE;
+    if (segments.length === 2) {
+      return { name: "task", taskId };
+    }
+    if (segments.length === 3 && isTaskResource(segments[2])) {
+      return { name: "task", taskId, resource: segments[2] };
+    }
+    return TASKS_ROUTE;
   }
   if (segments.length === 1 && segments[0] === "settings") {
     return { name: "settings" };
   }
-  return SESSIONS_ROUTE;
+  return TASKS_ROUTE;
 }
 
 export function hrefForRoute(route: AppRoute): string {
   switch (route.name) {
-    case "sessions":
-      return "/sessions";
+    case "tasks":
+      return "/tasks";
     case "projects":
       return "/projects";
     case "project":
       return `/projects/${encodeURIComponent(route.projectId)}`;
-    case "session":
-      return `/session/${route.kind}/${encodeURIComponent(route.id)}`;
+    case "task": {
+      if (!validTaskId(route.taskId)) return "/tasks";
+      const base = `/tasks/${encodeURIComponent(route.taskId)}`;
+      const resource = route.resource ?? DEFAULT_TASK_RESOURCE;
+      return resource === DEFAULT_TASK_RESOURCE ? base : `${base}/${resource}`;
+    }
     case "settings":
       return "/settings";
   }
 }
 
-export function routeForSessionKey(stableSessionKey: StableSessionKey): AppRoute {
-  const separator = stableSessionKey.indexOf(":");
-  if (separator <= 0 || separator === stableSessionKey.length - 1) {
-    return SESSIONS_ROUTE;
-  }
-  const kind = stableSessionKey.slice(0, separator);
-  const id = stableSessionKey.slice(separator + 1);
-  if (kind !== "server" && kind !== "tab") return SESSIONS_ROUTE;
-  return { name: "session", kind, id };
+export function routeForTaskId(
+  taskId: TaskId,
+  resource: TaskResource = DEFAULT_TASK_RESOURCE,
+): AppRoute {
+  if (!validTaskId(taskId)) return TASKS_ROUTE;
+  return resource === DEFAULT_TASK_RESOURCE
+    ? { name: "task", taskId }
+    : { name: "task", taskId, resource };
+}
+
+/** Map a host stable session key onto the Task Cockpit route. */
+export function routeForStableSessionKey(
+  stableSessionKey: StableSessionKey,
+  resource: TaskResource = DEFAULT_TASK_RESOURCE,
+): AppRoute {
+  return routeForTaskId(taskIdFromStableSessionKey(stableSessionKey), resource);
+}
+
+export function taskIdForRoute(route: AppRoute): TaskId | null {
+  return route.name === "task" ? route.taskId : null;
 }
 
 export function stableSessionKeyForRoute(
   route: AppRoute,
 ): StableSessionKey | null {
-  return route.name === "session" ? `${route.kind}:${route.id}` : null;
+  const taskId = taskIdForRoute(route);
+  return taskId ? taskIdToStableSessionKey(taskId) : null;
 }
 
 export function destinationForRoute(route: AppRoute): AppDestination | null {
   switch (route.name) {
-    case "sessions":
-      return "sessions";
+    case "tasks":
+      return "tasks";
     case "projects":
     case "project":
       return "projects";
     case "settings":
       return "settings";
-    case "session":
+    case "task":
       return null;
   }
 }
@@ -111,7 +148,7 @@ export function isCanonicalRouteLocation(
 }
 
 export function currentBrowserRoute(): AppRoute {
-  if (typeof window === "undefined") return SESSIONS_ROUTE;
+  if (typeof window === "undefined") return TASKS_ROUTE;
   return parseRoute(`${window.location.pathname}${window.location.search}`);
 }
 

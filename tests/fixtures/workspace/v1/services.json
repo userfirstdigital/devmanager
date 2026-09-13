@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "services": [
+    {
+      "id": "fixture-api",
+      "scope": { "Task": { "task_id": "0198b6b0-0000-7000-8000-000000000001" } },
+      "command": {
+        "program": "node",
+        "args": ["server.js"],
+        "cwd": "src",
+        "env": [{ "name": "PORT" }]
+      },
+      "dependencies": [],
+      "health": {
+        "Tcp": {
+          "port": 18081,
+          "policy": {
+            "startup_deadline_ms": 5000,
+            "probe_interval_ms": 1000,
+            "max_probe_interval_ms": 4000,
+            "backoff_multiplier": 2,
+            "success_threshold": 2,
+            "failure_threshold": 2,
+            "stale_after_ms": 2500
+          }
+        }
+      },
+      "startup": { "trigger": "Manual", "restart_limit": 0 },
+      "stop": { "graceful_timeout_ms": 1000, "kill_after_ms": 3000 },
+      "expected_port": { "protocol": "Tcp", "port": 18081 }
+    }
+  ]
+}

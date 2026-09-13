@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "project": {
+    "id": "0198b6b0-0000-7000-8000-0000000000aa",
+    "name": "workspace-conformance-fixture",
+    "root": "repo",
+    "default_workspace": "new_worktree"
+  },
+  "folders": [{ "id": "src", "path": "src" }],
+  "commands": [
+    {
+      "id": "fixture-dev",
+      "program": "node",
+      "args": ["server.js"],
+      "cwd": "src"
+    }
+  ],
+  "ssh_hosts": [
+    {
+      "id": "fixture-ssh",
+      "host": "127.0.0.1",
+      "auth_mode": "key_path",
+      "key_ref": "local-credential:fixture-ssh-key"
+    }
+  ],
+  "external_listeners": [
+    {
+      "id": "fixture-external",
+      "protocol": "Tcp",
+      "port": 18080,
+      "ownership": "external_observed_only"
+    }
+  ]
+}

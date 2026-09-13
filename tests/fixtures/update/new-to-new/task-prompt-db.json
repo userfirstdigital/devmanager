@@ -1,0 +1,58 @@
+{
+  "tasks": [
+    {
+      "id": "task-open-1",
+      "title": "Open task",
+      "state": "open",
+      "providerSessionId": "provider-session-exact-001"
+    },
+    {
+      "id": "task-closed-1",
+      "title": "Closed task",
+      "state": "closed",
+      "providerSessionId": "provider-session-exact-002"
+    }
+  ],
+  "operations": [
+    {
+      "id": "op-pending",
+      "state": "pending",
+      "replayPolicy": "exact"
+    },
+    {
+      "id": "op-settled",
+      "state": "settled",
+      "replayPolicy": "exact"
+    },
+    {
+      "id": "op-uncertain",
+      "state": "uncertain",
+      "replayPolicy": "visible"
+    }
+  ],
+  "personalPrompts": [
+    {
+      "id": "prompt-1",
+      "versions": ["v1", "v2"],
+      "currentVersion": "v2"
+    }
+  ],
+  "chains": [
+    {
+      "id": "chain-1",
+      "links": ["prompt-1@v1", "prompt-1@v2"]
+    }
+  ],
+  "organizationPromptRefs": [
+    {
+      "orgId": "org-1",
+      "promptId": "org-prompt-9",
+      "version": "3"
+    }
+  ],
+  "taskInvitation": {
+    "id": "invite-unexpired",
+    "expiresAt": "2099-01-01T00:00:00Z"
+  },
+  "fts": ["open task", "personal prompt v2", "org-prompt-9"]
+}

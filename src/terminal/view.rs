@@ -3,29 +3,291 @@ use crate::browser::{
     BrowserAnnotation, BrowserWorkspaceKey, BrowserWorkspaceSnapshot,
 };
 use crate::models::TabType;
-use crate::state::{AiActivity, SessionStatus};
+use crate::state::{AiActivity, ResourceMetricValueState, ResourceSnapshot, SessionStatus};
 use crate::terminal::session::{
     TerminalCellSnapshot, TerminalCursorSnapshot, TerminalIndexedCellSnapshot, TerminalSessionView,
 };
 use crate::theme;
+use crate::ui::scrollbar::{thumb_geometry, track_geometry, ScrollbarThumb, ScrollbarTrack};
+use crate::ui::tokens::{ScrollbarTokens, ThemeTokens};
 use alacritty_terminal::vte::ansi::CursorShape;
 use gpui::{
     canvas, div, fill, img, point, px, rgb, size, AnyElement, App, Bounds, Hsla, ImageSource,
-    InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ObjectFit, ParentElement,
-    SharedString, StrikethroughStyle, Styled, StyledImage, TextRun, UnderlineStyle, Window,
+    InteractiveElement, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    ObjectFit, ParentElement, Pixels, Point, SharedString, StrikethroughStyle, Styled, StyledImage,
+    TextRun, UnderlineStyle, Window,
 };
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
 
 pub const TERMINAL_FONT_SIZE: f32 = 13.0;
 pub const TERMINAL_LINE_HEIGHT: f32 = 18.0;
-pub const TERMINAL_SCROLLBAR_WIDTH_PX: f32 = 10.0;
-pub const TERMINAL_SCROLLBAR_TRACK_INSET_X_PX: f32 = 2.0;
-pub const TERMINAL_SCROLLBAR_TRACK_INSET_Y_PX: f32 = 6.0;
-pub const TERMINAL_SCROLLBAR_TRACK_WIDTH_PX: f32 = 6.0;
-pub const TERMINAL_SCROLLBAR_MIN_THUMB_HEIGHT_PX: f32 = 18.0;
+/// The terminal's scrollbar carries no geometry of its own any more: every
+/// width, inset, length and radius comes from `ThemeTokens::scrollbar`, the
+/// same struct `crate::ui::scrollbar` paints every shell surface from, and the
+/// two call the same geometry functions. See
+/// `terminal_scrollbar_geometry_equals_the_shared_spec` for the assertion that
+/// keeps them identical rather than merely similar.
+///
+/// Kept as a function rather than a constant so a caller cannot read a width
+/// without saying which theme it belongs to.
+pub fn terminal_scrollbar_gutter_width(spec: ScrollbarTokens) -> f32 {
+    spec.gutter_width
+}
+
+/// The scrollbar geometry, for callers that have no `ThemeTokens` in hand.
+///
+/// Geometry is mode-independent by construction -- a pointer target does not
+/// change size with the palette -- so reading it from the dark theme is not a
+/// theme choice, it is the only geometry there is. Colours are NOT available
+/// this way on purpose: those DO depend on the ground.
+pub fn terminal_scrollbar_spec() -> ScrollbarTokens {
+    crate::ui::tokens::dark(
+        crate::ui::tokens::Density::Comfortable,
+        crate::ui::tokens::Scale::Scale100,
+    )
+    .scrollbar
+}
 
 pub fn terminal_line_height(font_size: f32) -> f32 {
     (font_size + 5.0).max(TERMINAL_LINE_HEIGHT)
+}
+
+/// Cell pitch used only where there is no window or text system to ask:
+/// headless hosts, unit tests, and the rounded `u16` grid dimensions the host
+/// carries in [`crate::state::SessionDimensions`].
+///
+/// This is the FALLBACK, not the truth. The truth is the terminal font's own
+/// horizontal advance, measured through GPUI's text system by
+/// [`measure_terminal_cell_advance`]. Cascadia Mono at 13 px advances
+/// 7.617 px, so painting on this constant places every glyph in a run
+/// 0.383 px per column further right than the shaped run actually is.
+pub const FALLBACK_TERMINAL_CELL_WIDTH: f32 = 8.0;
+
+/// One source of truth for the terminal grid's horizontal pitch.
+///
+/// `measured_advance` is what GPUI's text system reports for the exact `Font`
+/// the runs are shaped with (so a fallback substitution is measured rather
+/// than assumed); `None` means nothing could be measured. The pitch MUST equal
+/// that advance: background quads, the cursor quad and the shaped glyphs are
+/// all positioned from it, and any other value makes the three disagree about
+/// where a column starts, accumulating across a run and resetting at every run
+/// boundary.
+pub fn terminal_cell_pitch(measured_advance: Option<f32>) -> f32 {
+    measured_advance
+        .filter(|advance| advance.is_finite() && *advance > 0.0)
+        .unwrap_or(FALLBACK_TERMINAL_CELL_WIDTH)
+}
+
+/// Window-space horizontal offset of a grid column, at the given pitch.
+///
+/// Every painted x in the grid goes through here so the quads and the glyphs
+/// cannot drift apart.
+pub fn terminal_column_offset(column: usize, cell_pitch: f32) -> f32 {
+    column as f32 * cell_pitch
+}
+
+/// Measured advances, keyed by font size bits. Shaping metrics are constant
+/// for a (font, size) pair, so the text system is asked once and never per
+/// frame.
+fn measured_cell_advances() -> &'static Mutex<HashMap<u32, f32>> {
+    static CACHE: OnceLock<Mutex<HashMap<u32, f32>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Record one measurement so window-free callers (the replica pane model, the
+/// PTY cell-size report) can read the same number the painter uses.
+pub(crate) fn record_measured_terminal_cell_advance(font_size: f32, advance: f32) {
+    if !advance.is_finite() || advance <= 0.0 {
+        return;
+    }
+    if let Ok(mut cache) = measured_cell_advances().lock() {
+        cache.insert(font_size.to_bits(), advance);
+    }
+}
+
+/// The advance last measured for `font_size`, or `None` when no window has
+/// measured yet (headless hosts and tests).
+pub fn measured_terminal_cell_advance(font_size: f32) -> Option<f32> {
+    measured_cell_advances()
+        .lock()
+        .ok()
+        .and_then(|cache| cache.get(&font_size.to_bits()).copied())
+}
+
+/// The pitch every window-free caller should use: the measured advance when
+/// one exists, otherwise [`FALLBACK_TERMINAL_CELL_WIDTH`].
+pub fn last_measured_terminal_cell_pitch(font_size: f32) -> f32 {
+    terminal_cell_pitch(measured_terminal_cell_advance(font_size))
+}
+
+/// Measure the terminal font's advance through GPUI's text system, resolving
+/// the same [`crate::terminal::terminal_font`] value the runs are shaped with
+/// so a font substitution is measured rather than assumed. Cached per font
+/// size; safe to call every frame. `None` only when the text system cannot
+/// answer for this font.
+pub fn measure_terminal_cell_advance(window: &Window, font_size: f32) -> Option<f32> {
+    if let Some(cached) = measured_terminal_cell_advance(font_size) {
+        return Some(cached);
+    }
+    let text_system = window.text_system();
+    let font_id = text_system.resolve_font(&crate::terminal::terminal_font());
+    let measured = text_system
+        .ch_advance(font_id, px(font_size))
+        .or_else(|_| text_system.ch_width(font_id, px(font_size)))
+        .ok()
+        .map(f32::from)
+        .filter(|advance| advance.is_finite() && *advance > 0.0);
+    if let Some(advance) = measured {
+        record_measured_terminal_cell_advance(font_size, advance);
+    }
+    measured
+}
+
+/// Explicit Copy palette for terminal chrome and default cell named colors.
+/// Built from [`ThemeTokens`] for live themed paint, or from legacy theme
+/// constants for the default wrapper used by older callers.
+// `Eq` is gone because the shared scrollbar spec carries f32 geometry.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TerminalRenderPalette {
+    pub canvas: u32,
+    pub panel: u32,
+    pub panel_header: u32,
+    pub row: u32,
+    pub row_hover: u32,
+    pub button_hover: u32,
+    pub border: u32,
+    pub text_primary: u32,
+    pub text_muted: u32,
+    pub text_subtle: u32,
+    pub text_dim: u32,
+    pub selection_bg: u32,
+    pub selection_text: u32,
+    pub primary: u32,
+    pub primary_muted: u32,
+    pub danger: u32,
+    pub danger_bg: u32,
+    pub warning: u32,
+    pub success: u32,
+    pub terminal_bg: u32,
+    pub terminal_fg: u32,
+    pub terminal_cursor: u32,
+    pub terminal_selection: u32,
+    pub scrollbar_track: u32,
+    pub scrollbar_thumb: u32,
+    pub scrollbar_thumb_hover: u32,
+    /// Geometry for the gutter. Colours stay as `u32` beside the rest of the
+    /// terminal chrome; the widths and lengths come straight from the shared
+    /// token spec so there is nothing left here to drift.
+    pub scrollbar_spec: ScrollbarTokens,
+}
+
+impl TerminalRenderPalette {
+    /// Map every chrome / named default color from the caller's active tokens.
+    pub fn from_tokens(tokens: ThemeTokens) -> Self {
+        // v0.4.1 hierarchy: darkest terminal cell plane, readable chrome labels,
+        // success-colored cursor visibility. ANSI cell colors stay process-owned
+        // in `effective_cell_style`; only default/named chrome is remapped here.
+        Self {
+            canvas: tokens.surfaces.canvas.to_u32(),
+            panel: tokens.surfaces.sunken.to_u32(),
+            panel_header: tokens.surfaces.raised.to_u32(),
+            row: tokens.surfaces.overlay.to_u32(),
+            row_hover: tokens.surfaces.hover.to_u32(),
+            button_hover: tokens.surfaces.hover.to_u32(),
+            border: tokens.borders.default.to_u32(),
+            text_primary: tokens.text.primary.to_u32(),
+            text_muted: tokens.text.muted.to_u32(),
+            text_subtle: tokens.text.muted.to_u32(),
+            text_dim: tokens.text.muted.to_u32(),
+            selection_bg: tokens.terminal.selection.to_u32(),
+            selection_text: tokens.text.on_selection.to_u32(),
+            primary: tokens.actions.primary.default.background.to_u32(),
+            primary_muted: tokens.actions.primary.selected.background.to_u32(),
+            danger: tokens.status.destructive.to_u32(),
+            danger_bg: tokens.status.destructive_surface.to_u32(),
+            warning: tokens.status.warning.to_u32(),
+            success: tokens.status.success.to_u32(),
+            terminal_bg: tokens.terminal.background.to_u32(),
+            terminal_fg: tokens.terminal.foreground.to_u32(),
+            terminal_cursor: tokens.status.success.to_u32(),
+            terminal_selection: tokens.terminal.selection.to_u32(),
+            // Resolved against the terminal plane, not the shell: in the
+            // light theme those are opposite polarities and one colour cannot
+            // serve both.
+            scrollbar_track: tokens
+                .scrollbar
+                .colors_on(tokens.terminal.background)
+                .track_active
+                .to_u32(),
+            scrollbar_thumb: tokens
+                .scrollbar
+                .colors_on(tokens.terminal.background)
+                .thumb_idle
+                .to_u32(),
+            scrollbar_thumb_hover: tokens
+                .scrollbar
+                .colors_on(tokens.terminal.background)
+                .thumb_hover
+                .to_u32(),
+            scrollbar_spec: tokens.scrollbar,
+        }
+    }
+
+    /// The thumb colour for one pointer state, so the two call sites cannot
+    /// pick different halves of the pair.
+    pub fn scrollbar_thumb_color(&self, active: bool) -> u32 {
+        if active {
+            self.scrollbar_thumb_hover
+        } else {
+            self.scrollbar_thumb
+        }
+    }
+
+    /// Preserve the pre-token hard-coded visual defaults for legacy callers.
+    pub fn legacy_default() -> Self {
+        Self {
+            canvas: theme::APP_BG,
+            panel: theme::PANEL_BG,
+            panel_header: theme::PANEL_HEADER_BG,
+            row: theme::PROJECT_ROW_BG,
+            row_hover: theme::ROW_HOVER_BG,
+            button_hover: theme::BUTTON_HOVER_BG,
+            border: theme::BORDER_PRIMARY,
+            text_primary: theme::TEXT_PRIMARY,
+            text_muted: theme::TEXT_MUTED,
+            text_subtle: theme::TEXT_SUBTLE,
+            text_dim: theme::TEXT_DIM,
+            selection_bg: theme::SELECTION_BG,
+            selection_text: theme::SELECTION_TEXT,
+            primary: theme::PRIMARY,
+            primary_muted: theme::PRIMARY_MUTED,
+            danger: theme::DANGER_TEXT,
+            danger_bg: theme::DANGER_BG_SUBTLE,
+            warning: theme::WARNING_TEXT,
+            success: theme::SUCCESS_TEXT,
+            terminal_bg: theme::TERMINAL_BG,
+            terminal_fg: theme::TEXT_PRIMARY,
+            terminal_cursor: theme::SUCCESS_TEXT,
+            terminal_selection: theme::SELECTION_BG,
+            // The legacy palette keeps its pre-token colours, but not its
+            // pre-token geometry: "one look" is the point, and the widths are
+            // mode-independent.
+            scrollbar_track: theme::PANEL_HEADER_BG,
+            scrollbar_thumb: theme::TEXT_DIM,
+            scrollbar_thumb_hover: theme::TEXT_PRIMARY,
+            scrollbar_spec: crate::ui::tokens::dark(
+                crate::ui::tokens::Density::Comfortable,
+                crate::ui::tokens::Scale::Scale100,
+            )
+            .scrollbar,
+        }
+    }
+}
+
+/// Public mapping seam used by themed render entrypoints and contract tests.
+pub fn terminal_render_palette_from_tokens(tokens: ThemeTokens) -> TerminalRenderPalette {
+    TerminalRenderPalette::from_tokens(tokens)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,6 +296,110 @@ pub struct TerminalSelectionSnapshot {
     pub start_column: usize,
     pub end_row: usize,
     pub end_column: usize,
+}
+
+/// Absolute buffer cell coordinates used by selection anchors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct TerminalGridPosition {
+    pub row: usize,
+    pub column: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum TerminalCellSide {
+    Left,
+    Right,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct TerminalSelectionEndpoint {
+    pub position: TerminalGridPosition,
+    pub side: TerminalCellSide,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalSelectionMode {
+    Simple,
+    Semantic,
+    Lines,
+}
+
+/// Active drag/click selection for one terminal pane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TerminalSelection {
+    pub anchor: TerminalSelectionEndpoint,
+    pub head: TerminalSelectionEndpoint,
+    pub moved: bool,
+    pub mode: TerminalSelectionMode,
+}
+
+/// Painted grid metrics used for hit-testing. Origin is window-space.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TerminalTextBounds {
+    pub left: f32,
+    pub top: f32,
+    pub width: f32,
+    pub height: f32,
+    pub cell_width: f32,
+    pub row_height: f32,
+    pub rows: usize,
+    pub cols: usize,
+}
+
+/// Translate the actual painted terminal canvas into the bounded PTY grid.
+/// This is deliberately based on the canvas bounds rather than the last host
+/// projection, so the terminal follows free-form pane resizing in both axes.
+pub fn terminal_grid_size_for_bounds(
+    width: f32,
+    height: f32,
+    cell_width: f32,
+    line_height: f32,
+) -> (u16, u16) {
+    let cols = (width.max(cell_width) / cell_width.max(1.0)).floor() as u16;
+    let rows = (height.max(line_height) / line_height.max(1.0)).floor() as u16;
+    (
+        cols.clamp(1, crate::terminal::protocol::MAX_TERMINAL_COLS),
+        rows.clamp(1, crate::terminal::protocol::MAX_TERMINAL_ROWS),
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TerminalSelectionRange {
+    pub start_row: usize,
+    pub start_column: usize,
+    pub end_row: usize,
+    pub end_column: usize,
+}
+
+/// Grid pointer payload delivered from the painted cell plane.
+#[derive(Debug, Clone, Copy)]
+pub struct TerminalGridPointerEvent {
+    pub endpoint: TerminalSelectionEndpoint,
+    pub click_count: usize,
+    pub shift: bool,
+    pub dragging: bool,
+}
+
+/// Optional selection interaction registered against the actual painted grid bounds.
+#[derive(Clone)]
+pub struct TerminalGridInteraction {
+    pub on_layout: Arc<dyn Fn((u16, u16), &mut Window, &mut App) + Send + Sync>,
+    /// Paint-local platform input registration. Zed registers terminal input
+    /// against the exact painted grid bounds, keeping mouse focus, IME, and the
+    /// PTY cell plane under one focus owner.
+    pub on_paint: Arc<dyn Fn(Bounds<Pixels>, &mut Window, &mut App) + Send + Sync>,
+    pub on_mouse_down:
+        Arc<dyn Fn(&MouseDownEvent, TerminalGridPointerEvent, &mut Window, &mut App) + Send + Sync>,
+    pub on_mouse_move:
+        Arc<dyn Fn(&MouseMoveEvent, TerminalGridPointerEvent, &mut Window, &mut App) + Send + Sync>,
+    pub on_mouse_up:
+        Arc<dyn Fn(&MouseUpEvent, TerminalGridPointerEvent, &mut Window, &mut App) + Send + Sync>,
+}
+
+impl std::fmt::Debug for TerminalGridInteraction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("TerminalGridInteraction")
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -126,7 +492,6 @@ pub struct TerminalPaneActions {
     pub on_stop_server: Option<Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>>,
     pub on_restart_server: Option<Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>>,
     pub on_clear_output: Option<Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>>,
-    pub on_kill_port: Option<Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>>,
     pub on_actionable_notice_action: Option<Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>>,
     pub on_open_local_url: Option<Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>>,
     pub on_prompt_action: Option<Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>>,
@@ -165,10 +530,7 @@ pub struct TerminalRuntimeControlsModel {
     pub can_stop: bool,
     pub can_restart: bool,
     pub can_clear: bool,
-    pub can_kill_port: bool,
     pub can_open_url: bool,
-    pub kill_label: &'static str,
-    pub kill_color: u32,
     pub prompt_action_label: Option<String>,
     pub prompt_action_color: u32,
     pub search_active: bool,
@@ -211,11 +573,201 @@ pub struct TerminalSearchHighlight {
 pub struct TerminalScrollbarModel {
     pub thumb_top_ratio: f32,
     pub thumb_height_ratio: f32,
+    /// True while the pointer is anywhere in the gutter, or while the thumb is
+    /// being dragged. Widening on gutter hover rather than thumb hover is what
+    /// makes a 4 px bar grabbable, and it is why this is a model field: a
+    /// `canvas` cannot answer a `group_hover`.
+    pub hovered: bool,
+}
+
+/// Where the thumb's top sits for one display offset, 0..=1.
+///
+/// `display_offset` counts lines scrolled UP from the live prompt, so a zero
+/// offset is the BOTTOM of the bar and the ratio runs the other way from the
+/// offset. Its inverse is [`display_offset_for_scrollbar_ratio`].
+pub fn scrollbar_thumb_top_ratio(display_offset: usize, max_offset: usize) -> f32 {
+    if max_offset == 0 {
+        1.0
+    } else {
+        1.0 - (display_offset.min(max_offset) as f32 / max_offset as f32)
+    }
+}
+
+/// The display offset a thumb position means. Inverse of
+/// [`scrollbar_thumb_top_ratio`].
+pub fn display_offset_for_scrollbar_ratio(thumb_top_ratio: f32, max_offset: usize) -> usize {
+    if max_offset == 0 {
+        0
+    } else {
+        ((1.0 - thumb_top_ratio.clamp(0.0, 1.0)) * max_offset as f32).round() as usize
+    }
+}
+
+/// The scrollbar for one admitted terminal screen, for every caller.
+///
+/// There is ONE derivation of this model. It used to be two -- the legacy app
+/// view's and the cockpit's -- which disagreed about the case that matters: the
+/// app's returned a full-height inert thumb when there was no scrollback, and
+/// the cockpit's returned `None`. The brief rules that no overflow shows no
+/// thumb, the same predicate every shell surface uses, so a screen that fits
+/// paints nothing at all here too.
+///
+/// `enabled` is the user's `show_terminal_scrollbar` setting; a caller with no
+/// such setting passes true. `drag_thumb_top_ratio` is the position a drag in
+/// progress is holding, which overrides the screen's own, and a drag is a hover
+/// that has committed, so it also widens the thumb.
+pub fn scrollbar_model_for_screen(
+    screen: &crate::terminal::session::TerminalScreenSnapshot,
+    drag_thumb_top_ratio: Option<f32>,
+    enabled: bool,
+    hovered: bool,
+) -> Option<TerminalScrollbarModel> {
+    if !enabled {
+        return None;
+    }
+
+    let visible_lines = screen.rows.max(1);
+    let total_lines = screen.total_lines.max(visible_lines);
+    if total_lines <= visible_lines {
+        return None;
+    }
+    let max_offset = screen.history_size.max(1);
+    let thumb_top_ratio = drag_thumb_top_ratio
+        .unwrap_or_else(|| scrollbar_thumb_top_ratio(screen.display_offset, max_offset));
+
+    Some(TerminalScrollbarModel {
+        thumb_top_ratio: thumb_top_ratio.clamp(0.0, 1.0),
+        thumb_height_ratio: visible_lines as f32 / total_lines as f32,
+        hovered: hovered || drag_thumb_top_ratio.is_some(),
+    })
+}
+
+/// Overlay painted over the last valid replica grid. The cockpit never owns a
+/// `TerminalSession`; it only projects a `TerminalReplica` snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TerminalReplicaOverlay {
+    None,
+    Reconnecting,
+    Resyncing,
+    Exited { summary: String },
+}
+
+/// Borrowed replica snapshot plus client-local viewport/overlay state.
+pub struct ReplicaPaneRequest<'a> {
+    pub active_project: &'a str,
+    pub session_label: &'a str,
+    pub replica_view: Option<&'a TerminalSessionView>,
+    pub last_valid_view: Option<&'a TerminalSessionView>,
+    pub overlay: TerminalReplicaOverlay,
+    pub selection: Option<TerminalSelectionSnapshot>,
+    pub search: Option<TerminalSearchUiModel>,
+    pub search_highlight: Option<TerminalSearchHighlight>,
+    pub scrollbar: Option<TerminalScrollbarModel>,
+}
+
+/// Map a Phase 3 replica snapshot onto the existing native terminal surface.
+///
+/// Overlay states use only the last valid grid. They never fall back to an
+/// uncorrelated optional replica view.
+pub fn terminal_pane_from_replica(request: ReplicaPaneRequest<'_>) -> TerminalPaneModel {
+    let session = match &request.overlay {
+        TerminalReplicaOverlay::None => request.replica_view.cloned(),
+        _ => request.last_valid_view.cloned(),
+    };
+    let blocking_notice = match &request.overlay {
+        TerminalReplicaOverlay::Reconnecting => Some(String::from("Reconnecting to terminal")),
+        TerminalReplicaOverlay::Resyncing => Some(String::from("Resynchronizing terminal")),
+        TerminalReplicaOverlay::Exited { summary } => Some(bound_overlay_summary(summary)),
+        TerminalReplicaOverlay::None => None,
+    };
+    // `runtime.dimensions.cell_width` is the host's rounded `u16`, which has
+    // always been the hardcoded fallback and cannot express a fractional
+    // advance at all. Take the pitch from the one measured source instead, so
+    // the model agrees with what the painter shapes.
+    let cell_width = last_measured_terminal_cell_pitch(TERMINAL_FONT_SIZE);
+    let line_height = session
+        .as_ref()
+        .map(|view| f32::from(view.runtime.dimensions.cell_height))
+        .filter(|height| *height > 0.0)
+        .unwrap_or_else(|| terminal_line_height(TERMINAL_FONT_SIZE));
+    TerminalPaneModel {
+        active_project: request.active_project.to_string(),
+        session_label: request.session_label.to_string(),
+        active_tab_type: None,
+        session,
+        startup_notice: None,
+        blocking_notice,
+        actionable_notice: None,
+        pending_annotations: Vec::new(),
+        debug_enabled: false,
+        font_size: TERMINAL_FONT_SIZE,
+        cell_width,
+        line_height,
+        selection: request.selection,
+        search: request.search,
+        search_highlight: request.search_highlight,
+        scrollbar: request.scrollbar,
+        runtime_controls: None,
+        splash_image: None,
+    }
+}
+
+fn bound_overlay_summary(summary: &str) -> String {
+    crate::ui::components::interaction::redacted_bounded_text(
+        "terminal exit summary",
+        summary,
+        160,
+        640,
+    )
+    .unwrap_or_else(|_| String::from("Terminal exited"))
 }
 
 pub fn render_terminal_surface(
     model: &TerminalPaneModel,
     actions: Option<TerminalPaneActions>,
+) -> impl IntoElement {
+    render_terminal_surface_with_palette(
+        model,
+        actions,
+        None,
+        TerminalRenderPalette::legacy_default(),
+    )
+}
+
+/// Themed terminal surface: every non-ANSI chrome color comes from `tokens`.
+pub fn render_terminal_surface_with_tokens(
+    model: &TerminalPaneModel,
+    actions: Option<TerminalPaneActions>,
+    tokens: ThemeTokens,
+) -> impl IntoElement {
+    render_terminal_surface_with_palette(
+        model,
+        actions,
+        None,
+        TerminalRenderPalette::from_tokens(tokens),
+    )
+}
+
+/// Themed terminal surface with grid-local selection hit-testing.
+pub fn render_terminal_surface_with_tokens_and_grid(
+    model: &TerminalPaneModel,
+    actions: Option<TerminalPaneActions>,
+    grid_selection: Option<TerminalGridInteraction>,
+    tokens: ThemeTokens,
+) -> impl IntoElement {
+    render_terminal_surface_with_palette(
+        model,
+        actions,
+        grid_selection,
+        TerminalRenderPalette::from_tokens(tokens),
+    )
+}
+
+fn render_terminal_surface_with_palette(
+    model: &TerminalPaneModel,
+    actions: Option<TerminalPaneActions>,
+    grid_selection: Option<TerminalGridInteraction>,
+    palette: TerminalRenderPalette,
 ) -> impl IntoElement {
     let mut actions = actions;
     let actionable_notice_action = actions
@@ -242,16 +794,16 @@ pub fn render_terminal_surface(
             div()
                 .px_2()
                 .py_1()
-                .bg(rgb(theme::PANEL_HEADER_BG))
+                .bg(rgb(palette.panel_header))
                 .text_xs()
-                .text_color(rgb(theme::TEXT_MUTED))
+                .text_color(rgb(palette.text_muted))
                 .child(SharedString::from(message.clone()))
         })
     };
     let actionable_banner = model
         .actionable_notice
         .as_ref()
-        .map(|banner| render_actionable_notice(banner, actionable_notice_action));
+        .map(|banner| render_actionable_notice(banner, actionable_notice_action, palette));
     let blocking_notice = model.blocking_notice.as_ref().map(|message| {
         div()
             .mx_2()
@@ -259,44 +811,18 @@ pub fn render_terminal_surface(
             .py_2()
             .border_t_1()
             .border_b_1()
-            .border_color(rgb(theme::BORDER_PRIMARY))
+            .border_color(rgb(palette.border))
             .flex()
             .items_center()
             .justify_center()
             .child(
                 div()
                     .text_sm()
-                    .text_color(rgb(theme::TEXT_MUTED))
+                    .text_color(rgb(palette.text_muted))
                     .child(SharedString::from(message.clone())),
             )
     });
 
-    let is_ai_tab = matches!(
-        model.active_tab_type,
-        Some(TabType::Claude) | Some(TabType::Codex)
-    );
-    let status_text = model
-        .session
-        .as_ref()
-        .map(|s| session_status_label(s, is_ai_tab))
-        .unwrap_or(if is_ai_tab { "saved" } else { "" });
-    let status_color = model
-        .session
-        .as_ref()
-        .map(session_status_color)
-        .unwrap_or(theme::TEXT_MUTED);
-    let session_title = model
-        .session
-        .as_ref()
-        .and_then(|session| session.runtime.title.clone())
-        .filter(|title| is_meaningful_title(title))
-        .unwrap_or_else(|| model.session_label.clone());
-    let header_title = if model.active_project.is_empty() || session_title == model.active_project {
-        session_title
-    } else {
-        format!("{} • {}", model.active_project, session_title)
-    };
-    let header_detail = surface_header_detail(model);
     let runtime_controls = model.runtime_controls.clone();
     let metrics = model.session.as_ref().map(|session| {
         let metrics = &session.runtime.metrics;
@@ -317,9 +843,9 @@ pub fn render_terminal_surface(
             div()
                 .px_2()
                 .py_1()
-                .bg(rgb(theme::PROJECT_ROW_BG))
+                .bg(rgb(palette.row))
                 .text_xs()
-                .text_color(rgb(theme::TEXT_MUTED))
+                .text_color(rgb(palette.text_muted))
                 .child(SharedString::from(exit.summary.clone()))
         });
     let terminal_body: AnyElement = if let Some(session) = model.session.as_ref() {
@@ -329,100 +855,78 @@ pub fn render_terminal_surface(
             model.search_highlight,
             model.scrollbar,
             scrollbar_actions,
+            grid_selection,
             model.font_size,
             model.cell_width,
             model.line_height,
+            palette,
         )
         .into_any_element()
     } else {
-        render_empty_body(empty_surface_message(model), model.splash_image.clone())
-            .into_any_element()
+        render_empty_body(
+            empty_surface_message(model),
+            model.splash_image.clone(),
+            palette,
+        )
+        .into_any_element()
     };
+
+    // What survives of the terminal's old 22 px header: the two ACTIONS it
+    // carried beside the diagnostic, plus the dev-server port they operate on.
+    // The four debug facts -- session title, backend, status and font size --
+    // are gone from the body (fix wave 1, F7) and reachable as the panel's
+    // Terminal tab tooltip through `terminal_surface_diagnostic`.
+    //
+    // The row exists only when it has an action to carry, so the ordinary
+    // terminal -- every panel and every dock, which pass no actions at all --
+    // now opens straight onto its grid.
+    let browser_action = open_browser_action.map(|on_click| {
+        runtime_action_button("Browser", palette.primary, on_click, palette).into_any_element()
+    });
+    let runtime_actions = actions
+        .zip(runtime_controls.clone())
+        .map(|(actions, controls)| {
+            render_runtime_actions(actions, controls, palette).into_any_element()
+        });
+    let port_label = runtime_controls
+        .as_ref()
+        .and_then(|controls| controls.port_label.clone())
+        .map(|detail| {
+            div()
+                .flex_shrink_0()
+                .text_xs()
+                .text_color(rgb(runtime_controls
+                    .as_ref()
+                    .map(|controls| controls.port_color)
+                    .unwrap_or(palette.text_dim)))
+                .child(SharedString::from(detail))
+                .into_any_element()
+        });
+    let action_row = (browser_action.is_some() || runtime_actions.is_some()).then(|| {
+        div()
+            .h(px(22.0))
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_end()
+            .gap(px(12.0))
+            .px(px(6.0))
+            .bg(rgb(palette.panel_header))
+            .border_b_1()
+            .border_color(rgb(palette.border))
+            .overflow_hidden()
+            .children(port_label)
+            .children(browser_action)
+            .children(runtime_actions)
+    });
 
     div()
         .flex_1()
         .h_full()
         .flex()
         .flex_col()
-        .bg(rgb(theme::APP_BG))
-        .child(
-            div()
-                .h(px(22.0))
-                .flex_none()
-                .flex()
-                .items_center()
-                .justify_between()
-                .px(px(6.0))
-                .bg(rgb(theme::TOPBAR_BG))
-                .border_b_1()
-                .border_color(rgb(theme::BORDER_PRIMARY))
-                .overflow_hidden()
-                .child(
-                    div()
-                        .flex_shrink_0()
-                        .text_xs()
-                        .font_weight(gpui::FontWeight::SEMIBOLD)
-                        .text_color(rgb(theme::TEXT_PRIMARY))
-                        .child(SharedString::from(header_title)),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(px(12.0))
-                        .overflow_hidden()
-                        .min_w(px(0.0))
-                        .children(
-                            runtime_controls
-                                .as_ref()
-                                .and_then(|controls| controls.port_label.as_ref())
-                                .map(|detail| {
-                                    div()
-                                        .text_xs()
-                                        .text_color(rgb(runtime_controls
-                                            .as_ref()
-                                            .map(|controls| controls.port_color)
-                                            .unwrap_or(theme::TEXT_DIM)))
-                                        .child(SharedString::from(detail.clone()))
-                                }),
-                        )
-                        .children(header_detail.map(|detail| {
-                            div()
-                                .text_xs()
-                                .text_color(rgb(theme::TEXT_DIM))
-                                .overflow_hidden()
-                                .whitespace_nowrap()
-                                .child(SharedString::from(detail))
-                        }))
-                        .child(
-                            div()
-                                .flex_shrink_0()
-                                .text_xs()
-                                .text_color(rgb(status_color))
-                                .child(status_text),
-                        )
-                        .child(
-                            div()
-                                .flex_shrink_0()
-                                .text_xs()
-                                .text_color(rgb(theme::TEXT_DIM))
-                                .child(SharedString::from(format!(
-                                    "font {}",
-                                    model.font_size.round() as u32
-                                ))),
-                        ),
-                )
-                .children(open_browser_action.map(|on_click| {
-                    runtime_action_button("Browser", theme::PRIMARY, on_click).into_any_element()
-                }))
-                .children(
-                    actions
-                        .zip(runtime_controls.clone())
-                        .map(|(actions, controls)| {
-                            render_runtime_actions(actions, controls).into_any_element()
-                        }),
-                ),
-        )
+        .bg(rgb(palette.canvas))
+        .children(action_row)
         .child(
             div().flex_1().pb(px(2.0)).child(
                 div()
@@ -430,7 +934,7 @@ pub fn render_terminal_surface(
                     .flex()
                     .flex_col()
                     .gap(px(2.0))
-                    .bg(rgb(theme::TERMINAL_BG))
+                    .bg(rgb(palette.terminal_bg))
                     .children(notice)
                     .children(actionable_banner)
                     .children(blocking_notice)
@@ -438,8 +942,14 @@ pub fn render_terminal_surface(
                         &model.pending_annotations,
                         preview_annotation_action,
                         remove_annotation_action,
+                        palette,
                     ))
-                    .children(model.search.as_ref().map(render_search_bar))
+                    .children(
+                        model
+                            .search
+                            .as_ref()
+                            .map(|search| render_search_bar(search, palette)),
+                    )
                     .children(exit_banner)
                     .child(terminal_body)
                     .children(model.debug_enabled.then(|| {
@@ -447,7 +957,7 @@ pub fn render_terminal_surface(
                             .px_2()
                             .pb_1()
                             .text_xs()
-                            .text_color(rgb(theme::TEXT_SUBTLE))
+                            .text_color(rgb(palette.text_subtle))
                             .child(SharedString::from(
                                 metrics.unwrap_or_else(|| "No metrics yet".to_string()),
                             ))
@@ -460,6 +970,7 @@ fn render_pending_annotation_chips(
     models: &[PendingAnnotationChipModel],
     preview: Option<PendingAnnotationActionHandler>,
     remove: Option<PendingAnnotationActionHandler>,
+    palette: TerminalRenderPalette,
 ) -> Option<AnyElement> {
     (!models.is_empty()).then(|| {
         div()
@@ -467,9 +978,9 @@ fn render_pending_annotation_chips(
             .mt_1()
             .px_2()
             .py_1()
-            .bg(rgb(theme::PANEL_HEADER_BG))
+            .bg(rgb(palette.panel_header))
             .border_1()
-            .border_color(rgb(theme::BORDER_PRIMARY))
+            .border_color(rgb(palette.border))
             .rounded_sm()
             .flex()
             .items_center()
@@ -479,7 +990,7 @@ fn render_pending_annotation_chips(
                 div()
                     .flex_shrink_0()
                     .text_xs()
-                    .text_color(rgb(theme::TEXT_SUBTLE))
+                    .text_color(rgb(palette.text_subtle))
                     .child("Pending"),
             )
             .children(models.iter().cloned().map(|model| {
@@ -491,13 +1002,13 @@ fn render_pending_annotation_chips(
                     .rounded_sm()
                     .border_1()
                     .border_color(rgb(if model.stale {
-                        theme::WARNING_TEXT
+                        palette.warning
                     } else {
-                        theme::BORDER_PRIMARY
+                        palette.border
                     }))
-                    .bg(rgb(theme::PROJECT_ROW_BG))
+                    .bg(rgb(palette.row))
                     .text_xs()
-                    .text_color(rgb(theme::TEXT_PRIMARY))
+                    .text_color(rgb(palette.text_primary))
                     .overflow_hidden()
                     .whitespace_nowrap()
                     .child(
@@ -520,8 +1031,8 @@ fn render_pending_annotation_chips(
                             .px_1()
                             .rounded_sm()
                             .cursor_pointer()
-                            .text_color(rgb(theme::TEXT_MUTED))
-                            .hover(|style| style.bg(rgb(theme::ROW_HOVER_BG)))
+                            .text_color(rgb(palette.text_muted))
+                            .hover(|style| style.bg(rgb(palette.row_hover)))
                             .child("×")
                             .on_mouse_down(MouseButton::Left, move |event, window, cx| {
                                 cx.stop_propagation();
@@ -531,7 +1042,7 @@ fn render_pending_annotation_chips(
                 if let Some(preview) = preview.clone() {
                     chip = chip
                         .cursor_pointer()
-                        .hover(|style| style.bg(rgb(theme::ROW_HOVER_BG)));
+                        .hover(|style| style.bg(rgb(palette.row_hover)));
                     chip = chip.on_mouse_down(MouseButton::Left, move |event, window, cx| {
                         cx.stop_propagation();
                         preview(action.clone(), event, window, cx);
@@ -549,11 +1060,14 @@ fn render_grid(
     search_highlight: Option<TerminalSearchHighlight>,
     scrollbar: Option<TerminalScrollbarModel>,
     scrollbar_actions: Option<TerminalScrollbarActions>,
+    grid_selection: Option<TerminalGridInteraction>,
     font_size: f32,
     cell_width: f32,
     line_height: f32,
+    palette: TerminalRenderPalette,
 ) -> impl IntoElement {
-    let (background_runs, text_runs, cursor_overlay) = collect_grid_paint_runs(session, selection);
+    let (background_runs, text_runs, cursor_overlay) =
+        collect_grid_paint_runs(session, selection, palette);
     let search_highlight = search_highlight.map(|highlight| {
         let start_column = highlight.start_column.min(session.screen.cols);
         let end_column = highlight
@@ -564,15 +1078,17 @@ fn render_grid(
             row: highlight.row.min(session.screen.rows.saturating_sub(1)),
             start_column,
             cell_count: end_column.saturating_sub(start_column),
-            color: theme::PRIMARY_MUTED,
+            color: palette.primary_muted,
         }
     });
+    let grid_rows = session.screen.rows.max(1);
+    let grid_cols = session.screen.cols.max(1);
 
     div()
         .flex_1()
         .flex()
         .flex_row()
-        .bg(rgb(theme::TERMINAL_BG))
+        .bg(rgb(palette.terminal_bg))
         .overflow_hidden()
         .child(
             div()
@@ -581,27 +1097,33 @@ fn render_grid(
                 .flex_col()
                 .px_1()
                 .py(px(2.0))
-                .bg(rgb(theme::TERMINAL_BG))
+                .bg(rgb(palette.terminal_bg))
                 .child(render_grid_canvas(
                     background_runs,
                     search_highlight,
                     text_runs,
                     cursor_overlay,
+                    grid_selection,
+                    grid_rows,
+                    grid_cols,
                     font_size,
                     cell_width,
                     line_height,
                 )),
         )
-        .children(scrollbar.map(|scrollbar| render_scrollbar(scrollbar, scrollbar_actions)))
+        .children(
+            scrollbar.map(|scrollbar| render_scrollbar(scrollbar, scrollbar_actions, palette)),
+        )
 }
 
 fn render_empty_body(
     message: String,
     splash_image: Option<std::sync::Arc<gpui::RenderImage>>,
+    palette: TerminalRenderPalette,
 ) -> impl IntoElement {
     div()
         .flex_1()
-        .bg(rgb(theme::TERMINAL_BG))
+        .bg(rgb(palette.terminal_bg))
         .flex()
         .items_center()
         .justify_center()
@@ -616,20 +1138,23 @@ fn render_empty_body(
                 .px(px(10.0))
                 .py(px(8.0))
                 .text_xs()
-                .text_color(rgb(theme::TEXT_SUBTLE))
+                .text_color(rgb(palette.text_subtle))
                 .child(SharedString::from(message))
         }))
 }
 
-fn render_search_bar(model: &TerminalSearchUiModel) -> impl IntoElement {
+fn render_search_bar(
+    model: &TerminalSearchUiModel,
+    palette: TerminalRenderPalette,
+) -> impl IntoElement {
     div()
         .mx_2()
         .mt_1()
         .px_2()
         .py(px(6.0))
-        .bg(rgb(theme::PANEL_HEADER_BG))
+        .bg(rgb(palette.panel_header))
         .border_1()
-        .border_color(rgb(theme::BORDER_PRIMARY))
+        .border_color(rgb(palette.border))
         .rounded_sm()
         .flex()
         .items_center()
@@ -644,13 +1169,13 @@ fn render_search_bar(model: &TerminalSearchUiModel) -> impl IntoElement {
                 .child(
                     div()
                         .text_xs()
-                        .text_color(rgb(theme::TEXT_SUBTLE))
+                        .text_color(rgb(palette.text_subtle))
                         .child("Search"),
                 )
                 .child(
                     div()
                         .text_xs()
-                        .text_color(rgb(theme::TEXT_PRIMARY))
+                        .text_color(rgb(palette.text_primary))
                         .overflow_hidden()
                         .whitespace_nowrap()
                         .child(SharedString::from(model.query.clone())),
@@ -665,52 +1190,97 @@ fn render_search_bar(model: &TerminalSearchUiModel) -> impl IntoElement {
                     div()
                         .text_xs()
                         .text_color(rgb(if model.case_sensitive {
-                            theme::PRIMARY
+                            palette.primary
                         } else {
-                            theme::TEXT_DIM
+                            palette.text_dim
                         }))
                         .child(if model.case_sensitive { "Aa" } else { "aa" }),
                 )
                 .child(
                     div()
                         .text_xs()
-                        .text_color(rgb(theme::TEXT_SUBTLE))
+                        .text_color(rgb(palette.text_subtle))
                         .child(SharedString::from(model.summary.clone())),
                 ),
         )
 }
 
+/// What the terminal's gutter paints for one model at one gutter height.
+///
+/// Extracted from the `canvas` closure below so a test can walk the TERMINAL'S
+/// OWN paint path rather than re-deriving what it believes the painter does.
+/// The painter therefore has no arithmetic of its own left: it turns this into
+/// quads and nothing else, and the minimum thumb length is the shared
+/// `thumb_geometry` rule -- there is no second clamp here.
+pub fn terminal_scrollbar_paint(
+    spec: ScrollbarTokens,
+    gutter_height: f32,
+    scrollbar: TerminalScrollbarModel,
+) -> Option<(Option<ScrollbarTrack>, ScrollbarThumb)> {
+    let active = scrollbar.hovered;
+    let thumb = thumb_geometry(
+        spec,
+        gutter_height,
+        scrollbar.thumb_height_ratio,
+        scrollbar.thumb_top_ratio,
+        active,
+    )?;
+    let track = active.then(|| track_geometry(spec, gutter_height));
+    Some((track, thumb))
+}
+
+/// The terminal gutter, painted from the same spec and the same geometry
+/// functions as every other scrollbar in the app.
+///
+/// It stays hand-painted -- the gutter's pixel height is only known at paint
+/// time and the `min_thumb_length` clamp is a pixel rule, so expressing it as
+/// layout percentages would silently break on a deep scrollback. The hover
+/// state therefore cannot come from `group_hover` and arrives on the model
+/// instead, set by the same mouse-move listener that already drives the drag.
 fn render_scrollbar(
     scrollbar: TerminalScrollbarModel,
     actions: Option<TerminalScrollbarActions>,
+    palette: TerminalRenderPalette,
 ) -> impl IntoElement {
+    let spec = palette.scrollbar_spec;
     canvas(
         move |_bounds, _window, _cx| (scrollbar, actions.clone()),
         move |bounds: Bounds<_>, state, window, _cx| {
             let (scrollbar, actions) = state;
-            let track = Bounds::new(
-                point(
-                    bounds.origin.x + px(TERMINAL_SCROLLBAR_TRACK_INSET_X_PX),
-                    bounds.origin.y + px(TERMINAL_SCROLLBAR_TRACK_INSET_Y_PX),
-                ),
-                size(
-                    px(TERMINAL_SCROLLBAR_TRACK_WIDTH_PX),
-                    (bounds.size.height - px(TERMINAL_SCROLLBAR_TRACK_INSET_Y_PX * 2.0))
-                        .max(px(12.0)),
-                ),
-            );
-            window.paint_quad(fill(track, rgb(theme::PANEL_HEADER_BG)));
+            let gutter_height: f32 = bounds.size.height.into();
+            let active = scrollbar.hovered;
 
-            let thumb_height = (track.size.height * scrollbar.thumb_height_ratio.clamp(0.08, 1.0))
-                .max(px(TERMINAL_SCROLLBAR_MIN_THUMB_HEIGHT_PX));
-            let thumb_range = (track.size.height - thumb_height).max(px(0.0));
-            let thumb_top =
-                track.origin.y + thumb_range * scrollbar.thumb_top_ratio.clamp(0.0, 1.0);
-            let thumb = Bounds::new(
-                point(track.origin.x, thumb_top),
-                size(track.size.width, thumb_height),
-            );
-            window.paint_quad(fill(thumb, rgb(theme::TEXT_DIM)));
+            if let Some((track, thumb)) = terminal_scrollbar_paint(spec, gutter_height, scrollbar) {
+                if let Some(track) = track {
+                    window.paint_quad(
+                        fill(
+                            Bounds::new(
+                                point(
+                                    bounds.origin.x + px(track.left),
+                                    bounds.origin.y + px(track.top),
+                                ),
+                                size(px(track.width), px(track.height)),
+                            ),
+                            rgb(palette.scrollbar_track),
+                        )
+                        .corner_radii(px(track.radius)),
+                    );
+                }
+
+                window.paint_quad(
+                    fill(
+                        Bounds::new(
+                            point(
+                                bounds.origin.x + px(thumb.left),
+                                bounds.origin.y + px(thumb.top),
+                            ),
+                            size(px(thumb.width), px(thumb.height)),
+                        ),
+                        rgb(palette.scrollbar_thumb_color(active)),
+                    )
+                    .corner_radii(px(thumb.radius)),
+                );
+            }
 
             if let Some(actions) = actions.as_ref() {
                 let on_mouse_down = actions.on_mouse_down.clone();
@@ -732,9 +1302,56 @@ fn render_scrollbar(
             }
         },
     )
-    .w(px(TERMINAL_SCROLLBAR_WIDTH_PX))
+    .w(px(terminal_scrollbar_gutter_width(spec)))
     .flex_none()
     .h_full()
+}
+
+/// The four facts the terminal body's 22 px debug strip used to print across
+/// the top of every terminal: the session's title, the backend behind it, its
+/// status, and the size the grid is rendering at.
+///
+/// The strip is gone from the body (fix wave 1, F7). Design language rule 1 is
+/// that grey is the interface and colour is information; a developer
+/// diagnostic spanning the full width of a panel is neither, and it cost a
+/// line of stream on every terminal. This is where the text went: the panel
+/// hangs it off its Terminal tab as a tooltip, so it is one hover away rather
+/// than gone.
+///
+/// One caller, deliberately. A second surface wanting these facts should call
+/// this rather than re-composing them, which is how the strip and its
+/// replacement would otherwise start saying different things.
+pub fn terminal_surface_diagnostic(model: &TerminalPaneModel) -> String {
+    let is_ai_tab = matches!(
+        model.active_tab_type,
+        Some(TabType::Claude) | Some(TabType::Codex)
+    );
+    let session_title = model
+        .session
+        .as_ref()
+        .and_then(|session| session.runtime.title.clone())
+        .filter(|title| is_meaningful_title(title))
+        .unwrap_or_else(|| model.session_label.clone());
+    let title = if model.active_project.is_empty() || session_title == model.active_project {
+        session_title
+    } else {
+        format!("{} • {}", model.active_project, session_title)
+    };
+    let status = model
+        .session
+        .as_ref()
+        .map(|session| session_status_label(session, is_ai_tab))
+        .unwrap_or(if is_ai_tab { "saved" } else { "" });
+
+    let mut parts = vec![title];
+    parts.extend(surface_header_detail(model));
+    parts.push(status.to_string());
+    parts.push(format!("font {}", model.font_size.round() as u32));
+    // A part that is empty is a fact the model does not have, and an empty
+    // segment between two separators reads as a missing value rather than as
+    // an absent one.
+    parts.retain(|part| !part.trim().is_empty());
+    parts.join(" · ")
 }
 
 fn surface_header_detail(model: &TerminalPaneModel) -> Option<String> {
@@ -742,9 +1359,8 @@ fn surface_header_detail(model: &TerminalPaneModel) -> Option<String> {
     let has_live_terminal = session.runtime.status.is_live() || session.runtime.interactive_shell;
 
     if session.runtime.status.is_live() && session.runtime.resources.last_sample_at.is_some() {
-        let mem_mb = session.runtime.resources.memory_bytes / 1024 / 1024;
-        let cpu = session.runtime.resources.cpu_percent;
-        let procs = session.runtime.resources.process_count;
+        let resource_metrics = format_compact_resource_metrics(&session.runtime.resources);
+        let process_count = format_compact_process_count(&session.runtime.resources);
         let uptime = session
             .runtime
             .started_at
@@ -765,10 +1381,7 @@ fn surface_header_detail(model: &TerminalPaneModel) -> Option<String> {
         } else {
             format!(" • {uptime}")
         };
-        return Some(format!(
-            "{mem_mb} MB • {cpu:.1}% • {procs} proc{}{uptime_part}",
-            if procs == 1 { "" } else { "s" }
-        ));
+        return Some(format!("{resource_metrics} • {process_count}{uptime_part}"));
     }
 
     has_live_terminal.then(|| match model.active_tab_type.as_ref() {
@@ -805,6 +1418,7 @@ fn tab_kind_label(tab_type: Option<&TabType>) -> &'static str {
 fn collect_grid_paint_runs(
     session: &TerminalSessionView,
     selection: Option<&TerminalSelectionSnapshot>,
+    palette: TerminalRenderPalette,
 ) -> (
     Vec<TerminalBackgroundRect>,
     Vec<TerminalTextRun>,
@@ -834,7 +1448,7 @@ fn collect_grid_paint_runs(
                 && cursor.column == indexed.column
                 && matches!(cursor.shape, CursorShape::Block)
         });
-        let style = effective_cell_style(&indexed.cell, selected, cursor_cell);
+        let style = effective_cell_style(&indexed.cell, selected, cursor_cell, palette);
 
         if style.paint_background {
             let col = indexed.column;
@@ -907,7 +1521,7 @@ fn collect_grid_paint_runs(
             row: cursor.row,
             column: cursor.column,
             shape: cursor.shape,
-            color: theme::SUCCESS_TEXT,
+            color: palette.terminal_cursor,
         }),
         _ => None,
     });
@@ -920,43 +1534,84 @@ fn render_grid_canvas(
     search_highlight: Option<TerminalBackgroundRect>,
     text_runs: Vec<TerminalTextRun>,
     cursor_overlay: Option<TerminalCursorOverlay>,
+    grid_selection: Option<TerminalGridInteraction>,
+    grid_rows: usize,
+    grid_cols: usize,
     font_size: f32,
     cell_width: f32,
     line_height: f32,
 ) -> impl IntoElement {
     canvas(
-        move |_bounds, _window, _cx| (background_runs, search_highlight, text_runs, cursor_overlay),
+        move |bounds, window, cx| {
+            if let Some(interaction) = grid_selection.as_ref() {
+                // Column arithmetic must use the same pitch the paint pass
+                // below positions glyphs on, or the grid the PTY is told about
+                // and the grid that is drawn are different grids.
+                let cell_pitch = terminal_cell_pitch(
+                    measure_terminal_cell_advance(window, font_size).or(Some(cell_width)),
+                );
+                let size = terminal_grid_size_for_bounds(
+                    f32::from(bounds.size.width),
+                    f32::from(bounds.size.height),
+                    cell_pitch,
+                    line_height,
+                );
+                (interaction.on_layout)(size, window, cx);
+            }
+            (
+                background_runs,
+                search_highlight,
+                text_runs,
+                cursor_overlay,
+                grid_selection,
+            )
+        },
         move |bounds: Bounds<_>,
-              (background_runs, search_highlight, text_runs, cursor_overlay),
+              (background_runs, search_highlight, text_runs, cursor_overlay, grid_selection),
               window,
               cx| {
-            for run in background_runs {
+            // The pitch is the advance of the font this very window shapes the
+            // runs with — measured once per font size, never per frame. Any
+            // other value (notably the historical hardcoded 8) drifts the
+            // glyphs away from their own background quads by
+            // (pitch - advance) per column.
+            let cell_pitch = terminal_cell_pitch(
+                measure_terminal_cell_advance(window, font_size).or(Some(cell_width)),
+            );
+
+            for run in &background_runs {
                 let position = point(
-                    bounds.origin.x + px(run.start_column as f32 * cell_width),
+                    bounds.origin.x + px(terminal_column_offset(run.start_column, cell_pitch)),
                     bounds.origin.y + px(run.row as f32 * line_height),
                 );
-                let run_size = size(px(cell_width * run.cell_count as f32), px(line_height));
+                let run_size = size(
+                    px(terminal_column_offset(run.cell_count, cell_pitch)),
+                    px(line_height),
+                );
                 window.paint_quad(fill(Bounds::new(position, run_size), rgb(run.color)));
             }
 
             if let Some(run) = search_highlight {
                 let position = point(
-                    bounds.origin.x + px(run.start_column as f32 * cell_width),
+                    bounds.origin.x + px(terminal_column_offset(run.start_column, cell_pitch)),
                     bounds.origin.y + px(run.row as f32 * line_height),
                 );
-                let run_size = size(px(cell_width * run.cell_count as f32), px(line_height));
+                let run_size = size(
+                    px(terminal_column_offset(run.cell_count, cell_pitch)),
+                    px(line_height),
+                );
                 window.paint_quad(fill(Bounds::new(position, run_size), rgb(run.color)));
             }
 
-            for run in text_runs {
+            for run in &text_runs {
                 let shaped_line = window.text_system().shape_line(
-                    SharedString::from(run.text),
+                    SharedString::from(run.text.clone()),
                     px(font_size),
                     &[run.style.clone()],
                     None,
                 );
                 let position = point(
-                    bounds.origin.x + px(run.start_column as f32 * cell_width),
+                    bounds.origin.x + px(terminal_column_offset(run.start_column, cell_pitch)),
                     bounds.origin.y + px(run.row as f32 * line_height),
                 );
                 let _ = shaped_line.paint(position, px(line_height), window, cx);
@@ -964,20 +1619,123 @@ fn render_grid_canvas(
 
             if let Some(cursor) = cursor_overlay {
                 let position = point(
-                    bounds.origin.x + px(cursor.column as f32 * cell_width),
+                    bounds.origin.x + px(terminal_column_offset(cursor.column, cell_pitch)),
                     bounds.origin.y + px(cursor.row as f32 * line_height),
                 );
                 let cursor_bounds = match cursor.shape {
                     CursorShape::Underline => Bounds::new(
                         point(position.x, position.y + px((line_height - 2.0).max(0.0))),
-                        size(px(cell_width.max(1.0)), px(2.0)),
+                        size(px(cell_pitch.max(1.0)), px(2.0)),
                     ),
                     CursorShape::Beam => {
                         Bounds::new(position, size(px(2.0), px(line_height.max(1.0))))
                     }
-                    _ => Bounds::new(position, size(px(cell_width), px(line_height))),
+                    _ => Bounds::new(position, size(px(cell_pitch), px(line_height))),
                 };
                 window.paint_quad(fill(cursor_bounds, rgb(cursor.color)));
+            }
+
+            if let Some(interaction) = grid_selection.as_ref() {
+                (interaction.on_paint)(bounds, window, cx);
+                let text_bounds = terminal_grid_text_bounds(
+                    bounds,
+                    grid_cols,
+                    grid_rows,
+                    cell_pitch,
+                    line_height,
+                );
+                let on_mouse_down = interaction.on_mouse_down.clone();
+                window.on_mouse_event({
+                    let text_bounds = text_bounds;
+                    move |event: &MouseDownEvent, _, window, cx| {
+                        if event.button != MouseButton::Left {
+                            return;
+                        }
+                        let Some(endpoint) =
+                            terminal_endpoint_for_mouse(event.position, text_bounds, false)
+                        else {
+                            return;
+                        };
+                        cx.stop_propagation();
+                        window.prevent_default();
+                        (on_mouse_down)(
+                            event,
+                            TerminalGridPointerEvent {
+                                endpoint,
+                                click_count: event.click_count,
+                                shift: event.modifiers.shift,
+                                dragging: false,
+                            },
+                            window,
+                            cx,
+                        );
+                    }
+                });
+                let on_mouse_move = interaction.on_mouse_move.clone();
+                window.on_mouse_event({
+                    let text_bounds = text_bounds;
+                    move |event: &MouseMoveEvent, _, window, cx| {
+                        if !event.dragging() {
+                            return;
+                        }
+                        let Some(endpoint) =
+                            terminal_endpoint_for_mouse(event.position, text_bounds, false)
+                        else {
+                            return;
+                        };
+                        cx.stop_propagation();
+                        window.prevent_default();
+                        (on_mouse_move)(
+                            event,
+                            TerminalGridPointerEvent {
+                                endpoint,
+                                click_count: 1,
+                                shift: event.modifiers.shift,
+                                dragging: true,
+                            },
+                            window,
+                            cx,
+                        );
+                    }
+                });
+                let on_mouse_up = interaction.on_mouse_up.clone();
+                window.on_mouse_event({
+                    let text_bounds = text_bounds;
+                    move |event: &MouseUpEvent, _, window, cx| {
+                        let Some(endpoint) =
+                            terminal_endpoint_for_mouse(event.position, text_bounds, false)
+                        else {
+                            (on_mouse_up)(
+                                event,
+                                TerminalGridPointerEvent {
+                                    endpoint: TerminalSelectionEndpoint {
+                                        position: TerminalGridPosition { row: 0, column: 0 },
+                                        side: TerminalCellSide::Left,
+                                    },
+                                    click_count: 1,
+                                    shift: event.modifiers.shift,
+                                    dragging: false,
+                                },
+                                window,
+                                cx,
+                            );
+                            return;
+                        };
+                        cx.stop_propagation();
+                        window.prevent_default();
+                        (on_mouse_up)(
+                            event,
+                            TerminalGridPointerEvent {
+                                endpoint,
+                                click_count: 1,
+                                shift: event.modifiers.shift,
+                                dragging: false,
+                            },
+                            window,
+                            cx,
+                        );
+                    }
+                });
             }
         },
     )
@@ -1182,6 +1940,7 @@ fn effective_cell_style(
     cell: &TerminalCellSnapshot,
     selected: bool,
     cursor: Option<TerminalCursorSnapshot>,
+    palette: TerminalRenderPalette,
 ) -> EffectiveCellStyle {
     let mut foreground = cell.foreground;
     let mut background = cell.background;
@@ -1193,17 +1952,23 @@ fn effective_cell_style(
     let strike = cell.strike;
     let mut paint_background = !cell.default_background;
 
+    // Apply themed default foreground before selection/cursor overrides so
+    // custom/T3 tokens replace the stale NamedColor::Foreground static.
+    if cell.default_foreground {
+        foreground = palette.terminal_fg;
+    }
+
     if selected {
-        foreground = theme::SELECTION_TEXT;
-        background = theme::SELECTION_BG;
+        foreground = palette.selection_text;
+        background = palette.selection_bg;
         paint_background = true;
     }
 
     if let Some(cursor) = cursor {
         match cursor.shape {
             CursorShape::Block => {
-                foreground = theme::PANEL_BG;
-                background = theme::SUCCESS_TEXT;
+                foreground = palette.panel;
+                background = palette.terminal_cursor;
                 bold = true;
                 dim = false;
                 paint_background = true;
@@ -1229,6 +1994,7 @@ fn effective_cell_style(
 fn render_runtime_actions(
     actions: TerminalPaneActions,
     controls: TerminalRuntimeControlsModel,
+    palette: TerminalRenderPalette,
 ) -> impl IntoElement {
     let TerminalPaneActions {
         on_open_browser: _,
@@ -1238,7 +2004,6 @@ fn render_runtime_actions(
         on_stop_server,
         on_restart_server,
         on_clear_output: _,
-        on_kill_port,
         on_actionable_notice_action: _,
         on_open_local_url,
         on_prompt_action,
@@ -1268,29 +2033,22 @@ fn render_runtime_actions(
                 .can_start
                 .then_some(on_start_server)
                 .flatten()
-                .map(|on_click| runtime_action_button("start", theme::SUCCESS_TEXT, on_click)),
+                .map(|on_click| runtime_action_button("start", palette.success, on_click, palette)),
         )
         .children(
             controls
                 .can_stop
                 .then_some(on_stop_server)
                 .flatten()
-                .map(|on_click| runtime_action_button("stop", theme::DANGER_TEXT, on_click)),
+                .map(|on_click| runtime_action_button("stop", palette.danger, on_click, palette)),
         )
         .children(
             controls
                 .can_restart
                 .then_some(on_restart_server)
                 .flatten()
-                .map(|on_click| runtime_action_button("restart", theme::WARNING_TEXT, on_click)),
-        )
-        .children(
-            controls
-                .can_kill_port
-                .then_some(on_kill_port)
-                .flatten()
                 .map(|on_click| {
-                    runtime_action_button(controls.kill_label, controls.kill_color, on_click)
+                    runtime_action_button("restart", palette.warning, on_click, palette)
                 }),
         )
         .children(
@@ -1298,18 +2056,28 @@ fn render_runtime_actions(
                 .can_open_url
                 .then_some(on_open_local_url)
                 .flatten()
-                .map(|on_click| runtime_action_button("open", theme::PRIMARY, on_click)),
+                .map(|on_click| runtime_action_button("open", palette.primary, on_click, palette)),
         )
         .children(
             controls
                 .prompt_action_label
                 .zip(on_prompt_action)
                 .map(|(label, on_click)| {
-                    runtime_action_button(label.as_str(), controls.prompt_action_color, on_click)
+                    runtime_action_button(
+                        label.as_str(),
+                        controls.prompt_action_color,
+                        on_click,
+                        palette,
+                    )
                 }),
         )
         .children(controls.remote_control.map(|control| {
-            remote_control_button(control, on_take_remote_control, on_release_remote_control)
+            remote_control_button(
+                control,
+                on_take_remote_control,
+                on_release_remote_control,
+                palette,
+            )
         }))
         .children(
             controls
@@ -1324,11 +2092,12 @@ fn render_runtime_actions(
                             "search"
                         },
                         if controls.search_active {
-                            theme::PRIMARY
+                            palette.primary
                         } else {
-                            theme::TEXT_MUTED
+                            palette.text_muted
                         },
                         on_click,
+                        palette,
                     )
                 }),
         )
@@ -1337,14 +2106,18 @@ fn render_runtime_actions(
                 .search_active
                 .then_some(on_search_prev)
                 .flatten()
-                .map(|on_click| runtime_action_button("prev", theme::TEXT_MUTED, on_click)),
+                .map(|on_click| {
+                    runtime_action_button("prev", palette.text_muted, on_click, palette)
+                }),
         )
         .children(
             controls
                 .search_active
                 .then_some(on_search_next)
                 .flatten()
-                .map(|on_click| runtime_action_button("next", theme::TEXT_MUTED, on_click)),
+                .map(|on_click| {
+                    runtime_action_button("next", palette.text_muted, on_click, palette)
+                }),
         )
         .children(
             controls
@@ -1359,11 +2132,12 @@ fn render_runtime_actions(
                             "aa"
                         },
                         if controls.search_case_sensitive {
-                            theme::PRIMARY
+                            palette.primary
                         } else {
-                            theme::TEXT_MUTED
+                            palette.text_muted
                         },
                         on_click,
+                        palette,
                     )
                 }),
         )
@@ -1372,21 +2146,27 @@ fn render_runtime_actions(
                 .search_active
                 .then_some(on_close_search)
                 .flatten()
-                .map(|on_click| runtime_action_button("close", theme::TEXT_MUTED, on_click)),
+                .map(|on_click| {
+                    runtime_action_button("close", palette.text_muted, on_click, palette)
+                }),
         )
         .children(
             controls
                 .can_export_scrollback
                 .then_some(on_export_scrollback)
                 .flatten()
-                .map(|on_click| runtime_action_button("export", theme::TEXT_MUTED, on_click)),
+                .map(|on_click| {
+                    runtime_action_button("export", palette.text_muted, on_click, palette)
+                }),
         )
         .children(
             controls
                 .can_export_selection
                 .then_some(on_export_selection)
                 .flatten()
-                .map(|on_click| runtime_action_button("selection", theme::TEXT_MUTED, on_click)),
+                .map(|on_click| {
+                    runtime_action_button("selection", palette.text_muted, on_click, palette)
+                }),
         )
 }
 
@@ -1394,6 +2174,7 @@ fn remote_control_button(
     control: TerminalRemoteControlModel,
     on_take_remote_control: Option<Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>>,
     on_release_remote_control: Option<Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>>,
+    palette: TerminalRenderPalette,
 ) -> impl IntoElement {
     let action = if control.can_release {
         on_release_remote_control.map(|on_click| ("release", on_click))
@@ -1410,8 +2191,8 @@ fn remote_control_button(
         .px(px(5.0))
         .py(px(1.0))
         .border_1()
-        .border_color(rgb(theme::BORDER_PRIMARY))
-        .bg(rgb(theme::PANEL_HEADER_BG))
+        .border_color(rgb(palette.border))
+        .bg(rgb(palette.panel_header))
         .rounded_sm()
         .text_xs()
         .text_color(rgb(control.color))
@@ -1419,11 +2200,11 @@ fn remote_control_button(
         .children(action.map(|(label, on_click)| {
             div()
                 .px(px(4.0))
-                .bg(rgb(theme::BUTTON_HOVER_BG))
+                .bg(rgb(palette.button_hover))
                 .rounded_sm()
-                .text_color(rgb(theme::TEXT_PRIMARY))
+                .text_color(rgb(palette.text_primary))
                 .cursor_pointer()
-                .hover(|s| s.bg(rgb(theme::ROW_HOVER_BG)))
+                .hover(|s| s.bg(rgb(palette.row_hover)))
                 .child(SharedString::from(label.to_string()))
                 .on_mouse_down(MouseButton::Left, on_click)
         }))
@@ -1432,6 +2213,7 @@ fn remote_control_button(
 fn render_actionable_notice(
     banner: &TerminalActionableNotice,
     on_click: Option<Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>>,
+    palette: TerminalRenderPalette,
 ) -> impl IntoElement {
     div()
         .mx(px(8.0))
@@ -1439,8 +2221,8 @@ fn render_actionable_notice(
         .px(px(10.0))
         .py(px(6.0))
         .border_1()
-        .border_color(rgb(theme::DANGER_TEXT))
-        .bg(rgb(theme::DANGER_BG_SUBTLE))
+        .border_color(rgb(palette.danger))
+        .bg(rgb(palette.danger_bg))
         .rounded_sm()
         .flex()
         .items_center()
@@ -1449,11 +2231,11 @@ fn render_actionable_notice(
             div()
                 .flex_1()
                 .text_sm()
-                .text_color(rgb(theme::DANGER_TEXT))
+                .text_color(rgb(palette.danger))
                 .child(SharedString::from(banner.message.clone())),
         )
         .children(on_click.map(|handler| {
-            runtime_action_button(banner.action_label, banner.action_color, handler)
+            runtime_action_button(banner.action_label, banner.action_color, handler, palette)
         }))
 }
 
@@ -1461,18 +2243,19 @@ fn runtime_action_button(
     label: &str,
     color: u32,
     on_click: Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>,
+    palette: TerminalRenderPalette,
 ) -> impl IntoElement {
     div()
         .px(px(5.0))
         .py(px(1.0))
         .border_1()
-        .border_color(rgb(theme::BORDER_PRIMARY))
-        .bg(rgb(theme::PANEL_HEADER_BG))
+        .border_color(rgb(palette.border))
+        .bg(rgb(palette.panel_header))
         .rounded_sm()
         .text_xs()
         .text_color(rgb(color))
         .cursor_pointer()
-        .hover(|s| s.bg(rgb(theme::BUTTON_HOVER_BG)))
+        .hover(|s| s.bg(rgb(palette.button_hover)))
         .child(SharedString::from(label.to_string()))
         .on_mouse_down(MouseButton::Left, on_click)
 }
@@ -1499,6 +2282,429 @@ fn line_selection_range(
     };
 
     (start < end).then_some((start, end))
+}
+
+pub fn selection_mode_for_click(click_count: usize) -> Option<TerminalSelectionMode> {
+    match click_count {
+        0 => None,
+        1 => Some(TerminalSelectionMode::Simple),
+        2 => Some(TerminalSelectionMode::Semantic),
+        _ => Some(TerminalSelectionMode::Lines),
+    }
+}
+
+pub fn ordered_selection_endpoints(
+    anchor: TerminalSelectionEndpoint,
+    head: TerminalSelectionEndpoint,
+) -> (TerminalSelectionEndpoint, TerminalSelectionEndpoint) {
+    if anchor <= head {
+        (anchor, head)
+    } else {
+        (head, anchor)
+    }
+}
+
+pub fn boundary_column(endpoint: TerminalSelectionEndpoint, screen_cols: usize) -> usize {
+    match endpoint.side {
+        TerminalCellSide::Left => endpoint.position.column.min(screen_cols),
+        TerminalCellSide::Right => (endpoint.position.column + 1).min(screen_cols),
+    }
+}
+
+fn endpoint_at_boundary(
+    row: usize,
+    boundary: usize,
+    screen_cols: usize,
+) -> TerminalSelectionEndpoint {
+    if screen_cols == 0 || boundary == 0 {
+        return TerminalSelectionEndpoint {
+            position: TerminalGridPosition { row, column: 0 },
+            side: TerminalCellSide::Left,
+        };
+    }
+
+    TerminalSelectionEndpoint {
+        position: TerminalGridPosition {
+            row,
+            column: boundary
+                .saturating_sub(1)
+                .min(screen_cols.saturating_sub(1)),
+        },
+        side: TerminalCellSide::Right,
+    }
+}
+
+pub fn top_visible_buffer_line(screen: &crate::terminal::session::TerminalScreenSnapshot) -> usize {
+    screen
+        .total_lines
+        .saturating_sub(screen.rows.max(1))
+        .saturating_sub(screen.display_offset)
+}
+
+pub fn buffer_line_for_viewport_row(
+    screen: &crate::terminal::session::TerminalScreenSnapshot,
+    display_offset: usize,
+    viewport_row: usize,
+) -> usize {
+    let top = screen
+        .total_lines
+        .saturating_sub(screen.rows.max(1))
+        .saturating_sub(display_offset);
+    top.saturating_add(viewport_row.min(screen.rows.saturating_sub(1)))
+        .min(screen.total_lines.saturating_sub(1))
+}
+
+pub fn semantic_selection_bounds(
+    line: &[TerminalCellSnapshot],
+    column: usize,
+    screen_cols: usize,
+) -> (usize, usize) {
+    let len = line.len().min(screen_cols);
+    if len == 0 {
+        return (0, 0);
+    }
+
+    let column = column.min(len.saturating_sub(1));
+    let whitespace = line[column].character.is_whitespace();
+    let mut start = column;
+    while start > 0 && line[start - 1].character.is_whitespace() == whitespace {
+        start -= 1;
+    }
+
+    let mut end = column + 1;
+    while end < len && line[end].character.is_whitespace() == whitespace {
+        end += 1;
+    }
+
+    (start, end)
+}
+
+pub fn terminal_selection_for_click(
+    screen: &crate::terminal::session::TerminalScreenSnapshot,
+    position: TerminalGridPosition,
+    mode: TerminalSelectionMode,
+) -> Option<TerminalSelection> {
+    let visible_top = top_visible_buffer_line(screen);
+    let viewport_row = position
+        .row
+        .saturating_sub(visible_top)
+        .min(screen.lines.len().saturating_sub(1));
+    match mode {
+        TerminalSelectionMode::Simple => Some(TerminalSelection {
+            anchor: TerminalSelectionEndpoint {
+                position,
+                side: TerminalCellSide::Left,
+            },
+            head: TerminalSelectionEndpoint {
+                position,
+                side: TerminalCellSide::Left,
+            },
+            moved: false,
+            mode,
+        }),
+        TerminalSelectionMode::Semantic => {
+            let line = screen.lines.get(viewport_row)?;
+            let (start, end) = semantic_selection_bounds(line, position.column, screen.cols);
+            Some(TerminalSelection {
+                anchor: endpoint_at_boundary(position.row, start, screen.cols),
+                head: endpoint_at_boundary(position.row, end, screen.cols),
+                moved: start != end,
+                mode,
+            })
+        }
+        TerminalSelectionMode::Lines => Some(TerminalSelection {
+            anchor: endpoint_at_boundary(position.row, 0, screen.cols),
+            head: endpoint_at_boundary(position.row, screen.cols, screen.cols),
+            moved: screen.cols > 0,
+            mode,
+        }),
+    }
+}
+
+/// Hit-test a window-space point against the actual painted grid bounds.
+/// The rectangle a painted terminal grid claims pointer events inside, in
+/// window coordinates.
+///
+/// Two rules, in this order:
+///
+/// 1. at least one cell, so a one-column or one-row grid is still clickable;
+/// 2. and never larger than `element`, the bounds the grid was painted into.
+///
+/// Rule 2 is the property: a pointer event outside this rectangle belongs to
+/// whatever is under it, and [`terminal_endpoint_for_mouse`] with
+/// `clamp_to_terminal = false` is what refuses it. The two together are why
+/// a visible terminal is not a window-wide modal pointer surface.
+///
+/// Extracted from the paint closure so that property is a fact about a
+/// function a test can call, rather than a claim about a slice of this file's
+/// text: the guard that used to assert it sliced the closure between two
+/// literals and stopped matching -- and therefore stopped guarding -- the
+/// moment the closure moved.
+pub fn terminal_grid_text_bounds(
+    element: Bounds<Pixels>,
+    grid_cols: usize,
+    grid_rows: usize,
+    cell_pitch: f32,
+    line_height: f32,
+) -> TerminalTextBounds {
+    let element_width = f32::from(element.size.width).max(0.0);
+    let element_height = f32::from(element.size.height).max(0.0);
+    TerminalTextBounds {
+        left: f32::from(element.origin.x),
+        top: f32::from(element.origin.y),
+        width: terminal_column_offset(grid_cols, cell_pitch)
+            .max(cell_pitch)
+            .min(element_width),
+        height: (grid_rows as f32 * line_height)
+            .max(line_height)
+            .min(element_height),
+        cell_width: cell_pitch,
+        row_height: line_height,
+        rows: grid_rows,
+        cols: grid_cols,
+    }
+}
+
+pub fn terminal_endpoint_for_mouse(
+    position: Point<Pixels>,
+    bounds: TerminalTextBounds,
+    clamp_to_terminal: bool,
+) -> Option<TerminalSelectionEndpoint> {
+    if bounds.cols == 0 || bounds.rows == 0 {
+        return None;
+    }
+
+    let left = bounds.left;
+    let top = bounds.top;
+    let right = bounds.left + bounds.width;
+    let bottom = bounds.top + bounds.height;
+    let mut x: f32 = position.x.into();
+    let mut y: f32 = position.y.into();
+
+    if !clamp_to_terminal && (x < left || y < top || x >= right || y >= bottom) {
+        return None;
+    }
+
+    if clamp_to_terminal {
+        x = x.clamp(left, right);
+        y = y.clamp(top, bottom);
+    }
+
+    let relative_x = (x - left).max(0.0);
+    let relative_y = (y - top).max(0.0);
+    let mut column = (relative_x / bounds.cell_width).floor() as usize;
+    let mut row = (relative_y / bounds.row_height).floor() as usize;
+    let mut side = if relative_x % bounds.cell_width > bounds.cell_width / 2.0 {
+        TerminalCellSide::Right
+    } else {
+        TerminalCellSide::Left
+    };
+
+    if relative_x >= bounds.width {
+        column = bounds.cols.saturating_sub(1);
+        side = TerminalCellSide::Right;
+    } else {
+        column = column.min(bounds.cols.saturating_sub(1));
+    }
+
+    if y < top {
+        row = 0;
+        side = TerminalCellSide::Left;
+    } else if relative_y >= bounds.height {
+        row = bounds.rows.saturating_sub(1);
+        side = TerminalCellSide::Right;
+    } else {
+        row = row.min(bounds.rows.saturating_sub(1));
+    }
+
+    Some(TerminalSelectionEndpoint {
+        position: TerminalGridPosition { row, column },
+        side,
+    })
+}
+
+pub fn selection_range_from(
+    selection: TerminalSelection,
+    screen_cols: usize,
+) -> Option<TerminalSelectionRange> {
+    if !selection.moved {
+        return None;
+    }
+
+    let (start, end) = ordered_selection_endpoints(selection.anchor, selection.head);
+    let start_column = boundary_column(start, screen_cols);
+    let end_column = boundary_column(end, screen_cols);
+    if start.position.row == end.position.row && start_column == end_column {
+        return None;
+    }
+
+    Some(TerminalSelectionRange {
+        start_row: start.position.row,
+        start_column,
+        end_row: end.position.row,
+        end_column,
+    })
+}
+
+pub fn selection_snapshot_for_viewport(
+    range: TerminalSelectionRange,
+    screen: &crate::terminal::session::TerminalScreenSnapshot,
+) -> Option<TerminalSelectionSnapshot> {
+    let visible_top = top_visible_buffer_line(screen);
+    let visible_bottom = visible_top.saturating_add(screen.rows.saturating_sub(1));
+    if range.end_row < visible_top || range.start_row > visible_bottom {
+        return None;
+    }
+
+    let start_row = range.start_row.max(visible_top) - visible_top;
+    let end_row = range.end_row.min(visible_bottom) - visible_top;
+    let start_column = if range.start_row < visible_top {
+        0
+    } else {
+        range.start_column
+    };
+    let end_column = if range.end_row > visible_bottom {
+        screen.cols
+    } else {
+        range.end_column
+    };
+    if start_row == end_row && start_column == end_column {
+        return None;
+    }
+
+    Some(TerminalSelectionSnapshot {
+        start_row,
+        start_column,
+        end_row,
+        end_column,
+    })
+}
+
+/// Extract selected text from scrollback/line text with trailing-space trim per row.
+pub fn selected_text_from_lines(lines: &[&str], selection: TerminalSelectionRange) -> String {
+    let mut selected = Vec::new();
+    for row in selection.start_row..=selection.end_row {
+        let line = lines.get(row).copied().unwrap_or_default();
+        let characters: Vec<char> = line.chars().collect();
+        let start = if row == selection.start_row {
+            selection.start_column.min(characters.len())
+        } else {
+            0
+        };
+        let end = if row == selection.end_row {
+            selection.end_column.min(characters.len())
+        } else {
+            characters.len()
+        };
+        let mut segment: String = characters[start..end].iter().collect();
+        while segment.ends_with(' ') {
+            segment.pop();
+        }
+        selected.push(segment);
+    }
+    selected.join("\n")
+}
+
+pub fn selected_text_from_screen(
+    screen: &crate::terminal::session::TerminalScreenSnapshot,
+    selection: TerminalSelectionRange,
+) -> String {
+    let visible_top = top_visible_buffer_line(screen);
+    let visible_bottom = visible_top.saturating_add(screen.rows.saturating_sub(1));
+    if selection.end_row < visible_top || selection.start_row > visible_bottom {
+        return String::new();
+    }
+
+    let clipped = TerminalSelectionRange {
+        start_row: selection.start_row.max(visible_top),
+        start_column: if selection.start_row < visible_top {
+            0
+        } else {
+            selection.start_column
+        },
+        end_row: selection.end_row.min(visible_bottom),
+        end_column: if selection.end_row > visible_bottom {
+            screen.cols
+        } else {
+            selection.end_column
+        },
+    };
+    if clipped.start_row > clipped.end_row {
+        return String::new();
+    }
+
+    let lines: Vec<String> = screen
+        .lines
+        .iter()
+        .map(|line| line.iter().map(|cell| cell.character).collect::<String>())
+        .collect();
+    let mut selected = Vec::new();
+    for buffer_row in clipped.start_row..=clipped.end_row {
+        let viewport_row = buffer_row.saturating_sub(visible_top);
+        let line = lines
+            .get(viewport_row)
+            .map(String::as_str)
+            .unwrap_or_default();
+        let characters: Vec<char> = line.chars().collect();
+        let start = if buffer_row == clipped.start_row {
+            clipped.start_column.min(characters.len())
+        } else {
+            0
+        };
+        let end = if buffer_row == clipped.end_row {
+            clipped.end_column.min(characters.len())
+        } else {
+            characters.len()
+        };
+        let mut segment: String = characters.get(start..end).unwrap_or(&[]).iter().collect();
+        while segment.ends_with(' ') {
+            segment.pop();
+        }
+        selected.push(segment);
+    }
+    selected.join("\n")
+}
+
+pub fn begin_simple_selection(endpoint: TerminalSelectionEndpoint) -> TerminalSelection {
+    TerminalSelection {
+        anchor: endpoint,
+        head: endpoint,
+        moved: false,
+        mode: TerminalSelectionMode::Simple,
+    }
+}
+
+pub fn extend_selection_head(
+    selection: &mut TerminalSelection,
+    endpoint: TerminalSelectionEndpoint,
+) {
+    selection.head = endpoint;
+    selection.moved = selection.anchor != endpoint;
+    selection.mode = TerminalSelectionMode::Simple;
+}
+
+pub fn finish_simple_selection(selection: Option<TerminalSelection>) -> Option<TerminalSelection> {
+    let selection = selection?;
+    if !selection.moved && matches!(selection.mode, TerminalSelectionMode::Simple) {
+        None
+    } else {
+        Some(selection)
+    }
+}
+
+/// Ctrl+C copies when a committed selection exists; otherwise it remains interrupt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalCtrlCAction {
+    CopySelection,
+    Interrupt,
+}
+
+pub fn terminal_ctrl_c_action(has_copyable_selection: bool) -> TerminalCtrlCAction {
+    if has_copyable_selection {
+        TerminalCtrlCAction::CopySelection
+    } else {
+        TerminalCtrlCAction::Interrupt
+    }
 }
 
 fn is_meaningful_title(title: &str) -> bool {
@@ -1540,18 +2746,1065 @@ fn session_status_label(session: &TerminalSessionView, is_ai_tab: bool) -> &'sta
     }
 }
 
-fn session_status_color(session: &TerminalSessionView) -> u32 {
-    if session.runtime.unseen_ready {
-        return theme::SUCCESS_TEXT;
+fn format_compact_resource_metrics(resources: &ResourceSnapshot) -> String {
+    let cpu = match resources.cpu_value_state {
+        ResourceMetricValueState::Observed => format!("{:.1}% CPU", resources.cpu_percent),
+        ResourceMetricValueState::Partial => {
+            format!("{:.1}% CPU (partial)", resources.cpu_percent)
+        }
+        ResourceMetricValueState::LastKnown => {
+            format!("{:.1}% CPU (last known)", resources.cpu_percent)
+        }
+        ResourceMetricValueState::Unavailable => "CPU unavailable".to_string(),
+    };
+    let memory_mb = resources.memory_bytes / 1024 / 1024;
+    let memory = match resources.memory_value_state {
+        ResourceMetricValueState::Observed => {
+            format!("{} {memory_mb} MB", resources.memory_metric.label())
+        }
+        ResourceMetricValueState::Partial => format!(
+            "{} {memory_mb} MB (partial)",
+            resources.memory_metric.label()
+        ),
+        ResourceMetricValueState::LastKnown => format!(
+            "{} {memory_mb} MB (last known)",
+            resources.memory_metric.label()
+        ),
+        ResourceMetricValueState::Unavailable => {
+            format!("{} unavailable", resources.memory_metric.label())
+        }
+    };
+    format!("{cpu} • {memory}")
+}
+
+fn format_compact_process_count(resources: &ResourceSnapshot) -> String {
+    let count = resources.process_count;
+    let noun = if count == 1 { "proc" } else { "procs" };
+    match resources.process_count_value_state {
+        ResourceMetricValueState::Observed => format!("{count} {noun}"),
+        ResourceMetricValueState::Partial => format!("{count} {noun} (partial)"),
+        ResourceMetricValueState::LastKnown => format!("{count} {noun} (last known)"),
+        ResourceMetricValueState::Unavailable => "process count unavailable".to_string(),
     }
-    if matches!(session.runtime.ai_activity, Some(AiActivity::Thinking)) {
-        return theme::WARNING_TEXT;
+}
+
+#[cfg(test)]
+mod resource_metric_tests {
+    use super::{format_compact_process_count, format_compact_resource_metrics};
+    use crate::state::{ResourceMemoryMetric, ResourceMetricValueState, ResourceSnapshot};
+
+    #[test]
+    fn compact_terminal_metrics_do_not_render_unavailable_zero_as_idle() {
+        let unavailable = ResourceSnapshot {
+            cpu_percent: 0.0,
+            memory_bytes: 0,
+            memory_metric: ResourceMemoryMetric::PrivateCommitted,
+            cpu_value_state: ResourceMetricValueState::Unavailable,
+            memory_value_state: ResourceMetricValueState::Unavailable,
+            ..ResourceSnapshot::default()
+        };
+        let label = format_compact_resource_metrics(&unavailable);
+        assert!(label.contains("CPU unavailable"));
+        assert!(label.contains("private committed unavailable"));
+        assert!(!label.contains("0.0%"));
+
+        let partial = ResourceSnapshot {
+            cpu_percent: 6.25,
+            memory_bytes: 4 * 1024 * 1024,
+            memory_metric: ResourceMemoryMetric::PrivateCommitted,
+            cpu_value_state: ResourceMetricValueState::Partial,
+            memory_value_state: ResourceMetricValueState::Observed,
+            ..ResourceSnapshot::default()
+        };
+        let label = format_compact_resource_metrics(&partial);
+        assert!(label.contains("6.2% CPU (partial)"));
+        assert!(label.contains("private committed 4 MB"));
+
+        let retained_count = ResourceSnapshot {
+            process_count: 3,
+            process_count_value_state: ResourceMetricValueState::LastKnown,
+            ..ResourceSnapshot::default()
+        };
+        assert_eq!(
+            format_compact_process_count(&retained_count),
+            "3 procs (last known)"
+        );
+        assert_eq!(
+            format_compact_process_count(&ResourceSnapshot::default()),
+            "process count unavailable"
+        );
+    }
+}
+
+#[cfg(test)]
+mod theme_palette_tests {
+    use super::{effective_cell_style, terminal_render_palette_from_tokens, TerminalRenderPalette};
+    use crate::terminal::session::TerminalCellSnapshot;
+    use crate::theme;
+    use crate::ui::tokens::{dark, Color, Density, Scale, ThemeMode, PREVIEW_SENTINEL};
+
+    fn sentinel_tokens() -> crate::ui::tokens::ThemeTokens {
+        let mut tokens = dark(Density::Comfortable, Scale::Scale100);
+        tokens.mode = ThemeMode::Dark;
+        tokens.surfaces.canvas = Color::from_u32(0x010101);
+        tokens.surfaces.raised = Color::from_u32(0x020202);
+        tokens.surfaces.overlay = Color::from_u32(0x030303);
+        tokens.surfaces.hover = Color::from_u32(0x040404);
+        tokens.surfaces.disabled = Color::from_u32(0x050505);
+        tokens.surfaces.sunken = Color::from_u32(0x161616);
+        tokens.borders.default = Color::from_u32(0x060606);
+        tokens.text.primary = Color::from_u32(0x070707);
+        tokens.text.muted = Color::from_u32(0x080808);
+        tokens.text.disabled = Color::from_u32(0x090909);
+        tokens.text.on_selection = Color::from_u32(0x0a0a0a);
+        tokens.actions.primary.default.background = Color::from_u32(0x0b0b0b);
+        tokens.actions.primary.selected.background = Color::from_u32(0x0c0c0c);
+        tokens.status.destructive = Color::from_u32(0x0d0d0d);
+        tokens.status.destructive_surface = Color::from_u32(0x0e0e0e);
+        tokens.status.warning = Color::from_u32(0x0f0f0f);
+        tokens.status.success = Color::from_u32(0x101010);
+        tokens.terminal.background = PREVIEW_SENTINEL;
+        tokens.terminal.foreground = Color::from_u32(0x121212);
+        tokens.terminal.cursor = Color::from_u32(0x131313);
+        tokens.terminal.selection = Color::from_u32(0x141414);
+        tokens
     }
 
-    match session.runtime.status {
-        SessionStatus::Running => theme::TEXT_SUBTLE,
-        SessionStatus::Starting | SessionStatus::Stopping => theme::WARNING_TEXT,
-        SessionStatus::Crashed | SessionStatus::Failed => theme::DANGER_TEXT,
-        _ => theme::TEXT_MUTED,
+    #[test]
+    fn sentinel_theme_tokens_map_into_terminal_render_palette() {
+        let tokens = sentinel_tokens();
+        let palette = crate::terminal::view::terminal_render_palette_from_tokens(tokens);
+        assert_eq!(palette.canvas, 0x010101);
+        assert_eq!(palette.panel, 0x161616);
+        assert_eq!(palette.panel_header, 0x020202);
+        assert_eq!(palette.row, 0x030303);
+        assert_eq!(palette.row_hover, 0x040404);
+        assert_eq!(palette.button_hover, 0x040404);
+        assert_eq!(palette.border, 0x060606);
+        assert_eq!(palette.text_primary, 0x070707);
+        assert_eq!(palette.text_muted, 0x080808);
+        assert_eq!(palette.text_subtle, 0x080808);
+        assert_eq!(palette.text_dim, 0x080808);
+        assert_eq!(palette.selection_text, 0x0a0a0a);
+        assert_eq!(palette.primary, 0x0b0b0b);
+        assert_eq!(palette.primary_muted, 0x0c0c0c);
+        assert_eq!(palette.danger, 0x0d0d0d);
+        assert_eq!(palette.danger_bg, 0x0e0e0e);
+        assert_eq!(palette.warning, 0x0f0f0f);
+        assert_eq!(palette.success, 0x101010);
+        assert_eq!(palette.terminal_bg, PREVIEW_SENTINEL.to_u32());
+        assert_eq!(palette.terminal_fg, 0x121212);
+        assert_eq!(palette.terminal_cursor, 0x101010);
+        assert_eq!(palette.terminal_selection, 0x141414);
+        assert_eq!(palette.selection_bg, 0x141414);
+        // The scrollbar's colours are resolved against the TERMINAL plane, not
+        // the shell, so they do not follow the sentinel surfaces this fixture
+        // pins. Their identity is asserted by
+        // `hovering_the_terminal_gutter_changes_both_width_and_colour` and
+        // `the_light_theme_terminal_gutter_takes_the_dark_ground_colours`
+        // instead, and its geometry by
+        // `terminal_scrollbar_geometry_equals_the_shared_spec`.
+    }
+
+    #[test]
+    fn legacy_default_palette_matches_pre_token_theme_constants() {
+        let palette = TerminalRenderPalette::legacy_default();
+        assert_eq!(palette.canvas, theme::APP_BG);
+        assert_eq!(palette.panel, theme::PANEL_BG);
+        assert_eq!(palette.panel_header, theme::PANEL_HEADER_BG);
+        assert_eq!(palette.button_hover, theme::BUTTON_HOVER_BG);
+        assert_eq!(palette.text_dim, theme::TEXT_DIM);
+        assert_eq!(palette.terminal_bg, theme::TERMINAL_BG);
+        assert_eq!(palette.terminal_fg, theme::TEXT_PRIMARY);
+        assert_eq!(palette.terminal_cursor, theme::SUCCESS_TEXT);
+        assert_eq!(palette.selection_bg, theme::SELECTION_BG);
+        assert_eq!(palette.scrollbar_track, theme::PANEL_HEADER_BG);
+        assert_eq!(palette.scrollbar_thumb, theme::TEXT_DIM);
+        assert_eq!(palette.scrollbar_thumb_hover, theme::TEXT_PRIMARY);
+        // Geometry is shared even by the legacy palette: one look.
+        assert_eq!(
+            palette.scrollbar_spec.idle_thumb_width,
+            crate::terminal::view::terminal_scrollbar_spec().idle_thumb_width
+        );
+    }
+
+    #[test]
+    fn effective_style_replaces_default_foreground_with_palette_terminal_fg() {
+        let palette = crate::terminal::view::terminal_render_palette_from_tokens(sentinel_tokens());
+        let cell = TerminalCellSnapshot {
+            character: 'a',
+            zero_width: Vec::new(),
+            foreground: 0xe4e4e7,
+            background: 0x09090b,
+            bold: false,
+            dim: false,
+            italic: false,
+            underline: false,
+            undercurl: false,
+            strike: false,
+            hidden: false,
+            has_hyperlink: false,
+            default_background: true,
+            default_foreground: true,
+        };
+        let style = effective_cell_style(&cell, false, None, palette);
+        assert_eq!(style.foreground, palette.terminal_fg);
+        assert_eq!(style.foreground, 0x121212);
+        assert!(!style.paint_background);
+    }
+
+    #[test]
+    fn effective_style_keeps_explicit_ansi_foreground() {
+        let palette = crate::terminal::view::terminal_render_palette_from_tokens(sentinel_tokens());
+        let cell = TerminalCellSnapshot {
+            character: 'x',
+            zero_width: Vec::new(),
+            foreground: 0xef4444,
+            background: 0x09090b,
+            bold: false,
+            dim: false,
+            italic: false,
+            underline: false,
+            undercurl: false,
+            strike: false,
+            hidden: false,
+            has_hyperlink: false,
+            default_background: true,
+            default_foreground: false,
+        };
+        let style = effective_cell_style(&cell, false, None, palette);
+        assert_eq!(style.foreground, 0xef4444);
+        assert_ne!(style.foreground, palette.terminal_fg);
+    }
+
+    #[test]
+    fn effective_style_selection_overrides_themed_default_foreground() {
+        let palette = crate::terminal::view::terminal_render_palette_from_tokens(sentinel_tokens());
+        let cell = TerminalCellSnapshot {
+            character: 's',
+            zero_width: Vec::new(),
+            foreground: 0xe4e4e7,
+            background: 0x09090b,
+            bold: false,
+            dim: false,
+            italic: false,
+            underline: false,
+            undercurl: false,
+            strike: false,
+            hidden: false,
+            has_hyperlink: false,
+            default_background: true,
+            default_foreground: true,
+        };
+        let style = effective_cell_style(&cell, true, None, palette);
+        assert_eq!(style.foreground, palette.selection_text);
+        assert_eq!(style.background, palette.selection_bg);
+        assert!(style.paint_background);
+    }
+
+    #[test]
+    fn effective_style_preserves_explicit_ansi_rgb_background_and_text_attrs() {
+        let palette = crate::terminal::view::terminal_render_palette_from_tokens(sentinel_tokens());
+        let cell = TerminalCellSnapshot {
+            character: 'Z',
+            zero_width: Vec::new(),
+            foreground: 0x22c55e,
+            background: 0x1e3a5f,
+            bold: true,
+            dim: true,
+            italic: true,
+            underline: true,
+            undercurl: true,
+            strike: true,
+            hidden: false,
+            has_hyperlink: false,
+            default_background: false,
+            default_foreground: false,
+        };
+        let style = effective_cell_style(&cell, false, None, palette);
+        assert_eq!(style.foreground, 0x22c55e);
+        assert_eq!(style.background, 0x1e3a5f);
+        assert!(style.paint_background);
+        assert!(style.bold);
+        assert!(style.dim);
+        assert!(style.italic);
+        assert!(style.underline);
+        assert!(style.undercurl);
+        assert!(style.strike);
+        assert_ne!(style.foreground, palette.terminal_fg);
+        assert_ne!(style.background, palette.terminal_bg);
+    }
+
+    #[test]
+    fn effective_style_block_cursor_uses_visible_palette_cursor() {
+        use crate::terminal::session::TerminalCursorSnapshot;
+        use alacritty_terminal::vte::ansi::CursorShape;
+
+        let palette = crate::terminal::view::terminal_render_palette_from_tokens(sentinel_tokens());
+        let cell = TerminalCellSnapshot {
+            character: 'c',
+            zero_width: Vec::new(),
+            foreground: 0xe4e4e7,
+            background: 0x09090b,
+            bold: false,
+            dim: true,
+            italic: false,
+            underline: false,
+            undercurl: false,
+            strike: false,
+            hidden: false,
+            has_hyperlink: false,
+            default_background: true,
+            default_foreground: true,
+        };
+        let cursor = TerminalCursorSnapshot {
+            row: 0,
+            column: 0,
+            shape: CursorShape::Block,
+        };
+        let style = effective_cell_style(&cell, false, Some(cursor), palette);
+        assert_eq!(style.background, palette.terminal_cursor);
+        assert_eq!(style.foreground, palette.panel);
+        assert!(style.bold);
+        assert!(!style.dim);
+        assert!(style.paint_background);
+    }
+
+    fn relative_luminance(color: u32) -> f32 {
+        let channel = |value: u32| {
+            let c = (value as f32) / 255.0;
+            if c <= 0.04045 {
+                c / 12.92
+            } else {
+                ((c + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        let r = channel((color >> 16) & 0xff);
+        let g = channel((color >> 8) & 0xff);
+        let b = channel(color & 0xff);
+        0.2126 * r + 0.7152 * g + 0.0722 * b
+    }
+
+    fn contrast_ratio(a: u32, b: u32) -> f32 {
+        let (lighter, darker) = {
+            let la = relative_luminance(a);
+            let lb = relative_luminance(b);
+            if la >= lb {
+                (la, lb)
+            } else {
+                (lb, la)
+            }
+        };
+        (lighter + 0.05) / (darker + 0.05)
+    }
+
+    #[test]
+    fn v041_derived_chrome_hierarchy_is_readable() {
+        let legacy = TerminalRenderPalette::legacy_default();
+        assert!(
+            relative_luminance(legacy.terminal_bg) < relative_luminance(legacy.canvas),
+            "terminal cell plane must sit darker than outer canvas"
+        );
+        assert!(
+            relative_luminance(legacy.terminal_bg) < relative_luminance(legacy.panel_header),
+            "terminal cell plane must sit darker than header chrome"
+        );
+        assert!(
+            contrast_ratio(legacy.terminal_fg, legacy.terminal_bg) >= 7.0,
+            "monospace default fg needs strong contrast on terminal bg"
+        );
+        assert_eq!(legacy.terminal_cursor, theme::SUCCESS_TEXT);
+        assert_ne!(legacy.scrollbar_thumb, legacy.scrollbar_track);
+        assert_ne!(legacy.selection_bg, legacy.terminal_bg);
+
+        let tokens = dark(Density::Comfortable, Scale::Scale100);
+        let palette = crate::terminal::view::terminal_render_palette_from_tokens(tokens);
+        assert!(
+            relative_luminance(palette.terminal_bg) <= relative_luminance(palette.canvas),
+            "themed terminal bg must not wash above canvas"
+        );
+        assert!(
+            contrast_ratio(palette.terminal_fg, palette.terminal_bg) >= 4.5,
+            "themed terminal fg/bg must stay readable"
+        );
+        assert_eq!(
+            palette.terminal_cursor,
+            tokens.status.success.to_u32(),
+            "cursor chrome follows v0.4.1 success-colored visibility via ThemeTokens"
+        );
+        assert_eq!(
+            palette.text_dim,
+            tokens.text.muted.to_u32(),
+            "chrome labels use muted (readable) rather than disabled"
+        );
+        assert_eq!(
+            palette.scrollbar_thumb,
+            tokens
+                .scrollbar
+                .colors_on(tokens.terminal.background)
+                .thumb_idle
+                .to_u32()
+        );
+        assert_ne!(palette.scrollbar_thumb, palette.scrollbar_track);
+        assert_ne!(palette.scrollbar_thumb, palette.scrollbar_thumb_hover);
+        // Explicit ANSI must remain process-owned even after chrome remapping.
+        let ansi = TerminalCellSnapshot {
+            character: '!',
+            zero_width: Vec::new(),
+            foreground: 0xfacc15,
+            background: 0x1d4ed8,
+            bold: false,
+            dim: false,
+            italic: false,
+            underline: false,
+            undercurl: false,
+            strike: false,
+            hidden: false,
+            has_hyperlink: false,
+            default_background: false,
+            default_foreground: false,
+        };
+        let style = effective_cell_style(&ansi, false, None, palette);
+        assert_eq!(style.foreground, 0xfacc15);
+        assert_eq!(style.background, 0x1d4ed8);
+    }
+}
+
+#[cfg(test)]
+mod cell_pitch_tests {
+    use super::{
+        last_measured_terminal_cell_pitch, measured_terminal_cell_advance,
+        record_measured_terminal_cell_advance, terminal_cell_pitch, terminal_column_offset,
+        terminal_grid_size_for_bounds, terminal_pane_from_replica, ReplicaPaneRequest,
+        TerminalReplicaOverlay, FALLBACK_TERMINAL_CELL_WIDTH, TERMINAL_FONT_SIZE,
+    };
+    use crate::state::{SessionDimensions, SessionRuntimeState};
+    use crate::terminal::session::{TerminalBackend, TerminalScreenSnapshot, TerminalSessionView};
+    use std::path::PathBuf;
+
+    /// The advance GPUI's text system reports for Cascadia Mono at 13 px.
+    /// Injected, not measured, so this test does not depend on any font being
+    /// installed on the machine running it.
+    const MEASURED_CASCADIA_MONO_13PX: f32 = 7.6172;
+    /// Consolas is the first fallback. A substitution must be followed, never
+    /// rounded back to the constant.
+    const MEASURED_CONSOLAS_13PX: f32 = 7.1475;
+
+    fn replica_view(host_reported_cell_width: u16) -> TerminalSessionView {
+        let mut dimensions = SessionDimensions::default();
+        dimensions.cell_width = host_reported_cell_width;
+        TerminalSessionView {
+            runtime: SessionRuntimeState::new(
+                "pitch-session",
+                PathBuf::from("."),
+                dimensions,
+                TerminalBackend::PortablePtyFeedingAlacritty,
+            ),
+            screen: TerminalScreenSnapshot::default(),
+        }
+    }
+
+    #[test]
+    fn paint_pitch_is_the_measured_advance_not_the_fallback_constant() {
+        let pitch = terminal_cell_pitch(Some(MEASURED_CASCADIA_MONO_13PX));
+        assert_eq!(pitch, MEASURED_CASCADIA_MONO_13PX);
+        assert_eq!(
+            terminal_cell_pitch(Some(MEASURED_CONSOLAS_13PX)),
+            MEASURED_CONSOLAS_13PX
+        );
+
+        // Every painted x in the grid — background quads, glyph runs and the
+        // cursor — is `terminal_column_offset(column, pitch)`, so this is the
+        // pitch the paint pass actually uses.
+        assert_eq!(
+            terminal_column_offset(80, pitch),
+            MEASURED_CASCADIA_MONO_13PX * 80.0
+        );
+
+        // The defect being guarded: on the constant, column 80 was painted
+        // 30.6 px right of the glyph the shaping had put there.
+        let drift = terminal_column_offset(80, FALLBACK_TERMINAL_CELL_WIDTH)
+            - terminal_column_offset(80, pitch);
+        assert!(
+            drift > 30.0,
+            "the fallback constant must not be the paint pitch; drift was {drift}"
+        );
+    }
+
+    #[test]
+    fn the_constant_is_used_only_when_nothing_could_be_measured() {
+        assert_eq!(terminal_cell_pitch(None), FALLBACK_TERMINAL_CELL_WIDTH);
+        assert_eq!(terminal_cell_pitch(Some(0.0)), FALLBACK_TERMINAL_CELL_WIDTH);
+        assert_eq!(
+            terminal_cell_pitch(Some(-1.0)),
+            FALLBACK_TERMINAL_CELL_WIDTH
+        );
+        assert_eq!(
+            terminal_cell_pitch(Some(f32::NAN)),
+            FALLBACK_TERMINAL_CELL_WIDTH
+        );
+        assert_eq!(
+            terminal_cell_pitch(Some(f32::INFINITY)),
+            FALLBACK_TERMINAL_CELL_WIDTH
+        );
+    }
+
+    #[test]
+    fn every_window_free_reader_takes_the_injected_advance() {
+        record_measured_terminal_cell_advance(TERMINAL_FONT_SIZE, MEASURED_CASCADIA_MONO_13PX);
+        assert_eq!(
+            measured_terminal_cell_advance(TERMINAL_FONT_SIZE),
+            Some(MEASURED_CASCADIA_MONO_13PX)
+        );
+        let pitch = last_measured_terminal_cell_pitch(TERMINAL_FONT_SIZE);
+        assert_eq!(pitch, MEASURED_CASCADIA_MONO_13PX);
+
+        // Column arithmetic follows the font: 800 px holds 105 columns at the
+        // real advance and only 100 at the constant.
+        assert_eq!(
+            terminal_grid_size_for_bounds(800.0, 180.0, pitch, 18.0).0,
+            105
+        );
+        assert_eq!(
+            terminal_grid_size_for_bounds(800.0, 180.0, FALLBACK_TERMINAL_CELL_WIDTH, 18.0).0,
+            100
+        );
+
+        // The replica pane model must ignore the host's rounded u16 — that
+        // field is the fallback the host had no way to measure.
+        let view = replica_view(99);
+        let model = terminal_pane_from_replica(ReplicaPaneRequest {
+            active_project: "",
+            session_label: "pitch",
+            replica_view: Some(&view),
+            last_valid_view: None,
+            overlay: TerminalReplicaOverlay::None,
+            selection: None,
+            search: None,
+            search_highlight: None,
+            scrollbar: None,
+        });
+        assert_eq!(model.cell_width, MEASURED_CASCADIA_MONO_13PX);
+    }
+}
+
+#[cfg(test)]
+mod selection_helper_tests {
+    use super::{
+        begin_simple_selection, extend_selection_head, finish_simple_selection,
+        selected_text_from_lines, selected_text_from_screen, selection_mode_for_click,
+        selection_range_from, terminal_ctrl_c_action, terminal_endpoint_for_mouse,
+        terminal_grid_size_for_bounds, terminal_grid_text_bounds, terminal_selection_for_click,
+        top_visible_buffer_line, TerminalCellSide, TerminalCtrlCAction, TerminalGridPosition,
+        TerminalSelectionEndpoint, TerminalSelectionMode, TerminalSelectionRange,
+        TerminalTextBounds,
+    };
+    use crate::terminal::session::{TerminalCellSnapshot, TerminalScreenSnapshot};
+    use gpui::{point, px, size, Bounds};
+
+    fn snapshot_cell(character: char) -> TerminalCellSnapshot {
+        TerminalCellSnapshot {
+            character,
+            zero_width: Vec::new(),
+            foreground: 0,
+            background: 0,
+            bold: false,
+            dim: false,
+            italic: false,
+            underline: false,
+            undercurl: false,
+            strike: false,
+            hidden: false,
+            has_hyperlink: false,
+            default_background: true,
+            default_foreground: true,
+        }
+    }
+
+    #[test]
+    fn terminal_grid_size_uses_the_full_painted_bounds() {
+        assert_eq!(
+            terminal_grid_size_for_bounds(1_200.0, 756.0, 10.0, 18.0),
+            (120, 42)
+        );
+        assert_eq!(terminal_grid_size_for_bounds(2.0, 2.0, 10.0, 18.0), (1, 1));
+    }
+
+    #[test]
+    fn selected_text_from_screen_maps_absolute_buffer_rows_through_visible_top() {
+        // total=100, rows=2, offset=0 → visible_top = 98 (buffer rows 98..=99).
+        let line0: Vec<_> = "hello world".chars().map(snapshot_cell).collect();
+        let line1: Vec<_> = "second line".chars().map(snapshot_cell).collect();
+        let screen = TerminalScreenSnapshot {
+            lines: vec![line0, line1],
+            cols: 11,
+            rows: 2,
+            total_lines: 100,
+            history_size: 98,
+            display_offset: 0,
+            ..Default::default()
+        };
+        assert_eq!(top_visible_buffer_line(&screen), 98);
+        let range = TerminalSelectionRange {
+            start_row: 98,
+            start_column: 0,
+            end_row: 99,
+            end_column: 6,
+        };
+        assert_eq!(
+            selected_text_from_screen(&screen, range),
+            "hello world\nsecond"
+        );
+    }
+
+    #[test]
+    fn selected_text_from_screen_respects_scrolled_back_display_offset() {
+        // total=12, rows=3, display_offset=2 → visible_top = 7.
+        let lines: Vec<Vec<_>> = ["alpha   ", "bravo   ", "charlie "]
+            .into_iter()
+            .map(|line| line.chars().map(snapshot_cell).collect())
+            .collect();
+        let screen = TerminalScreenSnapshot {
+            lines,
+            cols: 8,
+            rows: 3,
+            total_lines: 12,
+            history_size: 9,
+            display_offset: 2,
+            ..Default::default()
+        };
+        assert_eq!(top_visible_buffer_line(&screen), 7);
+        let range = TerminalSelectionRange {
+            start_row: 7,
+            start_column: 0,
+            end_row: 8,
+            end_column: 5,
+        };
+        assert_eq!(selected_text_from_screen(&screen, range), "alpha\nbravo");
+    }
+
+    #[test]
+    fn drag_ordered_selection_extracts_exact_multiline_trimmed_text() {
+        let lines = ["alpha   ", "bravo   ", "charlie "];
+        let mut selection = begin_simple_selection(TerminalSelectionEndpoint {
+            position: TerminalGridPosition { row: 0, column: 0 },
+            side: TerminalCellSide::Left,
+        });
+        extend_selection_head(
+            &mut selection,
+            TerminalSelectionEndpoint {
+                position: TerminalGridPosition { row: 1, column: 4 },
+                side: TerminalCellSide::Right,
+            },
+        );
+        let range = selection_range_from(selection, 8).expect("moved selection");
+        assert_eq!(selected_text_from_lines(&lines, range), "alpha\nbravo");
+
+        // Reverse drag must order the same way.
+        let mut reverse = begin_simple_selection(TerminalSelectionEndpoint {
+            position: TerminalGridPosition { row: 1, column: 4 },
+            side: TerminalCellSide::Right,
+        });
+        extend_selection_head(
+            &mut reverse,
+            TerminalSelectionEndpoint {
+                position: TerminalGridPosition { row: 0, column: 0 },
+                side: TerminalCellSide::Left,
+            },
+        );
+        let reverse_range = selection_range_from(reverse, 8).expect("moved selection");
+        assert_eq!(
+            selected_text_from_lines(&lines, reverse_range),
+            "alpha\nbravo"
+        );
+    }
+
+    #[test]
+    fn copy_vs_interrupt_key_precedence_follows_selection_presence() {
+        assert_eq!(
+            terminal_ctrl_c_action(true),
+            TerminalCtrlCAction::CopySelection
+        );
+        assert_eq!(
+            terminal_ctrl_c_action(false),
+            TerminalCtrlCAction::Interrupt
+        );
+        assert!(
+            finish_simple_selection(Some(begin_simple_selection(TerminalSelectionEndpoint {
+                position: TerminalGridPosition { row: 0, column: 0 },
+                side: TerminalCellSide::Left,
+            })))
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn hit_testing_clamps_to_actual_grid_bounds() {
+        let bounds = TerminalTextBounds {
+            left: 10.0,
+            top: 20.0,
+            width: 40.0,
+            height: 20.0,
+            cell_width: 10.0,
+            row_height: 10.0,
+            rows: 2,
+            cols: 4,
+        };
+        let left_half =
+            terminal_endpoint_for_mouse(point(px(14.0), px(25.0)), bounds, true).unwrap();
+        let right_half =
+            terminal_endpoint_for_mouse(point(px(17.0), px(25.0)), bounds, true).unwrap();
+        let outside =
+            terminal_endpoint_for_mouse(point(px(200.0), px(200.0)), bounds, true).unwrap();
+        let rejected = terminal_endpoint_for_mouse(point(px(200.0), px(200.0)), bounds, false);
+
+        assert_eq!(left_half.position.column, 0);
+        assert_eq!(left_half.side, TerminalCellSide::Left);
+        assert_eq!(right_half.position.column, 0);
+        assert_eq!(right_half.side, TerminalCellSide::Right);
+        assert_eq!(outside.position.row, 1);
+        assert_eq!(outside.position.column, 3);
+        assert_eq!(outside.side, TerminalCellSide::Right);
+        assert!(rejected.is_none());
+    }
+
+    /// A painted terminal grid must not claim a pointer event outside its own
+    /// bounds -- a visible terminal is not a window-wide modal pointer
+    /// surface.
+    ///
+    /// This replaces a source-text guard that sliced the paint closure between
+    /// two string literals and asserted on the slice. It had stopped matching
+    /// its own end literal, so `.expect("terminal grid canvas handlers end")`
+    /// panicked at every base: a decayed anchor, red for a reason that had
+    /// nothing to do with the property.
+    ///
+    /// The property is now measured in two halves, and the FIRST is
+    /// behavioural:
+    ///
+    /// * [`terminal_grid_text_bounds`] never returns a rectangle larger than
+    ///   the element it was given, at any grid shape -- including an element
+    ///   narrower than one cell, which the old inline arithmetic got wrong
+    ///   (`.max(cell_pitch)` came last, so a 4 px element claimed 8 px).
+    /// * [`terminal_endpoint_for_mouse`] with `clamp_to_terminal = false`
+    ///   refuses every point outside that rectangle, on all four sides.
+    ///
+    /// The second half is the wiring, which no headless test can reach: the
+    /// handlers are installed on the WINDOW, and only a real window delivers
+    /// an event to them. That half is a source scan, and it carries a
+    /// DENOMINATOR -- the total number of call sites in the painter -- so a
+    /// call site that is renamed, moved or added fails loudly instead of
+    /// silently dropping out of the count.
+    #[test]
+    fn rendered_terminal_grid_never_claims_pointer_events_outside_its_bounds() {
+        // --- half one: behaviour ---
+        let element = Bounds::new(point(px(40.0), px(12.0)), size(px(300.0), px(200.0)));
+        // (cols, rows, cell pitch, line height): an ordinary 80x24, a single
+        // cell, a grid far larger than its element, and cells larger than the
+        // element itself.
+        for (cols, rows, pitch, line) in [
+            (80_usize, 24_usize, 8.0_f32, 16.0_f32),
+            (1, 1, 8.0, 16.0),
+            (400, 200, 8.0, 16.0),
+            (10, 4, 512.0, 512.0),
+        ] {
+            let claimed = terminal_grid_text_bounds(element, cols, rows, pitch, line);
+            let left = f32::from(element.origin.x);
+            let top = f32::from(element.origin.y);
+            let right = left + f32::from(element.size.width);
+            let bottom = top + f32::from(element.size.height);
+            assert_eq!((claimed.left, claimed.top), (left, top));
+            assert!(
+                claimed.left + claimed.width <= right,
+                "{cols}x{rows} claimed {} px to the right of its element",
+                claimed.left + claimed.width - right
+            );
+            assert!(
+                claimed.top + claimed.height <= bottom,
+                "{cols}x{rows} claimed {} px below its element",
+                claimed.top + claimed.height - bottom
+            );
+
+            // Every point outside the claimed rectangle is refused, on all
+            // four sides; the middle of it is not.
+            let outside = [
+                point(px(claimed.left - 1.0), px(claimed.top + 1.0)),
+                point(px(claimed.left + 1.0), px(claimed.top - 1.0)),
+                point(px(claimed.left + claimed.width), px(claimed.top + 1.0)),
+                point(px(claimed.left + 1.0), px(claimed.top + claimed.height)),
+            ];
+            for position in outside {
+                assert!(
+                    terminal_endpoint_for_mouse(position, claimed, false).is_none(),
+                    "{cols}x{rows} accepted {position:?}, which is outside its own bounds"
+                );
+            }
+            assert!(
+                terminal_endpoint_for_mouse(
+                    point(
+                        px(claimed.left + claimed.width / 2.0),
+                        px(claimed.top + claimed.height / 2.0),
+                    ),
+                    claimed,
+                    false,
+                )
+                .is_some(),
+                "{cols}x{rows} refused its own centre"
+            );
+        }
+
+        // --- half two: the wiring, with its denominator ---
+        let source = include_str!("view.rs").replace("\r\n", "\n");
+        let painter = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("the painter, up to the first test module");
+        assert!(
+            painter.len() > 40_000,
+            "the painter half of the file did not parse; every count below would be vacuous"
+        );
+        assert_eq!(
+            painter.matches("fn terminal_grid_text_bounds(").count(),
+            1,
+            "one definition of the rectangle the grid claims"
+        );
+        // The denominator: one declaration plus the three window handlers.
+        // Nothing else in the painter may ask this question at all.
+        assert_eq!(
+            painter.matches("terminal_endpoint_for_mouse(").count(),
+            4,
+            "the census of pointer-endpoint call sites moved; re-read them before adjusting this"
+        );
+        assert_eq!(
+            painter
+                .matches("terminal_endpoint_for_mouse(event.position, text_bounds, false)")
+                .count(),
+            3,
+            "terminal mouse down, drag, and release must not clamp unrelated window events into the grid"
+        );
+        assert!(
+            !painter.contains("text_bounds, true)"),
+            "a visible terminal must not become a window-wide modal pointer surface"
+        );
+        assert_eq!(
+            painter
+                .matches("let text_bounds = terminal_grid_text_bounds(")
+                .count(),
+            1,
+            "the handlers share one rectangle, computed by the one function that bounds it"
+        );
+    }
+
+    #[test]
+    fn semantic_and_line_click_modes_select_expected_ranges() {
+        assert_eq!(
+            selection_mode_for_click(2),
+            Some(TerminalSelectionMode::Semantic)
+        );
+        assert_eq!(
+            selection_mode_for_click(3),
+            Some(TerminalSelectionMode::Lines)
+        );
+        let line: Vec<TerminalCellSnapshot> = "cargo test".chars().map(snapshot_cell).collect();
+        let screen = TerminalScreenSnapshot {
+            lines: vec![line],
+            cols: 10,
+            rows: 1,
+            total_lines: 1,
+            ..Default::default()
+        };
+        let semantic = terminal_selection_for_click(
+            &screen,
+            TerminalGridPosition { row: 0, column: 2 },
+            TerminalSelectionMode::Semantic,
+        )
+        .unwrap();
+        let range = selection_range_from(semantic, screen.cols).unwrap();
+        assert_eq!(
+            range,
+            TerminalSelectionRange {
+                start_row: 0,
+                start_column: 0,
+                end_row: 0,
+                end_column: 5,
+            }
+        );
+    }
+
+    /// The whole point of the lane: the terminal's gutter and the shared shell
+    /// scrollbar must be the SAME scrollbar, not two that currently agree.
+    ///
+    /// They are proved equal by construction -- the terminal calls
+    /// `crate::ui::scrollbar`'s geometry directly -- so this asserts the
+    /// numbers that a reader would otherwise have to take on trust, and it is
+    /// sabotage-checked below by moving a token and watching both sides move.
+    #[test]
+    fn terminal_scrollbar_geometry_equals_the_shared_spec() {
+        use crate::ui::scrollbar::{thumb_geometry, track_geometry};
+        let tokens = crate::ui::tokens::dark(
+            crate::ui::tokens::Density::Comfortable,
+            crate::ui::tokens::Scale::Scale100,
+        );
+        let palette = crate::terminal::view::terminal_render_palette_from_tokens(tokens);
+        let spec = palette.scrollbar_spec;
+        assert_eq!(
+            spec, tokens.scrollbar,
+            "the terminal reads the shell's spec"
+        );
+        assert_eq!(
+            crate::terminal::view::terminal_scrollbar_gutter_width(spec),
+            spec.gutter_width
+        );
+
+        for gutter_height in [120.0_f32, 480.0, 1440.0] {
+            for visible in [0.02_f32, 0.25, 0.75] {
+                for position in [0.0_f32, 0.5, 1.0] {
+                    // Through the terminal's OWN paint path, not a re-derivation
+                    // of what it is believed to do: `render_scrollbar` turns
+                    // exactly this into quads.
+                    let (idle_track, idle) = crate::terminal::view::terminal_scrollbar_paint(
+                        spec,
+                        gutter_height,
+                        crate::terminal::view::TerminalScrollbarModel {
+                            thumb_top_ratio: position,
+                            thumb_height_ratio: visible,
+                            hovered: false,
+                        },
+                    )
+                    .expect("idle thumb");
+                    let (hover_track, hovered) = crate::terminal::view::terminal_scrollbar_paint(
+                        spec,
+                        gutter_height,
+                        crate::terminal::view::TerminalScrollbarModel {
+                            thumb_top_ratio: position,
+                            thumb_height_ratio: visible,
+                            hovered: true,
+                        },
+                    )
+                    .expect("hover thumb");
+                    assert_eq!(idle.width, 4.0);
+                    assert_eq!(hovered.width, 10.0);
+                    // The one min-thumb rule: `min_thumb_length` from the
+                    // tokens, applied by the shared geometry. The terminal used
+                    // to clamp the RATIO to 0.08 first, which is a second rule
+                    // and a different answer -- 0.08 of a 1440 px gutter is
+                    // 115 px, nearly five times the spec's minimum.
+                    assert_eq!(idle.height, hovered.height);
+                    assert!(idle.height >= spec.min_thumb_length);
+                    assert_eq!(
+                        idle,
+                        thumb_geometry(spec, gutter_height, visible, position, false)
+                            .expect("shared idle thumb"),
+                        "the terminal's paint path is the shared geometry, unmodified"
+                    );
+                    // Idle paints the thumb alone; the groove appears with the
+                    // pointer.
+                    assert!(idle_track.is_none());
+                    assert_eq!(
+                        hover_track,
+                        Some(track_geometry(spec, gutter_height)),
+                        "the hovered groove is the shared track"
+                    );
+                    let track = track_geometry(spec, gutter_height);
+                    assert!(idle.top >= track.top);
+                    assert!(idle.top + idle.height <= track.top + track.height + 1e-3);
+                }
+            }
+        }
+
+        // A tall gutter with a shallow scrollback is where the old ratio clamp
+        // and the shared minimum disagreed most, so it is asserted by number.
+        let (_, thumb) = crate::terminal::view::terminal_scrollbar_paint(
+            spec,
+            1440.0,
+            crate::terminal::view::TerminalScrollbarModel {
+                thumb_top_ratio: 0.0,
+                thumb_height_ratio: 0.002,
+                hovered: false,
+            },
+        )
+        .expect("thumb");
+        assert_eq!(thumb.height, spec.min_thumb_length);
+    }
+
+    /// Sabotage: change the token and both the shell geometry and the terminal
+    /// palette have to move. If either stayed put it was reading a constant.
+    #[test]
+    fn moving_the_scrollbar_token_moves_the_terminal_too() {
+        use crate::ui::scrollbar::thumb_geometry;
+        let mut tokens = crate::ui::tokens::dark(
+            crate::ui::tokens::Density::Comfortable,
+            crate::ui::tokens::Scale::Scale100,
+        );
+        let before =
+            crate::terminal::view::terminal_render_palette_from_tokens(tokens).scrollbar_spec;
+        let before_thumb = thumb_geometry(before, 400.0, 0.5, 0.0, false).expect("thumb");
+
+        tokens.scrollbar.idle_thumb_width += 7.0;
+        tokens.scrollbar.gutter_width += 7.0;
+        let after =
+            crate::terminal::view::terminal_render_palette_from_tokens(tokens).scrollbar_spec;
+        let after_thumb = thumb_geometry(after, 400.0, 0.5, 0.0, false).expect("thumb");
+
+        assert_eq!(
+            crate::terminal::view::terminal_scrollbar_gutter_width(after),
+            crate::terminal::view::terminal_scrollbar_gutter_width(before) + 7.0
+        );
+        assert_eq!(after_thumb.width, before_thumb.width + 7.0);
+    }
+
+    /// A screen that fits paints no thumb at all -- the same predicate the
+    /// shell surfaces use, so an empty log and an empty list agree.
+    #[test]
+    fn a_terminal_with_no_scrollback_paints_no_thumb() {
+        use crate::ui::scrollbar::thumb_geometry;
+        let spec = crate::terminal::view::terminal_scrollbar_spec();
+        assert!(thumb_geometry(spec, 400.0, 1.0, 0.0, false).is_none());
+    }
+
+    /// The hover state is what widens the thumb, and it must reach the colour
+    /// as well as the width or a 10 px bar in the idle grey reads as a bug.
+    #[test]
+    fn hovering_the_terminal_gutter_changes_both_width_and_colour() {
+        use crate::ui::scrollbar::thumb_geometry;
+        let tokens = crate::ui::tokens::dark(
+            crate::ui::tokens::Density::Comfortable,
+            crate::ui::tokens::Scale::Scale100,
+        );
+        let palette = crate::terminal::view::terminal_render_palette_from_tokens(tokens);
+        let spec = palette.scrollbar_spec;
+        let idle = thumb_geometry(spec, 400.0, 0.4, 0.2, false).expect("idle");
+        let hovered = thumb_geometry(spec, 400.0, 0.4, 0.2, true).expect("hover");
+        assert!(hovered.width > idle.width);
+        assert_eq!(
+            palette.scrollbar_thumb_color(false),
+            palette.scrollbar_thumb
+        );
+        assert_eq!(
+            palette.scrollbar_thumb_color(true),
+            palette.scrollbar_thumb_hover
+        );
+        assert_ne!(
+            palette.scrollbar_thumb_color(false),
+            palette.scrollbar_thumb_color(true)
+        );
+    }
+
+    /// The light theme's terminal is a dark island in a near-white shell, so
+    /// its gutter must NOT take the shell's dark-on-light thumb.
+    #[test]
+    fn the_light_theme_terminal_gutter_takes_the_dark_ground_colours() {
+        let tokens = crate::ui::tokens::light(
+            crate::ui::tokens::Density::Comfortable,
+            crate::ui::tokens::Scale::Scale100,
+        );
+        let palette = crate::terminal::view::terminal_render_palette_from_tokens(tokens);
+        assert_eq!(
+            palette.scrollbar_thumb,
+            tokens.scrollbar.on_dark.thumb_idle.to_u32()
+        );
+        assert_ne!(
+            palette.scrollbar_thumb,
+            tokens.scrollbar.on_light.thumb_idle.to_u32()
+        );
     }
 }

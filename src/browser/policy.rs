@@ -28,6 +28,22 @@ impl BrowserApprovalPolicy {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrowserIoRole {
+    LocalDesktop,
+    RemoteProjection,
+}
+
+impl BrowserIoRole {
+    pub fn may_submit_host_path(self) -> bool {
+        matches!(self, Self::LocalDesktop)
+    }
+
+    pub fn may_read_clipboard(self, granted: bool) -> bool {
+        granted && matches!(self, Self::LocalDesktop)
+    }
+}
+
 pub fn classify_upload_path(
     workspace_root: impl AsRef<Path>,
     candidate: impl AsRef<Path>,

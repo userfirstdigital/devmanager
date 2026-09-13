@@ -1,3 +1,4 @@
+# watch.bat is the hot-reload entry (this script, watching); launch-dev.bat passes -Once and is build-once.
 param(
     [int]$DebounceMs = 500,
     [switch]$Release,
@@ -11,16 +12,42 @@ $RepoRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $RepoRoot
 
 $BuildProfile = if ($Release) { "release" } else { "debug" }
-$BuildTargetDir = Join-Path $RepoRoot "target-watch"
+# Isolated compiler output outside the checkout (AGENTS.md CARGO_TARGET_DIR rule).
+# Hash the resolved worktree path so concurrent worktrees never share a target.
+$ResolvedRepoRoot = (Resolve-Path -LiteralPath $RepoRoot).Path
+$sha = [System.Security.Cryptography.SHA256]::Create()
+try {
+    $repoBytes = [System.Text.Encoding]::UTF8.GetBytes($ResolvedRepoRoot.ToLowerInvariant())
+    $digest = $sha.ComputeHash($repoBytes)
+    $repoHash = -join ($digest[0..7] | ForEach-Object { $_.ToString("x2") })
+} finally {
+    $sha.Dispose()
+}
+$WatchTargetName = "devmanager-watch-$repoHash"
+$BuildTargetDir = Join-Path "C:\Temp" $WatchTargetName
+$ExactBuildTargetDir = [System.IO.Path]::GetFullPath($BuildTargetDir)
+$TempRoot = [System.IO.Path]::GetFullPath("C:\Temp")
+$TempPrefix = Join-Path $TempRoot "devmanager-"
+if (-not $ExactBuildTargetDir.StartsWith($TempPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+    throw ("BuildTargetDir must be beneath an exact C:\Temp\devmanager-* root; refused {0}." -f $ExactBuildTargetDir)
+}
+$BuildTargetDir = $ExactBuildTargetDir
+Write-Host ("[watch {0}] Isolated build target: {1}" -f (Get-Date -Format "HH:mm:ss"), $BuildTargetDir) -ForegroundColor Cyan
+
 $BuildOutputDir = Join-Path $BuildTargetDir $BuildProfile
 $BuildExe = Join-Path $BuildOutputDir "devmanager.exe"
 $BuildPdb = Join-Path $BuildOutputDir "devmanager.pdb"
+$BuildHostExe = Join-Path $BuildOutputDir "devmanager-host.exe"
+$BuildHostPdb = Join-Path $BuildOutputDir "devmanager_host.pdb"
 $LiveDir = Join-Path $RepoRoot "target-live-dev"
 $LiveExe = Join-Path $LiveDir "devmanager.exe"
 $LivePdb = Join-Path $LiveDir "devmanager.pdb"
+$LiveHostExe = Join-Path $LiveDir "devmanager-host.exe"
+$LiveHostPdb = Join-Path $LiveDir "devmanager_host.pdb"
+$LaunchStatus = Join-Path $LiveDir "launch-status.txt"
+$NativeProfileBase = Join-Path $RepoRoot ".devmanager-next\dev-profile"
 $script:AppProcess = $null
-$DevManagerProfile = "dev-watch"
-$DevManagerLabel = "Dev"
+$DevManagerLabel = "Dev Smoke"
 
 function Write-Status {
     param(
@@ -58,18 +85,65 @@ function Stop-ManagedApp {
 }
 
 function Stop-StaleLiveCopies {
-    $livePath = $LiveExe.ToLowerInvariant()
-    $runningCopies = Get-CimInstance Win32_Process -Filter "Name = 'devmanager.exe'" -ErrorAction SilentlyContinue |
-        Where-Object { $_.ExecutablePath -and $_.ExecutablePath.ToLowerInvariant() -eq $livePath }
+    $script:StaleKillErrors = @()
+    $liveProcesses = @(
+        @{ Name = "devmanager.exe"; Path = $LiveExe },
+        @{ Name = "devmanager-host.exe"; Path = $LiveHostExe }
+    )
 
-    foreach ($copy in $runningCopies) {
-        if ($script:AppProcess -and $copy.ProcessId -eq $script:AppProcess.Id) {
-            continue
+    foreach ($liveProcess in $liveProcesses) {
+        $livePath = $liveProcess.Path.ToLowerInvariant()
+        $runningCopies = Get-CimInstance Win32_Process -Filter ("Name = '{0}'" -f $liveProcess.Name) -ErrorAction SilentlyContinue |
+            Where-Object { $_.ExecutablePath -and $_.ExecutablePath.ToLowerInvariant() -eq $livePath }
+
+        foreach ($copy in $runningCopies) {
+            if ($script:AppProcess -and $copy.ProcessId -eq $script:AppProcess.Id) {
+                continue
+            }
+
+            Write-Status ("Stopping stale live {0} (pid {1})." -f $liveProcess.Name, $copy.ProcessId) "warn"
+            # A silenced kill plus a bare timeout below cannot say WHY a copy
+            # survived, and the two failures need opposite remedies: an access
+            # error means another launcher owns it, a still-running process
+            # means it is shutting down slowly. Record the reason for the wait.
+            try {
+                Stop-Process -Id $copy.ProcessId -Force -ErrorAction Stop
+            } catch {
+                $script:StaleKillErrors += ("{0} (pid {1}): {2}" -f $liveProcess.Name, $copy.ProcessId, $_.Exception.Message)
+                Write-Status ("Could not stop {0} (pid {1}): {2}" -f $liveProcess.Name, $copy.ProcessId, $_.Exception.Message) "error"
+            }
         }
-
-        Write-Status ("Stopping stale live copy (pid {0})." -f $copy.ProcessId) "warn"
-        Stop-Process -Id $copy.ProcessId -Force -ErrorAction SilentlyContinue
     }
+}
+
+function Wait-ForStaleLiveCopiesToExit {
+    param([int]$TimeoutMs = 20000)
+
+    $targets = @(
+        @{ Name = "devmanager.exe"; Path = $LiveExe.ToLowerInvariant() },
+        @{ Name = "devmanager-host.exe"; Path = $LiveHostExe.ToLowerInvariant() }
+    )
+    $deadline = (Get-Date).AddMilliseconds($TimeoutMs)
+    do {
+        $running = @(
+            foreach ($target in $targets) {
+                Get-CimInstance Win32_Process -Filter ("Name = '{0}'" -f $target.Name) -ErrorAction SilentlyContinue |
+                    Where-Object { $_.ExecutablePath -and $_.ExecutablePath.ToLowerInvariant() -eq $target.Path }
+            }
+        )
+        if ($running.Count -eq 0) {
+            return
+        }
+        Start-Sleep -Milliseconds 120
+    } while ((Get-Date) -lt $deadline)
+
+    $remaining = $running | ForEach-Object { "{0} (pid {1})" -f $_.Name, $_.ProcessId }
+    $reason = if ($script:StaleKillErrors -and $script:StaleKillErrors.Count -gt 0) {
+        " Stop-Process refused: " + ($script:StaleKillErrors -join "; ") + "."
+    } else {
+        " The kill was accepted but they are still running; another dev-watch/launch-dev instance may have just started them. Close the DevManager window, or stop them with: Stop-Process -Id <pid> -Force."
+    }
+    throw ("Timed out after {0}s waiting for stale live processes to exit: {1}.{2}" -f [int]($TimeoutMs / 1000), ($remaining -join ", "), $reason)
 }
 
 function Wait-ForFileUnlock {
@@ -101,12 +175,139 @@ function Wait-ForFileUnlock {
     throw ("Timed out waiting for {0} to unlock." -f $Path)
 }
 
+if (-not ("DevWatch.Native" -as [type])) {
+    Add-Type -Namespace DevWatch -Name Native -MemberDefinition @'
+[System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError=true, CharSet=System.Runtime.InteropServices.CharSet.Unicode)]
+public static extern System.IntPtr CreateFileW(string name, uint access, uint share, System.IntPtr sa, uint disposition, uint flags, System.IntPtr template);
+[System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError=true)]
+public static extern bool CloseHandle(System.IntPtr handle);
+'@
+}
+
+# The host opens its profile root with FILE_DELETE_CHILD. Windows "Modify" does
+# not grant that right, so a directory inheriting only Modify fails the host's
+# fail-closed root check with a bare "Access is denied".
+function Test-ProfileRootDeleteChild {
+    param([string]$Path)
+
+    $DesiredDeleteChild = 0x00000040
+    $ShareAll = 0x00000007
+    $OpenExisting = 3
+    $DirectoryFlags = 0x02000000 -bor 0x00200000
+
+    $handle = [DevWatch.Native]::CreateFileW(
+        $Path, $DesiredDeleteChild, $ShareAll, [IntPtr]::Zero, $OpenExisting, $DirectoryFlags, [IntPtr]::Zero)
+    if ($handle -eq [IntPtr](-1)) {
+        return $false
+    }
+
+    [void][DevWatch.Native]::CloseHandle($handle)
+    return $true
+}
+
+function Initialize-DevProfileStorage {
+    New-Item -ItemType Directory -Path $NativeProfileBase -Force | Out-Null
+
+    if (Test-ProfileRootDeleteChild -Path $NativeProfileBase) {
+        return
+    }
+
+    Write-Status "Dev profile storage lacks FILE_DELETE_CHILD; granting this user full control." "warn"
+    $grant = "{0}:(OI)(CI)(F)" -f ([System.Security.Principal.WindowsIdentity]::GetCurrent().Name)
+    & icacls $NativeProfileBase /grant $grant /T | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw ("Failed to grant full control on {0}." -f $NativeProfileBase)
+    }
+
+    if (-not (Test-ProfileRootDeleteChild -Path $NativeProfileBase)) {
+        throw ("The dev profile root {0} still denies FILE_DELETE_CHILD; the host cannot open its config store." -f $NativeProfileBase)
+    }
+}
+
+function Get-WorkspaceProfileName {
+    # Mirrors workspace_profile_name() in src/ui/native_shell.rs: the first eight
+    # bytes of sha256("native-next" || 0x00 || canonicalized workspace path).
+    # Rust canonicalization yields a verbatim path with an uppercase drive letter.
+    $full = (Get-Item -LiteralPath $RepoRoot).FullName.TrimEnd('\')
+    $full = $full.Substring(0, 1).ToUpperInvariant() + $full.Substring(1)
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes("native-next") +
+        [byte]0 +
+        [System.Text.Encoding]::UTF8.GetBytes("\\?\" + $full)
+    $digest = [System.Security.Cryptography.SHA256]::Create().ComputeHash($bytes)
+    $suffix = -join ($digest[0..7] | ForEach-Object { $_.ToString("x2") })
+    return "native-next-$suffix"
+}
+
+function Get-RunningDevHost {
+    $hostPath = $LiveHostExe.ToLowerInvariant()
+    return @(Get-CimInstance Win32_Process -Filter "Name = 'devmanager-host.exe'" -ErrorAction SilentlyContinue |
+        Where-Object { $_.ExecutablePath -and $_.ExecutablePath.ToLowerInvariant() -eq $hostPath })
+}
+
+# The shell nulls its child host's stderr and still opens a degraded window when
+# the host dies, so a failed host looks like a working launch. Re-run the host
+# directly to surface the error the shell swallowed.
+function Show-HostStartupFailure {
+    $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+    $startInfo.FileName = $LiveHostExe
+    $startInfo.WorkingDirectory = $RepoRoot
+    $startInfo.UseShellExecute = $false
+    $startInfo.RedirectStandardError = $true
+    $startInfo.Arguments = '--profile {0} --instance-label "Dev Smoke Probe" --parent-pid {1} --foreground --config-base "{2}"' -f
+        (Get-WorkspaceProfileName), $PID, $NativeProfileBase
+
+    $probe = [System.Diagnostics.Process]::Start($startInfo)
+    if ($probe.WaitForExit(10000)) {
+        $stderr = $probe.StandardError.ReadToEnd().Trim()
+        Write-Status ("Host probe exited with code {0}." -f $probe.ExitCode) "error"
+        if ($stderr) {
+            Write-Status ("Host reported: {0}" -f $stderr) "error"
+        }
+        return
+    }
+
+    Stop-Process -Id $probe.Id -Force -ErrorAction SilentlyContinue
+    Write-Status "Host probe started cleanly on its own; the shell may have exceeded its startup budget." "warn"
+}
+
+function Wait-ForDevHost {
+    param([int]$TimeoutMs = 45000)
+
+    $deadline = (Get-Date).AddMilliseconds($TimeoutMs)
+    while ((Get-Date) -lt $deadline) {
+        $running = @(Get-RunningDevHost)
+        if ($running.Count -gt 0) {
+            Write-Status ("Durable host attached (pid {0})." -f $running[0].ProcessId) "success"
+            return $true
+        }
+        if ($script:AppProcess -and $script:AppProcess.HasExited) {
+            return $false
+        }
+        Start-Sleep -Milliseconds 250
+    }
+
+    return $false
+}
+
 function Invoke-BuildAndRelaunch {
     param([string]$Reason)
 
     Write-Status ("Building because {0} changed..." -f $Reason) "build"
+    Write-Status ("BuildTargetDir={0}" -f $BuildTargetDir) "build"
+    $ExactBuildTargetDir = [System.IO.Path]::GetFullPath($BuildTargetDir)
+    $TempRoot = [System.IO.Path]::GetFullPath("C:\Temp")
+    $TempPrefix = Join-Path $TempRoot "devmanager-"
+    if (-not $ExactBuildTargetDir.StartsWith($TempPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw ("BuildTargetDir must be beneath an exact C:\Temp\devmanager-* root before Cargo; refused {0}." -f $ExactBuildTargetDir)
+    }
 
-    $cargoArgs = @("build", "--target-dir", $BuildTargetDir)
+    $cargoArgs = @(
+        "build",
+        "--locked",
+        "--target-dir", $ExactBuildTargetDir,
+        "--bin", "devmanager",
+        "--bin", "devmanager-host"
+    )
     if ($Release) {
         $cargoArgs += "--release"
     }
@@ -117,29 +318,63 @@ function Invoke-BuildAndRelaunch {
         return $false
     }
 
-    if (-not (Test-Path $BuildExe)) {
-        throw ("Build succeeded but no executable was found at {0}." -f $BuildExe)
+    foreach ($requiredBinary in @($BuildExe, $BuildHostExe)) {
+        if (-not (Test-Path $requiredBinary)) {
+            throw ("Build succeeded but no executable was found at {0}." -f $requiredBinary)
+        }
     }
 
     New-Item -ItemType Directory -Path $LiveDir -Force | Out-Null
+    Initialize-DevProfileStorage
 
     Stop-ManagedApp
     Stop-StaleLiveCopies
+    Wait-ForStaleLiveCopiesToExit
     Wait-ForFileUnlock -Path $LiveExe
+    Wait-ForFileUnlock -Path $LiveHostExe
 
     Copy-Item $BuildExe $LiveExe -Force
+    Copy-Item $BuildHostExe $LiveHostExe -Force
     if (Test-Path $BuildPdb) {
         Copy-Item $BuildPdb $LivePdb -Force
+    }
+    if (Test-Path $BuildHostPdb) {
+        Copy-Item $BuildHostPdb $LiveHostPdb -Force
     }
 
     $startInfo = New-Object System.Diagnostics.ProcessStartInfo
     $startInfo.FileName = $LiveExe
     $startInfo.WorkingDirectory = $RepoRoot
     $startInfo.UseShellExecute = $false
-    $startInfo.EnvironmentVariables["DEVMANAGER_PROFILE"] = $DevManagerProfile
+    foreach ($key in @(
+        "DEVMANAGER_PROFILE",
+        "DEVMANAGER_RUNTIME_KIND",
+        "DEVMANAGER_CONFIG_DIR",
+        "DEVMANAGER_APP_IDENTITY"
+    )) {
+        $startInfo.EnvironmentVariables.Remove($key)
+    }
     $startInfo.EnvironmentVariables["DEVMANAGER_INSTANCE_LABEL"] = $DevManagerLabel
     $script:AppProcess = [System.Diagnostics.Process]::Start($startInfo)
-    Write-Status ("Launched DevManager from target-live-dev (pid {0})." -f $script:AppProcess.Id) "success"
+    if ($script:AppProcess.WaitForExit(3000)) {
+        $exitCode = $script:AppProcess.ExitCode
+        $message = "DevManager Dev Smoke exited during startup with code $exitCode."
+        Set-Content -LiteralPath $LaunchStatus -Value ("{0:u} FAIL {1}" -f (Get-Date), $message)
+        Write-Status $message "error"
+        $script:AppProcess = $null
+        return $false
+    }
+    Set-Content -LiteralPath $LaunchStatus -Value ("{0:u} RUNNING pid={1}" -f (Get-Date), $script:AppProcess.Id)
+    Write-Status ("Launched DevManager Dev Smoke from target-live-dev (pid {0}) with its sibling host." -f $script:AppProcess.Id) "success"
+
+    if (-not (Wait-ForDevHost)) {
+        $message = "DevManager Dev Smoke opened without a durable host; the window will be degraded."
+        Set-Content -LiteralPath $LaunchStatus -Value ("{0:u} DEGRADED {1}" -f (Get-Date), $message)
+        Write-Status $message "error"
+        Show-HostStartupFailure
+        return $false
+    }
+
     return $true
 }
 
@@ -188,8 +423,8 @@ $lastReason = "startup"
 $lastChangeAt = Get-Date
 
 Write-Status "Watching src/, assets/, Cargo.toml, and Cargo.lock." "info"
-Write-Status "Builds go to target-watch/ and the running app comes from target-live-dev/ to avoid Windows locking." "info"
-Write-Status ("The hot-reload app runs in the '{0}' profile and uses its own app-data/session namespace." -f $DevManagerProfile) "info"
+Write-Status "Builds go to C:\Temp\devmanager-watch-<hash>\ and the running app comes from target-live-dev/ to avoid Windows locking." "info"
+Write-Status "The hot-reload app uses its generated workspace-bound profile and never reuses the installed app profile." "info"
 
 try {
     if ($Once) {

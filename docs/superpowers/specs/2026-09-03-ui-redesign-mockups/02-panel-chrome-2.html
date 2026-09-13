@@ -1,0 +1,134 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>02-panel-chrome-2</title>
+<style>
+  body { margin:0; padding:28px 32px; background:#0c0c0e; color:#e6e6ea; font: 14px/1.45 "Segoe UI", system-ui, sans-serif; }
+  h2 { margin:0 0 6px; font-size:20px; }
+  h3 { font-size:15px; }
+  .subtitle { color:#9a9aa3; margin:0 0 18px; max-width:1100px; }
+  .options { margin-top:10px; }
+  .option { display:flex; gap:10px; align-items:flex-start; border:1px solid #2c2c33; border-radius:8px; padding:8px 10px; max-width:300px; }
+  .option .letter { font-weight:700; color:#9a9aa3; min-width:16px; }
+  .option h3 { margin:0 0 2px; font-size:13px; }
+  .option p { margin:0; color:#9a9aa3; font-size:12px; }
+  .option[data-choice="2"] { border-color:#f2b441; }
+  .option[data-choice="2"] .letter::after { content:" CHOSEN"; color:#f2b441; font-size:10px; letter-spacing:.06em; }
+  div:has(> .options > .option:not([data-choice="2"])) { opacity:.38; }
+  div:has(> .options > .option[data-choice="2"]) { opacity:1; }
+</style></head><body>
+<h2>How should a panel wear its chrome?</h2>
+<p class="subtitle">Same panel, "Snake Frontend", at the width it gets as one of eight (about 470 px). Three arrangements of the title, status line, tabs and actions. Below them, the same panel zoomed, and the ⋯ menu open. Click the arrangement you would want to look at all day.</p>
+
+<style>
+  .pc { font: 13px/1.4 "Segoe UI", system-ui, sans-serif; color:#e6e6ea; }
+  .pc * { box-sizing:border-box; }
+  .row3 { display:grid; grid-template-columns:repeat(3, 470px); gap:22px; justify-content:start; }
+  .pane { width:470px; height:300px; background:#151518; border:1px solid #26262b; border-radius:9px; display:flex; flex-direction:column; overflow:hidden; }
+  .pane.z { width:100%; height:420px; }
+  .hdr { display:flex; align-items:center; gap:8px; padding:8px 10px 0; min-width:0; }
+  .hdr .title { font-weight:600; font-size:13px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; min-width:0; flex:1; }
+  .hdr .crumb { color:#6b6b74; font-weight:400; }
+  .ic { color:#6b6b74; font-size:12px; flex:none; }
+  .act { flex:none; border:1px solid #2c2c33; border-radius:6px; padding:2px 9px; font-size:11.5px; color:#c9c9d1; }
+  .act.primary { border-color:#f2b441; color:#f2b441; }
+  .menu { flex:none; color:#8a8a94; font-size:15px; line-height:1; padding:0 3px; }
+  .st { display:flex; align-items:center; gap:8px; padding:4px 10px 0; font-size:11.5px; color:#9a9aa3; white-space:nowrap; overflow:hidden; }
+  .st .s { display:flex; align-items:center; gap:5px; }
+  .st .sep { color:#3a3a46; }
+  .st .prog { margin-left:auto; color:#8a8a94; }
+  .st .prog i { display:inline-block; width:46px; height:4px; border-radius:2px; background:#26262b; vertical-align:middle; margin-left:5px; position:relative; }
+  .st .prog i::after { content:""; position:absolute; inset:0; width:var(--p); background:#8a8a94; border-radius:2px; }
+  .tabs { display:flex; gap:2px; padding:6px 10px 0; font-size:11.5px; color:#8a8a94; white-space:nowrap; overflow:hidden; border-bottom:1px solid #1f1f24; }
+  .tabs span { padding:3px 9px 5px; border-radius:6px 6px 0 0; }
+  .tabs span.on { background:#1c1c21; color:#e6e6ea; }
+  .tabs span.sub::before { content:"•"; color:#7fb07f; margin-right:5px; }
+  .tabs span.sub.done::before { color:#3a3a46; }
+  .tabs .gap { flex:1; }
+  .stream { flex:1; background:#111114; margin:8px 10px 10px; border-radius:6px; border:1px solid #1f1f24; padding:8px 10px; font: 11.5px/1.5 "Cascadia Mono", Consolas, monospace; color:#c9c9d1; overflow:hidden; }
+  .stream .u { color:#8a8a94; }
+  .stream .a { color:#e6e6ea; }
+  .stream .cmd { color:#9ec1e0; }
+  .stream .ok { color:#7fb07f; }
+  .stream .cursor { display:inline-block; width:7px; height:12px; background:#c9c9d1; vertical-align:-2px; }
+  .compose { margin:0 10px 10px; border:1px solid #26262b; border-radius:6px; padding:6px 10px; color:#6b6b74; font-size:12px; display:flex; align-items:center; }
+  .compose .k { margin-left:auto; color:#6b6b74; font-size:11px; }
+  /* variant 2: status inside the header */
+  .hdr .inline { color:#9a9aa3; font-weight:400; font-size:11.5px; white-space:nowrap; flex:none; }
+  /* variant 3: tabs on top */
+  .tabs.top { padding-top:6px; border-bottom:0; }
+  .hdr.under { padding-top:6px; }
+  .cap { color:#9a9aa3; font-size:12px; margin:8px 0 4px; max-width:470px; }
+  .menu-open { position:relative; }
+  .dd { position:absolute; right:10px; top:34px; width:220px; background:#1a1a1f; border:1px solid #3a3a46; border-radius:8px; box-shadow:0 14px 40px rgba(0,0,0,.55); padding:6px; z-index:3; font-size:12.5px; }
+  .dd div { padding:6px 10px; border-radius:5px; color:#d6d6de; display:flex; }
+  .dd div .k { margin-left:auto; color:#6b6b74; font-size:11px; }
+  .dd .hr { height:1px; background:#2c2c33; margin:4px 2px; padding:0; }
+  .dd .danger { color:#e5484d; }
+  .dd .muted { color:#8a8a94; }
+</style>
+
+<div class="pc">
+<div class="row3">
+
+  <!-- 1 -->
+  <div>
+    <div class="pane">
+      <div class="hdr"><span class="ic">⊟</span><span class="title">Snake Frontend <span class="crumb">· Snake Game · Claude</span></span><span class="ic">⤢</span><span class="act">Done</span><span class="menu">⋯</span></div>
+      <div class="st"><span class="s">▶ Running · cargo test --lib ui::</span><span class="sep">·</span><span>12s</span><span class="prog">5/6<i style="--p:83%"></i></span></div>
+      <div class="tabs"><span class="on">Conversation</span><span>Terminal</span><span>Files</span><span>Git</span><span class="gap"></span><span class="sub">code-reviewer</span><span class="sub done">Explore</span></div>
+      <div class="stream"><div class="u">› make the snake speed up every 5 apples</div><div class="a">Added a tick-rate ramp in game/loop.ts; the floor is 60 ms so it never becomes unplayable.</div><div class="cmd">$ cargo test --lib ui::</div><div>running 112 tests … <span class="ok">98 passed</span> <span class="cursor"></span></div></div>
+      <div class="compose">Message Claude… <span class="k">⏎ send · ⇧⏎ newline</span></div>
+    </div>
+    <p class="cap">Three rows: title, status, tabs. Most explicit; subagent tabs sit right-aligned so they read as "children" of the views.</p>
+    <div class="options" style="margin-top:0"><div class="option" data-choice="1" onclick="toggleSelect(this)"><div class="letter">1</div><div class="content"><h3>Title · status · tabs</h3><p>Three thin rows, everything labelled.</p></div></div></div>
+  </div>
+
+  <!-- 2 -->
+  <div>
+    <div class="pane">
+      <div class="hdr"><span class="ic">⊟</span><span class="title">Snake Frontend</span><span class="inline">▶ cargo test · 12s · 5/6</span><span class="ic">⤢</span><span class="act">Done</span><span class="menu">⋯</span></div>
+      <div class="tabs"><span class="on">Conversation</span><span>Terminal</span><span>Files</span><span>Git</span><span class="gap"></span><span class="sub">code-reviewer</span><span class="sub done">Explore</span></div>
+      <div class="stream" style="margin-top:8px"><div class="u">› make the snake speed up every 5 apples</div><div class="a">Added a tick-rate ramp in game/loop.ts; the floor is 60 ms so it never becomes unplayable.</div><div class="cmd">$ cargo test --lib ui::</div><div>running 112 tests … <span class="ok">98 passed</span> <span class="cursor"></span></div><div class="u">…</div><div class="a">Two more lines of stream fit here.</div></div>
+      <div class="compose">Message Claude… <span class="k">⏎ send</span></div>
+    </div>
+    <p class="cap">Status folded into the title row. One row shorter, so two more lines of stream fit; the status truncates first when the panel is narrow, and the "why" (asked a question) has less room.</p>
+    <div class="options" style="margin-top:0"><div class="option" data-choice="2" onclick="toggleSelect(this)"><div class="letter">2</div><div class="content"><h3>Status in the title row</h3><p>Two rows; more stream, tighter status.</p></div></div></div>
+  </div>
+
+  <!-- 3 -->
+  <div>
+    <div class="pane">
+      <div class="tabs top"><span class="on">Conversation</span><span>Terminal</span><span>Files</span><span>Git</span><span class="gap"></span><span class="sub">code-reviewer</span><span class="sub done">Explore</span><span class="menu" style="padding-left:6px">⋯</span></div>
+      <div class="hdr under"><span class="ic">⊟</span><span class="title">Snake Frontend</span><span class="ic">⤢</span><span class="act">Done</span></div>
+      <div class="st"><span class="s">▶ Running · cargo test --lib ui::</span><span class="sep">·</span><span>12s</span><span class="prog">5/6<i style="--p:83%"></i></span></div>
+      <div class="stream"><div class="u">› make the snake speed up every 5 apples</div><div class="a">Added a tick-rate ramp in game/loop.ts; the floor is 60 ms so it never becomes unplayable.</div><div class="cmd">$ cargo test --lib ui::</div><div>running 112 tests … <span class="ok">98 passed</span> <span class="cursor"></span></div></div>
+      <div class="compose">Message Claude… <span class="k">⏎ send</span></div>
+    </div>
+    <p class="cap">Tabs first, like a browser: the view is the outermost thing, the title and status describe what is inside. Familiar, but the title drops below the fold of your eye when scanning eight.</p>
+    <div class="options" style="margin-top:0"><div class="option" data-choice="3" onclick="toggleSelect(this)"><div class="letter">3</div><div class="content"><h3>Tabs on top</h3><p>Browser-like; title and status inside the tab.</p></div></div></div>
+  </div>
+</div>
+
+<h3 style="margin-top:28px">The same panel zoomed (Z), with the ⋯ menu open</h3>
+<p class="subtitle">Zoom keeps the identical chrome so nothing moves under your hands; only the stream gets the room. The menu holds everything that is not the one primary action.</p>
+<div class="pane z menu-open">
+  <div class="hdr"><span class="ic">⊟</span><span class="title">Snake Frontend <span class="crumb">· Snake Game · Claude · main</span></span><span class="ic">⤡ Esc</span><span class="act">Done</span><span class="menu">⋯</span></div>
+  <div class="dd">
+    <div>Add action <span class="k">A</span></div>
+    <div>Commit <span class="k">C</span></div>
+    <div class="hr"></div>
+    <div>Pin size <span class="k">P</span></div>
+    <div>Move ← ↑ ↓ → <span class="k">⇧⌘arrows</span></div>
+    <div>Swap with… <span class="k">S</span></div>
+    <div class="hr"></div>
+    <div>Rename</div>
+    <div>Archive</div>
+    <div class="danger">Delete… <span class="k muted">confirms</span></div>
+  </div>
+  <div class="st"><span class="s">▶ Running · cargo test --lib ui::</span><span class="sep">·</span><span>12s</span><span class="prog">5/6<i style="--p:83%"></i></span></div>
+  <div class="tabs"><span class="on">Conversation</span><span>Terminal</span><span>Files</span><span>Git</span><span>Browser</span><span class="gap"></span><span class="sub">code-reviewer · 40s</span><span class="sub done">Explore · done</span></div>
+  <div class="stream"><div class="u">› make the snake speed up every 5 apples</div><div class="a">Added a tick-rate ramp in game/loop.ts. The floor is 60 ms so it never becomes unplayable; the ramp is linear, 8 ms per 5 apples.</div><div class="cmd">$ cargo test --lib ui::</div><div>running 112 tests</div><div>test ui::loop::ramp_floor … <span class="ok">ok</span></div><div>test ui::loop::ramp_step … <span class="ok">ok</span></div><div>… <span class="ok">98 passed</span>; 14 running <span class="cursor"></span></div></div>
+  <div class="compose">Message Claude… <span class="k">⏎ send · ⇧⏎ newline · Esc back to the board</span></div>
+</div>
+</div>
+
+</body></html>

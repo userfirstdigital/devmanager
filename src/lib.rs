@@ -1,18 +1,37 @@
+#[cfg(test)]
+extern crate self as devmanager;
+
 pub mod ai;
 pub mod app;
 pub mod assets;
 pub mod browser;
+pub mod client;
+pub mod config;
+pub mod connect;
 pub mod diagnostics;
+pub mod domain;
 pub mod git;
+pub mod host;
 pub mod icons;
+pub mod kernel;
 pub mod models;
 pub mod notifications;
+pub mod org;
+pub mod organization;
 pub mod persistence;
+pub mod process;
+pub mod prompts;
+pub mod protocol;
+pub mod providers;
 pub mod remote;
+#[cfg(target_os = "linux")]
+mod secret_custody;
 pub mod services;
 pub mod sidebar;
+pub mod ssh;
 pub mod state;
 pub mod terminal;
 pub mod theme;
+pub mod ui;
 pub mod updater;
 pub mod workspace;

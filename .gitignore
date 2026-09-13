@@ -38,6 +38,7 @@ serviceAccountKey.json
 /target-check
 /target-live
 /target-watch
+/web/src/connect/wasm/
 /target-test
 /target-scan
 /target-test-*
@@ -45,3 +46,8 @@ serviceAccountKey.json
 /.worktrees/
 /.superpowers/
 /target-live-dev
+/.devmanager-next/
+/target-native-next/
+/target-live-native-next/
+/.cargo-target-06-09/
+/.codex-target-connect-review6

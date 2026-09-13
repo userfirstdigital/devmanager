@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "source_type": "session_state",
+  "provider_event_id": "cursor_evt_session_1",
+  "occurred_at_ms": 1725000001400,
+  "payload": {
+    "kind": "session_state",
+    "state": "open"
+  },
+  "extensions": {
+    "cursor_surface": "cli_event"
+  }
+}

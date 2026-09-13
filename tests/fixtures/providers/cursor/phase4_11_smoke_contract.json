@@ -1,0 +1,89 @@
+{
+  "contract_id": "phase4.11.cursor.smoke",
+  "schema_version": 1,
+  "kind": "Cursor",
+  "mode": "fixture_only",
+  "launches_provider": false,
+  "claims_auth": false,
+  "host_registration_required": true,
+  "later_runner": {
+    "script": "scripts/native-next/Invoke-ProviderSmoke.ps1",
+    "working_directory": "repository-root",
+    "fixture": {
+      "authenticated": false,
+      "argv": [],
+      "cargo_test": {
+        "argv": [
+          "cargo",
+          "test",
+          "--test",
+          "provider_cursor",
+          "cursor_phase4_11_smoke_contract",
+          "--",
+          "--nocapture"
+        ]
+      }
+    },
+    "authenticated": {
+      "authenticated": true,
+      "requires_operator_opt_in": true,
+      "refuse_noninteractive_ci": true,
+      "refuse_production_profile": true,
+      "refuse_production_browser_data": true,
+      "argv": [
+        "-Authenticated",
+        "-Provider",
+        "cursor"
+      ],
+      "allowlist": ["cursor"],
+      "precondition": "host ProviderRegistry::register(CursorAdapter) plus cursor-agent CapabilitySupport::Supported; this fixture contract does not satisfy that precondition and must not spawn"
+    }
+  },
+  "environment": {
+    "required": {
+      "DEVMANAGER_PROFILE": "provider-smoke-cursor-dev"
+    },
+    "forbidden_profile_values": ["", "production"],
+    "unset_profile_means_production": true,
+    "forbidden_config_roots": [
+      "%APPDATA%\\com.userfirst.devmanager"
+    ]
+  },
+  "executable": {
+    "allowed_entrypoints": ["cursor-agent"],
+    "forbidden_entrypoints": ["cursor.exe", "cmd.exe", "powershell.exe", "pwsh.exe"]
+  },
+  "capabilities": {
+    "terminal_only": true,
+    "build_launch": "SupportedOnlyAfterPinnedInteractiveHelp",
+    "exact_resume": "Unsupported",
+    "semantic_events": "Unsupported",
+    "provider_session_id": "Unsupported",
+    "parse_signal": "Unsupported",
+    "cooperative_stop": "Unsupported",
+    "observe_quota": "Unsupported",
+    "auth_state": "Unknown"
+  },
+  "assertions": {
+    "exact_resume_error": "UnsupportedCapability(ExactResume)",
+    "no_fresh_conversation": true,
+    "one_root_pty": true,
+    "zero_post_close_residue": true,
+    "evidence_must_omit": [
+      "prompt",
+      "response",
+      "credential",
+      "absolute_user_path"
+    ],
+    "evidence_may_include": [
+      "kind",
+      "version",
+      "capabilities",
+      "launch_argument_count",
+      "exact_resume_error",
+      "root_count",
+      "pty_count",
+      "residue_count"
+    ]
+  }
+}

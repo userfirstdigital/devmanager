@@ -37,6 +37,10 @@ pub struct PairedWebClient {
     pub browser_version: Option<String>,
     pub os_family: Option<String>,
     pub device_class: Option<String>,
+    /// When `Some`, this record is cross-origin-only and must never authorize
+    /// the same-origin cookie `/api/connect` path. Same-origin pairs keep `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permitted_origin: Option<String>,
 }
 
 impl Default for PairedWebClient {
@@ -54,6 +58,7 @@ impl Default for PairedWebClient {
             browser_version: None,
             os_family: None,
             device_class: None,
+            permitted_origin: None,
         }
     }
 }

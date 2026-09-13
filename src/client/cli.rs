@@ -1,0 +1,1875 @@
+//! Strict `devmanager-host ctl` parsing and versioned JSON output.
+
+use std::{
+    collections::HashSet,
+    io::{self, Write},
+    process::ExitCode,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
+
+use serde_json::json;
+
+use super::action::{
+    self, provider_input_command, service_control_command, task_create_v2_command,
+    task_rename_command, ActionArgumentSchema, ActionRisk, ActionScope, ProviderInputArguments,
+    ServiceControlArguments, TaskCreateV2Arguments, TaskRenameArguments, ACTION_HOST_STATUS,
+    ACTION_PROVIDER_ANSWER_QUESTION, ACTION_PROVIDER_NEW_CONVERSATION,
+    ACTION_PROVIDER_QUEUE_FOLLOW_UP, ACTION_PROVIDER_RESOLVE_APPROVAL, ACTION_PROVIDER_SEND_NOW,
+    ACTION_PROVIDER_STEER_CURRENT_TURN, ACTION_PROVIDER_STOP_TURN, ACTION_PROVIDER_TERMINAL_INPUT,
+    ACTION_SERVICE_RESTART, ACTION_SERVICE_START, ACTION_SERVICE_STOP, ACTION_TASK_ANSWER_QUESTION,
+    ACTION_TASK_CREATE, ACTION_TASK_CREATE_V2, ACTION_TASK_LIST, ACTION_TASK_QUEUE_FOLLOW_UP,
+    ACTION_TASK_RENAME, ACTION_TASK_RESOLVE_APPROVAL, ACTION_TASK_SEND_NOW, ACTION_TASK_SHOW,
+    ACTION_TASK_STEER_CURRENT_TURN, ACTION_TASK_STOP_TURN,
+};
+use super::{HostClient, HostClientConfig};
+use crate::domain::command::{CommandEnvelope, CommandReceipt, RejectionCode};
+use crate::domain::id::SnapshotId;
+use crate::domain::operation::OperationState;
+use crate::domain::query::QueryError;
+use crate::domain::snapshot::{SnapshotItem, SnapshotSection, TaskSnapshotItem};
+use crate::domain::{ClientId, CommandId, OperationId, TaskId};
+use crate::host::IpcError;
+use crate::protocol::{Capability, CapabilitySet, FrameLimits};
+
+const SCHEMA_VERSION: u16 = 1;
+const STATUS_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const STATUS_CONNECT_POLL: Duration = Duration::from_millis(25);
+const COMMAND_REPLAY_TIMEOUT: Duration = Duration::from_secs(16);
+const PROVIDER_DELIVERY_WAIT: Duration = Duration::from_secs(3);
+const PROVIDER_DELIVERY_POLL: Duration = Duration::from_millis(50);
+const MAX_COMMAND_ATTEMPTS: usize = 2;
+const MAX_DIAGNOSTIC_CHARS: usize = 1_024;
+const MAX_ARGUMENTS_JSON_BYTES: usize = 64 * 1024;
+const MAX_TASK_LIST_PAGES: usize = 1_024;
+const MAX_TASK_LIST_ITEMS: usize = 100_000;
+
+/// Parsed ctl invocation for this lean slice.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CtlCommand {
+    Actions,
+    Status {
+        profile: String,
+    },
+    Tasks {
+        profile: String,
+    },
+    TaskShow {
+        profile: String,
+        task_id: TaskId,
+    },
+    Invoke {
+        profile: String,
+        action_id: String,
+        arguments_json: String,
+        expected_task_revision: Option<u64>,
+    },
+}
+
+/// Bounded, human-readable ctl failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CliError {
+    message: String,
+}
+
+impl CliError {
+    pub fn new(message: impl Into<String>) -> Self {
+        let message = message.into();
+        if message.chars().count() <= MAX_DIAGNOSTIC_CHARS {
+            return Self { message };
+        }
+        let mut bounded: String = message.chars().take(MAX_DIAGNOSTIC_CHARS - 1).collect();
+        bounded.push('\u{2026}');
+        Self { message: bounded }
+    }
+
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+impl std::fmt::Display for CliError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for CliError {}
+
+/// Parse `ctl` arguments after the leading `ctl` token has been consumed.
+pub fn parse_ctl_args<I, S>(args: I) -> Result<CtlCommand, CliError>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let mut args = args.into_iter().map(|s| s.as_ref().to_string());
+    let Some(subcommand) = args.next() else {
+        return Err(CliError::new("missing ctl subcommand"));
+    };
+    match subcommand.as_str() {
+        "actions" => parse_actions(args),
+        "status" => parse_status(args),
+        "tasks" => parse_tasks(args),
+        "task-show" => parse_task_show(args),
+        "invoke" => parse_invoke(args),
+        other => Err(CliError::new(format!("unknown ctl subcommand: {other}"))),
+    }
+}
+
+fn parse_actions<I>(mut args: I) -> Result<CtlCommand, CliError>
+where
+    I: Iterator<Item = String>,
+{
+    let mut json = false;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--json" => {
+                if json {
+                    return Err(CliError::new("duplicate --json"));
+                }
+                json = true;
+            }
+            other if other.starts_with('-') => {
+                return Err(CliError::new(format!("unknown flag: {other}")));
+            }
+            other => return Err(CliError::new(format!("unexpected argument: {other}"))),
+        }
+    }
+    if !json {
+        return Err(CliError::new("missing required --json"));
+    }
+    Ok(CtlCommand::Actions)
+}
+
+fn parse_status<I>(mut args: I) -> Result<CtlCommand, CliError>
+where
+    I: Iterator<Item = String>,
+{
+    let mut json = false;
+    let mut profile: Option<String> = None;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--json" => {
+                if json {
+                    return Err(CliError::new("duplicate --json"));
+                }
+                json = true;
+            }
+            "--profile" => {
+                if profile.is_some() {
+                    return Err(CliError::new("duplicate --profile"));
+                }
+                let value = args
+                    .next()
+                    .ok_or_else(|| CliError::new("missing value for --profile"))?;
+                profile = Some(value);
+            }
+            other if other.starts_with('-') => {
+                return Err(CliError::new(format!("unknown flag: {other}")));
+            }
+            other => return Err(CliError::new(format!("unexpected argument: {other}"))),
+        }
+    }
+    if !json {
+        return Err(CliError::new("missing required --json"));
+    }
+    let profile = profile.ok_or_else(|| CliError::new("missing required --profile"))?;
+    let profile = validate_ctl_profile(&profile)?;
+    Ok(CtlCommand::Status { profile })
+}
+
+fn parse_tasks<I>(mut args: I) -> Result<CtlCommand, CliError>
+where
+    I: Iterator<Item = String>,
+{
+    let mut json = false;
+    let mut profile: Option<String> = None;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--json" => {
+                if json {
+                    return Err(CliError::new("duplicate --json"));
+                }
+                json = true;
+            }
+            "--profile" => {
+                if profile.is_some() {
+                    return Err(CliError::new("duplicate --profile"));
+                }
+                let value = args
+                    .next()
+                    .ok_or_else(|| CliError::new("missing value for --profile"))?;
+                profile = Some(value);
+            }
+            other if other.starts_with('-') => {
+                return Err(CliError::new(format!("unknown flag: {other}")));
+            }
+            other => return Err(CliError::new(format!("unexpected argument: {other}"))),
+        }
+    }
+    if !json {
+        return Err(CliError::new("missing required --json"));
+    }
+    let profile = profile.ok_or_else(|| CliError::new("missing required --profile"))?;
+    let profile = validate_ctl_profile(&profile)?;
+    Ok(CtlCommand::Tasks { profile })
+}
+
+fn parse_task_show<I>(mut args: I) -> Result<CtlCommand, CliError>
+where
+    I: Iterator<Item = String>,
+{
+    let mut json = false;
+    let mut profile: Option<String> = None;
+    let mut task_id: Option<TaskId> = None;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--json" => {
+                if json {
+                    return Err(CliError::new("duplicate --json"));
+                }
+                json = true;
+            }
+            "--profile" => {
+                if profile.is_some() {
+                    return Err(CliError::new("duplicate --profile"));
+                }
+                let value = args
+                    .next()
+                    .ok_or_else(|| CliError::new("missing value for --profile"))?;
+                profile = Some(value);
+            }
+            "--task-id" => {
+                if task_id.is_some() {
+                    return Err(CliError::new("duplicate --task-id"));
+                }
+                let value = args
+                    .next()
+                    .ok_or_else(|| CliError::new("missing value for --task-id"))?;
+                task_id = Some(
+                    TaskId::parse(&value)
+                        .map_err(|error| CliError::new(format!("invalid --task-id: {error}")))?,
+                );
+            }
+            other if other.starts_with('-') => {
+                return Err(CliError::new(format!("unknown flag: {other}")));
+            }
+            other => return Err(CliError::new(format!("unexpected argument: {other}"))),
+        }
+    }
+    if !json {
+        return Err(CliError::new("missing required --json"));
+    }
+    let profile = profile.ok_or_else(|| CliError::new("missing required --profile"))?;
+    let profile = validate_ctl_profile(&profile)?;
+    let task_id = task_id.ok_or_else(|| CliError::new("missing required --task-id"))?;
+    Ok(CtlCommand::TaskShow { profile, task_id })
+}
+
+fn parse_invoke<I>(mut args: I) -> Result<CtlCommand, CliError>
+where
+    I: Iterator<Item = String>,
+{
+    let mut json = false;
+    let mut profile: Option<String> = None;
+    let mut action_id: Option<String> = None;
+    let mut arguments_json: Option<String> = None;
+    let mut expected_task_revision: Option<u64> = None;
+    let mut saw_expected_task_revision = false;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--json" => {
+                if json {
+                    return Err(CliError::new("duplicate --json"));
+                }
+                json = true;
+            }
+            "--profile" => {
+                if profile.is_some() {
+                    return Err(CliError::new("duplicate --profile"));
+                }
+                let value = args
+                    .next()
+                    .ok_or_else(|| CliError::new("missing value for --profile"))?;
+                profile = Some(value);
+            }
+            "--action" => {
+                if action_id.is_some() {
+                    return Err(CliError::new("duplicate --action"));
+                }
+                let value = args
+                    .next()
+                    .ok_or_else(|| CliError::new("missing value for --action"))?;
+                if value.is_empty() {
+                    return Err(CliError::new("action id must be nonempty"));
+                }
+                action_id = Some(value);
+            }
+            "--arguments-json" => {
+                if arguments_json.is_some() {
+                    return Err(CliError::new("duplicate --arguments-json"));
+                }
+                let value = args
+                    .next()
+                    .ok_or_else(|| CliError::new("missing value for --arguments-json"))?;
+                if value.len() > MAX_ARGUMENTS_JSON_BYTES {
+                    return Err(CliError::new("arguments JSON exceeds maximum size"));
+                }
+                arguments_json = Some(value);
+            }
+            "--expected-task-revision" => {
+                if saw_expected_task_revision {
+                    return Err(CliError::new("duplicate --expected-task-revision"));
+                }
+                saw_expected_task_revision = true;
+                let value = args
+                    .next()
+                    .ok_or_else(|| CliError::new("missing value for --expected-task-revision"))?;
+                let parsed = value.parse::<u64>().map_err(|_| {
+                    CliError::new(format!("invalid --expected-task-revision: {value}"))
+                })?;
+                expected_task_revision = Some(parsed);
+            }
+            other if other.starts_with('-') => {
+                return Err(CliError::new(format!("unknown flag: {other}")));
+            }
+            other => return Err(CliError::new(format!("unexpected argument: {other}"))),
+        }
+    }
+    if !json {
+        return Err(CliError::new("missing required --json"));
+    }
+    let profile = profile.ok_or_else(|| CliError::new("missing required --profile"))?;
+    let profile = validate_ctl_profile(&profile)?;
+    let action_id = action_id.ok_or_else(|| CliError::new("missing required --action"))?;
+    let arguments_json =
+        arguments_json.ok_or_else(|| CliError::new("missing required --arguments-json"))?;
+    Ok(CtlCommand::Invoke {
+        profile,
+        action_id,
+        arguments_json,
+        expected_task_revision,
+    })
+}
+
+fn validate_ctl_profile(raw: &str) -> Result<String, CliError> {
+    validate_ctl_profile_for_build(raw, cfg!(debug_assertions))
+}
+
+fn validate_ctl_profile_for_build(raw: &str, debug_build: bool) -> Result<String, CliError> {
+    if raw.is_empty() {
+        return Err(CliError::new("profile must be nonempty"));
+    }
+    if debug_build && raw.eq_ignore_ascii_case("production") {
+        return Err(CliError::new(
+            "reserved production profile is forbidden for debug ctl commands",
+        ));
+    }
+    match crate::config::paths::AppProfile::named(raw) {
+        Ok(crate::config::paths::AppProfile::Named(name)) => {
+            if debug_build && name == "production" {
+                return Err(CliError::new(
+                    "reserved production profile is forbidden for debug ctl commands",
+                ));
+            }
+            Ok(name)
+        }
+        Ok(_) => Err(CliError::new(format!("invalid named profile: {raw:?}"))),
+        Err(error) => Err(CliError::new(error.to_string())),
+    }
+}
+
+/// Render the versioned actions document without connecting or touching HostLock.
+pub fn actions_json_document() -> Result<String, CliError> {
+    action::require_unique_ids().map_err(CliError::new)?;
+    let actions: Vec<_> = action::catalog()
+        .iter()
+        .map(|entry| {
+            // Offline catalog has no Hello grant. Emit disabled_reason on every
+            // row so omission cannot be read as enabled.
+            let reason = action::disabled_reason(entry.id, CapabilitySet::empty());
+            json!({
+                "id": entry.id,
+                "title": entry.title,
+                "description": entry.description,
+                "keywords": entry.keywords,
+                "scope": match entry.scope {
+                    ActionScope::Host => "host",
+                    ActionScope::Task => "task",
+                },
+                "required_capability": entry.required_capability.map(capability_name),
+                "risk": match entry.risk {
+                    ActionRisk::ReadOnly => "read_only",
+                    ActionRisk::Mutating => "mutating",
+                },
+                "argument_schema": argument_schema_json(entry.argument_schema),
+                "enabled": reason.is_none(),
+                "disabled_reason": reason,
+            })
+        })
+        .collect();
+    let doc = json!({
+        "schema_version": SCHEMA_VERSION,
+        "actions": actions,
+    });
+    // Compact JSON keeps the offline catalog byte-stable across platforms.
+    serde_json::to_string(&doc)
+        .map_err(|error| CliError::new(format!("failed to encode actions JSON: {error}")))
+}
+
+fn argument_schema_json(schema: ActionArgumentSchema) -> serde_json::Value {
+    let uuid = || json!({ "type": "string", "format": "uuid" });
+    match schema {
+        ActionArgumentSchema::None => json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {},
+            "required": [],
+        }),
+        ActionArgumentSchema::TaskId => json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": { "task_id": uuid() },
+            "required": ["task_id"],
+        }),
+        ActionArgumentSchema::TaskCreateV1 => json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "task_id": uuid(),
+                "environment_id": uuid(),
+                "title": { "type": "string", "minLength": 1 },
+                "description": { "type": ["string", "null"] },
+                "project_id": uuid(),
+                "workspace": {
+                    "oneOf": [
+                        { "const": "main" },
+                        {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "properties": {
+                                "worktree": {
+                                    "type": "object",
+                                    "additionalProperties": false,
+                                    "properties": {
+                                        "path": { "type": "string", "minLength": 1 },
+                                        "branch": { "type": "string", "minLength": 1 }
+                                    },
+                                    "required": ["path", "branch"]
+                                }
+                            },
+                            "required": ["worktree"]
+                        },
+                        {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "properties": {
+                                "external": {
+                                    "type": "object",
+                                    "additionalProperties": false,
+                                    "properties": {
+                                        "path": { "type": "string", "minLength": 1 }
+                                    },
+                                    "required": ["path"]
+                                }
+                            },
+                            "required": ["external"]
+                        }
+                    ]
+                }
+            },
+            "required": ["task_id", "environment_id", "title", "project_id", "workspace"],
+        }),
+        ActionArgumentSchema::TaskCreateV2 => json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "task_id": uuid(),
+                "environment_id": uuid(),
+                "title": { "type": "string", "minLength": 1 },
+                "description": { "type": ["string", "null"] },
+                "project_id": uuid(),
+                "primary_provider": {
+                    "type": ["string", "null"],
+                    "enum": ["claude", "codex", null]
+                },
+                "workspace": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "choice": {
+                            "type": "string",
+                            "enum": ["main", "new_worktree", "ask", "external"]
+                        },
+                        "path": { "type": ["string", "null"] },
+                        "branch": { "type": ["string", "null"] },
+                        "external_confirmed": { "type": "boolean" }
+                    },
+                    "required": ["choice", "path", "branch", "external_confirmed"]
+                }
+            },
+            "required": [
+                "task_id",
+                "environment_id",
+                "title",
+                "project_id",
+                "workspace"
+            ],
+        }),
+        ActionArgumentSchema::TaskRenameV1 => json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "task_id": uuid(),
+                "title": { "type": "string", "minLength": 1 },
+            },
+            "required": ["task_id", "title"],
+        }),
+        ActionArgumentSchema::ProviderInputV1 => json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "task_id": uuid(),
+                "agent_session_id": uuid(),
+                "runtime_generation": { "type": "integer", "minimum": 0 },
+                "action_epoch": { "type": "integer", "minimum": 0 },
+                "turn_id": uuid(),
+                "question_id": uuid(),
+                "approval_id": uuid(),
+                "text": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 65536
+                },
+                "wait": { "type": "boolean" },
+                "allow": { "type": "boolean" },
+            },
+            "required": [
+                "task_id",
+                "agent_session_id",
+                "runtime_generation",
+                "action_epoch",
+                "turn_id"
+            ],
+        }),
+        ActionArgumentSchema::PromptMetadataPageV1 => json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "namespace": { "enum": ["personal"] },
+                "cursor": { "type": ["string", "null"] },
+                "expected_revision": { "type": ["integer", "null"], "minimum": 0 }
+            },
+            "required": ["namespace"],
+        }),
+        ActionArgumentSchema::PromptVersionPageV1 => json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "version_id": uuid(),
+                "cursor": { "type": ["string", "null"] }
+            },
+            "required": ["version_id"],
+        }),
+        ActionArgumentSchema::PromptDiffV1 => json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "old_version_id": uuid(),
+                "new_version_id": uuid(),
+                "cursor": { "type": ["string", "null"] }
+            },
+            "required": ["old_version_id", "new_version_id"],
+        }),
+        ActionArgumentSchema::PromptChainPageV1 => json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "chain_id": uuid(),
+                "cursor": { "type": ["string", "null"] },
+                "expected_revision": { "type": ["integer", "null"], "minimum": 0 }
+            },
+            "required": ["chain_id"],
+        }),
+        ActionArgumentSchema::ServiceControlV1 => json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "service_id": { "type": "string", "minLength": 1, "maxLength": 64 },
+                "resource_generation": { "type": "integer", "minimum": 1 },
+                "connection_epoch": { "type": "integer", "minimum": 1 },
+                "action_epoch": { "type": "integer", "minimum": 1 },
+            },
+            "required": [
+                "service_id",
+                "resource_generation",
+                "connection_epoch",
+                "action_epoch"
+            ],
+        }),
+        ActionArgumentSchema::TaskCockpitV1 => json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "task_id": uuid()
+            },
+            "required": ["task_id"],
+        }),
+        ActionArgumentSchema::TerminalOpenShellV1 => json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "task_id": uuid(),
+                "cwd": { "type": ["string", "null"] }
+            },
+            "required": ["task_id"],
+        }),
+        ActionArgumentSchema::TerminalIdV1 => json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "task_id": uuid(),
+                "resource_id": uuid()
+            },
+            "required": ["task_id", "resource_id"],
+        }),
+        ActionArgumentSchema::TerminalRenameV1 => json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "task_id": uuid(),
+                "resource_id": uuid(),
+                "title": { "type": "string", "minLength": 1 }
+            },
+            "required": ["task_id", "resource_id", "title"],
+        }),
+        ActionArgumentSchema::TerminalStripV1 => json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "task_id": uuid(),
+                "strip": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "order": { "type": "array", "items": uuid() },
+                        "focused": { "type": ["string", "null"], "format": "uuid" }
+                    },
+                    "required": ["order"],
+                }
+            },
+            "required": ["task_id", "strip"],
+        }),
+    }
+}
+
+fn capability_name(capability: crate::protocol::Capability) -> &'static str {
+    capability.wire_name()
+}
+
+/// Execute a parsed ctl command. Writes JSON to stdout on success.
+pub fn run_ctl(command: CtlCommand) -> Result<(), CliError> {
+    match command {
+        CtlCommand::Actions => {
+            let document = actions_json_document()?;
+            write_stdout(&document)
+        }
+        CtlCommand::Status { profile } => {
+            let document = status_json_document(&profile)?;
+            write_stdout(&document)
+        }
+        CtlCommand::Tasks { profile } => {
+            let document = tasks_json_document(&profile)?;
+            write_stdout(&document)
+        }
+        CtlCommand::TaskShow { profile, task_id } => {
+            let document = task_show_json_document(&profile, task_id)?;
+            write_stdout(&document)
+        }
+        CtlCommand::Invoke {
+            profile,
+            action_id,
+            arguments_json,
+            expected_task_revision,
+        } => {
+            let document = invoke_json_document(
+                &profile,
+                &action_id,
+                &arguments_json,
+                expected_task_revision,
+            )?;
+            write_stdout(&document)
+        }
+    }
+}
+
+fn status_json_document(profile: &str) -> Result<String, CliError> {
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        let _ = profile;
+        return Err(CliError::new("ctl status requires Windows or Linux"));
+    }
+
+    #[cfg(any(windows, target_os = "linux"))]
+    {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| CliError::new(format!("failed to build ctl runtime: {error}")))?;
+        runtime.block_on(status_json_document_async(profile))
+    }
+}
+
+#[cfg(any(windows, target_os = "linux"))]
+async fn status_json_document_async(profile: &str) -> Result<String, CliError> {
+    let client = connect_profile_client(profile, ClientId::new(), CapabilitySet::empty()).await?;
+
+    let doc = json!({
+        "schema_version": SCHEMA_VERSION,
+        "action_id": ACTION_HOST_STATUS,
+        "profile": profile,
+        "host_boot_id": client.host_boot_id(),
+        "connection_id": client.connection_id(),
+        "granted_capabilities": client.granted_capabilities().bits(),
+        "server_build": client.server_build(),
+        "protocol_major": client.protocol_major(),
+        "protocol_minor": client.protocol_minor(),
+    });
+    serde_json::to_string(&doc)
+        .map_err(|error| CliError::new(format!("failed to encode status JSON: {error}")))
+}
+
+fn tasks_json_document(profile: &str) -> Result<String, CliError> {
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        let _ = profile;
+        return Err(CliError::new("ctl tasks requires Windows or Linux"));
+    }
+
+    #[cfg(any(windows, target_os = "linux"))]
+    {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| CliError::new(format!("failed to build ctl runtime: {error}")))?;
+        runtime.block_on(tasks_json_document_async(profile))
+    }
+}
+
+#[cfg(any(windows, target_os = "linux"))]
+async fn tasks_json_document_async(profile: &str) -> Result<String, CliError> {
+    let mut client = connect_profile_client(
+        profile,
+        ClientId::new(),
+        CapabilitySet::from_capabilities([Capability::PagedSnapshots]),
+    )
+    .await?;
+    if !client
+        .granted_capabilities()
+        .contains(Capability::PagedSnapshots)
+    {
+        return Err(CliError::new(
+            "host did not grant required paged_snapshots capability",
+        ));
+    }
+
+    let mut opened: Option<SnapshotId> = None;
+    let result = assemble_task_list(&mut client, profile, &mut opened).await;
+    if let Some(snapshot_id) = opened {
+        let _ = client.release_snapshot(snapshot_id).await;
+    }
+    result
+}
+
+#[cfg(any(windows, target_os = "linux"))]
+async fn assemble_task_list(
+    client: &mut HostClient,
+    profile: &str,
+    opened: &mut Option<SnapshotId>,
+) -> Result<String, CliError> {
+    let mut tasks: Vec<TaskSnapshotItem> = Vec::new();
+    let mut seen_cursors: HashSet<Vec<u8>> = HashSet::new();
+    let mut page_count: u64 = 0;
+    let mut snapshot_id: Option<SnapshotId> = None;
+    let mut through_sequence: Option<u64> = None;
+    let mut resume_cursor: Option<Vec<u8>> = None;
+
+    loop {
+        if page_count as usize >= MAX_TASK_LIST_PAGES {
+            return Err(CliError::new("task.list exceeded finite page bound"));
+        }
+        let requested_id = snapshot_id;
+        let page = match client
+            .snapshot_page(SnapshotSection::Tasks, requested_id, resume_cursor.clone())
+            .await
+        {
+            Ok(Ok(page)) => page,
+            Ok(Err(QueryError::NotFound)) => {
+                return Err(CliError::new("task.list snapshot was not found"))
+            }
+            Ok(Err(QueryError::Unauthorized)) => {
+                return Err(CliError::new("task.list query was unauthorized"))
+            }
+            Ok(Err(QueryError::InvalidRequest)) => {
+                return Err(CliError::new("task.list query was invalid"))
+            }
+            Ok(Err(QueryError::Conflict)) => {
+                return Err(CliError::new(
+                    "task.list query conflicted with durable state",
+                ))
+            }
+            Ok(Err(QueryError::UnsupportedCapability)) => {
+                return Err(CliError::new("task.list query capability is unsupported"))
+            }
+            Ok(Err(QueryError::ReplayUnavailable { .. })) => {
+                return Err(CliError::new("task.list query replay is unavailable"))
+            }
+            Ok(Err(QueryError::Unavailable { reason })) => {
+                return Err(CliError::new(format!(
+                    "task.list query is unavailable: {reason}"
+                )))
+            }
+            Err(error) => return Err(CliError::new(format!("task.list query failed: {error}"))),
+        };
+
+        *opened = Some(page.snapshot_id);
+        if let Some(expected) = snapshot_id {
+            if page.snapshot_id != expected {
+                return Err(CliError::new(
+                    "task.list snapshot identity drifted across pages",
+                ));
+            }
+        } else {
+            snapshot_id = Some(page.snapshot_id);
+        }
+        if let Some(expected) = through_sequence {
+            if page.through_sequence != expected {
+                return Err(CliError::new(
+                    "task.list through_sequence drifted across pages",
+                ));
+            }
+        } else {
+            through_sequence = Some(page.through_sequence);
+        }
+        if page.section != SnapshotSection::Tasks {
+            return Err(CliError::new("task.list returned a non-tasks section"));
+        }
+
+        for item in &page.items {
+            let SnapshotItem::Task(task_item) = item else {
+                return Err(CliError::new(
+                    "task.list page contained a non-task snapshot item",
+                ));
+            };
+            if tasks.len() >= MAX_TASK_LIST_ITEMS {
+                return Err(CliError::new("task.list exceeded finite item bound"));
+            }
+            tasks.push(task_item.clone());
+        }
+        page_count += 1;
+
+        match page.next_cursor {
+            Some(cursor) => {
+                if !seen_cursors.insert(cursor.clone()) {
+                    return Err(CliError::new(
+                        "task.list observed a repeated snapshot cursor",
+                    ));
+                }
+                resume_cursor = Some(cursor);
+            }
+            None => break,
+        }
+    }
+
+    let snapshot_id = snapshot_id.ok_or_else(|| CliError::new("task.list produced no pages"))?;
+    let through_sequence =
+        through_sequence.ok_or_else(|| CliError::new("task.list produced no pages"))?;
+
+    let doc = json!({
+        "schema_version": SCHEMA_VERSION,
+        "action_id": ACTION_TASK_LIST,
+        "profile": profile,
+        "snapshot_id": snapshot_id,
+        "through_sequence": through_sequence,
+        "page_count": page_count,
+        "tasks": tasks,
+    });
+    serde_json::to_string(&doc)
+        .map_err(|error| CliError::new(format!("failed to encode tasks JSON: {error}")))
+}
+
+fn task_show_json_document(profile: &str, task_id: TaskId) -> Result<String, CliError> {
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        let _ = profile;
+        let _ = task_id;
+        return Err(CliError::new("ctl task-show requires Windows or Linux"));
+    }
+
+    #[cfg(any(windows, target_os = "linux"))]
+    {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| CliError::new(format!("failed to build ctl runtime: {error}")))?;
+        runtime.block_on(task_show_json_document_async(profile, task_id))
+    }
+}
+
+#[cfg(any(windows, target_os = "linux"))]
+async fn task_show_json_document_async(profile: &str, task_id: TaskId) -> Result<String, CliError> {
+    let mut client =
+        connect_profile_client(profile, ClientId::new(), CapabilitySet::empty()).await?;
+    let snapshot = match client.task_snapshot(task_id).await {
+        Ok(Ok(snapshot)) => snapshot,
+        Ok(Err(QueryError::NotFound)) => {
+            return Err(CliError::new(format!("task {task_id} not found")))
+        }
+        Ok(Err(QueryError::Unauthorized)) => {
+            return Err(CliError::new("task.show query was unauthorized"))
+        }
+        Ok(Err(QueryError::InvalidRequest)) => {
+            return Err(CliError::new("task.show query was invalid"))
+        }
+        Ok(Err(QueryError::Conflict)) => {
+            return Err(CliError::new(
+                "task.show query conflicted with durable state",
+            ))
+        }
+        Ok(Err(QueryError::UnsupportedCapability)) => {
+            return Err(CliError::new("task.show query capability is unsupported"))
+        }
+        Ok(Err(QueryError::ReplayUnavailable { .. })) => {
+            return Err(CliError::new("task.show query replay is unavailable"))
+        }
+        Ok(Err(QueryError::Unavailable { reason })) => {
+            return Err(CliError::new(format!(
+                "task.show query is unavailable: {reason}"
+            )))
+        }
+        Err(error) => return Err(CliError::new(format!("task.show query failed: {error}"))),
+    };
+    let doc = json!({
+        "schema_version": SCHEMA_VERSION,
+        "action_id": ACTION_TASK_SHOW,
+        "profile": profile,
+        "task_id": task_id,
+        "snapshot": snapshot,
+    });
+    serde_json::to_string(&doc)
+        .map_err(|error| CliError::new(format!("failed to encode task-show JSON: {error}")))
+}
+
+fn is_provider_input_invoke_action(action_id: &str) -> bool {
+    matches!(
+        action_id,
+        ACTION_PROVIDER_SEND_NOW
+            | ACTION_PROVIDER_STEER_CURRENT_TURN
+            | ACTION_PROVIDER_QUEUE_FOLLOW_UP
+            | ACTION_PROVIDER_ANSWER_QUESTION
+            | ACTION_PROVIDER_RESOLVE_APPROVAL
+            | ACTION_PROVIDER_TERMINAL_INPUT
+            | ACTION_PROVIDER_STOP_TURN
+            | ACTION_TASK_SEND_NOW
+            | ACTION_TASK_STEER_CURRENT_TURN
+            | ACTION_TASK_QUEUE_FOLLOW_UP
+            | ACTION_TASK_ANSWER_QUESTION
+            | ACTION_TASK_RESOLVE_APPROVAL
+            | ACTION_TASK_STOP_TURN
+    )
+}
+
+fn invoke_json_document(
+    profile: &str,
+    action_id: &str,
+    arguments_json: &str,
+    expected_task_revision: Option<u64>,
+) -> Result<String, CliError> {
+    match action_id {
+        ACTION_TASK_CREATE_V2 => {
+            if expected_task_revision.is_some() {
+                return Err(CliError::new(
+                    "task creation requires expected-task-revision to be absent",
+                ));
+            }
+            #[cfg(not(any(windows, target_os = "linux")))]
+            {
+                let _ = profile;
+                let _ = arguments_json;
+                return Err(CliError::new("ctl invoke requires Windows or Linux"));
+            }
+            #[cfg(any(windows, target_os = "linux"))]
+            {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|error| {
+                        CliError::new(format!("failed to build ctl runtime: {error}"))
+                    })?;
+                runtime.block_on(task_create_invoke_async(profile, action_id, arguments_json))
+            }
+        }
+        ACTION_TASK_CREATE => Err(CliError::new(
+            "task.create is a frozen V1 codec and is not an advertised public action; use task.create.v2",
+        )),
+        ACTION_TASK_RENAME => {
+            let Some(expected_task_revision) = expected_task_revision else {
+                return Err(CliError::new("task.rename requires expected-task-revision"));
+            };
+            #[cfg(not(any(windows, target_os = "linux")))]
+            {
+                let _ = profile;
+                let _ = arguments_json;
+                let _ = expected_task_revision;
+                return Err(CliError::new("ctl invoke requires Windows or Linux"));
+            }
+            #[cfg(any(windows, target_os = "linux"))]
+            {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|error| {
+                        CliError::new(format!("failed to build ctl runtime: {error}"))
+                    })?;
+                runtime.block_on(task_rename_invoke_async(
+                    profile,
+                    arguments_json,
+                    expected_task_revision,
+                ))
+            }
+        }
+        ACTION_PROVIDER_NEW_CONVERSATION => {
+            let reason = crate::providers::input::new_conversation_availability();
+            Err(CliError::new(format!(
+                "{} unavailable: {}",
+                reason.action_id(),
+                reason.reason_code()
+            )))
+        }
+        provider_action if is_provider_input_invoke_action(provider_action) => {
+            let Some(expected_task_revision) = expected_task_revision else {
+                return Err(CliError::new(format!(
+                    "{action_id} requires expected-task-revision"
+                )));
+            };
+            #[cfg(not(any(windows, target_os = "linux")))]
+            {
+                let _ = profile;
+                let _ = arguments_json;
+                let _ = expected_task_revision;
+                return Err(CliError::new("ctl invoke requires Windows or Linux"));
+            }
+            #[cfg(any(windows, target_os = "linux"))]
+            {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|error| {
+                        CliError::new(format!("failed to build ctl runtime: {error}"))
+                    })?;
+                runtime.block_on(provider_input_invoke_async(
+                    profile,
+                    action_id,
+                    arguments_json,
+                    expected_task_revision,
+                ))
+            }
+        }
+        ACTION_SERVICE_START | ACTION_SERVICE_STOP | ACTION_SERVICE_RESTART => {
+            #[cfg(not(any(windows, target_os = "linux")))]
+            {
+                let _ = profile;
+                let _ = arguments_json;
+                return Err(CliError::new("ctl invoke requires Windows or Linux"));
+            }
+            #[cfg(any(windows, target_os = "linux"))]
+            {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|error| {
+                        CliError::new(format!("failed to build ctl runtime: {error}"))
+                    })?;
+                runtime.block_on(service_control_invoke_async(
+                    profile,
+                    action_id,
+                    arguments_json,
+                ))
+            }
+        }
+        other => {
+            if let Some(reason) = action::disabled_reason(other, CapabilitySet::empty()) {
+                return Err(CliError::new(reason.to_string()));
+            }
+            Err(CliError::new(format!("unsupported action id: {other}")))
+        }
+    }
+}
+
+#[cfg(any(windows, target_os = "linux"))]
+async fn service_control_invoke_async(
+    profile: &str,
+    action_id: &str,
+    arguments_json: &str,
+) -> Result<String, CliError> {
+    let args: ServiceControlArguments = serde_json::from_str(arguments_json)
+        .map_err(|error| CliError::new(format!("invalid {action_id} arguments JSON: {error}")))?;
+    let service_id = args.service_id.clone();
+    let client_id = ClientId::new();
+    let envelope = service_control_command(
+        CommandId::new(),
+        client_id,
+        unix_epoch_ms()?,
+        action_id,
+        args,
+    )
+    .map_err(|error| CliError::new(format!("invalid {action_id} arguments: {error}")))?;
+    let mut client = connect_profile_client(
+        profile,
+        client_id,
+        CapabilitySet::from_capabilities([Capability::ServiceSupervisor]),
+    )
+    .await?;
+    if !client
+        .granted_capabilities()
+        .contains(Capability::ServiceSupervisor)
+    {
+        return Err(CliError::new(
+            "host did not grant required service_supervisor capability",
+        ));
+    }
+    let receipt = execute_command_with_reconnect(&mut client, envelope, action_id).await?;
+    match &receipt {
+        CommandReceipt::Accepted { .. } => {
+            let doc = json!({
+                "schema_version": SCHEMA_VERSION,
+                "action_id": action_id,
+                "profile": profile,
+                "service_id": service_id,
+                "receipt": receipt,
+            });
+            serde_json::to_string(&doc)
+                .map_err(|error| CliError::new(format!("failed to encode invoke JSON: {error}")))
+        }
+        CommandReceipt::Rejected { code, .. } => Err(CliError::new(format!(
+            "{action_id} rejected: {}",
+            rejection_code_name(*code)
+        ))),
+    }
+}
+
+#[cfg(any(windows, target_os = "linux"))]
+async fn task_create_invoke_async(
+    profile: &str,
+    action_id: &str,
+    arguments_json: &str,
+) -> Result<String, CliError> {
+    let args: TaskCreateV2Arguments = serde_json::from_str(arguments_json).map_err(|error| {
+        CliError::new(format!("invalid task.create.v2 arguments JSON: {error}"))
+    })?;
+    let task_id = args.task_id;
+    let requested = task_create_requested_capabilities(&args);
+    let envelope =
+        task_create_v2_command(CommandId::new(), ClientId::new(), unix_epoch_ms()?, args)
+            .map_err(|error| CliError::new(format!("invalid task.create.v2 arguments: {error}")))?;
+    let client_id = ClientId::new();
+    let envelope = CommandEnvelope {
+        client_id,
+        ..envelope
+    };
+
+    let mut client = connect_profile_client(profile, client_id, requested).await?;
+    let receipt = execute_command_with_reconnect(&mut client, envelope, action_id).await?;
+    match &receipt {
+        CommandReceipt::Accepted { .. } => {
+            let doc = json!({
+                "schema_version": SCHEMA_VERSION,
+                "action_id": action_id,
+                "profile": profile,
+                "task_id": task_id,
+                "receipt": receipt,
+            });
+            serde_json::to_string(&doc)
+                .map_err(|error| CliError::new(format!("failed to encode invoke JSON: {error}")))
+        }
+        CommandReceipt::Rejected { code, .. } => Err(CliError::new(format!(
+            "{action_id} rejected: {}",
+            rejection_code_name(*code)
+        ))),
+    }
+}
+
+fn task_create_requested_capabilities(args: &TaskCreateV2Arguments) -> CapabilitySet {
+    if args.primary_provider.is_some() {
+        CapabilitySet::from_capabilities([Capability::ProviderInput])
+    } else {
+        CapabilitySet::empty()
+    }
+}
+
+#[cfg(any(windows, target_os = "linux"))]
+async fn task_rename_invoke_async(
+    profile: &str,
+    arguments_json: &str,
+    expected_task_revision: u64,
+) -> Result<String, CliError> {
+    let args: TaskRenameArguments = serde_json::from_str(arguments_json)
+        .map_err(|error| CliError::new(format!("invalid task.rename arguments JSON: {error}")))?;
+    let task_id = args.task_id;
+    let client_id = ClientId::new();
+    let command_id = CommandId::new();
+    let issued_at_ms = unix_epoch_ms()?;
+    let envelope = task_rename_command(
+        command_id,
+        client_id,
+        issued_at_ms,
+        expected_task_revision,
+        args,
+    )
+    .map_err(|error| CliError::new(format!("invalid task.rename arguments: {error}")))?;
+
+    let mut client = connect_profile_client(profile, client_id, CapabilitySet::empty()).await?;
+    let receipt = execute_command_with_reconnect(&mut client, envelope, ACTION_TASK_RENAME).await?;
+    match &receipt {
+        CommandReceipt::Accepted { .. } => {
+            let doc = json!({
+                "schema_version": SCHEMA_VERSION,
+                "action_id": ACTION_TASK_RENAME,
+                "profile": profile,
+                "task_id": task_id,
+                "receipt": receipt,
+            });
+            serde_json::to_string(&doc)
+                .map_err(|error| CliError::new(format!("failed to encode invoke JSON: {error}")))
+        }
+        CommandReceipt::Rejected { code, .. } => Err(CliError::new(format!(
+            "task.rename rejected: {}",
+            rejection_code_name(*code)
+        ))),
+    }
+}
+
+#[cfg(any(windows, target_os = "linux"))]
+async fn provider_input_invoke_async(
+    profile: &str,
+    action_id: &str,
+    arguments_json: &str,
+    expected_task_revision: u64,
+) -> Result<String, CliError> {
+    let args: ProviderInputArguments = serde_json::from_str(arguments_json)
+        .map_err(|error| CliError::new(format!("invalid {action_id} arguments JSON: {error}")))?;
+    let task_id = args.task_id;
+    let client_id = ClientId::new();
+    let command_id = CommandId::new();
+    let issued_at_ms = unix_epoch_ms()?;
+    let envelope = provider_input_command(
+        command_id,
+        client_id,
+        issued_at_ms,
+        expected_task_revision,
+        action_id,
+        args,
+    )
+    .map_err(|error| CliError::new(format!("invalid {action_id} arguments: {error}")))?;
+
+    let mut client = connect_profile_client(
+        profile,
+        client_id,
+        CapabilitySet::from_capabilities([
+            Capability::ProviderInput,
+            Capability::OperationSettlement,
+        ]),
+    )
+    .await?;
+    if !client
+        .granted_capabilities()
+        .contains(Capability::ProviderInput)
+    {
+        return Err(CliError::new(
+            "host did not grant required provider_input capability",
+        ));
+    }
+    let receipt = execute_command_with_reconnect(&mut client, envelope, action_id).await?;
+    match &receipt {
+        CommandReceipt::Accepted { operation_id, .. } => {
+            let delivery = wait_for_provider_input_delivery(&mut client, *operation_id).await;
+            let doc = json!({
+                "schema_version": SCHEMA_VERSION,
+                "action_id": action_id,
+                "profile": profile,
+                "task_id": task_id,
+                "receipt": receipt,
+                "intent": "accepted",
+                "delivery": delivery,
+            });
+            serde_json::to_string(&doc)
+                .map_err(|error| CliError::new(format!("failed to encode invoke JSON: {error}")))
+        }
+        CommandReceipt::Rejected { code, .. } => Err(CliError::new(format!(
+            "{action_id} rejected: {}",
+            rejection_code_name(*code)
+        ))),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProviderInputDeliveryReport {
+    status: &'static str,
+    reason: &'static str,
+    delivered: bool,
+}
+
+impl ProviderInputDeliveryReport {
+    fn to_json(&self) -> serde_json::Value {
+        json!({
+            "status": self.status,
+            "reason": self.reason,
+            "delivered": self.delivered,
+        })
+    }
+}
+
+fn provider_input_delivery_from_operation_state(
+    state: &OperationState,
+) -> Option<ProviderInputDeliveryReport> {
+    match state {
+        OperationState::Settled { .. } => Some(ProviderInputDeliveryReport {
+            status: "delivered",
+            reason: "settled",
+            delivered: true,
+        }),
+        OperationState::Uncertain { .. } => Some(ProviderInputDeliveryReport {
+            status: "uncertain",
+            reason: "ambiguous_dispatch",
+            delivered: false,
+        }),
+        OperationState::Failed { .. } => Some(ProviderInputDeliveryReport {
+            status: "failed",
+            reason: "operation_failed",
+            delivered: false,
+        }),
+        OperationState::Cancelled { .. } => Some(ProviderInputDeliveryReport {
+            status: "failed",
+            reason: "operation_cancelled",
+            delivered: false,
+        }),
+        OperationState::Accepted => None,
+    }
+}
+
+#[cfg(any(windows, target_os = "linux"))]
+async fn wait_for_provider_input_delivery(
+    client: &mut HostClient,
+    operation_id: OperationId,
+) -> serde_json::Value {
+    if !client
+        .granted_capabilities()
+        .contains(Capability::OperationSettlement)
+    {
+        return ProviderInputDeliveryReport {
+            status: "pending",
+            reason: "operation_settlement_ungranted",
+            delivered: false,
+        }
+        .to_json();
+    }
+    let deadline = tokio::time::Instant::now() + PROVIDER_DELIVERY_WAIT;
+    loop {
+        match client.refresh_operation(operation_id).await {
+            Ok(Ok(state)) => {
+                if let Some(report) = provider_input_delivery_from_operation_state(&state) {
+                    return report.to_json();
+                }
+            }
+            Ok(Err(_)) | Err(_) => {
+                return ProviderInputDeliveryReport {
+                    status: "pending",
+                    reason: "operation_status_unavailable",
+                    delivered: false,
+                }
+                .to_json();
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return ProviderInputDeliveryReport {
+                status: "pending",
+                reason: "delivery_wait_elapsed",
+                delivered: false,
+            }
+            .to_json();
+        }
+        tokio::time::sleep(PROVIDER_DELIVERY_POLL).await;
+    }
+}
+
+fn rejection_code_name(code: RejectionCode) -> &'static str {
+    match code {
+        RejectionCode::NotFound => "not_found",
+        RejectionCode::AlreadyExists => "already_exists",
+        RejectionCode::RevisionConflict => "revision_conflict",
+        RejectionCode::InvalidTransition => "invalid_transition",
+        RejectionCode::OwnershipConflict => "ownership_conflict",
+        RejectionCode::UnsupportedCapability => "unsupported_capability",
+        RejectionCode::Closing => "closing",
+        RejectionCode::IdempotencyConflict => "idempotency_conflict",
+        RejectionCode::AlreadyResolved => "already_resolved",
+        RejectionCode::TooManyTerminals => "too_many_terminals",
+    }
+}
+
+fn unix_epoch_ms() -> Result<i64, CliError> {
+    let duration = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| CliError::new(format!("system clock precedes Unix epoch: {error}")))?;
+    i64::try_from(duration.as_millis())
+        .map_err(|_| CliError::new("system clock milliseconds exceed supported range"))
+}
+
+#[cfg(any(windows, target_os = "linux"))]
+async fn execute_command_with_reconnect(
+    client: &mut HostClient,
+    envelope: CommandEnvelope,
+    action_id: &str,
+) -> Result<CommandReceipt, CliError> {
+    let deadline = tokio::time::Instant::now() + COMMAND_REPLAY_TIMEOUT;
+    for attempt in 0..MAX_COMMAND_ATTEMPTS {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            client.disconnect();
+            return Err(command_replay_timeout_error(action_id));
+        }
+        let outcome =
+            tokio::time::timeout(remaining, client.execute_command(envelope.clone())).await;
+        match outcome {
+            Ok(Ok(receipt)) => return Ok(receipt),
+            Ok(Err(error))
+                if is_retryable_connect_error(&error) && attempt + 1 < MAX_COMMAND_ATTEMPTS =>
+            {
+                reconnect_before_deadline(client, deadline, action_id).await?;
+            }
+            Ok(Err(error)) => {
+                return Err(CliError::new(format!(
+                    "{action_id} command failed: {error}"
+                )))
+            }
+            Err(_) => {
+                client.disconnect();
+                return Err(command_replay_timeout_error(action_id));
+            }
+        }
+    }
+    Err(CliError::new(format!(
+        "{action_id} command exhausted its bounded replay attempts"
+    )))
+}
+
+#[cfg(any(windows, target_os = "linux"))]
+async fn reconnect_before_deadline(
+    client: &mut HostClient,
+    deadline: tokio::time::Instant,
+    action_id: &str,
+) -> Result<(), CliError> {
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            client.disconnect();
+            return Err(command_replay_timeout_error(action_id));
+        }
+        match tokio::time::timeout(remaining, client.reconnect()).await {
+            Ok(Ok(())) => return Ok(()),
+            Ok(Err(error)) if is_retryable_connect_error(&error) => {
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    client.disconnect();
+                    return Err(command_replay_timeout_error(action_id));
+                }
+                tokio::time::sleep(STATUS_CONNECT_POLL.min(remaining)).await;
+            }
+            Ok(Err(error)) => return Err(map_connect_error(error)),
+            Err(_) => {
+                client.disconnect();
+                return Err(command_replay_timeout_error(action_id));
+            }
+        }
+    }
+}
+
+fn command_replay_timeout_error(action_id: &str) -> CliError {
+    CliError::new(format!(
+        "{action_id} command exceeded its bounded reconnect/replay window"
+    ))
+}
+
+#[cfg(any(windows, target_os = "linux"))]
+async fn connect_profile_client(
+    profile: &str,
+    client_id: ClientId,
+    requested: CapabilitySet,
+) -> Result<HostClient, CliError> {
+    let config = HostClientConfig {
+        named_profile: profile.to_string(),
+        client_build: format!("devmanager-host-ctl/{}", env!("CARGO_PKG_VERSION")),
+        client_id,
+        requested,
+        limits: FrameLimits::v1_default(),
+    };
+
+    let deadline = tokio::time::Instant::now() + STATUS_CONNECT_TIMEOUT;
+    let client = loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(CliError::new(
+                "host connect timed out; is a foreground host running for this profile?",
+            ));
+        }
+        match tokio::time::timeout(remaining, HostClient::connect(config.clone())).await {
+            Ok(Ok(client)) => break client,
+            Ok(Err(error)) if is_retryable_connect_error(&error) => {
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    return Err(map_connect_error(error));
+                }
+                tokio::time::sleep(STATUS_CONNECT_POLL.min(remaining)).await;
+            }
+            Ok(Err(error)) => return Err(map_connect_error(error)),
+            Err(_) => {
+                return Err(CliError::new(
+                    "host connect timed out; is a foreground host running for this profile?",
+                ));
+            }
+        }
+    };
+    Ok(client)
+}
+
+fn is_retryable_connect_error(error: &IpcError) -> bool {
+    matches!(
+        error,
+        IpcError::Unavailable | IpcError::Io(_) | IpcError::Timeout | IpcError::ConnectionPoisoned
+    )
+}
+
+fn map_connect_error(error: IpcError) -> CliError {
+    match error {
+        IpcError::Unavailable | IpcError::Io(_) | IpcError::Timeout => {
+            CliError::new(format!("host unavailable for ctl attach: {error}"))
+        }
+        IpcError::InvalidProfile(name) => CliError::new(format!("invalid named profile: {name:?}")),
+        other => CliError::new(format!("host ctl attach failed: {other}")),
+    }
+}
+
+fn write_stdout(document: &str) -> Result<(), CliError> {
+    let mut out = io::stdout().lock();
+    out.write_all(document.as_bytes())
+        .and_then(|_| out.write_all(b"\n"))
+        .map_err(|error| CliError::new(format!("failed to write JSON to stdout: {error}")))
+}
+
+/// Binary entry helper: parse args after `ctl`, run, map errors to exit codes.
+pub fn dispatch_ctl_from_args<I, S>(args: I) -> ExitCode
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    match parse_ctl_args(args).and_then(run_ctl) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            let _ = writeln!(io::stderr(), "devmanager-host: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        is_provider_input_invoke_action, parse_ctl_args, task_create_requested_capabilities,
+        CliError, CtlCommand, COMMAND_REPLAY_TIMEOUT, MAX_ARGUMENTS_JSON_BYTES,
+        MAX_COMMAND_ATTEMPTS, MAX_DIAGNOSTIC_CHARS, STATUS_CONNECT_TIMEOUT,
+    };
+    use crate::{
+        client::action::{
+            TaskCreateV2Arguments, ACTION_PROVIDER_ANSWER_QUESTION,
+            ACTION_PROVIDER_QUEUE_FOLLOW_UP, ACTION_PROVIDER_RESOLVE_APPROVAL,
+            ACTION_PROVIDER_SEND_NOW, ACTION_PROVIDER_STEER_CURRENT_TURN,
+            ACTION_PROVIDER_STOP_TURN, ACTION_PROVIDER_TERMINAL_INPUT, ACTION_TASK_ANSWER_QUESTION,
+            ACTION_TASK_CREATE, ACTION_TASK_QUEUE_FOLLOW_UP, ACTION_TASK_RESOLVE_APPROVAL,
+            ACTION_TASK_SEND_NOW, ACTION_TASK_STEER_CURRENT_TURN, ACTION_TASK_STOP_TURN,
+        },
+        domain::{EnvironmentId, ProjectId, TaskId},
+        protocol::Capability,
+        providers::ProviderKind,
+        workspace::WorkspaceRequest,
+    };
+
+    fn create_args(primary_provider: Option<ProviderKind>) -> TaskCreateV2Arguments {
+        TaskCreateV2Arguments {
+            task_id: TaskId::new(),
+            environment_id: EnvironmentId::new(),
+            title: "CLI task".into(),
+            description: None,
+            project_id: ProjectId::new(),
+            workspace: WorkspaceRequest::main(),
+            primary_provider,
+            defer_primary_provider_start: false,
+        }
+    }
+
+    #[test]
+    fn primary_provider_task_create_requests_provider_input_capability() {
+        assert!(!task_create_requested_capabilities(&create_args(None))
+            .contains(Capability::ProviderInput));
+        for provider in [ProviderKind::ClaudeCode, ProviderKind::Codex] {
+            assert!(
+                task_create_requested_capabilities(&create_args(Some(provider)))
+                    .contains(Capability::ProviderInput)
+            );
+        }
+    }
+
+    #[test]
+    fn ctl_routes_canonical_composer_actions_to_provider_input() {
+        for action_id in [
+            ACTION_TASK_SEND_NOW,
+            ACTION_TASK_STEER_CURRENT_TURN,
+            ACTION_TASK_QUEUE_FOLLOW_UP,
+            ACTION_TASK_ANSWER_QUESTION,
+            ACTION_TASK_RESOLVE_APPROVAL,
+            ACTION_TASK_STOP_TURN,
+            ACTION_PROVIDER_SEND_NOW,
+            ACTION_PROVIDER_STEER_CURRENT_TURN,
+            ACTION_PROVIDER_QUEUE_FOLLOW_UP,
+            ACTION_PROVIDER_ANSWER_QUESTION,
+            ACTION_PROVIDER_RESOLVE_APPROVAL,
+            ACTION_PROVIDER_TERMINAL_INPUT,
+            ACTION_PROVIDER_STOP_TURN,
+        ] {
+            assert!(
+                is_provider_input_invoke_action(action_id),
+                "{action_id} must reach the provider-input dispatcher"
+            );
+        }
+        assert!(!is_provider_input_invoke_action(ACTION_TASK_CREATE));
+    }
+
+    #[test]
+    fn parses_actions_status_and_task_show() {
+        assert_eq!(
+            parse_ctl_args(["actions", "--json"]).expect("actions"),
+            CtlCommand::Actions
+        );
+        assert_eq!(
+            parse_ctl_args(["status", "--profile", "Alpha_1", "--json"]).expect("status"),
+            CtlCommand::Status {
+                profile: "alpha_1".to_string()
+            }
+        );
+        assert_eq!(
+            parse_ctl_args(["tasks", "--profile", "Alpha_1", "--json"]).expect("tasks"),
+            CtlCommand::Tasks {
+                profile: "alpha_1".to_string()
+            }
+        );
+        let task_id = TaskId::new();
+        assert_eq!(
+            parse_ctl_args([
+                "task-show".to_string(),
+                "--profile".to_string(),
+                "Alpha_1".to_string(),
+                "--task-id".to_string(),
+                task_id.to_string(),
+                "--json".to_string(),
+            ])
+            .expect("task-show"),
+            CtlCommand::TaskShow {
+                profile: "alpha_1".to_string(),
+                task_id,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_invoke_task_create_without_expected_revision() {
+        let arguments = r#"{"title":"CLI Created Task"}"#;
+        assert_eq!(
+            parse_ctl_args([
+                "invoke",
+                "--profile",
+                "Alpha_1",
+                "--action",
+                ACTION_TASK_CREATE,
+                "--arguments-json",
+                arguments,
+                "--json",
+            ])
+            .expect("invoke"),
+            CtlCommand::Invoke {
+                profile: "alpha_1".to_string(),
+                action_id: ACTION_TASK_CREATE.to_string(),
+                arguments_json: arguments.to_string(),
+                expected_task_revision: None,
+            }
+        );
+        assert_eq!(
+            parse_ctl_args([
+                "invoke",
+                "--profile",
+                "Alpha_1",
+                "--action",
+                ACTION_TASK_CREATE,
+                "--arguments-json",
+                arguments,
+                "--expected-task-revision",
+                "1",
+                "--json",
+            ])
+            .expect("invoke with revision"),
+            CtlCommand::Invoke {
+                profile: "alpha_1".to_string(),
+                action_id: ACTION_TASK_CREATE.to_string(),
+                arguments_json: arguments.to_string(),
+                expected_task_revision: Some(1),
+            }
+        );
+    }
+
+    #[test]
+    fn shipping_ctl_accepts_production_while_debug_ctl_remains_isolated() {
+        use super::validate_ctl_profile_for_build;
+        assert_eq!(
+            validate_ctl_profile_for_build("Production", false).unwrap(),
+            "production"
+        );
+        assert!(validate_ctl_profile_for_build("Production", true).is_err());
+        assert!(validate_ctl_profile_for_build("../production", false).is_err());
+        assert_eq!(
+            validate_ctl_profile_for_build("Alpha_1", true).unwrap(),
+            "alpha_1"
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_and_duplicates() {
+        assert!(parse_ctl_args(["nope", "--json"]).is_err());
+        assert!(parse_ctl_args(["actions"]).is_err());
+        assert!(parse_ctl_args(["actions", "--json", "--json"]).is_err());
+        assert!(parse_ctl_args(["status", "--json"]).is_err());
+        assert!(parse_ctl_args(["status", "--profile", "production", "--json"]).is_err());
+        assert!(parse_ctl_args(["status", "--profile", "a", "--profile", "b", "--json"]).is_err());
+        assert!(parse_ctl_args([
+            "task-show",
+            "--profile",
+            "valid",
+            "--task-id",
+            "not-a-uuid",
+            "--json"
+        ])
+        .is_err());
+        assert!(parse_ctl_args(["task-show", "--profile", "valid", "--json"]).is_err());
+        let task_id = TaskId::new().to_string();
+        assert!(parse_ctl_args([
+            "task-show".to_string(),
+            "--profile".to_string(),
+            "valid".to_string(),
+            "--task-id".to_string(),
+            task_id.clone(),
+            "--task-id".to_string(),
+            task_id,
+            "--json".to_string(),
+        ])
+        .is_err());
+        assert!(parse_ctl_args([
+            "invoke",
+            "--profile",
+            "valid",
+            "--action",
+            ACTION_TASK_CREATE,
+            "--json"
+        ])
+        .is_err());
+        assert!(parse_ctl_args([
+            "invoke",
+            "--profile",
+            "valid",
+            "--action",
+            ACTION_TASK_CREATE,
+            "--arguments-json",
+            "{}",
+            "--arguments-json",
+            "{}",
+            "--json"
+        ])
+        .is_err());
+        let oversized = "x".repeat(MAX_ARGUMENTS_JSON_BYTES + 1);
+        assert!(parse_ctl_args([
+            "invoke",
+            "--profile",
+            "valid",
+            "--action",
+            ACTION_TASK_CREATE,
+            "--arguments-json",
+            &oversized,
+            "--json"
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn diagnostics_are_bounded() {
+        let error = CliError::new("x".repeat(MAX_DIAGNOSTIC_CHARS * 2));
+        assert_eq!(error.message().chars().count(), MAX_DIAGNOSTIC_CHARS);
+        assert!(error.message().ends_with('\u{2026}'));
+    }
+
+    #[test]
+    fn command_replay_budget_allows_one_full_replay_after_timeout() {
+        assert_eq!(MAX_COMMAND_ATTEMPTS, 2);
+        assert!(COMMAND_REPLAY_TIMEOUT > STATUS_CONNECT_TIMEOUT * 3);
+    }
+
+    #[test]
+    fn provider_input_delivery_report_never_hardcodes_adapter_not_wired() {
+        use super::provider_input_delivery_from_operation_state;
+        use crate::domain::operation::{
+            CancellationReason, OperationErrorCode, OperationState, OperationUncertaintyCode,
+        };
+        use crate::domain::EventId;
+
+        let settled = provider_input_delivery_from_operation_state(&OperationState::Settled {
+            settled_at_ms: 1,
+            result_event_ids: Vec::<EventId>::new(),
+        })
+        .expect("settled");
+        assert!(settled.delivered);
+        assert_eq!(settled.status, "delivered");
+        assert_ne!(settled.reason, "destination_adapter_not_wired");
+
+        let uncertain = provider_input_delivery_from_operation_state(&OperationState::Uncertain {
+            observed_at_ms: 1,
+            code: OperationUncertaintyCode::AmbiguousDispatch,
+        })
+        .expect("uncertain");
+        assert!(!uncertain.delivered);
+        assert_eq!(uncertain.status, "uncertain");
+        assert_ne!(uncertain.reason, "destination_adapter_not_wired");
+
+        let failed = provider_input_delivery_from_operation_state(&OperationState::Failed {
+            settled_at_ms: 1,
+            code: OperationErrorCode::SideEffectFailed,
+        })
+        .expect("failed");
+        assert!(!failed.delivered);
+        assert_eq!(failed.status, "failed");
+        assert_ne!(failed.reason, "destination_adapter_not_wired");
+
+        let cancelled = provider_input_delivery_from_operation_state(&OperationState::Cancelled {
+            settled_at_ms: 1,
+            reason: CancellationReason::Superseded,
+        })
+        .expect("cancelled");
+        assert!(!cancelled.delivered);
+        assert_ne!(cancelled.reason, "destination_adapter_not_wired");
+
+        assert!(provider_input_delivery_from_operation_state(&OperationState::Accepted).is_none());
+    }
+}

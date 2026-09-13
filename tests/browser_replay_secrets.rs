@@ -676,7 +676,9 @@ fn windows_host_taint_gates_content_capture_ipc_recording_and_post_exposure_succ
         .find("fn selected_tab_id(")
         .map(|offset| exposure_start + offset)
         .expect("exposure boundary end");
-    let exposure = &windows[exposure_start..exposure_end];
+    let exposure = windows[exposure_start..exposure_end]
+        .split_whitespace()
+        .collect::<String>();
     assert!(
         exposure.find("state.begin_exposure()").unwrap()
             < exposure.find("remove_page_recording_view").unwrap(),

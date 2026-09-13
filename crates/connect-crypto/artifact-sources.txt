@@ -1,0 +1,7 @@
+# Paths are relative to the repository root. Directories are expanded recursively.
+crates/connect-crypto/Cargo.toml
+crates/connect-crypto/src
+src/connect/envelope.rs
+src/connect/schema.rs
+src/protocol/crypto.rs
+src/protocol/envelope.rs

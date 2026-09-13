@@ -3,20 +3,27 @@
 //! Mirrors the Claude hooks relay (`claude_hooks.rs`).
 
 use crate::ai::claude_hooks::is_valid_loopback_relay_url_for;
+use crate::domain::{AgentSessionId, ProviderSessionId, TaskId};
+use crate::process::identity::ManagedProcessId;
 use crate::remote::presentation::{
     SemanticEventDraft, SemanticEventKind, SemanticRetention, SemanticSource, SemanticToolState,
     StableSessionKey,
 };
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::fmt;
 use std::io::Read;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::time::Duration;
 
 pub const CODEX_HOOK_RELAY_PATH: &str = "/internal/codex-hook";
 pub const MAX_CODEX_HOOK_BODY_BYTES: usize = 256 * 1024;
 const MAX_CODEX_HOOK_TEXT_BYTES: usize = 64 * 1024;
+const MAX_CODEX_HOOK_PATH_BYTES: usize = 4 * 1024;
+const MAX_CODEX_TOOL_NAME_BYTES: usize = 256;
 const TRUNCATION_SUFFIX: &str = "\n[truncated by DevManager]";
 
 fn truncate_utf8(value: &str, max_bytes: usize) -> &str {
@@ -39,7 +46,35 @@ fn bounded_hook_text(value: &str) -> String {
 }
 
 fn bounded_identifier(value: &str) -> String {
-    value.chars().take(256).collect()
+    let mut bounded = String::with_capacity(value.len().min(MAX_CODEX_TOOL_NAME_BYTES));
+    for character in value.chars() {
+        if character.is_control()
+            || bounded.len().saturating_add(character.len_utf8()) > MAX_CODEX_TOOL_NAME_BYTES
+        {
+            break;
+        }
+        bounded.push(character);
+    }
+    bounded
+}
+
+fn bounded_tool_name(value: &str, fallback: &str) -> String {
+    let bounded = bounded_identifier(value);
+    if bounded.is_empty() {
+        fallback.to_string()
+    } else {
+        bounded
+    }
+}
+
+fn bounded_path(value: &str) -> Option<PathBuf> {
+    if value.is_empty()
+        || value.len() > MAX_CODEX_HOOK_PATH_BYTES
+        || value.chars().any(char::is_control)
+    {
+        return None;
+    }
+    Some(PathBuf::from(value))
 }
 
 fn string_field<'a>(value: &'a Value, field: &str) -> Option<&'a str> {
@@ -100,9 +135,10 @@ impl CodexHookReducer {
                 let binding = CodexSessionBinding {
                     session_id: session_id.clone(),
                     transcript_path: string_field(payload, "transcript_path")
-                        .filter(|path| !path.is_empty())
-                        .map(PathBuf::from),
-                    cwd: PathBuf::from(string_field(payload, "cwd").unwrap_or_default()),
+                        .and_then(bounded_path),
+                    cwd: string_field(payload, "cwd")
+                        .and_then(bounded_path)
+                        .unwrap_or_default(),
                 };
                 CodexHookReduction {
                     drafts: vec![self.event(
@@ -141,7 +177,9 @@ impl CodexHookReducer {
                 self.tool_reduction(payload, occurred_at_epoch_ms, SemanticToolState::Completed)
             }
             "PermissionRequest" => {
-                let tool_name = string_field(payload, "tool_name").unwrap_or("a tool");
+                let tool_name = string_field(payload, "tool_name")
+                    .map(|name| bounded_tool_name(name, "a tool"))
+                    .unwrap_or_else(|| "a tool".to_string());
                 let tool_use_id = string_field(payload, "tool_use_id")
                     .map(bounded_identifier)
                     .unwrap_or_else(|| "unknown".to_string());
@@ -166,18 +204,40 @@ impl CodexHookReducer {
                     session_binding: None,
                 }
             }
-            "Stop" => CodexHookReduction {
-                drafts: vec![self.event(
+            "Stop" => {
+                let turn_key = string_field(payload, "turn_id")
+                    .map(bounded_identifier)
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or_else(|| occurred_at_epoch_ms.to_string());
+                let mut drafts = Vec::with_capacity(2);
+                if let Some(text) =
+                    string_field(payload, "last_assistant_message").filter(|text| !text.is_empty())
+                {
+                    drafts.push(self.event(
+                        occurred_at_epoch_ms,
+                        SemanticEventKind::AssistantMessage {
+                            message_id: turn_key.clone(),
+                            text: bounded_hook_text(text),
+                            streaming: false,
+                        },
+                        SemanticRetention::Canonical,
+                        format!("codex-hook:assistant:{session_id}:{turn_key}"),
+                    ));
+                }
+                drafts.push(self.event(
                     occurred_at_epoch_ms,
                     SemanticEventKind::Status {
                         state: "idle".to_string(),
                         detail: None,
                     },
                     SemanticRetention::Canonical,
-                    format!("codex-hook:turn-status:{session_id}"),
-                )],
-                session_binding: None,
-            },
+                    format!("codex-hook:turn-status:{session_id}:{turn_key}"),
+                ));
+                CodexHookReduction {
+                    drafts,
+                    session_binding: None,
+                }
+            }
             _ => CodexHookReduction::default(),
         }
     }
@@ -191,7 +251,9 @@ impl CodexHookReducer {
         let Some(tool_use_id) = string_field(payload, "tool_use_id").map(bounded_identifier) else {
             return CodexHookReduction::default();
         };
-        let tool_name = string_field(payload, "tool_name").unwrap_or("Tool");
+        let tool_name = string_field(payload, "tool_name")
+            .map(|name| bounded_tool_name(name, "Tool"))
+            .unwrap_or_else(|| "Tool".to_string());
         let current = self
             .tool_states
             .get(&tool_use_id)
@@ -211,7 +273,7 @@ impl CodexHookReducer {
                 occurred_at_epoch_ms,
                 SemanticEventKind::Tool {
                     tool_id: tool_use_id.clone(),
-                    name: tool_name.to_string(),
+                    name: tool_name,
                     state: requested,
                     summary: tool_input_summary(payload),
                 },
@@ -230,6 +292,7 @@ impl CodexHookReducer {
         deduplication_key: String,
     ) -> SemanticEventDraft {
         SemanticEventDraft {
+            subagent_id: None,
             stable_session_key: self.stable_session_key.clone(),
             occurred_at_epoch_ms,
             source: SemanticSource::Codex,
@@ -262,17 +325,81 @@ fn unix_epoch_ms() -> u64 {
         .min(u128::from(u64::MAX)) as u64
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct CodexHookRegistration {
-    pub nonce: String,
-    pub stable_session_key: StableSessionKey,
-    pub generation: u64,
+    pub(crate) nonce: String,
+    pub(crate) stable_session_key: StableSessionKey,
+    pub(crate) generation: u64,
+}
+
+impl fmt::Debug for CodexHookRegistration {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CodexHookRegistration")
+            .field("generation", &self.generation)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Registry-issued launch authority. Production callers cannot mint the
+/// enclosed nonce or generation; dropping an unused permit unregisters it.
+pub struct CodexLaunchPermit {
+    registry: Arc<CodexHookRegistry>,
+    registration: CodexHookRegistration,
+    task_id: TaskId,
+    agent_session_id: AgentSessionId,
+    process_root: ManagedProcessId,
+    live: bool,
+}
+
+impl fmt::Debug for CodexLaunchPermit {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CodexLaunchPermit")
+            .field("generation", &self.registration.generation)
+            .field("live", &self.live)
+            .finish_non_exhaustive()
+    }
+}
+
+impl CodexLaunchPermit {
+    pub(crate) fn registration(&self) -> &CodexHookRegistration {
+        &self.registration
+    }
+
+    pub(crate) fn registry(&self) -> Arc<CodexHookRegistry> {
+        Arc::clone(&self.registry)
+    }
+
+    pub(crate) fn task_id(&self) -> TaskId {
+        self.task_id
+    }
+
+    pub(crate) fn agent_session_id(&self) -> AgentSessionId {
+        self.agent_session_id
+    }
+
+    pub(crate) fn process_root(&self) -> ManagedProcessId {
+        self.process_root
+    }
+
+    pub(crate) fn into_registration(mut self) -> CodexHookRegistration {
+        self.live = false;
+        self.registration.clone()
+    }
+}
+
+impl Drop for CodexLaunchPermit {
+    fn drop(&mut self) {
+        if self.live {
+            self.registry.unregister(&self.registration.nonce);
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
 pub enum CodexRegistryEvent {
     Semantic(SemanticEventDraft),
     SessionStarted(CodexSessionBinding),
+    ExactResumeFailed,
 }
 
 pub type CodexRegistryEventHandler =
@@ -286,10 +413,80 @@ pub enum CodexRelayIngestStatus {
     Malformed,
 }
 
+/// The registry's authenticated observation of one exact relay request.
+///
+/// The body digest and current registration are intentionally private. A
+/// caller may inspect the status, but admission must consume this value with
+/// the same body that the relay authenticated; a status cannot be paired with
+/// a different payload or launch generation.
+pub struct CodexRelayIngestObservation {
+    status: CodexRelayIngestStatus,
+    body_digest: Option<[u8; 32]>,
+    registration: Option<CodexHookRegistration>,
+    occurred_at_epoch_ms: u64,
+}
+
+impl fmt::Debug for CodexRelayIngestObservation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CodexRelayIngestObservation")
+            .field("status", &self.status)
+            .field("authenticated", &self.registration.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq<CodexRelayIngestStatus> for CodexRelayIngestObservation {
+    fn eq(&self, other: &CodexRelayIngestStatus) -> bool {
+        self.status == *other
+    }
+}
+
+impl CodexRelayIngestObservation {
+    fn new(
+        status: CodexRelayIngestStatus,
+        body: &[u8],
+        registration: Option<CodexHookRegistration>,
+        occurred_at_epoch_ms: u64,
+    ) -> Self {
+        Self {
+            status,
+            body_digest: (body.len() <= MAX_CODEX_HOOK_BODY_BYTES)
+                .then(|| Sha256::digest(body).into()),
+            registration,
+            occurred_at_epoch_ms,
+        }
+    }
+
+    pub const fn status(&self) -> CodexRelayIngestStatus {
+        self.status
+    }
+
+    pub(crate) fn authenticates(&self, registration: &CodexHookRegistration, body: &[u8]) -> bool {
+        self.status == CodexRelayIngestStatus::Accepted
+            && self.registration.as_ref().is_some_and(|current| {
+                current.nonce == registration.nonce
+                    && current.stable_session_key == registration.stable_session_key
+                    && current.generation == registration.generation
+            })
+            && self.body_digest.is_some_and(|digest| {
+                let computed: [u8; 32] = Sha256::digest(body).into();
+                computed == digest
+            })
+    }
+}
+
 struct RegisteredCodexSession {
     stable_session_key: StableSessionKey,
     generation: u64,
     reducer: CodexHookReducer,
+    /// The provider-issued conversation identity for this exact launch
+    /// generation. It is deliberately write-once: a PTY/relay nonce is not a
+    /// substitute for the provider's SessionStart identity.
+    provider_session_id: Option<ProviderSessionId>,
+    /// Exact provider identity requested by a resume launch. This remains
+    /// separate from `provider_session_id`: an expected identity is not a
+    /// provider-confirmed binding until the correlated SessionStart arrives.
+    expected_provider_session_id: Option<ProviderSessionId>,
 }
 
 struct CodexRegistryState {
@@ -299,12 +496,33 @@ struct CodexRegistryState {
     latest_generation_by_key: HashMap<StableSessionKey, u64>,
 }
 
+fn registration_is_current(state: &CodexRegistryState, expected: &CodexHookRegistration) -> bool {
+    let Some(session) = state.registrations.get(&expected.nonce) else {
+        return false;
+    };
+    session.generation == expected.generation
+        && session.stable_session_key == expected.stable_session_key
+        && state
+            .latest_generation_by_key
+            .get(&session.stable_session_key)
+            == Some(&session.generation)
+}
+
+fn session_is_current(state: &CodexRegistryState, session: &RegisteredCodexSession) -> bool {
+    state
+        .latest_generation_by_key
+        .get(&session.stable_session_key)
+        == Some(&session.generation)
+}
+
 /// Nonce- and generation-fenced ingest for Codex hook relay payloads.
 /// Superseded registrations (an older launch of the same session key) are
 /// rejected so a stale relaunch can never publish into the newer session.
 ///
-/// The registered event handler is invoked while a publication read-guard is
-/// held: it must not call back into the registry.
+/// Normal admitted events invoke the registered handler while a publication
+/// read-guard is held, so those callbacks must not call back into the registry.
+/// An exact-resume mismatch is terminal and publishes only after releasing the
+/// gate, allowing its owner to unregister and settle the rejected generation.
 pub struct CodexHookRegistry {
     publication_gate: std::sync::RwLock<()>,
     state: std::sync::Mutex<CodexRegistryState>,
@@ -333,9 +551,17 @@ impl CodexHookRegistry {
         }
     }
 
-    pub fn register(
+    pub(crate) fn register(
         &self,
         stable_session_key: StableSessionKey,
+    ) -> Result<CodexHookRegistration, String> {
+        self.register_expected(stable_session_key, None)
+    }
+
+    pub(crate) fn register_expected(
+        &self,
+        stable_session_key: StableSessionKey,
+        expected_provider_session_id: Option<ProviderSessionId>,
     ) -> Result<CodexHookRegistration, String> {
         let _publication = self
             .publication_gate
@@ -349,7 +575,17 @@ impl CodexHookRegistry {
             let Some(oldest) = state.order.pop_front() else {
                 break;
             };
-            state.registrations.remove(&oldest);
+            if let Some(removed) = state.registrations.remove(&oldest) {
+                if state
+                    .latest_generation_by_key
+                    .get(&removed.stable_session_key)
+                    == Some(&removed.generation)
+                {
+                    state
+                        .latest_generation_by_key
+                        .remove(&removed.stable_session_key);
+                }
+            }
         }
         let nonce = loop {
             let candidate = random_codex_nonce()?;
@@ -372,6 +608,8 @@ impl CodexHookRegistry {
                 stable_session_key: stable_session_key.clone(),
                 generation,
                 reducer: CodexHookReducer::new(stable_session_key.clone()),
+                provider_session_id: None,
+                expected_provider_session_id,
             },
         );
         Ok(CodexHookRegistration {
@@ -381,7 +619,81 @@ impl CodexHookRegistry {
         })
     }
 
-    pub fn unregister(&self, nonce: &str) -> Option<StableSessionKey> {
+    pub fn issue_launch_permit(
+        registry: Arc<Self>,
+        task_id: TaskId,
+        agent_session_id: AgentSessionId,
+        process_root: ManagedProcessId,
+    ) -> Result<CodexLaunchPermit, String> {
+        let registration =
+            registry.register(StableSessionKey::from_tab(agent_session_id.to_string()))?;
+        if registration.generation == 0 || registration.nonce.is_empty() {
+            registry.unregister(&registration.nonce);
+            return Err("Codex launch permit rejected empty nonce or zero generation".to_string());
+        }
+        Ok(CodexLaunchPermit {
+            registry,
+            registration,
+            task_id,
+            agent_session_id,
+            process_root,
+            live: true,
+        })
+    }
+
+    pub(crate) fn current_registration(&self, nonce: &str) -> Option<CodexHookRegistration> {
+        let _publication = self.publication_gate.read().ok()?;
+        let state = self.state.lock().ok()?;
+        let session = state.registrations.get(nonce)?;
+        if !session_is_current(&state, session) {
+            return None;
+        }
+        Some(CodexHookRegistration {
+            nonce: nonce.to_string(),
+            stable_session_key: session.stable_session_key.clone(),
+            generation: session.generation,
+        })
+    }
+
+    /// Return the identity already accepted for one live nonce. This is a
+    /// read-only adapter seam used to preserve the adapter's typed
+    /// AlreadyBound/Replay errors while the registry independently rejects a
+    /// mismatched SessionStart before publication.
+    pub(crate) fn bound_provider_session_id(&self, nonce: &str) -> Option<String> {
+        let _publication = self.publication_gate.read().ok()?;
+        let state = self.state.lock().ok()?;
+        let session = state.registrations.get(nonce)?;
+        session
+            .provider_session_id
+            .as_ref()
+            .map(|id| id.as_str().to_string())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_live_registration<T>(
+        &self,
+        expected: &CodexHookRegistration,
+        operation: impl FnOnce() -> T,
+    ) -> Option<T> {
+        let _publication = self.publication_gate.read().ok()?;
+        let state = self.state.lock().ok()?;
+        if !registration_is_current(&state, expected) {
+            return None;
+        }
+        Some(operation())
+    }
+
+    pub(crate) fn has_live_registrations(&self) -> bool {
+        let Ok(state) = self.state.lock() else {
+            return false;
+        };
+        state
+            .registrations
+            .values()
+            .any(|session| session_is_current(&state, session))
+    }
+
+    pub(crate) fn unregister(&self, nonce: &str) -> Option<StableSessionKey> {
         let _publication = self.publication_gate.write().ok()?;
         let mut state = self.state.lock().ok()?;
         let removed = state.registrations.remove(nonce)?;
@@ -398,69 +710,234 @@ impl CodexHookRegistry {
         Some(removed.stable_session_key)
     }
 
-    pub fn ingest(
+    pub(crate) fn observe_ingest(
         &self,
         peer: std::net::SocketAddr,
         nonce: &str,
         body: &[u8],
         occurred_at_epoch_ms: u64,
-    ) -> CodexRelayIngestStatus {
+    ) -> CodexRelayIngestObservation {
         if !peer.ip().is_loopback() {
-            return CodexRelayIngestStatus::Rejected;
+            return CodexRelayIngestObservation::new(
+                CodexRelayIngestStatus::Rejected,
+                body,
+                None,
+                occurred_at_epoch_ms,
+            );
         }
         if body.len() > MAX_CODEX_HOOK_BODY_BYTES {
-            return CodexRelayIngestStatus::BodyTooLarge;
+            return CodexRelayIngestObservation::new(
+                CodexRelayIngestStatus::BodyTooLarge,
+                body,
+                None,
+                occurred_at_epoch_ms,
+            );
         }
-        let Ok(payload) = serde_json::from_slice::<Value>(body) else {
-            return CodexRelayIngestStatus::Malformed;
+        if serde_json::from_slice::<Value>(body).is_err() {
+            return CodexRelayIngestObservation::new(
+                CodexRelayIngestStatus::Malformed,
+                body,
+                None,
+                occurred_at_epoch_ms,
+            );
         };
         let Ok(_publication) = self.publication_gate.read() else {
-            return CodexRelayIngestStatus::Rejected;
+            return CodexRelayIngestObservation::new(
+                CodexRelayIngestStatus::Rejected,
+                body,
+                None,
+                occurred_at_epoch_ms,
+            );
         };
-        let (registration, reduction) = {
-            let Ok(mut state) = self.state.lock() else {
-                return CodexRelayIngestStatus::Rejected;
+        let registration = {
+            let Ok(state) = self.state.lock() else {
+                return CodexRelayIngestObservation::new(
+                    CodexRelayIngestStatus::Rejected,
+                    body,
+                    None,
+                    occurred_at_epoch_ms,
+                );
             };
-            let latest = {
-                let Some(session) = state.registrations.get(nonce) else {
-                    return CodexRelayIngestStatus::Rejected;
-                };
-                state
-                    .latest_generation_by_key
-                    .get(&session.stable_session_key)
-                    == Some(&session.generation)
+            let Some(session) = state.registrations.get(nonce) else {
+                return CodexRelayIngestObservation::new(
+                    CodexRelayIngestStatus::Rejected,
+                    body,
+                    None,
+                    occurred_at_epoch_ms,
+                );
             };
-            if !latest {
-                state.registrations.remove(nonce);
-                state.order.retain(|candidate| candidate != nonce);
-                return CodexRelayIngestStatus::Rejected;
+            if !session_is_current(&state, session) {
+                return CodexRelayIngestObservation::new(
+                    CodexRelayIngestStatus::Rejected,
+                    body,
+                    None,
+                    occurred_at_epoch_ms,
+                );
             }
-            let Some(session) = state.registrations.get_mut(nonce) else {
-                return CodexRelayIngestStatus::Rejected;
-            };
-            let registration = CodexHookRegistration {
+            CodexHookRegistration {
                 nonce: nonce.to_string(),
                 stable_session_key: session.stable_session_key.clone(),
                 generation: session.generation,
-            };
-            (
-                registration,
-                session.reducer.apply_json(&payload, occurred_at_epoch_ms),
-            )
+            }
         };
+        CodexRelayIngestObservation::new(
+            CodexRelayIngestStatus::Accepted,
+            body,
+            Some(registration),
+            occurred_at_epoch_ms,
+        )
+    }
+
+    pub(crate) fn admit_and_publish<T, E>(
+        &self,
+        expected: &CodexHookRegistration,
+        observation: &CodexRelayIngestObservation,
+        body: &[u8],
+        operation: impl FnOnce() -> Result<T, E>,
+    ) -> Result<Option<T>, E> {
+        if !observation.authenticates(expected, body) {
+            return Ok(None);
+        }
+        let Ok(payload) = serde_json::from_slice::<Value>(body) else {
+            return Ok(None);
+        };
+        let Ok(_publication) = self.publication_gate.read() else {
+            return Ok(None);
+        };
+        let Ok(mut state) = self.state.lock() else {
+            return Ok(None);
+        };
+        if !registration_is_current(&state, expected) {
+            return Ok(None);
+        }
+        let Some(session) = state.registrations.get_mut(&expected.nonce) else {
+            return Ok(None);
+        };
+        match provider_identity_admission(session, &payload) {
+            ProviderIdentityAdmission::Admit => {}
+            ProviderIdentityAdmission::Reject => return Ok(None),
+            ProviderIdentityAdmission::ExactResumeMismatch => {
+                drop(state);
+                drop(_publication);
+                let handler = self.event_handler.read().ok().and_then(|slot| slot.clone());
+                if let Some(handler) = handler {
+                    handler(expected.clone(), CodexRegistryEvent::ExactResumeFailed);
+                }
+                return Ok(None);
+            }
+        }
+        // The publication read-lock and registry state lock remain held while
+        // the adapter commits its identity decision. The operation must only
+        // mutate adapter-local state; registry callbacks would deadlock.
+        let admitted = operation()?;
+        if let Some(provider_session_id) = session_start_provider_session_id(&payload) {
+            // `admit_provider_identity` has already checked the existing
+            // value. Commit only after the adapter operation succeeds, so a
+            // failed/stale adapter admission cannot poison this generation.
+            if session.provider_session_id.is_none() {
+                session.provider_session_id = Some(provider_session_id);
+            }
+        }
+        let reduction = session
+            .reducer
+            .apply_json(&payload, observation.occurred_at_epoch_ms);
+        drop(state);
         let handler = self.event_handler.read().ok().and_then(|slot| slot.clone());
         if let Some(handler) = handler {
             if let Some(binding) = reduction.session_binding {
                 handler(
-                    registration.clone(),
+                    expected.clone(),
                     CodexRegistryEvent::SessionStarted(binding),
                 );
             }
             for draft in reduction.drafts {
-                handler(registration.clone(), CodexRegistryEvent::Semantic(draft));
+                handler(expected.clone(), CodexRegistryEvent::Semantic(draft));
             }
         }
-        CodexRelayIngestStatus::Accepted
+        Ok(Some(admitted))
+    }
+
+    pub(crate) fn ingest(
+        &self,
+        peer: std::net::SocketAddr,
+        nonce: &str,
+        body: &[u8],
+        occurred_at_epoch_ms: u64,
+    ) -> CodexRelayIngestObservation {
+        let observation = self.observe_ingest(peer, nonce, body, occurred_at_epoch_ms);
+        let Some(registration) = observation.registration.clone() else {
+            return observation;
+        };
+        match self.admit_and_publish(&registration, &observation, body, || {
+            Ok::<(), std::convert::Infallible>(())
+        }) {
+            Ok(Some(())) => observation,
+            _ => CodexRelayIngestObservation::new(
+                CodexRelayIngestStatus::Rejected,
+                body,
+                None,
+                occurred_at_epoch_ms,
+            ),
+        }
+    }
+}
+
+fn session_start_provider_session_id(payload: &Value) -> Option<ProviderSessionId> {
+    (string_field(payload, "hook_event_name") == Some("SessionStart"))
+        .then(|| string_field(payload, "session_id"))
+        .flatten()
+        .and_then(|raw| ProviderSessionId::new(raw.to_string()).ok())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProviderIdentityAdmission {
+    Admit,
+    Reject,
+    ExactResumeMismatch,
+}
+
+fn provider_identity_admission(
+    session: &RegisteredCodexSession,
+    payload: &Value,
+) -> ProviderIdentityAdmission {
+    let event_name = string_field(payload, "hook_event_name");
+    if event_name == Some("SessionStart") {
+        let Some(observed) = session_start_provider_session_id(payload) else {
+            return ProviderIdentityAdmission::Reject;
+        };
+        if let Some(bound) = session.provider_session_id.as_ref() {
+            return if bound == &observed {
+                ProviderIdentityAdmission::Admit
+            } else {
+                ProviderIdentityAdmission::Reject
+            };
+        }
+        if session
+            .expected_provider_session_id
+            .as_ref()
+            .is_some_and(|expected| expected != &observed)
+        {
+            return ProviderIdentityAdmission::ExactResumeMismatch;
+        }
+        return ProviderIdentityAdmission::Admit;
+    }
+
+    // Known semantic events must carry the exact identity already established
+    // by SessionStart. Unknown provider events remain redacted by the adapter
+    // and do not cross this identity boundary.
+    if !event_name.is_some_and(|name| CODEX_HOOK_EVENTS.contains(&name)) {
+        return ProviderIdentityAdmission::Admit;
+    }
+    let Some(bound) = session.provider_session_id.as_ref() else {
+        return ProviderIdentityAdmission::Reject;
+    };
+    if string_field(payload, "session_id")
+        .and_then(|raw| ProviderSessionId::new(raw.to_string()).ok())
+        .is_some_and(|observed| observed.as_str() == bound.as_str())
+    {
+        ProviderIdentityAdmission::Admit
+    } else {
+        ProviderIdentityAdmission::Reject
     }
 }
 
@@ -548,7 +1025,10 @@ async fn handle_codex_hook(
     else {
         return axum::http::StatusCode::UNAUTHORIZED;
     };
-    match registry.ingest(peer, nonce, &body, unix_epoch_ms()) {
+    match registry
+        .ingest(peer, nonce, &body, unix_epoch_ms())
+        .status()
+    {
         CodexRelayIngestStatus::Accepted | CodexRelayIngestStatus::Malformed => {
             axum::http::StatusCode::NO_CONTENT
         }
@@ -635,6 +1115,33 @@ pub fn build_codex_hooks_command(
     if tokens.is_empty() {
         return Err("Codex command is empty".to_string());
     }
+    for override_value in config {
+        tokens.push("--config".to_string());
+        tokens.push(override_value.argument());
+    }
+    tokens.extend(codex_hook_argument_tokens(
+        devmanager_executable,
+        endpoint,
+        nonce,
+    )?);
+    Ok(crate::ai::codex_cli::quote_command_for_shell(
+        &tokens,
+        shell_program,
+    ))
+}
+
+/// Stock CLI argv suffix that registers the authenticated loopback relay.
+pub fn codex_hook_argument_tokens(
+    devmanager_executable: &std::path::Path,
+    endpoint: &str,
+    nonce: &str,
+) -> Result<Vec<String>, String> {
+    if !is_valid_loopback_relay_url_for(endpoint, CODEX_HOOK_RELAY_PATH) {
+        return Err("Codex hook relay endpoint is not an exact loopback URL".to_string());
+    }
+    if nonce.is_empty() || !nonce.chars().all(|character| character.is_ascii_hexdigit()) {
+        return Err("Codex hook relay nonce must be non-empty hex".to_string());
+    }
     // Codex runs hook commands through a shell; double quotes around the
     // executable path are safe on cmd, PowerShell, and sh alike.
     // Forward-slash the relay executable only: Windows backslashes become
@@ -649,20 +1156,14 @@ pub fn build_codex_hooks_command(
         "& '{}' codex-hook-relay --url {endpoint} --nonce {nonce}",
         relay_executable.replace('\'', "''")
     );
-    for override_value in config {
-        tokens.push("--config".to_string());
-        tokens.push(override_value.argument());
-    }
+    let mut tokens = Vec::new();
     for event in CODEX_HOOK_EVENTS {
         let override_value = codex_hook_override(event, &relay_command, &relay_command_windows);
         tokens.push("-c".to_string());
         tokens.push(override_value);
     }
     tokens.push(CODEX_HOOK_TRUST_FLAG.to_string());
-    Ok(crate::ai::codex_cli::quote_command_for_shell(
-        &tokens,
-        shell_program,
-    ))
+    Ok(tokens)
 }
 
 fn codex_hook_override(event: &str, command: &str, command_windows: &str) -> String {
@@ -758,7 +1259,7 @@ mod reducer_tests {
         let mut reducer = test_reducer();
         let payload = serde_json::json!({
             "session_id": "019f-abc", "cwd": "C:\\proj",
-            "transcript_path": "C:\\Users\\u\\.codex\\sessions\\2026\\07\\17\\rollout-x.jsonl",
+            "transcript_path": std::env::temp_dir().join("sessions").join("rollout-x.jsonl"),
             "hook_event_name": "SessionStart", "model": "gpt-5",
             "permission_mode": "danger-full-access"
         });
@@ -862,12 +1363,33 @@ mod reducer_tests {
     }
 
     #[test]
-    fn stop_produces_idle_status() {
+    fn stop_produces_last_assistant_message_before_idle_status() {
+        let mut reducer = test_reducer();
+        let payload = serde_json::json!({
+            "session_id": "s", "hook_event_name": "Stop",
+            "turn_id": "turn-1",
+            "last_assistant_message": "The fix is complete."
+        });
+        let out = reducer.apply_json(&payload, 1);
+        assert!(matches!(
+            &out.drafts[0].kind,
+            SemanticEventKind::AssistantMessage { text, streaming, .. }
+                if text == "The fix is complete." && !streaming
+        ));
+        assert!(matches!(
+            &out.drafts[1].kind,
+            SemanticEventKind::Status { state, .. } if state == "idle"
+        ));
+    }
+
+    #[test]
+    fn stop_without_assistant_message_still_produces_idle_status() {
         let mut reducer = test_reducer();
         let payload = serde_json::json!({
             "session_id": "s", "hook_event_name": "Stop"
         });
         let out = reducer.apply_json(&payload, 1);
+        assert_eq!(out.drafts.len(), 1);
         assert!(matches!(
             &out.drafts[0].kind,
             SemanticEventKind::Status { state, .. } if state == "idle"
@@ -899,6 +1421,37 @@ mod reducer_tests {
             SemanticEventKind::Tool { summary, .. } => {
                 assert!(summary.len() <= MAX_CODEX_HOOK_TEXT_BYTES);
                 assert!(summary.ends_with("[truncated by DevManager]"));
+            }
+            other => panic!("expected tool, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn semantic_storage_bounds_tool_name_and_session_paths() {
+        let mut reducer = test_reducer();
+        let oversized_path = "x".repeat(MAX_CODEX_HOOK_TEXT_BYTES + 1);
+        let binding_payload = serde_json::json!({
+            "session_id": "s", "hook_event_name": "SessionStart",
+            "cwd": oversized_path,
+            "transcript_path": oversized_path
+        });
+        let binding = reducer
+            .apply_json(&binding_payload, 1)
+            .session_binding
+            .expect("session binding");
+        assert!(binding.cwd.as_os_str().is_empty());
+        assert!(binding.transcript_path.is_none());
+
+        let oversized_tool = "tool-".to_string() + &"x".repeat(MAX_CODEX_HOOK_TEXT_BYTES);
+        let tool_payload = serde_json::json!({
+            "session_id": "s", "hook_event_name": "PreToolUse",
+            "tool_name": oversized_tool, "tool_use_id": "call-bounded",
+            "tool_input": {}
+        });
+        let out = reducer.apply_json(&tool_payload, 2);
+        match &out.drafts[0].kind {
+            SemanticEventKind::Tool { name, .. } => {
+                assert!(name.len() <= MAX_CODEX_TOOL_NAME_BYTES);
             }
             other => panic!("expected tool, got {other:?}"),
         }
@@ -942,9 +1495,24 @@ mod registry_tests {
         let _events = collecting_handler(&registry);
         let _registration = registry.register(StableSessionKey::from_tab("t1")).unwrap();
         assert_eq!(
-            registry.ingest(loopback_peer(), "deadbeef", &session_start_body("s"), 1),
+            registry
+                .ingest(loopback_peer(), "deadbeef", &session_start_body("s"), 1)
+                .status(),
             CodexRelayIngestStatus::Rejected
         );
+    }
+
+    #[test]
+    fn latest_generation_index_is_bounded_with_registration_eviction() {
+        let registry = CodexHookRegistry::default();
+        for index in 0..(MAX_CODEX_REGISTRATIONS + 32) {
+            registry
+                .register(StableSessionKey::from_tab(format!("tab-{index}")))
+                .unwrap();
+        }
+        let state = registry.state.lock().unwrap();
+        assert!(state.registrations.len() <= MAX_CODEX_REGISTRATIONS);
+        assert!(state.latest_generation_by_key.len() <= MAX_CODEX_REGISTRATIONS);
     }
 
     #[test]
@@ -954,12 +1522,14 @@ mod registry_tests {
         let registration = registry.register(StableSessionKey::from_tab("t1")).unwrap();
         registry.unregister(&registration.nonce);
         assert_eq!(
-            registry.ingest(
-                loopback_peer(),
-                &registration.nonce,
-                &session_start_body("s"),
-                1
-            ),
+            registry
+                .ingest(
+                    loopback_peer(),
+                    &registration.nonce,
+                    &session_start_body("s"),
+                    1
+                )
+                .status(),
             CodexRelayIngestStatus::Rejected
         );
     }
@@ -971,17 +1541,21 @@ mod registry_tests {
         let first = registry.register(StableSessionKey::from_tab("t1")).unwrap();
         let second = registry.register(StableSessionKey::from_tab("t1")).unwrap();
         assert_eq!(
-            registry.ingest(loopback_peer(), &first.nonce, &session_start_body("old"), 1),
+            registry
+                .ingest(loopback_peer(), &first.nonce, &session_start_body("old"), 1)
+                .status(),
             CodexRelayIngestStatus::Rejected
         );
         assert!(events.lock().unwrap().is_empty());
         assert_eq!(
-            registry.ingest(
-                loopback_peer(),
-                &second.nonce,
-                &session_start_body("new"),
-                2
-            ),
+            registry
+                .ingest(
+                    loopback_peer(),
+                    &second.nonce,
+                    &session_start_body("new"),
+                    2
+                )
+                .status(),
             CodexRelayIngestStatus::Accepted
         );
         let published = events.lock().unwrap();
@@ -996,12 +1570,14 @@ mod registry_tests {
         let events = collecting_handler(&registry);
         let registration = registry.register(StableSessionKey::from_tab("t1")).unwrap();
         assert_eq!(
-            registry.ingest(
-                loopback_peer(),
-                &registration.nonce,
-                &session_start_body("s-9"),
-                1
-            ),
+            registry
+                .ingest(
+                    loopback_peer(),
+                    &registration.nonce,
+                    &session_start_body("s-9"),
+                    1
+                )
+                .status(),
             CodexRelayIngestStatus::Accepted
         );
         let published = events.lock().unwrap();
@@ -1015,17 +1591,183 @@ mod registry_tests {
     }
 
     #[test]
+    fn session_start_identity_is_write_once_and_generation_scoped() {
+        let registry = CodexHookRegistry::default();
+        let events = collecting_handler(&registry);
+        let registration = registry.register(StableSessionKey::from_tab("t1")).unwrap();
+        assert_eq!(
+            registry
+                .ingest(
+                    loopback_peer(),
+                    &registration.nonce,
+                    &session_start_body("first"),
+                    1,
+                )
+                .status(),
+            CodexRelayIngestStatus::Accepted
+        );
+        assert_eq!(
+            registry
+                .ingest(
+                    loopback_peer(),
+                    &registration.nonce,
+                    &session_start_body("different"),
+                    2,
+                )
+                .status(),
+            CodexRelayIngestStatus::Rejected
+        );
+        assert_eq!(
+            registry
+                .bound_provider_session_id(&registration.nonce)
+                .as_deref(),
+            Some("first")
+        );
+        assert_eq!(
+            events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(_, event)| matches!(event, CodexRegistryEvent::SessionStarted(_)))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn exact_resume_mismatch_is_rejected_and_reported_without_binding() {
+        let registry = CodexHookRegistry::default();
+        let events = collecting_handler(&registry);
+        let expected = ProviderSessionId::new("expected-conversation").unwrap();
+        let registration = registry
+            .register_expected(StableSessionKey::from_tab("t1"), Some(expected))
+            .unwrap();
+
+        assert_eq!(
+            registry
+                .ingest(
+                    loopback_peer(),
+                    &registration.nonce,
+                    &session_start_body("different-conversation"),
+                    1,
+                )
+                .status(),
+            CodexRelayIngestStatus::Rejected
+        );
+        assert_eq!(
+            registry.bound_provider_session_id(&registration.nonce),
+            None
+        );
+        assert!(events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(_, event)| matches!(event, CodexRegistryEvent::ExactResumeFailed)));
+    }
+
+    #[test]
+    fn exact_resume_matching_session_start_becomes_the_confirmed_binding() {
+        let registry = CodexHookRegistry::default();
+        let events = collecting_handler(&registry);
+        let expected = ProviderSessionId::new("expected-conversation").unwrap();
+        let registration = registry
+            .register_expected(StableSessionKey::from_tab("t1"), Some(expected))
+            .unwrap();
+
+        assert_eq!(
+            registry
+                .ingest(
+                    loopback_peer(),
+                    &registration.nonce,
+                    &session_start_body("expected-conversation"),
+                    1,
+                )
+                .status(),
+            CodexRelayIngestStatus::Accepted
+        );
+        assert_eq!(
+            registry
+                .bound_provider_session_id(&registration.nonce)
+                .as_deref(),
+            Some("expected-conversation")
+        );
+        assert!(events.lock().unwrap().iter().any(|(_, event)| matches!(
+            event,
+            CodexRegistryEvent::SessionStarted(binding)
+                if binding.session_id == "expected-conversation"
+        )));
+    }
+
+    #[test]
+    fn session_start_missing_or_invalid_identity_is_rejected() {
+        let registry = CodexHookRegistry::default();
+        let registration = registry.register(StableSessionKey::from_tab("t1")).unwrap();
+        for body in [
+            br#"{"hook_event_name":"SessionStart"}"#.to_vec(),
+            br#"{"hook_event_name":"SessionStart","session_id":" "}"#.to_vec(),
+            br#"{"hook_event_name":"SessionStart","session_id":"bad\nid"}"#.to_vec(),
+        ] {
+            assert_eq!(
+                registry
+                    .ingest(loopback_peer(), &registration.nonce, &body, 1)
+                    .status(),
+                CodexRelayIngestStatus::Rejected
+            );
+        }
+        assert_eq!(
+            registry.bound_provider_session_id(&registration.nonce),
+            None
+        );
+    }
+
+    #[test]
+    fn known_semantic_event_must_match_bound_identity() {
+        let registry = CodexHookRegistry::default();
+        let registration = registry.register(StableSessionKey::from_tab("t1")).unwrap();
+        assert_eq!(
+            registry
+                .ingest(
+                    loopback_peer(),
+                    &registration.nonce,
+                    &session_start_body("bound"),
+                    1,
+                )
+                .status(),
+            CodexRelayIngestStatus::Accepted
+        );
+        let different = serde_json::json!({
+            "hook_event_name": "UserPromptSubmit",
+            "session_id": "other",
+            "prompt": "do not cross the boundary"
+        })
+        .to_string();
+        assert_eq!(
+            registry
+                .ingest(
+                    loopback_peer(),
+                    &registration.nonce,
+                    different.as_bytes(),
+                    2,
+                )
+                .status(),
+            CodexRelayIngestStatus::Rejected
+        );
+    }
+
+    #[test]
     fn non_loopback_peer_is_rejected() {
         let registry = CodexHookRegistry::default();
         let registration = registry.register(StableSessionKey::from_tab("t1")).unwrap();
         let remote_peer: std::net::SocketAddr = "10.0.0.9:5555".parse().unwrap();
         assert_eq!(
-            registry.ingest(
-                remote_peer,
-                &registration.nonce,
-                &session_start_body("s"),
-                1
-            ),
+            registry
+                .ingest(
+                    remote_peer,
+                    &registration.nonce,
+                    &session_start_body("s"),
+                    1
+                )
+                .status(),
             CodexRelayIngestStatus::Rejected
         );
     }

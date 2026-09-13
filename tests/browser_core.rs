@@ -149,8 +149,14 @@ fn browser_session_normalization_preserves_only_ai_workspaces() {
 fn browser_enabled_uses_the_platform_default_for_legacy_settings() {
     let legacy: Settings = serde_json::from_str("{}").expect("legacy settings");
 
-    assert_eq!(Settings::default().browser_enabled, cfg!(windows));
-    assert_eq!(legacy.browser_enabled, cfg!(windows));
+    assert_eq!(
+        Settings::default().browser_enabled,
+        cfg!(any(windows, target_os = "linux"))
+    );
+    assert_eq!(
+        legacy.browser_enabled,
+        cfg!(any(windows, target_os = "linux"))
+    );
 }
 
 #[test]
@@ -371,7 +377,11 @@ fn browser_error_taxonomy_is_serializable_and_displayable() {
         let json = serde_json::to_string(&error).expect("serialize browser error");
         let round_trip: BrowserError =
             serde_json::from_str(&json).expect("round-trip browser error");
-        assert_eq!(round_trip, error);
+        assert_eq!(
+            serde_json::to_value(&round_trip).expect("serialize public round-trip error"),
+            serde_json::to_value(&error).expect("serialize public source error"),
+            "the public BrowserError wire contract must round-trip even when sensitive internals are redacted"
+        );
     }
 }
 
@@ -674,7 +684,7 @@ fn browser_recipe_direct_serialization_rejects_secret_defaults() {
 
     let error = serde_json::to_string(&recipe).expect_err("secret default must be rejected");
     let message = error.to_string();
-    assert!(message.contains("secret input default"));
+    assert!(message.contains("browser recipe is invalid"));
     assert!(!message.contains("must-not-be-serialized"));
 }
 

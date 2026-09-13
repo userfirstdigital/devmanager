@@ -153,9 +153,7 @@ export async function readPushStatus(
   const value = (await response.json()) as unknown;
   const record = value as Record<string, unknown>;
   const enabled =
-    typeof record?.enabled === "boolean"
-      ? record.enabled
-      : record?.subscribed;
+    typeof record?.enabled === "boolean" ? record.enabled : record?.subscribed;
   if (
     value === null ||
     typeof value !== "object" ||
@@ -273,7 +271,9 @@ function decodeBase64Url(value: string): Uint8Array {
   if (decoded.length === 0) {
     throw new Error("The host returned an invalid notification key.");
   }
-  const bytes = Uint8Array.from(decoded, (character) => character.charCodeAt(0));
+  const bytes = Uint8Array.from(decoded, (character) =>
+    character.charCodeAt(0),
+  );
   if (bytes.length !== 65 || bytes[0] !== 4) {
     throw new Error("The host returned an invalid notification key.");
   }
@@ -354,7 +354,8 @@ async function registerHostSubscription(
 export async function reconcilePushNotificationsOnForeground(
   dependencies?: PushBrowserDependencies,
 ): Promise<PushStatus | null> {
-  if (!dependencies && !currentNotificationAvailability().supported) return null;
+  if (!dependencies && !currentNotificationAvailability().supported)
+    return null;
   const resolved = dependencies ?? browserDependencies();
   if (resolved.notification.permission !== "granted") return null;
   if (automaticReconciliation) return automaticReconciliation;
@@ -503,7 +504,9 @@ async function enablePushNotificationsNow(
 export async function disablePushNotifications(
   dependencies: PushBrowserDependencies = browserDependencies(),
 ): Promise<boolean> {
-  return serializePushOperation(() => disablePushNotificationsNow(dependencies));
+  return serializePushOperation(() =>
+    disablePushNotificationsNow(dependencies),
+  );
 }
 
 async function disablePushNotificationsNow(
@@ -571,12 +574,12 @@ export function notificationClickDestination(
   data: { route?: unknown; runtimeInstanceId?: unknown } | null | undefined,
   origin: string,
 ): string {
-  const sessions = new URL("/sessions", origin).href;
-  if (!isRuntimeInstanceId(data?.runtimeInstanceId)) return sessions;
+  const tasks = new URL("/tasks", origin).href;
+  if (!isRuntimeInstanceId(data?.runtimeInstanceId)) return tasks;
 
   const route = safeRoute(data?.route, origin);
-  if (!route.startsWith("/session/")) return sessions;
-  const destination = new URL("/sessions", origin);
+  if (!route.startsWith("/tasks/")) return tasks;
+  const destination = new URL("/tasks", origin);
   destination.searchParams.set(
     NOTIFICATION_RUNTIME_QUERY,
     data.runtimeInstanceId,

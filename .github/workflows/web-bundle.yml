@@ -6,8 +6,22 @@ on:
       - ".gitattributes"
       - ".github/workflows/web-bundle.yml"
       - "build.rs"
+      - "crates/connect-crypto/**"
+      - "packaging/package-contract.json"
+      - "packaging/exclusions.txt"
+      - "packaging/prepare-ci-checkout.py"
+      - "packaging/install-linux-build-dependencies.sh"
+      - "packaging/Assert-PackageContract.ps1"
+      - "packaging/Assert-StaleReferences.ps1"
+      - "packaging/Assert-ThirdPartyProvenance.ps1"
+      - "scripts/native-next/Invoke-CutoverAudit.ps1"
+      - "scripts/native-next/Invoke-ReleaseCandidate.ps1"
       - "src/remote/web/assets.rs"
       - "src/remote/web/mod.rs"
+      - "src/connect/envelope.rs"
+      - "src/connect/schema.rs"
+      - "src/protocol/crypto.rs"
+      - "src/protocol/envelope.rs"
       - "web/**"
 
 permissions:
@@ -15,12 +29,22 @@ permissions:
 
 env:
   RUST_TOOLCHAIN: "1.94.0"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+  CARGO_INCREMENTAL: "0"
 
 jobs:
   verify:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+
+      - name: Prepare isolated target and reviewed WASM inputs
+        run: python3 packaging/prepare-ci-checkout.py
+
+      - name: Install native dependencies for embedded-asset tests
+        run: sudo bash packaging/install-linux-build-dependencies.sh
 
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
@@ -46,12 +70,16 @@ jobs:
           npm --prefix web test
           npm --prefix web run typecheck
           npm --prefix web run build
-          if [ -n "$(git status --porcelain -- web/bundle)" ]; then
-            git status --short -- web/bundle
-            git diff -- web/bundle
+          if [ -n "$(GIT_OPTIONAL_LOCKS=0 git status --porcelain -- web/bundle)" ]; then
+            GIT_OPTIONAL_LOCKS=0 git status --short -- web/bundle
+            GIT_OPTIONAL_LOCKS=0 git diff -- web/bundle
             echo "Generated web/bundle differs from the tracked bundle." >&2
             exit 1
           fi
 
       - name: Validate embedded browser assets
-        run: cargo test --locked remote::web::assets --lib -j 1
+        run: cargo test --locked remote::web::assets --lib -j 2 -- --test-threads=1
+
+      - name: Check for owned process residue
+        if: always()
+        run: python3 packaging/assert-linux-process-clean.py

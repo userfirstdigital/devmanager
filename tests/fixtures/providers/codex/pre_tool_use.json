@@ -1,0 +1,6 @@
+{
+  "hook_event_name": "PreToolUse",
+  "session_id": "019f-fixture-codex-session",
+  "tool_name": "fixture_tool",
+  "tool_use_id": "tool-1"
+}

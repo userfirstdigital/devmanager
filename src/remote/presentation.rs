@@ -5,6 +5,9 @@ use alacritty_terminal::vte::{Parser, Perform};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
+use std::fs;
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 const DEFAULT_CANONICAL_EVENTS: usize = 50_000;
@@ -14,8 +17,12 @@ const DEFAULT_VERBOSE_BYTES: usize = 8 * 1024 * 1024;
 const DEFAULT_STORE_SESSIONS: usize = 256;
 const DEFAULT_STORE_BYTES: usize = 128 * 1024 * 1024;
 pub(crate) const MAX_SEMANTIC_EVENT_BYTES: usize = 64 * 1024;
-const AI_FALLBACK_SCREEN_DEDUP_KEY: &str = "ai-screen-fallback";
 const AI_FALLBACK_MAX_CHARS: usize = 12_288;
+const CONVERSATION_HISTORY_SCHEMA: &str = "devmanager.conversation-history/v1";
+pub const CONVERSATION_HISTORY_FILE_NAME: &str = "conversation-history.json";
+const MAX_PERSISTED_SESSIONS: usize = DEFAULT_STORE_SESSIONS;
+const MAX_PERSISTED_EVENTS_PER_SESSION: usize = DEFAULT_CANONICAL_EVENTS;
+const MAX_CONVERSATION_HISTORY_FILE_BYTES: usize = DEFAULT_STORE_BYTES;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -28,6 +35,21 @@ impl StableSessionKey {
 
     pub fn from_tab(tab_id: impl AsRef<str>) -> Self {
         Self(format!("tab:{}", tab_id.as_ref()))
+    }
+
+    /// The journal key for a sealed provider launch, which is keyed by
+    /// the kernel task rather than by a UI tab.
+    ///
+    /// This layer holds no `TaskId` on purpose, so the caller passes the
+    /// rendered id. It exists so the launch that WRITES a task's
+    /// transcript (`ProcessManager::prepare_sealed_provider_adapter`)
+    /// and the purge sweep that REMOVES it
+    /// (`HostRequestExecutor::forget_purged_task_host_state`) cannot
+    /// build different keys: a drift between the two would silently
+    /// leave a purged task's transcript in `conversation-history.json`
+    /// forever, with nothing to report it.
+    pub fn for_task(task_id: impl AsRef<str>) -> Self {
+        Self::from_tab(task_id)
     }
 
     pub fn resolve(runtime: &SessionRuntimeState, tabs: &[SessionTab]) -> Option<Self> {
@@ -164,6 +186,9 @@ pub struct SemanticEvent {
     pub sequence: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replaces_sequence: Option<u64>,
+    /// Provider-issued identity scoped to the correlated provider conversation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subagent_id: Option<String>,
     pub occurred_at_epoch_ms: u64,
     pub source: SemanticSource,
     #[serde(flatten)]
@@ -179,6 +204,7 @@ pub enum SemanticRetention {
 #[derive(Debug, Clone)]
 pub struct SemanticEventDraft {
     pub stable_session_key: StableSessionKey,
+    pub subagent_id: Option<String>,
     pub occurred_at_epoch_ms: u64,
     pub source: SemanticSource,
     pub kind: SemanticEventKind,
@@ -352,6 +378,68 @@ impl SemanticJournal {
         self.replay_invocations.get()
     }
 
+    fn canonical_event_count(&self) -> usize {
+        self.canonical.len()
+    }
+
+    fn canonical_events_for_persist(&self) -> Vec<SemanticEvent> {
+        self.canonical
+            .iter()
+            .map(|stored| (*stored.event).clone())
+            .collect()
+    }
+
+    fn restore_canonical_events(
+        limits: JournalLimits,
+        events: &[SemanticEvent],
+        next_sequence: u64,
+        highest_evicted_sequence: u64,
+    ) -> Result<Self, &'static str> {
+        if next_sequence == 0 {
+            return Err("conversation-history next_sequence must be at least 1");
+        }
+        let mut journal = Self::with_limits(limits);
+        journal.highest_evicted_sequence = highest_evicted_sequence;
+        let mut last_sequence = highest_evicted_sequence;
+        for event in events {
+            if event.sequence == 0 || event.sequence <= last_sequence {
+                return Err("conversation-history events must be strictly increasing");
+            }
+            if event.sequence >= next_sequence {
+                return Err("conversation-history event sequence exceeds next_sequence");
+            }
+            if !is_restorable_canonical_kind(&event.kind) {
+                return Err("conversation-history contains a non-canonical event kind");
+            }
+            let encoded_bytes = serde_json::to_vec(event).map_or(0, |encoded| encoded.len());
+            if encoded_bytes > MAX_SEMANTIC_EVENT_BYTES {
+                return Err("conversation-history event exceeds encoded size bound");
+            }
+            let stored = StoredSemanticEvent {
+                encoded_bytes,
+                event: Arc::new(event.clone()),
+                deduplication_key: None,
+            };
+            journal.canonical_bytes = journal.canonical_bytes.saturating_add(encoded_bytes);
+            journal.canonical.push_back(stored);
+            last_sequence = event.sequence;
+        }
+        journal.next_sequence = next_sequence;
+        journal.enforce_canonical_limits();
+        if journal.canonical.len() != events.len() {
+            return Err("conversation-history restore exceeded journal bounds");
+        }
+        let cursor = journal.cursor_metadata();
+        if events.is_empty() {
+            if next_sequence != highest_evicted_sequence.saturating_add(1) {
+                return Err("conversation-history empty session sequence fence mismatch");
+            }
+        } else if cursor.latest_sequence != last_sequence {
+            return Err("conversation-history restore cursor mismatch");
+        }
+        Ok(journal)
+    }
+
     fn allocate_sequence(&mut self) -> u64 {
         let sequence = self.next_sequence;
         self.next_sequence = sequence
@@ -370,6 +458,7 @@ impl SemanticJournal {
             stable_session_key: draft.stable_session_key,
             sequence,
             replaces_sequence,
+            subagent_id: draft.subagent_id,
             occurred_at_epoch_ms: draft.occurred_at_epoch_ms,
             source: draft.source,
             kind: draft.kind,
@@ -558,6 +647,7 @@ impl SemanticJournal {
 
     fn upsert_verbose_truncation_marker(&mut self, key: &StableSessionKey) {
         let event = SemanticEvent {
+            subagent_id: None,
             stable_session_key: key.clone(),
             sequence: self.allocate_sequence(),
             replaces_sequence: None,
@@ -642,7 +732,8 @@ pub struct SemanticJournalStore {
     sessions: HashMap<StableSessionKey, StoredSessionJournal>,
     session_bindings: HashMap<String, SessionBinding>,
     projectors: HashMap<String, PlainTextProjector>,
-    screen_projectors: HashMap<String, AiScreenProjector>,
+    persist_path: Option<PathBuf>,
+    dirty: bool,
 }
 
 impl Default for SemanticJournalStore {
@@ -668,8 +759,88 @@ impl SemanticJournalStore {
             sessions: HashMap::new(),
             session_bindings: HashMap::new(),
             projectors: HashMap::new(),
-            screen_projectors: HashMap::new(),
+            persist_path: None,
+            dirty: false,
         }
+    }
+
+    /// Open (or create) the bounded conversation-history sidecar beside the
+    /// profile. Missing files become an empty store; corrupt or oversized
+    /// payloads fail closed without loading partial truth.
+    pub fn open(path: impl Into<PathBuf>) -> io::Result<Self> {
+        let path = path.into();
+        let mut store = Self::empty_at(path.clone());
+        match fs::metadata(&path) {
+            Ok(metadata) => {
+                let len = metadata.len();
+                if len > MAX_CONVERSATION_HISTORY_FILE_BYTES as u64 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "conversation-history exceeds file size bound",
+                    ));
+                }
+                let bytes = fs::read(&path)?;
+                if bytes.len() > MAX_CONVERSATION_HISTORY_FILE_BYTES {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "conversation-history exceeds file size bound",
+                    ));
+                }
+                store.load_persisted_bytes(&bytes)?;
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        Ok(store)
+    }
+
+    /// Empty store that still flushes to `path` when durable facts arrive.
+    pub fn empty_at(path: impl Into<PathBuf>) -> Self {
+        let mut store = Self::with_limits(JournalLimits::default());
+        store.persist_path = Some(path.into());
+        store
+    }
+
+    /// Profile-sibling path used by the production host runtime.
+    pub fn open_at_profile_root(root: impl AsRef<Path>) -> io::Result<Self> {
+        Self::open(root.as_ref().join(CONVERSATION_HISTORY_FILE_NAME))
+    }
+
+    pub fn persist_path(&self) -> Option<&Path> {
+        self.persist_path.as_deref()
+    }
+
+    pub fn is_dirty(&self) -> bool {
+        self.dirty
+    }
+
+    /// Atomically write the durable conversation facts when dirty.
+    /// On failure the store stays dirty so maintenance can retry.
+    pub fn flush(&mut self) -> io::Result<()> {
+        if !self.dirty {
+            return Ok(());
+        }
+        let Some(path) = self.persist_path.clone() else {
+            self.dirty = false;
+            return Ok(());
+        };
+        let file = self.persisted_file()?;
+        let bytes = serde_json::to_vec_pretty(&file)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        if bytes.len() > MAX_CONVERSATION_HISTORY_FILE_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "conversation-history serialized payload exceeds file size bound",
+            ));
+        }
+        write_conversation_history_atomically(&path, &bytes)?;
+        self.dirty = false;
+        Ok(())
+    }
+
+    /// Flush only when durable conversation facts changed since the last write.
+    pub fn flush_if_dirty(&mut self) -> io::Result<()> {
+        self.flush()
     }
 
     pub fn observe_runtime(
@@ -729,6 +900,7 @@ impl SemanticJournalStore {
         let status_changed = previous_status != Some(runtime.status);
         if status_changed {
             let event = SemanticEventDraft {
+                subagent_id: None,
                 stable_session_key: key.clone(),
                 occurred_at_epoch_ms,
                 source: SemanticSource::System,
@@ -757,45 +929,32 @@ impl SemanticJournalStore {
         &mut self,
         session_id: &str,
         bytes: &[u8],
-        screen: Option<&TerminalScreenSnapshot>,
+        _screen: Option<&TerminalScreenSnapshot>,
         occurred_at_epoch_ms: u64,
     ) -> bool {
         let Some(binding) = self.session_bindings.get(session_id).cloned() else {
             return false;
         };
-        let uses_screen_projection = matches!(
+        let uses_ai_raw_screen = matches!(
             binding.source,
             SemanticSource::Claude | SemanticSource::Codex
         );
-        // Always project AI screens when a snapshot is available. Visibility is
-        // gated in AiSessionView via includeFallbackOutput={adapterHealth !==
-        // "healthy"}; keeping the replacing snapshot current means a health drop
-        // immediately has a fresh fallback rather than waiting for the next chunk.
-        let (text, deduplication_key) = if uses_screen_projection {
-            let Some(screen) = screen else {
-                return false;
-            };
-            let Some(text) = self
-                .screen_projectors
-                .entry(session_id.to_string())
-                .or_default()
-                .project(screen)
-            else {
-                return false;
-            };
-            (text, Some(AI_FALLBACK_SCREEN_DEDUP_KEY.to_string()))
-        } else {
-            let text = self
-                .projectors
-                .entry(session_id.to_string())
-                .or_default()
-                .push(bytes);
-            if text.is_empty() {
-                return false;
-            }
-            (text, None)
-        };
+        // Raw Claude/Codex PTY screens stay in Terminal only. Never record AI
+        // Output fallback facts into the semantic journal; conversation truth
+        // comes from AssistantMessage and other semantic events.
+        if uses_ai_raw_screen {
+            return false;
+        }
+        let text = self
+            .projectors
+            .entry(session_id.to_string())
+            .or_default()
+            .push(bytes);
+        if text.is_empty() {
+            return false;
+        }
         self.record(SemanticEventDraft {
+            subagent_id: None,
             stable_session_key: binding.key,
             occurred_at_epoch_ms,
             source: binding.source,
@@ -804,7 +963,7 @@ impl SemanticJournalStore {
                 text,
             },
             retention: SemanticRetention::Verbose,
-            deduplication_key,
+            deduplication_key: None,
         });
         true
     }
@@ -826,6 +985,7 @@ impl SemanticJournalStore {
         let session = self.ensure_session(&key, false);
         session.metadata.raw_required = raw_required;
         self.record(SemanticEventDraft {
+            subagent_id: None,
             stable_session_key: key,
             occurred_at_epoch_ms,
             source: SemanticSource::System,
@@ -862,6 +1022,7 @@ impl SemanticJournalStore {
         let occurred_at_epoch_ms = draft.occurred_at_epoch_ms;
         let is_question = matches!(&draft.kind, SemanticEventKind::Question { .. });
         let is_user_message = matches!(&draft.kind, SemanticEventKind::UserMessage { .. });
+        let canonical = matches!(draft.retention, SemanticRetention::Canonical);
         let task_title_candidate = match &draft.kind {
             SemanticEventKind::UserMessage { text } => normalize_task_title(text),
             _ => None,
@@ -896,6 +1057,10 @@ impl SemanticJournalStore {
             event
         };
         self.enforce_store_limits();
+        // Ephemeral Output stays verbose and is never marked for the sidecar.
+        if self.persist_path.is_some() && canonical {
+            self.dirty = true;
+        }
         event
     }
 
@@ -926,6 +1091,23 @@ impl SemanticJournalStore {
         self.sessions
             .get(key)
             .map(|session| session.journal.capture_replay_after(cursor))
+    }
+
+    /// Pointer-only retained window for canonical conversation projection.
+    /// Replacement ancestry can precede the caller's cursor. Retaining those
+    /// links is necessary to keep message identity stable across incremental
+    /// pages; the caller still emits only facts newer than its cursor.
+    pub(crate) fn capture_conversation_after(
+        &self,
+        key: &StableSessionKey,
+        cursor: u64,
+    ) -> Option<SemanticReplayCapture> {
+        self.sessions.get(key).map(|session| {
+            let mut capture = session.journal.capture_replay_after(0);
+            capture.cursor_rolled_over =
+                cursor != 0 && cursor <= session.journal.highest_evicted_sequence;
+            capture
+        })
     }
 
     pub fn stable_key_for_session(&self, session_id: &str) -> Option<StableSessionKey> {
@@ -986,7 +1168,6 @@ impl SemanticJournalStore {
 
     pub fn remove_session_binding(&mut self, session_id: &str) -> Option<StableSessionKey> {
         self.projectors.remove(session_id);
-        self.screen_projectors.remove(session_id);
         let key = self
             .session_bindings
             .remove(session_id)
@@ -1007,6 +1188,41 @@ impl SemanticJournalStore {
         }
         self.enforce_store_limits();
         Some(key)
+    }
+
+    /// Drop one journal session and every binding that pointed at it.
+    ///
+    /// `remove_session_binding` above unbinds a session that WENT AWAY and
+    /// deliberately keeps the transcript. This is the purge's counterpart: the
+    /// task the transcript belongs to no longer exists, so the transcript must
+    /// not outlive it in `conversation-history.json`.
+    ///
+    /// Unconditional, unlike the eviction path `enforce_store_limits` uses,
+    /// which keeps an ACTIVE session's bindings alive and only advances their
+    /// evicted watermark. Nothing is active for a purged task, and leaving a
+    /// binding behind would leave a projector keyed to a task that is gone.
+    ///
+    /// Returns whether anything was removed, so a caller can log a real
+    /// removal separately from a no-op; the sweep re-runs after a crash and
+    /// the second run legitimately removes nothing.
+    pub fn remove_session(&mut self, key: &StableSessionKey) -> bool {
+        let had_session = self.sessions.contains_key(key);
+        let doomed_bindings = self
+            .session_bindings
+            .iter()
+            .filter(|(_, binding)| &binding.key == key)
+            .map(|(session_id, _)| session_id.clone())
+            .collect::<Vec<_>>();
+        for session_id in &doomed_bindings {
+            self.session_bindings.remove(session_id);
+            self.projectors.remove(session_id);
+        }
+        self.sessions.remove(key);
+        let removed = had_session || !doomed_bindings.is_empty();
+        if removed {
+            self.dirty = true;
+        }
+        removed
     }
 
     pub fn retained_session_count(&self) -> usize {
@@ -1118,6 +1334,7 @@ impl SemanticJournalStore {
         let Some(removed) = self.sessions.remove(key) else {
             return;
         };
+        self.dirty = true;
         if removed.active {
             let latest_sequence = removed.journal.cursor_metadata().latest_sequence;
             for binding in self
@@ -1139,9 +1356,235 @@ impl SemanticJournalStore {
         for session_id in removed_session_ids {
             self.session_bindings.remove(&session_id);
             self.projectors.remove(&session_id);
-            self.screen_projectors.remove(&session_id);
         }
     }
+
+    fn load_persisted_bytes(&mut self, bytes: &[u8]) -> io::Result<()> {
+        let file: ConversationHistoryFile = serde_json::from_slice(bytes)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        if file.schema != CONVERSATION_HISTORY_SCHEMA {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unsupported conversation-history schema",
+            ));
+        }
+        if file.sessions.len() > MAX_PERSISTED_SESSIONS {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "conversation-history exceeds session bound",
+            ));
+        }
+        let mut sessions = HashMap::new();
+        let mut aggregate_bytes = 0usize;
+        for persisted in file.sessions {
+            if persisted.events.len() > MAX_PERSISTED_EVENTS_PER_SESSION {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "conversation-history session exceeds event bound",
+                ));
+            }
+            if sessions.contains_key(&persisted.key) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "conversation-history has duplicate stable session keys",
+                ));
+            }
+            let mut session_bytes = 0usize;
+            for event in &persisted.events {
+                if matches!(event.kind, SemanticEventKind::Output { .. }) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "conversation-history must not contain ephemeral Output events",
+                    ));
+                }
+                let encoded = serde_json::to_vec(event)
+                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+                if encoded.len() > MAX_SEMANTIC_EVENT_BYTES {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "conversation-history event exceeds encoded size bound",
+                    ));
+                }
+                session_bytes = session_bytes.saturating_add(encoded.len());
+            }
+            if session_bytes > self.limits.canonical_bytes {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "conversation-history session exceeds canonical byte bound",
+                ));
+            }
+            aggregate_bytes = aggregate_bytes.saturating_add(session_bytes);
+            if aggregate_bytes > self.max_total_bytes {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "conversation-history exceeds aggregate store byte bound",
+                ));
+            }
+            let journal = SemanticJournal::restore_canonical_events(
+                self.limits,
+                &persisted.events,
+                persisted.next_sequence,
+                persisted.highest_evicted_sequence,
+            )
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+            let cursor = journal.cursor_metadata();
+            if persisted.metadata.oldest_sequence != cursor.oldest_sequence
+                || persisted.metadata.latest_sequence != cursor.latest_sequence
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "conversation-history metadata sequence mismatch",
+                ));
+            }
+            sessions.insert(
+                persisted.key,
+                StoredSessionJournal {
+                    journal,
+                    metadata: persisted.metadata,
+                    active: false,
+                },
+            );
+        }
+        self.sessions = sessions;
+        self.dirty = false;
+        Ok(())
+    }
+
+    fn persisted_file(&self) -> io::Result<ConversationHistoryFile> {
+        if self.sessions.len() > MAX_PERSISTED_SESSIONS {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "conversation-history exceeds session bound",
+            ));
+        }
+        let mut sessions = Vec::with_capacity(self.sessions.len());
+        let mut aggregate_bytes = 0usize;
+        for (key, session) in &self.sessions {
+            let events = session
+                .journal
+                .canonical_events_for_persist()
+                .into_iter()
+                .filter(|event| !matches!(event.kind, SemanticEventKind::Output { .. }))
+                .take(MAX_PERSISTED_EVENTS_PER_SESSION)
+                .collect::<Vec<_>>();
+            if events.len() == MAX_PERSISTED_EVENTS_PER_SESSION
+                && session
+                    .journal
+                    .canonical_events_for_persist()
+                    .iter()
+                    .filter(|event| !matches!(event.kind, SemanticEventKind::Output { .. }))
+                    .count()
+                    > MAX_PERSISTED_EVENTS_PER_SESSION
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "conversation-history session exceeds event bound",
+                ));
+            }
+            let session_bytes: usize = events
+                .iter()
+                .map(|event| serde_json::to_vec(event).map_or(0, |encoded| encoded.len()))
+                .sum();
+            if session_bytes > self.limits.canonical_bytes {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "conversation-history session exceeds canonical byte bound",
+                ));
+            }
+            aggregate_bytes = aggregate_bytes.saturating_add(session_bytes);
+            if aggregate_bytes > self.max_total_bytes {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "conversation-history exceeds aggregate store byte bound",
+                ));
+            }
+            sessions.push(PersistedConversationSession {
+                key: key.clone(),
+                metadata: session.metadata.clone(),
+                next_sequence: session.journal.next_sequence,
+                highest_evicted_sequence: session.journal.highest_evicted_sequence,
+                events,
+            });
+        }
+        sessions.sort_by(|left, right| left.key.as_str().cmp(right.key.as_str()));
+        Ok(ConversationHistoryFile {
+            schema: CONVERSATION_HISTORY_SCHEMA.to_string(),
+            sessions,
+        })
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ConversationHistoryFile {
+    schema: String,
+    sessions: Vec<PersistedConversationSession>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PersistedConversationSession {
+    key: StableSessionKey,
+    metadata: SemanticSessionMetadata,
+    next_sequence: u64,
+    highest_evicted_sequence: u64,
+    events: Vec<SemanticEvent>,
+}
+
+fn is_restorable_canonical_kind(kind: &SemanticEventKind) -> bool {
+    !matches!(kind, SemanticEventKind::Output { .. })
+}
+
+fn write_conversation_history_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+    let temporary = parent.join(format!(
+        "{}.tmp",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(CONVERSATION_HISTORY_FILE_NAME)
+    ));
+    {
+        let mut handle = fs::File::create(&temporary)?;
+        handle.write_all(bytes)?;
+        handle.sync_all()?;
+    }
+    match replace_conversation_history_file(&temporary, path) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let _ = fs::remove_file(&temporary);
+            Err(error)
+        }
+    }
+}
+
+#[cfg(windows)]
+fn replace_conversation_history_file(temporary: &Path, destination: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::PCWSTR;
+    use windows::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+
+    let temporary: Vec<u16> = temporary.as_os_str().encode_wide().chain(Some(0)).collect();
+    let destination: Vec<u16> = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    unsafe {
+        MoveFileExW(
+            PCWSTR(temporary.as_ptr()),
+            PCWSTR(destination.as_ptr()),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+        .map_err(io::Error::from)
+    }
+}
+
+#[cfg(not(windows))]
+fn replace_conversation_history_file(temporary: &Path, destination: &Path) -> io::Result<()> {
+    fs::rename(temporary, destination)
 }
 
 fn semantic_source(kind: SessionKind) -> SemanticSource {
@@ -1176,7 +1619,7 @@ fn semantic_status(status: SessionStatus) -> &'static str {
 
 const TASK_TITLE_MAX_CHARS: usize = 96;
 
-fn normalize_task_title(text: &str) -> Option<String> {
+pub(crate) fn normalize_task_title(text: &str) -> Option<String> {
     let collapsed: String = text
         .split_whitespace()
         .filter(|part| !part.is_empty())
@@ -1223,27 +1666,6 @@ impl PlainTextProjector {
         };
         self.parser.advance(&mut collector, bytes);
         collector.output
-    }
-}
-
-#[derive(Debug, Default)]
-struct AiScreenProjector {
-    last_projection: Option<String>,
-}
-
-impl AiScreenProjector {
-    fn project(&mut self, screen: &TerminalScreenSnapshot) -> Option<String> {
-        let text = project_terminal_screen(screen);
-        if self.last_projection.as_deref() == Some(text.as_str()) {
-            return None;
-        }
-        // Initial blank/cleared frames stay silent; a later clear after content
-        // emits one empty replacement so clients can drop the prior fallback.
-        if text.is_empty() && self.last_projection.is_none() {
-            return None;
-        }
-        self.last_projection = Some(text.clone());
-        Some(text)
     }
 }
 
@@ -1444,8 +1866,7 @@ mod tests {
     use crate::models::{SessionTab, TabType};
     use crate::state::{SessionKind, SessionRuntimeState};
     use crate::terminal::session::{
-        TerminalBackend, TerminalCellSnapshot, TerminalModeSnapshot, TerminalReplica,
-        TerminalScreenSnapshot,
+        TerminalBackend, TerminalCellSnapshot, TerminalModeSnapshot, TerminalScreenSnapshot,
     };
     use std::path::PathBuf;
 
@@ -1456,6 +1877,7 @@ mod tests {
         deduplication_key: Option<&str>,
     ) -> SemanticEventDraft {
         SemanticEventDraft {
+            subagent_id: None,
             stable_session_key: key,
             occurred_at_epoch_ms: 7,
             source: SemanticSource::Server,
@@ -1483,6 +1905,7 @@ mod tests {
             hidden: false,
             has_hyperlink: false,
             default_background: true,
+            default_foreground: false,
         }
     }
 
@@ -1514,27 +1937,6 @@ mod tests {
         runtime.session_kind = SessionKind::Claude;
         runtime.tab_id = Some(tab_id.to_string());
         assert!(store.observe_runtime(&runtime, &[], 1));
-    }
-
-    fn screen_after_bytes(chunks: &[&[u8]]) -> TerminalScreenSnapshot {
-        let dimensions = crate::state::SessionDimensions {
-            cols: 40,
-            rows: 12,
-            cell_width: 8,
-            cell_height: 16,
-        };
-        let mut runtime = SessionRuntimeState::new(
-            "projector",
-            PathBuf::new(),
-            dimensions,
-            TerminalBackend::default(),
-        );
-        runtime.session_kind = SessionKind::Claude;
-        let replica = TerminalReplica::from_bootstrap("projector", runtime, &[]);
-        for chunk in chunks {
-            replica.apply_output_bytes(chunk);
-        }
-        replica.view().expect("replica view").screen
     }
 
     fn output_texts(store: &SemanticJournalStore, key: &StableSessionKey) -> Vec<String> {
@@ -2164,7 +2566,7 @@ mod tests {
     }
 
     #[test]
-    fn journal_store_tracks_runtime_output_and_session_metadata() {
+    fn journal_store_tracks_ai_runtime_metadata_without_raw_output() {
         let mut runtime = SessionRuntimeState::new(
             "pty-ephemeral",
             PathBuf::new(),
@@ -2186,22 +2588,23 @@ mod tests {
 
         assert!(store.observe_runtime(&runtime, &tabs, 100));
         let screen = screen_from_lines(&["hello"]);
-        assert!(store.observe_output("pty-ephemeral", b"\x1b[31mhello\x1b[0m", Some(&screen), 101));
+        assert!(!store.observe_output(
+            "pty-ephemeral",
+            b"\x1b[31mhello\x1b[0m",
+            Some(&screen),
+            101
+        ));
 
         let metadata = store.metadata(&key).expect("session metadata");
-        assert_eq!(metadata.last_activity_epoch_ms, Some(101));
+        assert_eq!(metadata.last_activity_epoch_ms, Some(100));
         assert_eq!(metadata.attention, SemanticAttention::Unread);
         assert_eq!(metadata.attention_count, 2);
         assert_eq!(metadata.adapter_health, SemanticAdapterHealth::Degraded);
         let replay = store.replay_after(&key, 0).expect("session replay");
-        assert!(replay.events.iter().any(|event| matches!(
-            &event.kind,
-            SemanticEventKind::Output { text, .. } if text == "hello"
-        )));
-        assert!(replay.events.iter().any(|event| {
-            matches!(&event.kind, SemanticEventKind::Output { .. })
-                && event.replaces_sequence.is_none()
-        }));
+        assert!(replay
+            .events
+            .iter()
+            .all(|event| !matches!(event.kind, SemanticEventKind::Output { .. })));
     }
 
     #[test]
@@ -2227,6 +2630,7 @@ mod tests {
         store.observe_runtime(&runtime, std::slice::from_ref(&tab), 1);
 
         store.record(SemanticEventDraft {
+            subagent_id: None,
             stable_session_key: key.clone(),
             occurred_at_epoch_ms: 2,
             source: SemanticSource::Claude,
@@ -2254,6 +2658,7 @@ mod tests {
         );
 
         store.record(SemanticEventDraft {
+            subagent_id: None,
             stable_session_key: key.clone(),
             occurred_at_epoch_ms: 4,
             source: SemanticSource::Claude,
@@ -2275,6 +2680,7 @@ mod tests {
         let mut store = SemanticJournalStore::default();
         let key = StableSessionKey::from_tab("ai-tab");
         store.record(SemanticEventDraft {
+            subagent_id: None,
             stable_session_key: key.clone(),
             occurred_at_epoch_ms: 1,
             source: SemanticSource::Claude,
@@ -2290,6 +2696,7 @@ mod tests {
         );
 
         store.record(SemanticEventDraft {
+            subagent_id: None,
             stable_session_key: key.clone(),
             occurred_at_epoch_ms: 2,
             source: SemanticSource::Claude,
@@ -2305,6 +2712,7 @@ mod tests {
         );
 
         store.record(SemanticEventDraft {
+            subagent_id: None,
             stable_session_key: key.clone(),
             occurred_at_epoch_ms: 3,
             source: SemanticSource::Claude,
@@ -2325,6 +2733,7 @@ mod tests {
         let mut store = SemanticJournalStore::default();
         let key = StableSessionKey::from_tab("ai-tab");
         store.record(SemanticEventDraft {
+            subagent_id: None,
             stable_session_key: key.clone(),
             occurred_at_epoch_ms: 1,
             source: SemanticSource::Claude,
@@ -2337,6 +2746,7 @@ mod tests {
         assert_eq!(store.metadata(&key).unwrap().task_title, None);
 
         store.record(SemanticEventDraft {
+            subagent_id: None,
             stable_session_key: key.clone(),
             occurred_at_epoch_ms: 2,
             source: SemanticSource::Claude,
@@ -2358,6 +2768,7 @@ mod tests {
         let key = StableSessionKey::from_tab("ai-tab");
         let long = "字".repeat(100);
         store.record(SemanticEventDraft {
+            subagent_id: None,
             stable_session_key: key.clone(),
             occurred_at_epoch_ms: 1,
             source: SemanticSource::Claude,
@@ -2374,6 +2785,42 @@ mod tests {
         assert!(title.ends_with('…'));
         assert_eq!(title.chars().take(95).count(), 95);
         assert!(!title.contains('\u{fffd}'));
+    }
+
+    /// The purge sweep's transcript removal drops one task's session and
+    /// leaves every other one alone.
+    #[test]
+    fn remove_session_drops_one_transcript_and_keeps_the_rest() {
+        let mut store = SemanticJournalStore::default();
+        let purged = StableSessionKey::for_task("018f60b0-9c1a-7001-8000-000000000040");
+        let survivor = StableSessionKey::for_task("018f60b0-9c1a-7001-8000-000000000041");
+        for key in [&purged, &survivor] {
+            store.record(SemanticEventDraft {
+                subagent_id: None,
+                stable_session_key: key.clone(),
+                occurred_at_epoch_ms: 1,
+                source: SemanticSource::Claude,
+                kind: SemanticEventKind::UserMessage {
+                    text: "transcript".into(),
+                },
+                retention: SemanticRetention::Canonical,
+                deduplication_key: None,
+            });
+        }
+        assert_eq!(store.retained_session_count(), 2);
+
+        assert!(store.remove_session(&purged));
+        assert_eq!(store.retained_session_count(), 1);
+        assert!(store.metadata(&purged).is_none());
+        assert!(
+            store.metadata(&survivor).is_some(),
+            "another task's transcript must survive"
+        );
+
+        // Idempotent, and it says so: the sweep re-runs after a crash and the
+        // second run legitimately removes nothing.
+        assert!(!store.remove_session(&purged));
+        assert_eq!(store.retained_session_count(), 1);
     }
 
     #[test]
@@ -2418,7 +2865,6 @@ mod tests {
         assert!(store.retained_bytes() <= 2 * 1024);
         assert!(store.session_bindings.is_empty());
         assert!(store.projectors.is_empty());
-        assert!(store.screen_projectors.is_empty());
         assert!(store
             .metadata(&StableSessionKey::from_server("command-23"))
             .is_some());
@@ -2739,143 +3185,6 @@ mod tests {
     }
 
     #[test]
-    fn degraded_ai_screen_redraw_replaces_in_progress_output() {
-        let mut store = SemanticJournalStore::default();
-        bind_ai_session(&mut store, "ai-pty", "ai-tab");
-        let key = StableSessionKey::from_tab("ai-tab");
-
-        let first = screen_after_bytes(&[b"draft answer v1"]);
-        assert!(store.observe_output("ai-pty", b"draft answer v1", Some(&first), 10));
-        let second = screen_after_bytes(&[b"draft answer v1", b"\rdraft answer v2"]);
-        assert!(store.observe_output("ai-pty", b"\rdraft answer v2", Some(&second), 11));
-        let third = screen_after_bytes(&[
-            b"draft answer v1",
-            b"\rdraft answer v2",
-            b"\x1b[2J\x1b[Hfinal answer",
-        ]);
-        assert!(store.observe_output("ai-pty", b"\x1b[2J\x1b[Hfinal answer", Some(&third), 12));
-
-        let replay = store.replay_after(&key, 0).expect("replay");
-        let output_events = replay
-            .events
-            .iter()
-            .filter(|event| matches!(event.kind, SemanticEventKind::Output { .. }))
-            .cloned()
-            .collect::<Vec<_>>();
-        assert!(
-            output_events.len() <= 2,
-            "fallback redraws must stay replacement-chained, got {}",
-            output_events.len()
-        );
-        let mut visible = std::collections::BTreeSet::new();
-        for event in &output_events {
-            if let Some(replaced) = event.replaces_sequence {
-                visible.remove(&replaced);
-            }
-            visible.insert(event.sequence);
-        }
-        assert_eq!(visible.len(), 1);
-        let final_text = output_events
-            .iter()
-            .find(|event| visible.contains(&event.sequence))
-            .and_then(|event| match &event.kind {
-                SemanticEventKind::Output { text, .. } => Some(text.as_str()),
-                _ => None,
-            })
-            .expect("final fallback");
-        assert!(final_text.contains("final answer"));
-        assert!(!final_text.contains("draft answer v1"));
-    }
-
-    #[test]
-    fn degraded_ai_cursor_up_redraw_replaces_instead_of_appending() {
-        let mut store = SemanticJournalStore::default();
-        bind_ai_session(&mut store, "ai-pty", "ai-tab");
-        let key = StableSessionKey::from_tab("ai-tab");
-
-        let first = screen_after_bytes(&[b"line-one\nline-two"]);
-        assert!(store.observe_output("ai-pty", b"line-one\nline-two", Some(&first), 10));
-        let redraw = screen_after_bytes(&[b"line-one\nline-two", b"\x1b[1A\rline-ONE"]);
-        assert!(store.observe_output("ai-pty", b"\x1b[1A\rline-ONE", Some(&redraw), 11));
-
-        let outputs = output_texts(&store, &key);
-        assert_eq!(outputs.len(), 1);
-        assert!(outputs[0].contains("line-ONE"));
-        assert!(outputs[0].contains("line-two"));
-        assert_eq!(outputs[0].matches("line-one").count(), 0);
-    }
-
-    #[test]
-    fn degraded_ai_carriage_return_progress_keeps_latest_frame() {
-        let mut store = SemanticJournalStore::default();
-        bind_ai_session(&mut store, "ai-pty", "ai-tab");
-        let key = StableSessionKey::from_tab("ai-tab");
-
-        let first = screen_after_bytes(&[b"progress 10%"]);
-        assert!(store.observe_output("ai-pty", b"progress 10%", Some(&first), 10));
-        let second = screen_after_bytes(&[b"progress 10%", b"\rprogress 100%\n"]);
-        assert!(store.observe_output("ai-pty", b"\rprogress 100%\n", Some(&second), 11));
-
-        let outputs = output_texts(&store, &key);
-        assert_eq!(outputs, vec!["progress 100%".to_string()]);
-    }
-
-    #[test]
-    fn degraded_ai_blank_or_unchanged_screen_emits_no_event() {
-        let mut store = SemanticJournalStore::default();
-        bind_ai_session(&mut store, "ai-pty", "ai-tab");
-        let key = StableSessionKey::from_tab("ai-tab");
-
-        let blank = screen_from_lines(&["", "   ", ""]);
-        assert!(!store.observe_output("ai-pty", b"\x1b[2J", Some(&blank), 10));
-        assert!(output_texts(&store, &key).is_empty());
-
-        let screen = screen_from_lines(&["stable"]);
-        assert!(store.observe_output("ai-pty", b"stable", Some(&screen), 11));
-        assert!(!store.observe_output("ai-pty", b"stable", Some(&screen), 12));
-        assert_eq!(output_texts(&store, &key), vec!["stable".to_string()]);
-    }
-
-    #[test]
-    fn cleared_ai_screen_replaces_prior_fallback_with_empty_output() {
-        let mut store = SemanticJournalStore::default();
-        bind_ai_session(&mut store, "ai-pty", "ai-tab");
-        let key = StableSessionKey::from_tab("ai-tab");
-
-        let screen = screen_from_lines(&["visible fallback"]);
-        assert!(store.observe_output("ai-pty", b"visible fallback", Some(&screen), 10));
-        let blank = screen_from_lines(&["", "   ", ""]);
-        assert!(store.observe_output("ai-pty", b"\x1b[2J", Some(&blank), 11));
-        assert!(!store.observe_output("ai-pty", b"\x1b[2J", Some(&blank), 12));
-
-        let replay = store.replay_after(&key, 0).expect("replay");
-        let output_events = replay
-            .events
-            .iter()
-            .filter(|event| matches!(event.kind, SemanticEventKind::Output { .. }))
-            .cloned()
-            .collect::<Vec<_>>();
-        let mut visible = std::collections::BTreeSet::new();
-        for event in &output_events {
-            if let Some(replaced) = event.replaces_sequence {
-                visible.remove(&replaced);
-            }
-            visible.insert(event.sequence);
-        }
-        assert_eq!(visible.len(), 1);
-        let final_text = output_events
-            .iter()
-            .find(|event| visible.contains(&event.sequence))
-            .and_then(|event| match &event.kind {
-                SemanticEventKind::Output { text, .. } => Some(text.as_str()),
-                _ => None,
-            })
-            .expect("final fallback");
-        assert_eq!(final_text, "");
-        assert!(!final_text.contains("visible fallback"));
-    }
-
-    #[test]
     fn ai_output_without_screen_does_not_append_byte_dumps() {
         let mut store = SemanticJournalStore::default();
         bind_ai_session(&mut store, "ai-pty", "ai-tab");
@@ -2908,17 +3217,142 @@ mod tests {
     }
 
     #[test]
-    fn removing_ai_session_clears_screen_projector_state() {
+    fn ai_raw_screen_output_is_not_recorded_as_conversation() {
         let mut store = SemanticJournalStore::default();
         bind_ai_session(&mut store, "ai-pty", "ai-tab");
-        let screen = screen_from_lines(&["one"]);
-        assert!(store.observe_output("ai-pty", b"one", Some(&screen), 2));
-        assert!(store.screen_projectors.contains_key("ai-pty"));
+        let key = StableSessionKey::from_tab("ai-tab");
+        let screen = screen_from_lines(&["visible fallback"]);
 
-        assert_eq!(
-            store.remove_session_binding("ai-pty"),
-            Some(StableSessionKey::from_tab("ai-tab"))
+        assert!(
+            !store.observe_output("ai-pty", b"visible fallback", Some(&screen), 10),
+            "AI raw PTY screens must stay out of the semantic journal"
         );
-        assert!(!store.screen_projectors.contains_key("ai-pty"));
+        assert!(
+            output_texts(&store, &key).is_empty(),
+            "AI Output facts must not be recorded"
+        );
+
+        store.record(SemanticEventDraft {
+            subagent_id: None,
+            stable_session_key: key.clone(),
+            occurred_at_epoch_ms: 11,
+            source: SemanticSource::Claude,
+            kind: SemanticEventKind::AssistantMessage {
+                message_id: "msg-1".into(),
+                text: "semantic assistant reply".into(),
+                streaming: false,
+            },
+            retention: SemanticRetention::Canonical,
+            deduplication_key: None,
+        });
+        let replay = store.replay_after(&key, 0).expect("replay");
+        assert!(
+            replay.events.iter().any(|event| matches!(
+                &event.kind,
+                SemanticEventKind::AssistantMessage { text, .. }
+                    if text == "semantic assistant reply"
+            )),
+            "semantic AssistantMessage must remain"
+        );
+        assert!(
+            !replay
+                .events
+                .iter()
+                .any(|event| matches!(event.kind, SemanticEventKind::Output { .. })),
+            "no AI Output events may remain in the journal"
+        );
+
+        let mut shell = SemanticJournalStore::default();
+        let mut runtime = SessionRuntimeState::new(
+            "shell-pty",
+            PathBuf::new(),
+            Default::default(),
+            TerminalBackend::default(),
+        );
+        runtime.session_kind = SessionKind::Shell;
+        runtime.command_id = Some("shell-command".to_string());
+        assert!(shell.observe_runtime(&runtime, &[], 1));
+        let shell_key = StableSessionKey::from_server("shell-command");
+        assert!(shell.observe_output("shell-pty", b"shell line\n", None, 2));
+        assert_eq!(
+            output_texts(&shell, &shell_key),
+            vec!["shell line\n".to_string()]
+        );
+    }
+
+    #[test]
+    fn conversation_history_sidecar_reopens_durable_facts_across_restart() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let path = directory.path().join(CONVERSATION_HISTORY_FILE_NAME);
+        let key = StableSessionKey::from_tab("task-reopen");
+        {
+            let mut store = SemanticJournalStore::open(&path).expect("open empty history");
+            store.record(SemanticEventDraft {
+                subagent_id: None,
+                stable_session_key: key.clone(),
+                occurred_at_epoch_ms: 10,
+                source: SemanticSource::Claude,
+                kind: SemanticEventKind::UserMessage {
+                    text: "remember this across restart".into(),
+                },
+                retention: SemanticRetention::Canonical,
+                deduplication_key: None,
+            });
+            store.record(SemanticEventDraft {
+                subagent_id: None,
+                stable_session_key: key.clone(),
+                occurred_at_epoch_ms: 11,
+                source: SemanticSource::Claude,
+                kind: SemanticEventKind::AssistantMessage {
+                    message_id: "m1".into(),
+                    text: "durable final reply".into(),
+                    streaming: false,
+                },
+                retention: SemanticRetention::Canonical,
+                deduplication_key: None,
+            });
+            assert!(store.is_dirty(), "canonical facts stay dirty until flush");
+            store.flush().expect("prompt flush durable facts");
+            assert!(!store.is_dirty(), "successful flush clears dirty");
+            assert!(path.is_file(), "sidecar must exist after durable flush");
+        }
+
+        let reopened = SemanticJournalStore::open(&path).expect("reopen history");
+        let replay = reopened.replay_after(&key, 0).expect("replay after reopen");
+        assert_eq!(replay.events.len(), 2);
+        assert!(matches!(
+            &replay.events[0].kind,
+            SemanticEventKind::UserMessage { text } if text == "remember this across restart"
+        ));
+        assert!(matches!(
+            &replay.events[1].kind,
+            SemanticEventKind::AssistantMessage {
+                text,
+                streaming: false,
+                ..
+            } if text == "durable final reply"
+        ));
+        assert_eq!(
+            reopened.metadata(&key).map(|meta| meta.latest_sequence),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn conversation_history_corrupt_sidecar_fails_closed() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let path = directory.path().join(CONVERSATION_HISTORY_FILE_NAME);
+        let corrupt = b"{not-json";
+        fs::write(&path, corrupt).expect("write corrupt");
+        let error = match SemanticJournalStore::open(&path) {
+            Ok(_) => panic!("corrupt must fail closed"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            fs::read(&path).expect("corrupt evidence retained"),
+            corrupt,
+            "fail-closed open must leave the corrupt sidecar untouched"
+        );
     }
 }

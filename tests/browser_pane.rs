@@ -370,6 +370,13 @@ fn native_webview_construction_never_runs_under_the_gpui_app_borrow() {
     assert!(restore < accept);
     assert!(completion.contains("set_bounds(wry_bounds(self.bounds))"));
     assert!(completion.contains("self.apply_visibility_plan()"));
+    assert!(
+        !completion.contains("let _ = agent_session_id"),
+        "task-aware completion must preserve AgentSessionId through bind and gateway publish"
+    );
+    assert!(completion.contains("completed_task_aware_identity"));
+    assert!(completion.contains("bind_completed_identity"));
+    assert!(completion.contains("publish_completed_host_binding"));
 
     let build_start = host
         .find("impl BrowserNativeViewBuildJob")
@@ -392,16 +399,42 @@ fn native_webview_construction_never_runs_under_the_gpui_app_borrow() {
         .map(|offset| request_start + offset)
         .expect("request handler should end before repair cleanup");
     let request = &host[request_start..request_end];
+    let identity = request
+        .find("capture_request_task_surface_identity")
+        .expect("exact request identity must be prepared before native view admission");
     let readiness = request
         .find("require_command_view_ready")
         .expect("view readiness must be established before agent side effects");
     let recording = request
         .find("reserve_agent_command")
         .expect("agent workflow recording admission should remain present");
+    assert!(identity < readiness);
     assert!(readiness < recording);
     let readiness_branch = &request[readiness..recording];
     assert!(readiness_branch.contains("request.respond(Err(error))"));
     assert!(!readiness_branch.contains("self.respond_request"));
+}
+
+#[test]
+fn native_task_aware_webview_completion_publishes_and_clears_per_registration() {
+    let host = include_str!("../src/browser/host/windows.rs");
+    let gateway = include_str!("../src/browser/gateway.rs");
+
+    assert!(host.contains("fn attach_gateway_registrar("));
+    assert!(host.contains("fn capture_request_task_surface_identity("));
+    assert!(host.contains("fn publish_completed_host_binding("));
+    assert!(host.contains("fn clear_published_gateway_binding("));
+    assert!(host.contains("prepare_task_surface_identity"));
+    assert!(host.contains("publish_host_surface_binding("));
+    assert!(host.contains("clear_host_surface_binding("));
+    assert!(host.contains("process_session_id_for_workspace"));
+    assert!(
+        !host.contains("let _ = agent_session_id"),
+        "production completion must not discard AgentSessionId"
+    );
+    assert!(gateway.contains("fn process_session_id_for_workspace("));
+    assert!(gateway.contains("if let Some(existing) = *binding"));
+    assert!(gateway.contains("return existing == next"));
 }
 
 #[test]
@@ -942,7 +975,8 @@ fn pane_model_projects_the_latest_bounded_agent_journal_entries() {
 #[test]
 fn pane_model_tracks_default_open_collapse_and_control_vocabulary() {
     let key = BrowserWorkspaceKey::new("project-a", "conversation-a").unwrap();
-    let mut host = BrowserHostState::new(PathBuf::from("pane-model-test"));
+    let mut host =
+        BrowserHostState::new(PathBuf::from("pane-model-test")).expect("browser host state");
     let initial = host
         .ensure_workspace(key.clone(), BrowserWorkspaceSnapshot::default())
         .unwrap();
@@ -1366,7 +1400,8 @@ fn user_input_and_new_window_events_stay_in_the_matching_conversation() {
     let open = vec![active.clone(), other.clone()];
 
     let user_input =
-        BrowserHostEvent::user_input(active.clone(), "tab-a", BrowserUserInputKind::Keyboard);
+        BrowserHostEvent::user_input(active.clone(), "tab-a", BrowserUserInputKind::Keyboard)
+            .expect("interaction epoch");
     assert_eq!(
         browser_event_plan(&open, &user_input),
         Some(BrowserPaneEventPlan::SyncSnapshot {

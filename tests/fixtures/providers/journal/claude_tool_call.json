@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "source_type": "tool_call",
+  "provider_event_id": "claude_evt_tool_1",
+  "occurred_at_ms": 1725000001100,
+  "payload": {
+    "kind": "tool_call",
+    "tool_name": "Read",
+    "call_id": "toolu_claude_1"
+  },
+  "extensions": {
+    "hook_event_name": "PreToolUse"
+  }
+}

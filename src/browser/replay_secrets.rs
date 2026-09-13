@@ -141,6 +141,20 @@ impl BrowserReplaySecretStore {
         })
     }
 
+    pub fn redacted_fill_metadata(
+        vault_ref: &str,
+        field_selector: &str,
+    ) -> Result<(String, String, &'static str), BrowserReplaySecretError> {
+        if vault_ref.is_empty() || field_selector.is_empty() {
+            return Err(BrowserReplaySecretError::InvalidSubmission);
+        }
+        Ok((
+            vault_ref.to_string(),
+            field_selector.to_string(),
+            super::REDACTED_VALUE,
+        ))
+    }
+
     pub(crate) fn close(&self) {
         let mut state = self.lock();
         if matches!(state.status, BrowserReplaySecretStoreStatus::Closed) {

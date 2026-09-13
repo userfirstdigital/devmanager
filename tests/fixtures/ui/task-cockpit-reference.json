@@ -1,0 +1,47 @@
+{
+  "schema": "devmanager.ui.preview/v1",
+  "id": "task-cockpit-reference",
+  "title": "Reference-scale task conversation",
+  "capture": {
+    "cursor": "excluded",
+    "border": "excluded"
+  },
+  "root": {
+    "kind": "task-cockpit",
+    "label": "Task Cockpit",
+    "conversation": {
+      "plan_steps": [
+        {
+          "step_id": "task:reference-1",
+          "title": "Close development migrations and generated-authority commit",
+          "status": "active"
+        },
+        {
+          "step_id": "task:reference-2",
+          "title": "Finish provider enablement and verify dispatcher preconditions",
+          "status": "pending"
+        },
+        {
+          "step_id": "task:reference-3",
+          "title": "Repair dependency matrix and resolve the isolation conflict",
+          "status": "pending"
+        },
+        {
+          "step_id": "task:reference-4",
+          "title": "Finish generated authority and behavior contracts",
+          "status": "pending"
+        },
+        {
+          "step_id": "task:reference-5",
+          "title": "Implement integration spine and cutover prerequisites",
+          "status": "pending"
+        },
+        {
+          "step_id": "task:reference-6",
+          "title": "Run qualification, retirement, and final acceptance gates",
+          "status": "pending"
+        }
+      ]
+    }
+  }
+}

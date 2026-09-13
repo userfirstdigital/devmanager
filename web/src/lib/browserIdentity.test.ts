@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
-  buildPairingUrl,
+  buildPairingRequest,
   buildWebSocketUrl,
   getBrowserInstallId,
 } from "./browserIdentity";
@@ -45,10 +45,13 @@ describe("browserIdentity", () => {
     expect(second).toBe("browser-install-uuid");
   });
 
-  it("includes browser install id in pairing and websocket urls", () => {
-    expect(buildPairingUrl("PAIR1234")).toBe(
-      "/pair?t=PAIR1234&browserInstallId=browser-install-uuid",
-    );
+  it("sends the pairing secret only in a POST body and retains stable browser identity", () => {
+    const request = buildPairingRequest("PAIR1234");
+    expect(request.method).toBe("POST");
+    expect(request.credentials).toBe("include");
+    expect(JSON.parse(request.body as string)).toEqual({
+      t: "PAIR1234", browserInstallId: "browser-install-uuid",
+    });
     expect(buildWebSocketUrl({ protocol: "https:", host: "example.test" })).toBe(
       "wss://example.test/api/ws?browserInstallId=browser-install-uuid",
     );

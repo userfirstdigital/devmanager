@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "event_type": "artifact.registered",
+  "payload": {
+    "artifact": {
+      "id": "018f60b0-9c1a-7001-8000-000000000056",
+      "task_id": "018f60b0-9c1a-7001-8000-00000000000b",
+      "kind": "finding",
+      "label": "note",
+      "content_ref": {
+        "inline_utf8": "body"
+      },
+      "sha256": [7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7],
+      "privacy_class": "local_only",
+      "created_at_ms": 1725000000280
+    }
+  }
+}

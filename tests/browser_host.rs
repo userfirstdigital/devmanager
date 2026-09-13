@@ -450,7 +450,7 @@ fn workspace(project: &str, conversation: &str) -> BrowserWorkspaceKey {
 #[test]
 fn attachment_acknowledgement_preserves_host_workspace_and_concurrent_additions() {
     let key = workspace("project", "conversation");
-    let mut state = BrowserHostState::new(".");
+    let mut state = BrowserHostState::new(".").expect("browser host state");
     let page_revision = BrowserRevision(41);
     let selected_tab_id = Some("tab-b".to_string());
     state
@@ -579,7 +579,7 @@ fn attachment_acknowledgement_behavior_unpins_resolved_delivery_and_keeps_pendin
             true,
         )
         .unwrap();
-    let mut state = BrowserHostState::new(temp.path());
+    let mut state = BrowserHostState::new(temp.path()).expect("browser host state");
     state
         .ensure_workspace(
             key.clone(),
@@ -1770,11 +1770,10 @@ async fn routed_user_input_events_interrupt_the_matching_controller_tab() {
     });
     let _request = inbox.recv().await.expect("reload request");
 
-    bridge.observe_host_event(&BrowserHostEvent::user_input(
-        key,
-        "tab-a",
-        BrowserUserInputKind::Keyboard,
-    ));
+    bridge.observe_host_event(
+        &BrowserHostEvent::user_input(key, "tab-a", BrowserUserInputKind::Keyboard)
+            .expect("browser user input event"),
+    );
     assert_eq!(
         request_task.await.expect("interrupted request"),
         Err(BrowserError::Interrupted)
@@ -1788,7 +1787,7 @@ async fn routed_user_input_events_interrupt_the_matching_controller_tab() {
 #[test]
 fn host_state_creates_isolated_blank_tabs_and_restores_the_selected_tab() {
     let temp = TestDir::new("workspace-state");
-    let mut host = BrowserHostState::new(temp.path());
+    let mut host = BrowserHostState::new(temp.path()).expect("browser host state");
     let first_key = workspace("project-a", "conversation-a");
     let second_key = workspace("project-a", "conversation-b");
 
@@ -1846,7 +1845,7 @@ fn host_state_creates_isolated_blank_tabs_and_restores_the_selected_tab() {
 #[test]
 fn ensure_workspace_never_replaces_newer_live_state_with_a_launch_snapshot() {
     let temp = TestDir::new("idempotent-ensure");
-    let mut host = BrowserHostState::new(temp.path());
+    let mut host = BrowserHostState::new(temp.path()).expect("browser host state");
     let key = workspace("project-a", "conversation-a");
     let launch_snapshot = BrowserWorkspaceSnapshot {
         revision: devmanager::browser::BrowserRevision(3),
@@ -1878,7 +1877,7 @@ fn ensure_workspace_never_replaces_newer_live_state_with_a_launch_snapshot() {
 #[test]
 fn project_context_planning_reuses_only_same_project_profiles() {
     let temp = TestDir::new("project-context");
-    let host = BrowserHostState::new(temp.path());
+    let host = BrowserHostState::new(temp.path()).expect("browser host state");
     let conversation_a = workspace("project-a", "conversation-a");
     let conversation_b = workspace("project-a", "conversation-b");
     let other_project = workspace("project-b", "conversation-a");
@@ -1897,7 +1896,7 @@ fn project_context_planning_reuses_only_same_project_profiles() {
 #[test]
 fn visibility_planning_shows_one_selected_view_and_suspends_every_other_view() {
     let temp = TestDir::new("visibility");
-    let mut host = BrowserHostState::new(temp.path());
+    let mut host = BrowserHostState::new(temp.path()).expect("browser host state");
     let first_key = workspace("project-a", "conversation-a");
     let second_key = workspace("project-a", "conversation-b");
 
@@ -1971,7 +1970,7 @@ fn browser_url_validation_rejects_dangerous_and_malformed_schemes() {
     }
 
     let temp = TestDir::new("url-validation");
-    let mut host = BrowserHostState::new(temp.path());
+    let mut host = BrowserHostState::new(temp.path()).expect("browser host state");
     let key = workspace("project-a", "conversation-a");
     host.ensure_workspace(key.clone(), BrowserWorkspaceSnapshot::default())
         .unwrap();
@@ -1984,7 +1983,7 @@ fn browser_url_validation_rejects_dangerous_and_malformed_schemes() {
 #[test]
 fn profile_clear_planning_is_confined_to_the_exact_hashed_profile_directory() {
     let temp = TestDir::new("profile-clear");
-    let host = BrowserHostState::new(temp.path());
+    let host = BrowserHostState::new(temp.path()).expect("browser host state");
     let key = workspace("private/project:id", "conversation-a");
     let layout = BrowserStorageLayout::new(temp.path(), &key.project_id);
 
@@ -2159,7 +2158,8 @@ fn browser_command_response_and_event_json_names_are_stable_camel_case() {
             state: BrowserPageLoadState::Finished,
             url: "https://example.test".to_string(),
         },
-        BrowserHostEvent::user_input(key.clone(), "tab-a", BrowserUserInputKind::Pointer),
+        BrowserHostEvent::user_input(key.clone(), "tab-a", BrowserUserInputKind::Pointer)
+            .expect("browser user input event"),
         BrowserHostEvent::NewWindow {
             workspace_key: key.clone(),
             tab_id: "tab-a".to_string(),
@@ -3857,8 +3857,9 @@ fn windows_secret_lifecycle_uses_native_navigation_identity_and_success_args() {
     assert!(source.contains("args.IsErrorPage(&mut is_error_page)"));
     assert!(source.contains("add_NavigationCompleted"));
     assert!(source.contains("args.IsSuccess(&mut is_success)"));
-    assert!(source.contains("document_secret_state.content_loading("));
-    assert!(source.contains("document_secret_state.navigation_completed("));
+    let compact = source.split_whitespace().collect::<String>();
+    assert!(compact.contains("content_document_secret_state.content_loading("));
+    assert!(compact.contains("document_secret_state.navigation_completed("));
 }
 
 #[test]
@@ -4187,7 +4188,7 @@ fn windows_host_profile_state_and_clear_plan_use_the_retained_canonical_root() {
     let source = include_str!("../src/browser/host/windows.rs");
     let constructor = source.find("fn with_status(").unwrap();
     let clear = source.find("fn clear_project_profile(").unwrap();
-    assert!(source[constructor..clear].contains("BrowserHostState::new(state_app_config_dir)"));
+    assert!(source[constructor..clear].contains("BrowserHostState::new(&state_app_config_dir)"));
     let clear_body = &source[clear..];
     let retained = clear_body.find("self.trusted_app_config_dir").unwrap();
     let layout = clear_body
@@ -4233,6 +4234,7 @@ fn verified_resource_store_rejects_an_intermediate_resources_reparse() {
     remove_directory_redirect(&redirected_resources);
 }
 
+#[cfg(windows)]
 #[test]
 fn verified_resource_store_root_lock_blocks_post_open_swap_and_store_remains_usable() {
     let temp = TestDir::new("resource-root-swap");
@@ -4259,6 +4261,49 @@ fn verified_resource_store_root_lock_blocks_post_open_swap_and_store_remains_usa
         )
         .is_ok());
     assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_verified_resource_store_rejects_replaced_root_and_does_not_write_outside() {
+    let temp = TestDir::new("linux-resource-root-swap");
+    let trusted = temp.path().join("trusted-config");
+    let store = BrowserResourceStore::open_verified(
+        &trusted,
+        "project-a",
+        BrowserResourceLimits::default(),
+    )
+    .unwrap();
+    let root = store.root().to_path_buf();
+    let retired = root.with_extension("retired");
+    std::fs::rename(&root, &retired).unwrap();
+    std::fs::create_dir(&root).unwrap();
+    assert!(store
+        .put(
+            &workspace("project-a", "conversation-a"),
+            BrowserResourceKind::ConsoleLog,
+            "text/plain",
+            b"must remain private",
+            false
+        )
+        .is_err());
+    assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+    std::fs::remove_dir(&root).unwrap();
+    let outside = temp.path().join("outside");
+    std::fs::create_dir(&outside).unwrap();
+    std::os::unix::fs::symlink(&outside, &root).unwrap();
+    assert!(store
+        .put(
+            &workspace("project-a", "conversation-a"),
+            BrowserResourceKind::ConsoleLog,
+            "text/plain",
+            b"must remain private",
+            false
+        )
+        .is_err());
+    drop(store);
+    assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
+    std::fs::remove_file(&root).unwrap();
 }
 
 #[test]
@@ -4352,7 +4397,7 @@ fn annotation_host_contract_redacts_lists_creates_owned_details_and_returns_muta
             true,
         )
         .expect("store other screenshot");
-    let mut state = BrowserHostState::new(temp.path());
+    let mut state = BrowserHostState::new(temp.path()).expect("browser host state");
     let snapshot = BrowserWorkspaceSnapshot {
         revision: BrowserRevision(1),
         tabs: vec![BrowserTabSnapshot {
@@ -4581,7 +4626,7 @@ fn annotation_details_failure_restores_pin_and_forged_same_owner_resources_are_m
         ],
         ..BrowserWorkspaceSnapshot::default()
     };
-    let mut state = BrowserHostState::new(temp.path());
+    let mut state = BrowserHostState::new(temp.path()).expect("browser host state");
     state.ensure_workspace(key.clone(), snapshot).unwrap();
     for id in ["ann-wrong-kind", "ann-wrong-mime"] {
         assert!(matches!(
@@ -4642,7 +4687,7 @@ fn annotation_pin_reconciliation_keeps_shared_refs_and_releases_only_after_last_
         ],
         ..BrowserWorkspaceSnapshot::default()
     };
-    let mut state = BrowserHostState::new(temp.path());
+    let mut state = BrowserHostState::new(temp.path()).expect("browser host state");
     state.ensure_workspace(key.clone(), snapshot).unwrap();
 
     let resolved = state
@@ -4717,7 +4762,7 @@ fn non_annotation_journal_eviction_releases_the_last_annotation_resource_referen
             true,
         )
         .unwrap();
-    let mut state = BrowserHostState::new(temp.path());
+    let mut state = BrowserHostState::new(temp.path()).expect("browser host state");
     state
         .ensure_workspace(key.clone(), BrowserWorkspaceSnapshot::default())
         .unwrap();
@@ -4790,7 +4835,7 @@ fn direct_annotation_resolve_reconciliation_does_not_leave_a_permanent_pin() {
         )],
         ..BrowserWorkspaceSnapshot::default()
     };
-    let mut state = BrowserHostState::new(temp.path());
+    let mut state = BrowserHostState::new(temp.path()).expect("browser host state");
     state.ensure_workspace(key.clone(), snapshot).unwrap();
     let resolved = state
         .apply_annotation_operation(
@@ -4838,7 +4883,7 @@ fn repeated_direct_get_finalization_releases_details_and_resolved_screenshot_pin
         annotations: vec![annotation],
         ..BrowserWorkspaceSnapshot::default()
     };
-    let mut state = BrowserHostState::new(temp.path());
+    let mut state = BrowserHostState::new(temp.path()).expect("browser host state");
     state.ensure_workspace(key.clone(), snapshot).unwrap();
 
     for _ in 0..3 {
@@ -4910,7 +4955,7 @@ fn redacted_secret_query_url_does_not_make_a_fresh_annotation_stale() {
 #[test]
 fn host_tab_and_page_mutations_advance_the_existing_snapshot_revision() {
     let temp = TestDir::new("host-mutations");
-    let mut host = BrowserHostState::new(temp.path());
+    let mut host = BrowserHostState::new(temp.path()).expect("browser host state");
     let key = workspace("project-a", "conversation-a");
     let ensured = host
         .ensure_workspace(key.clone(), BrowserWorkspaceSnapshot::default())
@@ -5010,7 +5055,7 @@ fn title_and_viewport_revision_causes_cancel_annotation_before_state_mutation() 
 #[test]
 fn host_journal_and_pane_metadata_do_not_stale_page_element_references() {
     let temp = TestDir::new("host-journal");
-    let mut host = BrowserHostState::new(temp.path());
+    let mut host = BrowserHostState::new(temp.path()).expect("browser host state");
     let key = workspace("project-a", "conversation-a");
     let initial = host
         .ensure_workspace(key.clone(), BrowserWorkspaceSnapshot::default())
@@ -5080,4 +5125,26 @@ fn browser_webview_host_exposes_the_main_thread_mounting_seam(
     });
     let _: Vec<BrowserHostEvent> = host.drain_events();
     let _: Option<&BrowserWorkspaceSnapshot> = host.workspace_snapshot(workspace_key);
+}
+
+#[test]
+fn exact_surface_binding_is_host_provided_and_rejects_partial_identity() {
+    use devmanager::domain::id::{AgentSessionId, BrowserContextId, ResourceId, TaskId};
+
+    let unbound = BrowserInvocationContext::agent("legacy mcp", BrowserRisk::Normal).unwrap();
+    assert!(unbound.exact_surface_binding().is_none());
+    assert!(unbound.exact_task_id().is_none());
+
+    let task_id = TaskId::new();
+    let session_id = AgentSessionId::new();
+    let context_id = BrowserContextId::new();
+    let resource_id = ResourceId::new();
+    let bound = unbound.bind_exact_surface(task_id, session_id, context_id, resource_id);
+    assert_eq!(
+        bound.exact_surface_binding(),
+        Some((task_id, session_id, context_id, resource_id))
+    );
+    assert_ne!(bound.exact_task_id(), Some(TaskId::new()));
+    assert_ne!(bound.exact_context_id(), Some(BrowserContextId::new()));
+    assert_ne!(bound.exact_resource_id(), Some(ResourceId::new()));
 }

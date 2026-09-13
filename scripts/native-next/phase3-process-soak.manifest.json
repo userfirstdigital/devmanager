@@ -1,0 +1,66 @@
+{
+  "schemaVersion": 1,
+  "revision": "phase3.10-supervisor-v3",
+  "gitRevision": "EXTERNAL",
+  "buildId": "EXTERNAL",
+  "targetDirectory": "target-native-next",
+  "sourceTreeState": "EXTERNAL",
+  "supervisorExecutable": "target-native-next\\debug\\devmanager-process-test-helper.exe",
+  "supervisorSha256": "EXTERNAL",
+  "helperExecutable": "target-native-next\\debug\\devmanager-process-test-helper.exe",
+  "helperSha256": "EXTERNAL",
+  "cycleExecutable": "target-native-next\\debug\\devmanager-process-test-helper.exe",
+  "cycleSha256": "EXTERNAL",
+  "workingDirectory": ".",
+  "evidenceRoot": ".devmanager-next\\evidence",
+  "environment": {
+    "systemRoot": "C:\\WINDOWS",
+    "tempDirectory": ".tmp-phase3-soak",
+    "pathDirectories": [
+      "C:\\WINDOWS\\System32",
+      "target-native-next\\debug"
+    ],
+    "allowlist": {
+      "DEVMANAGER_PROFILE": "native-next-dev",
+      "DEVMANAGER_INSTANCE_LABEL": "Next",
+      "DEVMANAGER_RUNTIME_KIND": "native-next"
+    }
+  },
+  "ansiCorpus": {
+    "path": "tests\\fixtures\\ansi\\phase3-v1.json",
+    "sha256": "b18f4257eb34fda828983c09746046013319d72fb85e7e3c30e1e1ff3809ce5d",
+    "revision": "phase3.10-ansi-v1"
+  },
+  "seed": 3403,
+  "iterations": 100,
+  "budgets": {
+    "suiteDeadlineMs": 600000,
+    "cycleDeadlineMs": 5000,
+    "cleanupDeadlineMs": 5000,
+    "stdoutBytes": 65536,
+    "stderrBytes": 16384,
+    "resultBytes": 262144
+  },
+  "scenarioCatalog": [
+    {
+      "name": "natural",
+      "arguments": ["cycle", "natural"],
+      "expectedExitCode": 0
+    },
+    {
+      "name": "ansi-corpus",
+      "arguments": ["cycle", "ansi-corpus"],
+      "expectedExitCode": 0
+    },
+    {
+      "name": "restart-resume",
+      "arguments": ["cycle", "restart-resume"],
+      "expectedExitCode": 0
+    },
+    {
+      "name": "occupied-port",
+      "arguments": ["cycle", "occupied-port"],
+      "expectedExitCode": 0
+    }
+  ]
+}

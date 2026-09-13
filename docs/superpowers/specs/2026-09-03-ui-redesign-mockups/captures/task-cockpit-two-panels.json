@@ -1,0 +1,53 @@
+{
+  "schema": "devmanager.ui.preview/v1",
+  "id": "task-cockpit-two-panels",
+  "title": "Two panels at mockup width",
+  "capture": { "cursor": "excluded", "border": "excluded" },
+  "root": {
+    "kind": "task-cockpit",
+    "label": "Task Cockpit",
+    "tasks": [
+      {
+        "title": "Snake Frontend",
+        "provider": "claude",
+        "state": "working",
+        "age_ms": 12000,
+        "project": "Snake Game",
+        "open": true,
+        "focused": true,
+        "view": "conversation",
+        "conversation": {
+          "messages": [
+            { "role": "user", "text": "make the snake speed up every 5 apples" },
+            { "role": "assistant", "text": "Added a tick-rate ramp in game/loop.ts; the speed floor is 60 ms so it never becomes unplayable." },
+            { "role": "user", "text": "run the tests" },
+            { "role": "assistant", "text": "cargo test --lib ui:: -- running 112 tests, 98 passed. The ramp floor and the ramp step both hold." }
+          ]
+        }
+      },
+      {
+        "title": "Build the Snake backend in C:/Code/userfirst/snake-game-backend. You own only that folder.",
+        "provider": "codex",
+        "state": "blocked",
+        "age_ms": 120000,
+        "project": "Snake Game",
+        "open": true,
+        "view": "terminal"
+      },
+      {
+        "title": "Port herdr zoom toggle to the workspace",
+        "provider": "cursor",
+        "state": "question",
+        "age_ms": 8000,
+        "project": "command"
+      },
+      {
+        "title": "hi there",
+        "provider": "codex",
+        "state": "idle",
+        "age_ms": 1080000,
+        "project": "command"
+      }
+    ]
+  }
+}

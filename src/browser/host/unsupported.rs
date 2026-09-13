@@ -1,27 +1,28 @@
-#[cfg(any(not(target_os = "windows"), test))]
+#[cfg(any(not(any(target_os = "windows", target_os = "linux")), test))]
 use super::super::BrowserCommandRequest;
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
 use super::super::{
     apply_browser_workflow_review_mutation, browser_workflow_review_projection,
     discard_browser_workflow_review, preview_browser_workflow_review, save_browser_workflow_review,
-    BrowserBounds, BrowserHostControl, BrowserHostEvent, BrowserPageRecordingIpcError,
-    BrowserPaneSurface, BrowserRecipeV1, BrowserRecordingError, BrowserRecordingInstance,
-    BrowserRecordingReview, BrowserRecordingStatus, BrowserReplayRepairCleanupWork,
-    BrowserWorkflowCoordinator, BrowserWorkflowReviewMutation, BrowserWorkflowReviewProjection,
-    BrowserWorkspaceKey,
+    BrowserBounds, BrowserGatewayRegistrar, BrowserHostControl, BrowserHostEvent,
+    BrowserNativeHostCommand, BrowserNativeHostOutcome, BrowserNativeLeaseFence,
+    BrowserPageRecordingIpcError, BrowserPaneSurface, BrowserRecipeV1, BrowserRecordingError,
+    BrowserRecordingInstance, BrowserRecordingReview, BrowserRecordingStatus,
+    BrowserReplayRepairCleanupWork, BrowserWorkflowCoordinator, BrowserWorkflowReviewMutation,
+    BrowserWorkflowReviewProjection, BrowserWorkspaceKey,
 };
 use super::super::{
     validate_direct_repair_preview_command, validate_direct_secret_command, BrowserCommand,
     BrowserError, BrowserHostStatus, BrowserResponse,
 };
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
 use super::{
     BrowserAppExitDisposition, BrowserHostState, BrowserNativeWindowLifetime,
     BrowserWorkspaceSnapshot,
 };
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
 use crate::browser::BrowserAttachmentProjection;
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
 use std::{
     marker::PhantomData,
     path::{Path, PathBuf},
@@ -29,7 +30,7 @@ use std::{
 };
 
 pub fn unsupported_host_status(platform: impl Into<String>) -> BrowserHostStatus {
-    let platform = platform.into();
+    let platform = bounded_platform(platform.into());
     BrowserHostStatus {
         available: false,
         diagnostic: Some(format!(
@@ -40,11 +41,42 @@ pub fn unsupported_host_status(platform: impl Into<String>) -> BrowserHostStatus
     }
 }
 
+fn bounded_platform(platform: String) -> String {
+    const KNOWN_PLATFORMS: &[&str] = &[
+        "windows", "macos", "linux", "android", "ios", "freebsd", "openbsd", "netbsd",
+    ];
+    if KNOWN_PLATFORMS.contains(&platform.as_str()) {
+        platform
+    } else {
+        "unknown".to_string()
+    }
+}
+
 pub fn unsupported_platform_error(platform: impl Into<String>) -> BrowserError {
-    // Locator failures can only be produced by the Windows host action boundary.
+    // Locator failures can only be produced by the native host action boundary.
     // Unsupported hosts must remain unavailable without attempting locator resolution.
     BrowserError::UnavailablePlatform {
-        platform: platform.into(),
+        platform: bounded_platform(platform.into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::unsupported_host_status;
+
+    #[test]
+    fn unsupported_host_status_redacts_unrecognized_platform_text() {
+        const SENTINEL: &str = "unsupported-platform-attacker-sentinel";
+        let status = unsupported_host_status(SENTINEL);
+        assert_eq!(status.platform, "unknown");
+        assert_eq!(
+            status.diagnostic.as_deref(),
+            Some("embedded browser support is unavailable on unknown")
+        );
+        assert!(!status
+            .diagnostic
+            .as_deref()
+            .is_some_and(|diagnostic| diagnostic.contains(SENTINEL)));
     }
 }
 
@@ -71,7 +103,7 @@ pub(crate) fn unsupported_validated_command_response(
     }
 }
 
-#[cfg(any(not(target_os = "windows"), test))]
+#[cfg(any(not(any(target_os = "windows", target_os = "linux")), test))]
 pub(crate) fn unsupported_request_response(
     platform: impl Into<String>,
     request: &BrowserCommandRequest,
@@ -86,38 +118,43 @@ pub(crate) fn unsupported_request_response(
     unsupported_validated_command_response(platform, request.command().clone())
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
 pub struct BrowserWebViewHost {
     status: BrowserHostStatus,
     #[allow(dead_code)]
     state: BrowserHostState,
     workflow_coordinator: BrowserWorkflowCoordinator,
+    native_shell_lease_fence: BrowserNativeLeaseFence,
     native_window_lifetime: BrowserNativeWindowLifetime,
     _main_thread_only: PhantomData<Rc<()>>,
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
 impl BrowserWebViewHost {
     pub fn new(app_config_dir: impl AsRef<Path>) -> Self {
+        let app_config_dir = app_config_dir.as_ref().to_path_buf();
         Self {
             status: unsupported_host_status(std::env::consts::OS),
-            state: BrowserHostState::new(app_config_dir),
+            state: BrowserHostState::new(&app_config_dir)
+                .unwrap_or_else(|_| BrowserHostState::unavailable(&app_config_dir)),
             workflow_coordinator: BrowserWorkflowCoordinator::default(),
+            native_shell_lease_fence: BrowserNativeLeaseFence::default(),
             native_window_lifetime: BrowserNativeWindowLifetime::default(),
             _main_thread_only: PhantomData,
         }
     }
 
-    pub fn unavailable(diagnostic: impl Into<String>) -> Self {
+    pub fn unavailable(_diagnostic: impl Into<String>) -> Self {
         Self {
             status: BrowserHostStatus {
                 available: false,
-                diagnostic: Some(diagnostic.into()),
+                diagnostic: Some("embedded browser support is unavailable".to_string()),
                 platform: std::env::consts::OS.to_string(),
                 version: None,
             },
-            state: BrowserHostState::new(PathBuf::new()),
+            state: BrowserHostState::unavailable(PathBuf::new()),
             workflow_coordinator: BrowserWorkflowCoordinator::default(),
+            native_shell_lease_fence: BrowserNativeLeaseFence::default(),
             native_window_lifetime: BrowserNativeWindowLifetime::default(),
             _main_thread_only: PhantomData,
         }
@@ -127,14 +164,58 @@ impl BrowserWebViewHost {
         self.status.clone()
     }
 
+    /// Unsupported platforms never mint a BrowserService settler.  Keeping
+    /// this method on the same host facade makes the production call seam
+    /// explicit while preserving the typed HOLD instead of silently falling
+    /// back to a source-level browser command.
+    pub fn settle_accepted_browser_hold(
+        &mut self,
+        _hello: crate::protocol::CapabilitySet,
+        _intent: &crate::browser::protocol::BrowserHostSettleIntent,
+        _hold: &crate::kernel::Effect,
+        _identity: &crate::protocol::BrowserSurfaceIdentity,
+    ) -> Result<
+        crate::domain::browser::BrowserHostOutcome,
+        crate::browser::protocol::BrowserHoldSettleError,
+    > {
+        Err(crate::browser::protocol::BrowserHoldSettleError::Hold(
+            crate::domain::browser::BrowserIntegrationHold::WebViewSurfaceAbsent,
+        ))
+    }
+
     pub fn attach_foreground_executor(&mut self, _executor: gpui::ForegroundExecutor) {}
+
+    pub fn attach_gateway_registrar(&mut self, _registrar: BrowserGatewayRegistrar) {}
+
+    pub fn detach_gateway_registrar(&mut self) {}
+
+    pub fn apply_native_shell_command(
+        &mut self,
+        command: &BrowserNativeHostCommand,
+    ) -> Result<BrowserNativeHostOutcome, BrowserError> {
+        let lease = command.lease();
+        self.native_shell_lease_fence
+            .admit(lease)
+            .map_err(BrowserError::from)?;
+        match command {
+            BrowserNativeHostCommand::Detach { .. } => {
+                self.native_shell_lease_fence
+                    .retire(lease)
+                    .map_err(BrowserError::from)?;
+                Ok(BrowserNativeHostOutcome::Idempotent)
+            }
+            _ => Err(unsupported_platform_error(std::env::consts::OS)),
+        }
+    }
 
     pub(crate) fn window_lifetime_fence(&self) -> BrowserNativeWindowLifetime {
         self.native_window_lifetime.clone()
     }
 
     pub(crate) fn begin_native_window_teardown(&mut self) -> BrowserAppExitDisposition {
-        self.native_window_lifetime.begin_teardown()
+        self.native_window_lifetime
+            .begin_teardown()
+            .unwrap_or(BrowserAppExitDisposition::Deferred)
     }
 
     pub(crate) fn finish_native_window_teardown_cleanup(&mut self) {}

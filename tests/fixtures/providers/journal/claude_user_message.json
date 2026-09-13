@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "source_type": "user_message",
+  "provider_event_id": "claude_evt_user_1",
+  "occurred_at_ms": 1725000001000,
+  "payload": {
+    "kind": "user_message",
+    "text": "Normalize Claude into the semantic journal"
+  },
+  "extensions": {
+    "hook_event_name": "UserPromptSubmit"
+  }
+}

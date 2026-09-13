@@ -1,0 +1,30 @@
+{
+  "chain_page": {
+    "schema_version": 1,
+    "library_revision": 7,
+    "chains": [
+      {
+        "chain": {
+          "id": "0192f5d0-0000-7000-8000-000000000010",
+          "title": "Review chain",
+          "description": "Linear review steps",
+          "revision": 2,
+          "archived_at_ms": null
+        },
+        "links": [
+          {
+            "id": "0192f5d0-0000-7000-8000-000000000011",
+            "chain_id": "0192f5d0-0000-7000-8000-000000000010",
+            "position": 1,
+            "prompt_id": "0192f5d0-0000-7000-8000-000000000001",
+            "prompt_version_id": "0192f5d0-0000-7000-8000-000000000002",
+            "previous_link_id": null,
+            "next_link_id": null,
+            "update_available": false
+          }
+        ]
+      }
+    ],
+    "next_cursor": null
+  }
+}

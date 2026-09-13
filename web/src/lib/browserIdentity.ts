@@ -5,6 +5,8 @@ type LocationLike = {
   host: string;
 };
 
+export { buildConnectWebSocketUrl } from "../connect/transport";
+
 function createBrowserInstallId(): string {
   if (typeof globalThis.crypto?.randomUUID === "function") {
     return globalThis.crypto.randomUUID();
@@ -22,10 +24,13 @@ export function getBrowserInstallId(): string {
   return created;
 }
 
-export function buildPairingUrl(token: string): string {
-  const params = new URLSearchParams({ t: token });
-  params.set("browserInstallId", getBrowserInstallId());
-  return `/pair?${params.toString()}`;
+export function buildPairingRequest(token: string): RequestInit {
+  return {
+    method: "POST",
+    credentials: "include",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ t: token, browserInstallId: getBrowserInstallId() }),
+  };
 }
 
 export function buildWebSocketUrl(

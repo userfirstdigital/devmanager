@@ -17,7 +17,7 @@ describe("native app shell connection feedback", () => {
     vi.useFakeTimers();
     const { rerender } = render(
       <AppShell
-        route={{ name: "sessions" }}
+        route={{ name: "tasks" }}
         status={{ kind: "closed", reason: "network changed" }}
         attentionCount={0}
         lastError={null}
@@ -33,12 +33,16 @@ describe("native app shell connection feedback", () => {
     act(() => vi.advanceTimersByTime(6_999));
     expect(screen.queryByRole("status")).toBeNull();
     act(() => vi.advanceTimersByTime(1));
-    expect(screen.getByRole("status").textContent).toMatch(/offline.*reconnecting/i);
-    expect(screen.queryByRole("button", { name: /resume|reconnect/i })).toBeNull();
+    expect(screen.getByRole("status").textContent).toMatch(
+      /offline.*reconnecting/i,
+    );
+    expect(
+      screen.queryByRole("button", { name: /resume|reconnect/i }),
+    ).toBeNull();
 
     rerender(
       <AppShell
-        route={{ name: "sessions" }}
+        route={{ name: "tasks" }}
         status={{ kind: "open" }}
         attentionCount={0}
         lastError={null}
@@ -56,14 +60,14 @@ describe("native app shell connection feedback", () => {
     const onDismissError = vi.fn();
     render(
       <AppShell
-        route={{ name: "sessions" }}
+        route={{ name: "tasks" }}
         status={{ kind: "open" }}
         attentionCount={0}
         lastError="Server could not be restarted."
         onDismissError={onDismissError}
         onNavigate={() => {}}
       >
-        <p>Sessions</p>
+        <p>Tasks</p>
       </AppShell>,
     );
 

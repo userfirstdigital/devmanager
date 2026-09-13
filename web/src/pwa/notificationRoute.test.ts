@@ -5,21 +5,19 @@ describe("safeRoute", () => {
   const origin = "https://devmanager.local";
 
   it("falls back when push data contains a malformed URL", () => {
-    expect(safeRoute("http://[", origin)).toBe("/sessions");
+    expect(safeRoute("http://[", origin)).toBe("/tasks");
   });
 
   it("keeps only same-origin route components", () => {
-    expect(safeRoute("/sessions?filter=active#latest", origin)).toBe(
-      "/sessions?filter=active#latest",
+    expect(safeRoute("/tasks?filter=active#latest", origin)).toBe(
+      "/tasks?filter=active#latest",
     );
-    expect(safeRoute("/session/tab/tab-1", origin)).toBe(
-      "/session/tab/tab-1",
+    expect(safeRoute("/tasks/tab%3Atab-1", origin)).toBe("/tasks/tab%3Atab-1");
+    expect(safeRoute("/tasks/server%3Adev%2Fweb", origin)).toBe(
+      "/tasks/server%3Adev%2Fweb",
     );
-    expect(safeRoute("/session/server/dev%2Fweb", origin)).toBe(
-      "/session/server/dev%2Fweb",
-    );
-    expect(safeRoute("https://example.com/escape", origin)).toBe("/sessions");
-    expect(safeRoute("/api/push", origin)).toBe("/sessions");
-    expect(safeRoute("/settings", origin)).toBe("/sessions");
+    expect(safeRoute("https://example.com/escape", origin)).toBe("/tasks");
+    expect(safeRoute("/api/push", origin)).toBe("/tasks");
+    expect(safeRoute("/settings", origin)).toBe("/tasks");
   });
 });

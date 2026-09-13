@@ -1,0 +1,117 @@
+{
+  "schema_version": 1,
+  "suite": "workspace-conformance-v1",
+  "mode": "fixture-fake-host",
+  "integration_claim": "none",
+  "required_cases": [
+    "binding.explicit_main",
+    "binding.explicit_worktree",
+    "binding.explicit_external",
+    "worktree.create_isolated",
+    "worktree.remove_refuses_dirty",
+    "files.bounded_access",
+    "artifacts.bounded_export",
+    "checkpoint.capture_and_restore",
+    "checkpoint.forbids_hard_reset",
+    "capabilities.git",
+    "capabilities.service",
+    "capabilities.port",
+    "capabilities.ssh",
+    "lifecycle.cancel",
+    "lifecycle.restart_replay",
+    "lifecycle.zero_orphan"
+  ],
+  "case_authority": {
+    "binding.explicit_main": "fake",
+    "binding.explicit_worktree": "fake",
+    "binding.explicit_external": "fake",
+    "worktree.create_isolated": "fake",
+    "worktree.remove_refuses_dirty": "fake",
+    "files.bounded_access": "fake",
+    "artifacts.bounded_export": "fake",
+    "checkpoint.capture_and_restore": "fake",
+    "checkpoint.forbids_hard_reset": "fake",
+    "capabilities.git": "fake",
+    "capabilities.service": "fake",
+    "capabilities.port": "fake",
+    "capabilities.ssh": "fake",
+    "lifecycle.cancel": "fake",
+    "lifecycle.restart_replay": "fake",
+    "lifecycle.zero_orphan": "fake"
+  },
+  "declared_metrics": [
+    "result",
+    "latency_ms",
+    "residue_jobs",
+    "residue_worktrees",
+    "cancelled_generations"
+  ],
+  "evidence_ids_required_for_integrated": [
+    "host.lock",
+    "kernel.sqlite3",
+    "ManagedProcessJob.active_process_ids"
+  ],
+  "preconditions": [
+    {
+      "id": "S2",
+      "seams": [
+        { "path": "src/config/project_store.rs", "needle": "pub struct ProjectStore" }
+      ]
+    },
+    {
+      "id": "S3",
+      "seams": [
+        { "path": "src/workspace/service.rs", "needle": "WorkspaceChoice" },
+        { "path": "src/domain/command.rs", "needle": "BindWorkspace" },
+        { "path": "src/client/cli.rs", "needle": "fn bind_workspace" }
+      ]
+    },
+    {
+      "id": "S4",
+      "seams": [
+        { "path": "src/workspace/worktree.rs", "needle": "fn preview_remove_worktree" },
+        { "path": "src/git/command.rs", "needle": "GIT_TERMINAL_PROMPT" }
+      ]
+    },
+    {
+      "id": "S5",
+      "seams": [
+        { "path": "src/workspace/files.rs", "needle": "fn bounded_read" }
+      ]
+    },
+    {
+      "id": "S6",
+      "seams": [
+        { "path": "src/workspace/checkpoint.rs", "needle": "struct Checkpoint" },
+        { "path": "src/git/checkpoint.rs", "needle": "fn restore" }
+      ]
+    },
+    {
+      "id": "S7",
+      "seams": [
+        { "path": "src/services/supervisor.rs", "needle": "ManagedProcessJob" },
+        { "path": "src/services/supervisor.rs", "needle": "prepare_suspended_pty" }
+      ]
+    },
+    {
+      "id": "S8",
+      "seams": [
+        { "path": "src/client/cli.rs", "needle": "fn begin_close" },
+        { "path": "src/client/cli.rs", "needle": "BeginCloseTask" }
+      ]
+    },
+    {
+      "id": "S9",
+      "seams": [
+        { "path": "docs/replacement-deletion-ledger.md", "needle": "FakeWorkspaceHost" }
+      ]
+    }
+  ],
+  "cutover_delete_symbols": [
+    "FakeWorkspaceHost",
+    "WorkspaceChoice",
+    "HostError",
+    "ArtifactRecord",
+    "JournalEntry"
+  ]
+}

@@ -1,0 +1,37 @@
+{
+  "schema": "devmanager.ui.preview/v1",
+  "id": "composer-states",
+  "title": "Task composer states",
+  "root": {
+    "kind": "composer",
+    "label": "Capability-aware task composer",
+    "controls": {
+      "modes": ["Send Now", "Steer", "Queue Follow-up"],
+      "turn_controls": ["Answer", "Approval", "Stop turn"],
+      "draft_actions": ["Save draft", "Stage attachment", "Remove attachment"],
+      "enter": {
+        "enter_sends": true,
+        "shift_enter_newline": true,
+        "ime_composition_never_sends": true
+      }
+    },
+    "availability": {
+      "source": "shared ActionCatalog intersected with host projection",
+      "missing_task_4_7": "controls disabled; activation cannot mint ComposerIntent"
+    },
+    "drafts": {
+      "authority": "immutable host projection",
+      "ephemeral": "in-memory editor overlay only",
+      "never": ["composer-drafts.json", "session.json", "std::fs", "local paths"]
+    },
+    "attachments": {
+      "shape": "host-issued ArtifactId plus bounded label",
+      "never": ["raw local paths", "filesystem metadata"]
+    },
+    "prompt_library": {
+      "inserts": "exact immutable version",
+      "auto_send": false,
+      "auto_advance": false
+    }
+  }
+}

@@ -1,0 +1,2363 @@
+use std::collections::BTreeSet;
+
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+use crate::domain::TaskId;
+use crate::ui::task_workspace::allocation::{AllocatedWorkspace, AllocationMetrics};
+
+/// The column width the grid PACKS at, which is not the width below which a
+/// panel stops working.
+///
+/// `AllocationMetrics::full_min_width` (320) is the floor: below it a panel
+/// becomes a title strip. This is the target: composition A's canvas is about
+/// 1650 logical px and carries FOUR columns of roughly 390 px, not the five
+/// that 320 + an 8 px gap would allow, and the brief's own acceptance numbers
+/// (three columns at 1100 px, five at 2000) are the same ratio. Packing at the
+/// floor instead would make every panel the narrowest the chrome tolerates the
+/// moment one more task is opened, which is exactly the complaint this change
+/// answers.
+pub const GRID_COLUMN_WIDTH: f32 = 360.0;
+
+/// How many top-level columns this canvas holds at [`GRID_COLUMN_WIDTH`].
+///
+/// Always at least one: a canvas too narrow for a single column still has to
+/// put the pane somewhere, and the allocator's own floors decide what happens
+/// to it from there.
+pub fn grid_columns_for(canvas_width: f32, metrics: AllocationMetrics) -> usize {
+    if !canvas_width.is_finite() || canvas_width <= 0.0 {
+        return 1;
+    }
+    let gap = if metrics.divider.is_finite() && metrics.divider > 0.0 {
+        metrics.divider
+    } else {
+        0.0
+    };
+    let column = GRID_COLUMN_WIDTH.max(metrics.full_min_width).max(1.0);
+    let columns = ((canvas_width + gap) / (column + gap)).floor();
+    if columns < 1.0 {
+        1
+    } else {
+        columns as usize
+    }
+}
+
+/// The canvas a workspace is packed at when the caller only cares WHICH tasks
+/// are open and which is focused, not where their panes sit -- a pure
+/// reconstruction from a key list, or an open that happens before the first
+/// paint has measured a window. Wide enough that the grid never starts a
+/// second row for a workspace anyone could supervise.
+pub const GRID_NOMINAL_CANVAS_WIDTH: f32 = 8_192.0;
+
+/// How many rows `panes` need at `columns` per row.
+pub fn grid_rows_for(panes: usize, columns: usize) -> usize {
+    let columns = columns.max(1);
+    panes.div_ceil(columns).max(1)
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub struct PaneId(Uuid);
+
+impl PaneId {
+    pub fn new() -> Self {
+        Self(Uuid::now_v7())
+    }
+}
+
+impl Default for PaneId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub struct SplitId(Uuid);
+
+impl SplitId {
+    pub fn new() -> Self {
+        Self(Uuid::now_v7())
+    }
+
+    pub fn as_bytes(&self) -> &[u8; 16] {
+        self.0.as_bytes()
+    }
+}
+
+impl Default for SplitId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum Axis {
+    Horizontal,
+    Vertical,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub enum Allocation {
+    Auto { weight: f32 },
+    Pinned { logical_px: f32 },
+}
+
+impl Allocation {
+    pub const fn auto() -> Self {
+        Self::Auto { weight: 1.0 }
+    }
+
+    pub fn is_valid(self) -> bool {
+        match self {
+            Self::Auto { weight } => weight.is_finite() && weight > 0.0,
+            Self::Pinned { logical_px } => logical_px.is_finite() && logical_px > 0.0,
+        }
+    }
+
+    pub const fn is_pinned(self) -> bool {
+        matches!(self, Self::Pinned { .. })
+    }
+}
+
+impl Default for Allocation {
+    fn default() -> Self {
+        Self::auto()
+    }
+}
+
+/// Which view a task pane shows (spec 6.2). `TABS` are the five visible tabs
+/// in order; `MORE` live behind the panel menu. Serialised per pane; an
+/// unknown value fails closed to `Conversation`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PaneView {
+    #[default]
+    Conversation,
+    Terminal,
+    Files,
+    Changes,
+    Browser,
+    Review,
+    Artifacts,
+    Services,
+}
+
+impl PaneView {
+    pub const TABS: [PaneView; 5] = [
+        PaneView::Conversation,
+        PaneView::Terminal,
+        PaneView::Files,
+        PaneView::Changes,
+        PaneView::Browser,
+    ];
+    pub const MORE: [PaneView; 3] = [PaneView::Review, PaneView::Artifacts, PaneView::Services];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Conversation => "Conversation",
+            Self::Terminal => "Terminal",
+            Self::Files => "Files",
+            Self::Changes => "Changes",
+            Self::Browser => "Browser",
+            Self::Review => "Review",
+            Self::Artifacts => "Artifacts",
+            Self::Services => "Services",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum PanePresentation {
+    Full,
+    /// Too little room: the pane renders as its title row alone (28 px) until
+    /// allocation gives it space again. Never chosen by the user — the retired
+    /// `CompactManual` aliases in only so an older file still loads, and
+    /// [`KeyedWorkspaceLayout::sanitized`] puts every restored pane back to
+    /// `Full` because allocation re-derives this every frame anyway.
+    #[serde(alias = "CompactAutomatic", alias = "CompactManual")]
+    Minimised,
+}
+
+/// Recursive pane workspace keyed by task identity `K`.
+///
+/// Local callers keep [`TaskWorkspace`] / [`TaskPane`] aliases (`K = TaskId`).
+/// Future host-qualified keys (non-`Copy` enums) plug in without remapping UUIDs
+/// or spawning a separate workspace per host.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(bound(serialize = "K: Serialize", deserialize = "K: Deserialize<'de>"))]
+pub struct TaskPane<K = TaskId> {
+    pub id: PaneId,
+    pub task_id: K,
+    pub presentation: PanePresentation,
+    pub last_focused_at: u64,
+    /// Which surface this pane shows. Absent in files written before the pane
+    /// owned its own view, so it defaults rather than failing the load.
+    #[serde(default)]
+    pub view: PaneView,
+}
+
+impl<K> TaskPane<K> {
+    fn new(task_id: K, last_focused_at: u64) -> Self {
+        Self {
+            id: PaneId::new(),
+            task_id,
+            presentation: PanePresentation::Full,
+            last_focused_at,
+            view: PaneView::default(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(bound(serialize = "K: Serialize", deserialize = "K: Deserialize<'de>"))]
+pub struct SplitChild<K = TaskId> {
+    pub node: WorkspaceNode<K>,
+    pub allocation: Allocation,
+}
+
+impl<K> SplitChild<K> {
+    fn auto(node: WorkspaceNode<K>) -> Self {
+        Self {
+            node,
+            allocation: Allocation::auto(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(bound(serialize = "K: Serialize", deserialize = "K: Deserialize<'de>"))]
+pub enum WorkspaceNode<K = TaskId> {
+    Pane(TaskPane<K>),
+    Split {
+        id: SplitId,
+        axis: Axis,
+        children: Vec<SplitChild<K>>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Edge {
+    Left,
+    Right,
+    Top,
+    Bottom,
+}
+
+impl Edge {
+    pub const fn axis(self) -> Axis {
+        match self {
+            Self::Left | Self::Right => Axis::Horizontal,
+            Self::Top | Self::Bottom => Axis::Vertical,
+        }
+    }
+
+    const fn inserts_after(self) -> bool {
+        matches!(self, Self::Right | Self::Bottom)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DropTarget {
+    Center { pane: PaneId },
+    Edge { pane: PaneId, edge: Edge },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WorkspaceError {
+    DuplicateTask,
+    InvalidTree,
+    MissingPane,
+    SelfDrop,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(bound(serialize = "K: Serialize", deserialize = "K: Deserialize<'de>"))]
+pub struct Workspace<K = TaskId> {
+    root: Option<WorkspaceNode<K>>,
+    focused: Option<PaneId>,
+    previous_focus: Option<PaneId>,
+    focus_clock: u64,
+    /// The one pane filling the canvas right now. Zoom is a look, not a
+    /// layout: it never touches the tree and is deliberately not persisted,
+    /// so a restart returns to the arrangement the user actually built.
+    #[serde(skip)]
+    zoomed: Option<PaneId>,
+}
+
+/// Local TaskId-keyed workspace (existing public API).
+pub type TaskWorkspace = Workspace<TaskId>;
+
+impl<K> Default for Workspace<K> {
+    fn default() -> Self {
+        Self {
+            root: None,
+            focused: None,
+            previous_focus: None,
+            focus_clock: 0,
+            zoomed: None,
+        }
+    }
+}
+
+impl<K: Clone + Ord + Eq> Workspace<K> {
+    pub fn single(task_id: K) -> Self {
+        let focus_clock = 1;
+        let pane = TaskPane::new(task_id, focus_clock);
+        Self {
+            focused: Some(pane.id),
+            root: Some(WorkspaceNode::Pane(pane)),
+            previous_focus: None,
+            focus_clock,
+            zoomed: None,
+        }
+    }
+
+    pub fn root(&self) -> Option<&WorkspaceNode<K>> {
+        self.root.as_ref()
+    }
+
+    pub(crate) fn root_mut(&mut self) -> Option<&mut WorkspaceNode<K>> {
+        self.root.as_mut()
+    }
+
+    pub fn focused_pane_id(&self) -> Option<PaneId> {
+        self.focused
+    }
+
+    pub fn previous_focus(&self) -> Option<PaneId> {
+        self.previous_focus
+    }
+
+    pub fn focused_task(&self) -> Option<K> {
+        self.focused
+            .and_then(|pane_id| self.pane(pane_id))
+            .map(|pane| pane.task_id.clone())
+    }
+
+    pub fn pane_count(&self) -> usize {
+        self.root.as_ref().map(count_panes).unwrap_or(0)
+    }
+
+    pub fn pane(&self, pane_id: PaneId) -> Option<&TaskPane<K>> {
+        self.root.as_ref().and_then(|root| find_pane(root, pane_id))
+    }
+
+    pub fn pane_for_task(&self, task_id: K) -> Option<&TaskPane<K>> {
+        self.root
+            .as_ref()
+            .and_then(|root| find_pane_for_task(root, &task_id))
+    }
+
+    pub fn task_ids(&self) -> Vec<K> {
+        let mut task_ids = Vec::with_capacity(self.pane_count());
+        if let Some(root) = &self.root {
+            collect_task_ids(root, &mut task_ids);
+        }
+        task_ids
+    }
+
+    pub fn contains_task(&self, task_id: K) -> bool {
+        self.pane_for_task(task_id).is_some()
+    }
+
+    pub fn presentation(&self, task_id: K) -> Option<PanePresentation> {
+        self.pane_for_task(task_id).map(|pane| pane.presentation)
+    }
+
+    pub fn view_of(&self, task_id: K) -> Option<PaneView> {
+        self.pane_for_task(task_id).map(|pane| pane.view)
+    }
+
+    pub fn set_view(&mut self, task_id: K, view: PaneView) -> Result<(), WorkspaceError> {
+        let pane = self
+            .pane_for_task_mut(task_id)
+            .ok_or(WorkspaceError::MissingPane)?;
+        pane.view = view;
+        Ok(())
+    }
+
+    pub(crate) fn pane_for_task_mut(&mut self, task_id: K) -> Option<&mut TaskPane<K>> {
+        self.root
+            .as_mut()
+            .and_then(|root| find_pane_for_task_mut(root, &task_id))
+    }
+
+    pub fn insert_after_focused(
+        &mut self,
+        task_id: K,
+        axis: Axis,
+    ) -> Result<PaneId, WorkspaceError> {
+        let target = match self.focused {
+            Some(target) => target,
+            None if self.root.is_none() => {
+                if self.contains_task(task_id.clone()) {
+                    return Err(WorkspaceError::DuplicateTask);
+                }
+                *self = Self::single(task_id);
+                return self.focused.ok_or(WorkspaceError::InvalidTree);
+            }
+            None => return Err(WorkspaceError::InvalidTree),
+        };
+        self.insert_beside(
+            task_id,
+            target,
+            match axis {
+                Axis::Horizontal => Edge::Right,
+                Axis::Vertical => Edge::Bottom,
+            },
+        )
+    }
+
+    /// Split one named pane and put a new one on the given side of it.
+    ///
+    /// The general form of [`Self::insert_after_focused`], which is this with
+    /// the focused pane and the trailing edge. A caller that knows which pane
+    /// it is splitting -- a drag, a drop, a fixture describing an exact tree --
+    /// says so rather than moving focus first and inserting blind.
+    pub fn insert_beside(
+        &mut self,
+        task_id: K,
+        target: PaneId,
+        edge: Edge,
+    ) -> Result<PaneId, WorkspaceError> {
+        if self.contains_task(task_id.clone()) {
+            return Err(WorkspaceError::DuplicateTask);
+        }
+        if self.root.is_none() {
+            *self = Self::single(task_id);
+            return self.focused.ok_or(WorkspaceError::InvalidTree);
+        }
+        let mut candidate = self.clone();
+        candidate.focus_clock = candidate.focus_clock.saturating_add(1).max(1);
+        let pane = TaskPane::new(task_id, candidate.focus_clock);
+        let pane_id = pane.id;
+        let root = candidate.root.take().ok_or(WorkspaceError::InvalidTree)?;
+        let (next_root, inserted) =
+            insert_pane_near(root, target, pane, edge.axis(), edge.inserts_after());
+        if !inserted {
+            return Err(WorkspaceError::MissingPane);
+        }
+        candidate.root = Some(next_root);
+        candidate.previous_focus = candidate.focused;
+        candidate.focused = Some(pane_id);
+        candidate.validate()?;
+        *self = candidate;
+        Ok(pane_id)
+    }
+
+    /// Open a pane as one more cell of the grid (spec 6.5 / composition A).
+    ///
+    /// `insert_after_focused` nests the new pane INSIDE whatever the focused
+    /// pane already sits in, so opening five tasks in a row builds a ladder of
+    /// splits and the panels get narrower and narrower without the grid ever
+    /// reflowing. Composition A tiles instead: a new panel is a new top-level
+    /// column while the canvas can still hold one, and starts (or joins) a
+    /// second row when it cannot.
+    ///
+    /// Explicit gestures are untouched -- a drag, a move or a drop still nests
+    /// exactly where the user aimed, and this never rearranges what is already
+    /// on screen. It only decides where the NEW pane goes.
+    pub fn insert_into_grid(
+        &mut self,
+        task_id: K,
+        canvas_width: f32,
+        metrics: AllocationMetrics,
+    ) -> Result<PaneId, WorkspaceError> {
+        if self.contains_task(task_id.clone()) {
+            return Err(WorkspaceError::DuplicateTask);
+        }
+        if self.root.is_none() {
+            *self = Self::single(task_id);
+            return self.focused.ok_or(WorkspaceError::InvalidTree);
+        }
+        let columns = grid_columns_for(canvas_width, metrics);
+        let mut candidate = self.clone();
+        candidate.focus_clock = candidate.focus_clock.saturating_add(1).max(1);
+        let pane = TaskPane::new(task_id, candidate.focus_clock);
+        let pane_id = pane.id;
+        let root = candidate.root.take().ok_or(WorkspaceError::InvalidTree)?;
+        candidate.root = Some(place_in_grid(root, WorkspaceNode::Pane(pane), columns));
+        candidate.previous_focus = candidate.focused;
+        candidate.focused = Some(pane_id);
+        candidate.validate()?;
+        *self = candidate;
+        Ok(pane_id)
+    }
+
+    /// Rebuild the tree as a plain grid of `columns` columns, keeping every
+    /// pane's identity, view and focus clock, in the order given.
+    ///
+    /// The panes are re-parented, not recreated: a `PaneId` survives, so focus,
+    /// zoom and any in-flight drag still name the same pane afterwards.
+    pub(crate) fn rebuild_as_grid(&mut self, order: Vec<PaneId>, columns: usize) -> bool {
+        let Some(root) = self.root.take() else {
+            return false;
+        };
+        let mut panes: Vec<TaskPane<K>> = Vec::new();
+        collect_panes(root, &mut panes);
+        let mut ordered: Vec<TaskPane<K>> = Vec::with_capacity(panes.len());
+        for pane_id in order {
+            if let Some(index) = panes.iter().position(|pane| pane.id == pane_id) {
+                ordered.push(panes.remove(index));
+            }
+        }
+        // Anything the caller's order did not name keeps its tree order at the
+        // end rather than being dropped: a pane the ordering could not see is
+        // still a pane somebody opened.
+        ordered.append(&mut panes);
+        let rebuilt = grid_tree(ordered, columns);
+        let changed = rebuilt != self.root;
+        self.root = rebuilt;
+        if self
+            .focused
+            .is_none_or(|pane_id| self.pane(pane_id).is_none())
+        {
+            self.focused = self.root.as_ref().and_then(first_pane_id);
+        }
+        if self
+            .previous_focus
+            .is_some_and(|pane_id| self.pane(pane_id).is_none())
+        {
+            self.previous_focus = None;
+        }
+        if self
+            .zoomed
+            .is_some_and(|pane_id| self.pane(pane_id).is_none())
+        {
+            self.zoomed = None;
+        }
+        changed
+    }
+
+    pub fn focus_pane(&mut self, pane_id: PaneId) -> Result<(), WorkspaceError> {
+        if self.pane(pane_id).is_none() {
+            return Err(WorkspaceError::MissingPane);
+        }
+        if self.focused == Some(pane_id) {
+            return Ok(());
+        }
+        self.focus_clock = self.focus_clock.saturating_add(1).max(1);
+        self.previous_focus = self.focused;
+        self.focused = Some(pane_id);
+        let clock = self.focus_clock;
+        if let Some(pane) = self.pane_mut(pane_id) {
+            pane.last_focused_at = clock;
+        }
+        Ok(())
+    }
+
+    pub fn zoomed(&self) -> Option<PaneId> {
+        self.zoomed
+    }
+
+    /// Fill the canvas with one pane. Zooming also focuses it: the zoomed pane
+    /// is the only one on screen, so leaving focus elsewhere would strand the
+    /// composer and every keyboard route on a pane nobody can see.
+    pub fn zoom(&mut self, pane: PaneId) -> Result<(), WorkspaceError> {
+        self.focus_pane(pane)?;
+        // A pane filling the canvas cannot be a title strip: minimisation is a
+        // verdict about sharing a viewport, and a zoomed pane shares nothing.
+        self.pane_mut(pane)
+            .ok_or(WorkspaceError::MissingPane)?
+            .presentation = PanePresentation::Full;
+        self.zoomed = Some(pane);
+        Ok(())
+    }
+
+    pub fn unzoom(&mut self) {
+        self.zoomed = None;
+    }
+
+    pub fn toggle_zoom_focused(&mut self) {
+        match (self.zoomed, self.focused) {
+            (Some(_), _) => self.zoomed = None,
+            // Through `zoom` rather than the field, so the toggle restores a
+            // strip's content exactly as the explicit call does.
+            (None, Some(focused)) => {
+                let _ = self.zoom(focused);
+            }
+            (None, None) => {}
+        }
+    }
+
+    /// The pane the eye would land on moving `edge`-ward from the focused one.
+    ///
+    /// Geometry, not tree order: `⌘→` means "the panel to the right of this
+    /// one on screen", and the tree's sibling order answers a different
+    /// question (a pane can be the next sibling and be painted below). The
+    /// rects are the ones the shell last allocated, so the answer is about
+    /// what is actually on screen at this window size rather than about a
+    /// nominal layout nobody is looking at.
+    ///
+    /// Ties -- two panes stacked at the same distance to the right -- go to the
+    /// one whose centre is closest to the focused pane's own axis, which is the
+    /// one a person would say is "across from" it.
+    pub fn pane_toward(&self, edge: Edge, allocated: &AllocatedWorkspace<K>) -> Option<PaneId> {
+        let focused = self.focused?;
+        let origin = allocated.rect(self.pane(focused)?.task_id.clone())?;
+        let (origin_x, origin_y) = (
+            origin.x + origin.width / 2.0,
+            origin.y + origin.height / 2.0,
+        );
+        let mut best: Option<(f32, f32, PaneId)> = None;
+        for task_id in self.task_ids() {
+            let Some(pane) = self.pane_for_task(task_id.clone()) else {
+                continue;
+            };
+            if pane.id == focused {
+                continue;
+            }
+            let Some(rect) = allocated.rect(task_id) else {
+                continue;
+            };
+            let centre_x = rect.x + rect.width / 2.0;
+            let centre_y = rect.y + rect.height / 2.0;
+            // The forward distance must be strictly positive: a pane whose
+            // centre sits on the same axis is beside this one, not toward the
+            // edge, and admitting it would make `⌘←` and `⌘→` both answer with
+            // the same neighbour.
+            let (forward, sideways) = match edge {
+                Edge::Left => (origin_x - centre_x, (centre_y - origin_y).abs()),
+                Edge::Right => (centre_x - origin_x, (centre_y - origin_y).abs()),
+                Edge::Top => (origin_y - centre_y, (centre_x - origin_x).abs()),
+                Edge::Bottom => (centre_y - origin_y, (centre_x - origin_x).abs()),
+            };
+            if forward <= 0.0 {
+                continue;
+            }
+            let better = match best {
+                None => true,
+                Some((best_forward, best_sideways, _)) => {
+                    forward < best_forward || (forward == best_forward && sideways < best_sideways)
+                }
+            };
+            if better {
+                best = Some((forward, sideways, pane.id));
+            }
+        }
+        best.map(|(_, _, pane_id)| pane_id)
+    }
+
+    /// Move focus one pane toward `edge`. Returns whether focus moved.
+    ///
+    /// Nothing that way is an ordinary answer at the edge of the workspace, not
+    /// a fault -- but it is said out loud, because a chord that silently does
+    /// nothing is indistinguishable from a chord that never arrived.
+    pub fn focus_pane_toward(&mut self, edge: Edge, allocated: &AllocatedWorkspace<K>) -> bool {
+        let Some(target) = self.pane_toward(edge, allocated) else {
+            eprintln!("devmanager: no pane lies {edge:?} of the focused pane");
+            return false;
+        };
+        self.focus_pane(target).is_ok()
+    }
+
+    /// Move the focused pane past its `edge`-ward neighbour, landing on that
+    /// neighbour's far side so the pane keeps travelling in the direction the
+    /// arrow named. Returns whether the tree changed.
+    pub fn move_pane_toward(&mut self, edge: Edge, allocated: &AllocatedWorkspace<K>) -> bool {
+        let Some(target) = self.pane_toward(edge, allocated) else {
+            eprintln!("devmanager: no pane lies {edge:?} of the focused pane to move past");
+            return false;
+        };
+        let Some(source) = self.focused else {
+            return false;
+        };
+        self.move_pane(source, DropTarget::Edge { pane: target, edge })
+            .is_ok()
+    }
+
+    pub fn focus_task(&mut self, task_id: K) -> Result<(), WorkspaceError> {
+        let pane_id = self
+            .pane_for_task(task_id)
+            .map(|pane| pane.id)
+            .ok_or(WorkspaceError::MissingPane)?;
+        self.focus_pane(pane_id)
+    }
+
+    /// Open a different task in the focused slot without discarding other panes
+    /// or their manually sized split allocations. Compact presentation and the
+    /// pane identity stay put so geometry/pins transfer with the slot.
+    pub fn replace_focused_task(&mut self, task_id: K) -> Result<(), WorkspaceError> {
+        if self.contains_task(task_id.clone()) {
+            return self.focus_task(task_id);
+        }
+        let pane_id = self.focused.ok_or(WorkspaceError::MissingPane)?;
+        self.focus_clock = self.focus_clock.saturating_add(1).max(1);
+        let clock = self.focus_clock;
+        let pane = self.pane_mut(pane_id).ok_or(WorkspaceError::MissingPane)?;
+        pane.task_id = task_id;
+        pane.last_focused_at = clock;
+        Ok(())
+    }
+
+    pub fn remove_pane(&mut self, pane_id: PaneId) -> Result<(), WorkspaceError> {
+        if self.pane(pane_id).is_none() {
+            return Err(WorkspaceError::MissingPane);
+        }
+        let mut candidate = self.clone();
+        let root = candidate.root.take().ok_or(WorkspaceError::MissingPane)?;
+        let (next_root, removed) = remove_pane_node(root, pane_id);
+        if removed.is_none() {
+            return Err(WorkspaceError::MissingPane);
+        }
+        candidate.root = next_root;
+        if candidate.zoomed == Some(pane_id) {
+            candidate.zoomed = None;
+        }
+        candidate.repair_focus_after_removal(pane_id);
+        candidate.validate()?;
+        *self = candidate;
+        Ok(())
+    }
+
+    pub fn swap_panes(&mut self, first: PaneId, second: PaneId) -> Result<(), WorkspaceError> {
+        if first == second {
+            return Err(WorkspaceError::SelfDrop);
+        }
+        if self.pane(first).is_none() || self.pane(second).is_none() {
+            return Err(WorkspaceError::MissingPane);
+        }
+        let mut candidate = self.clone();
+        let first_pane = candidate
+            .pane(first)
+            .cloned()
+            .ok_or(WorkspaceError::MissingPane)?;
+        let second_pane = candidate
+            .pane(second)
+            .cloned()
+            .ok_or(WorkspaceError::MissingPane)?;
+        let mut first_replacement = second_pane;
+        first_replacement.id = first;
+        let mut second_replacement = first_pane;
+        second_replacement.id = second;
+        *candidate
+            .pane_mut(first)
+            .ok_or(WorkspaceError::MissingPane)? = first_replacement;
+        *candidate
+            .pane_mut(second)
+            .ok_or(WorkspaceError::MissingPane)? = second_replacement;
+        if candidate.focused == Some(first) {
+            candidate.focused = Some(second);
+        } else if candidate.focused == Some(second) {
+            candidate.focused = Some(first);
+        }
+        if candidate.previous_focus == Some(first) {
+            candidate.previous_focus = Some(second);
+        } else if candidate.previous_focus == Some(second) {
+            candidate.previous_focus = Some(first);
+        }
+        if candidate.zoomed == Some(first) {
+            candidate.zoomed = Some(second);
+        } else if candidate.zoomed == Some(second) {
+            candidate.zoomed = Some(first);
+        }
+        candidate.validate()?;
+        *self = candidate;
+        Ok(())
+    }
+
+    pub fn move_pane(&mut self, source: PaneId, target: DropTarget) -> Result<(), WorkspaceError> {
+        let target_pane = match target {
+            DropTarget::Center { pane } | DropTarget::Edge { pane, .. } => pane,
+        };
+        if source == target_pane {
+            return Err(WorkspaceError::SelfDrop);
+        }
+        if self.pane(source).is_none() || self.pane(target_pane).is_none() {
+            return Err(WorkspaceError::MissingPane);
+        }
+        if matches!(target, DropTarget::Center { .. }) {
+            return self.swap_panes(source, target_pane);
+        }
+
+        let DropTarget::Edge { edge, .. } = target else {
+            unreachable!();
+        };
+        let mut candidate = self.clone();
+        let root = candidate.root.take().ok_or(WorkspaceError::MissingPane)?;
+        let (without_source, moved) = remove_pane_node(root, source);
+        let moved = moved.ok_or(WorkspaceError::MissingPane)?;
+        let without_source = without_source.ok_or(WorkspaceError::InvalidTree)?;
+        let (next_root, inserted) = insert_pane_near(
+            without_source,
+            target_pane,
+            moved,
+            edge.axis(),
+            edge.inserts_after(),
+        );
+        if !inserted {
+            return Err(WorkspaceError::MissingPane);
+        }
+        candidate.root = Some(next_root);
+        candidate.validate()?;
+        *self = candidate;
+        Ok(())
+    }
+
+    /// Copy the exact pane tree while remapping task keys.
+    ///
+    /// Preserves pane IDs, split IDs, allocations, presentation, focus clocks,
+    /// focus/previous-focus pane IDs, and tree order. Mapping two distinct
+    /// source keys onto the same destination key is rejected (`DuplicateTask`)
+    /// rather than merging panes.
+    pub fn map_task_keys<U, F>(&self, mut map_key: F) -> Result<Workspace<U>, WorkspaceError>
+    where
+        U: Clone + Ord + Eq,
+        F: FnMut(&K) -> U,
+    {
+        let mut seen = BTreeSet::new();
+        let root = match &self.root {
+            Some(node) => Some(map_workspace_node(node, &mut map_key, &mut seen)?),
+            None => None,
+        };
+        let mapped = Workspace {
+            root,
+            focused: self.focused,
+            previous_focus: self.previous_focus,
+            focus_clock: self.focus_clock,
+            zoomed: self.zoomed,
+        };
+        mapped.validate()?;
+        Ok(mapped)
+    }
+
+    pub fn validate(&self) -> Result<(), WorkspaceError> {
+        let Some(root) = &self.root else {
+            return if self.focused.is_none()
+                && self.previous_focus.is_none()
+                && self.zoomed.is_none()
+            {
+                Ok(())
+            } else {
+                Err(WorkspaceError::InvalidTree)
+            };
+        };
+        let mut pane_ids = BTreeSet::new();
+        let mut task_ids = BTreeSet::new();
+        let mut split_ids = BTreeSet::new();
+        validate_node(root, &mut pane_ids, &mut task_ids, &mut split_ids)?;
+        let focused = self.focused.ok_or(WorkspaceError::InvalidTree)?;
+        if !pane_ids.contains(&focused) {
+            return Err(WorkspaceError::InvalidTree);
+        }
+        if self
+            .previous_focus
+            .is_some_and(|previous| previous == focused || !pane_ids.contains(&previous))
+        {
+            return Err(WorkspaceError::InvalidTree);
+        }
+        if self
+            .zoomed
+            .is_some_and(|zoomed| !pane_ids.contains(&zoomed))
+        {
+            return Err(WorkspaceError::InvalidTree);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn pane_mut(&mut self, pane_id: PaneId) -> Option<&mut TaskPane<K>> {
+        self.root
+            .as_mut()
+            .and_then(|root| find_pane_mut(root, pane_id))
+    }
+
+    /// The immediate split owns a panel's size; an ancestor's pin belongs to
+    /// the entire group and must not be reset by a panel action.
+    pub fn task_axis_allocation(&self, task_id: &K) -> Option<(Axis, Allocation)> {
+        fn visit<K: PartialEq>(node: &WorkspaceNode<K>, task: &K) -> Option<(Axis, Allocation)> {
+            let WorkspaceNode::Split { axis, children, .. } = node else {
+                return None;
+            };
+            for child in children {
+                match &child.node {
+                    WorkspaceNode::Pane(pane) if &pane.task_id == task => {
+                        return Some((*axis, child.allocation));
+                    }
+                    _ => {
+                        if let Some(found) = visit(&child.node, task) {
+                            return Some(found);
+                        }
+                    }
+                }
+            }
+            None
+        }
+        visit(self.root.as_ref()?, task_id)
+    }
+
+    /// Toggle a panel's explicit pin at its measured, unzoomed size.
+    pub fn toggle_task_size_pin(
+        &mut self,
+        task_id: K,
+        viewport: super::allocation::Viewport,
+        metrics: AllocationMetrics,
+    ) -> Result<(), WorkspaceError> {
+        let (axis, allocation) = self
+            .task_axis_allocation(&task_id)
+            .ok_or(WorkspaceError::MissingPane)?;
+        if allocation.is_pinned() {
+            return self.reset_task_axis_size(task_id);
+        }
+        let mut measured = self.clone();
+        measured.unzoom();
+        let rect = measured
+            .allocate(viewport, metrics)
+            .rect(task_id.clone())
+            .ok_or(WorkspaceError::MissingPane)?;
+        self.pin_task_axis_size(
+            task_id,
+            match axis {
+                Axis::Horizontal => rect.width,
+                Axis::Vertical => rect.height,
+            },
+        )
+    }
+
+    pub fn pin_task_axis_size(
+        &mut self,
+        task_id: K,
+        logical_px: f32,
+    ) -> Result<(), WorkspaceError> {
+        if !logical_px.is_finite() || logical_px <= 0.0 {
+            return Err(WorkspaceError::InvalidTree);
+        }
+        let root = self.root_mut().ok_or(WorkspaceError::MissingPane)?;
+        if set_task_allocation(root, &task_id, Allocation::Pinned { logical_px }) {
+            Ok(())
+        } else {
+            Err(WorkspaceError::MissingPane)
+        }
+    }
+
+    pub fn reset_task_axis_size(&mut self, task_id: K) -> Result<(), WorkspaceError> {
+        let root = self.root_mut().ok_or(WorkspaceError::MissingPane)?;
+        if set_task_allocation(root, &task_id, Allocation::auto()) {
+            Ok(())
+        } else {
+            Err(WorkspaceError::MissingPane)
+        }
+    }
+
+    pub fn split_child_allocation(
+        &self,
+        split_id: SplitId,
+        child_index: usize,
+    ) -> Option<Allocation> {
+        self.root
+            .as_ref()
+            .and_then(|root| find_split(root, split_id))
+            .and_then(|children| children.get(child_index))
+            .map(|child| child.allocation)
+    }
+
+    pub fn resize_split_child(
+        &mut self,
+        split_id: SplitId,
+        child_index: usize,
+        logical_px: f32,
+    ) -> Result<(), WorkspaceError> {
+        self.resize_split_child_with_parent_extent(split_id, child_index, logical_px, None)
+    }
+
+    /// Persist only explicit user intent; viewport-dependent peer adjustment is
+    /// owned by the allocator and must never overwrite another custom pin.
+    pub fn resize_split_child_with_parent_extent(
+        &mut self,
+        split_id: SplitId,
+        child_index: usize,
+        logical_px: f32,
+        _parent_extent: Option<(f32, f32)>,
+    ) -> Result<(), WorkspaceError> {
+        if !logical_px.is_finite() || logical_px <= 0.0 {
+            return Err(WorkspaceError::InvalidTree);
+        }
+        let mut candidate = self.clone();
+        let root = candidate.root_mut().ok_or(WorkspaceError::MissingPane)?;
+        let children = find_split_mut(root, split_id).ok_or(WorkspaceError::MissingPane)?;
+        if child_index + 1 >= children.len() {
+            return Err(WorkspaceError::MissingPane);
+        }
+        // Only the dragged pin is persisted. The allocator lets Auto peers yield,
+        // then the least-recently-focused custom peers when necessary. Mutating
+        // peer pins here makes saturated forward/back drags drift saved sizes.
+        children[child_index].allocation = Allocation::Pinned { logical_px };
+        candidate.validate()?;
+        *self = candidate;
+        Ok(())
+    }
+
+    pub fn reset_split_child(
+        &mut self,
+        split_id: SplitId,
+        child_index: usize,
+    ) -> Result<(), WorkspaceError> {
+        let mut candidate = self.clone();
+        let root = candidate.root_mut().ok_or(WorkspaceError::MissingPane)?;
+        let children = find_split_mut(root, split_id).ok_or(WorkspaceError::MissingPane)?;
+        if child_index + 1 >= children.len() {
+            return Err(WorkspaceError::MissingPane);
+        }
+        children[child_index].allocation = Allocation::auto();
+        candidate.validate()?;
+        *self = candidate;
+        Ok(())
+    }
+
+    pub(crate) fn task_is_unpinned(&self, task_id: K) -> bool {
+        self.root
+            .as_ref()
+            .is_some_and(|root| task_path_is_auto(root, &task_id, true))
+    }
+
+    pub(crate) fn set_presentation(
+        &mut self,
+        task_id: K,
+        presentation: PanePresentation,
+    ) -> Result<(), WorkspaceError> {
+        let pane_id = self
+            .pane_for_task(task_id)
+            .map(|pane| pane.id)
+            .ok_or(WorkspaceError::MissingPane)?;
+        self.pane_mut(pane_id)
+            .ok_or(WorkspaceError::MissingPane)?
+            .presentation = presentation;
+        Ok(())
+    }
+
+    fn repair_focus_after_removal(&mut self, removed: PaneId) {
+        if self.root.is_none() {
+            self.focused = None;
+            self.previous_focus = None;
+            return;
+        }
+        let previous = self
+            .previous_focus
+            .filter(|pane_id| *pane_id != removed && self.pane(*pane_id).is_some());
+        if self.focused == Some(removed) {
+            self.focused = previous.or_else(|| self.root.as_ref().and_then(first_pane_id));
+            self.previous_focus = None;
+        } else if self.previous_focus == Some(removed) {
+            self.previous_focus = None;
+        }
+    }
+}
+
+fn map_workspace_node<K, U, F>(
+    node: &WorkspaceNode<K>,
+    map_key: &mut F,
+    seen: &mut BTreeSet<U>,
+) -> Result<WorkspaceNode<U>, WorkspaceError>
+where
+    U: Clone + Ord + Eq,
+    F: FnMut(&K) -> U,
+{
+    match node {
+        WorkspaceNode::Pane(pane) => {
+            let mapped = map_key(&pane.task_id);
+            if !seen.insert(mapped.clone()) {
+                return Err(WorkspaceError::DuplicateTask);
+            }
+            Ok(WorkspaceNode::Pane(TaskPane {
+                id: pane.id,
+                task_id: mapped,
+                presentation: pane.presentation,
+                last_focused_at: pane.last_focused_at,
+                view: pane.view,
+            }))
+        }
+        WorkspaceNode::Split { id, axis, children } => {
+            let mut mapped_children = Vec::with_capacity(children.len());
+            for child in children {
+                mapped_children.push(SplitChild {
+                    node: map_workspace_node(&child.node, map_key, seen)?,
+                    allocation: child.allocation,
+                });
+            }
+            Ok(WorkspaceNode::Split {
+                id: *id,
+                axis: *axis,
+                children: mapped_children,
+            })
+        }
+    }
+}
+
+fn count_panes<K>(node: &WorkspaceNode<K>) -> usize {
+    match node {
+        WorkspaceNode::Pane(_) => 1,
+        WorkspaceNode::Split { children, .. } => {
+            children.iter().map(|child| count_panes(&child.node)).sum()
+        }
+    }
+}
+
+fn first_pane_id<K>(node: &WorkspaceNode<K>) -> Option<PaneId> {
+    match node {
+        WorkspaceNode::Pane(pane) => Some(pane.id),
+        WorkspaceNode::Split { children, .. } => children
+            .first()
+            .and_then(|child| first_pane_id(&child.node)),
+    }
+}
+
+fn most_recent_focus_in_node<K>(node: &WorkspaceNode<K>) -> Option<u64> {
+    match node {
+        WorkspaceNode::Pane(pane) => Some(pane.last_focused_at),
+        WorkspaceNode::Split { children, .. } => children
+            .iter()
+            .filter_map(|child| most_recent_focus_in_node(&child.node))
+            .max(),
+    }
+}
+
+fn find_pane<K>(node: &WorkspaceNode<K>, pane_id: PaneId) -> Option<&TaskPane<K>> {
+    match node {
+        WorkspaceNode::Pane(pane) => (pane.id == pane_id).then_some(pane),
+        WorkspaceNode::Split { children, .. } => children
+            .iter()
+            .find_map(|child| find_pane(&child.node, pane_id)),
+    }
+}
+
+fn find_pane_for_task<'a, K: PartialEq>(
+    node: &'a WorkspaceNode<K>,
+    task_id: &K,
+) -> Option<&'a TaskPane<K>> {
+    match node {
+        WorkspaceNode::Pane(pane) => (pane.task_id == *task_id).then_some(pane),
+        WorkspaceNode::Split { children, .. } => children
+            .iter()
+            .find_map(|child| find_pane_for_task(&child.node, task_id)),
+    }
+}
+
+fn find_pane_for_task_mut<'a, K: PartialEq>(
+    node: &'a mut WorkspaceNode<K>,
+    task_id: &K,
+) -> Option<&'a mut TaskPane<K>> {
+    match node {
+        WorkspaceNode::Pane(pane) => (pane.task_id == *task_id).then_some(pane),
+        WorkspaceNode::Split { children, .. } => children
+            .iter_mut()
+            .find_map(|child| find_pane_for_task_mut(&mut child.node, task_id)),
+    }
+}
+
+fn find_pane_mut<K>(node: &mut WorkspaceNode<K>, pane_id: PaneId) -> Option<&mut TaskPane<K>> {
+    match node {
+        WorkspaceNode::Pane(pane) => (pane.id == pane_id).then_some(pane),
+        WorkspaceNode::Split { children, .. } => children
+            .iter_mut()
+            .find_map(|child| find_pane_mut(&mut child.node, pane_id)),
+    }
+}
+
+fn find_split<K>(node: &WorkspaceNode<K>, split_id: SplitId) -> Option<&[SplitChild<K>]> {
+    match node {
+        WorkspaceNode::Pane(_) => None,
+        WorkspaceNode::Split { id, children, .. } if *id == split_id => Some(children),
+        WorkspaceNode::Split { children, .. } => children
+            .iter()
+            .find_map(|child| find_split(&child.node, split_id)),
+    }
+}
+
+fn find_split_mut<K>(
+    node: &mut WorkspaceNode<K>,
+    split_id: SplitId,
+) -> Option<&mut Vec<SplitChild<K>>> {
+    match node {
+        WorkspaceNode::Pane(_) => None,
+        WorkspaceNode::Split { id, children, .. } => {
+            if *id == split_id {
+                Some(children)
+            } else {
+                children
+                    .iter_mut()
+                    .find_map(|child| find_split_mut(&mut child.node, split_id))
+            }
+        }
+    }
+}
+
+fn collect_task_ids<K: Clone>(node: &WorkspaceNode<K>, task_ids: &mut Vec<K>) {
+    match node {
+        WorkspaceNode::Pane(pane) => task_ids.push(pane.task_id.clone()),
+        WorkspaceNode::Split { children, .. } => {
+            for child in children {
+                collect_task_ids(&child.node, task_ids);
+            }
+        }
+    }
+}
+
+fn set_task_allocation<K: PartialEq>(
+    node: &mut WorkspaceNode<K>,
+    task_id: &K,
+    allocation: Allocation,
+) -> bool {
+    let WorkspaceNode::Split { children, .. } = node else {
+        return false;
+    };
+    for child in children {
+        if !contains_task(&child.node, task_id) {
+            continue;
+        }
+        if set_task_allocation(&mut child.node, task_id, allocation) {
+            return true;
+        }
+        child.allocation = allocation;
+        return true;
+    }
+    false
+}
+
+fn contains_task<K: PartialEq>(node: &WorkspaceNode<K>, task_id: &K) -> bool {
+    find_pane_for_task(node, task_id).is_some()
+}
+
+fn task_path_is_auto<K: PartialEq>(
+    node: &WorkspaceNode<K>,
+    task_id: &K,
+    path_is_auto: bool,
+) -> bool {
+    match node {
+        WorkspaceNode::Pane(pane) => pane.task_id == *task_id && path_is_auto,
+        WorkspaceNode::Split { children, .. } => children.iter().any(|child| {
+            contains_task(&child.node, task_id)
+                && task_path_is_auto(
+                    &child.node,
+                    task_id,
+                    path_is_auto && !child.allocation.is_pinned(),
+                )
+        }),
+    }
+}
+
+/// Put `new` in the grid `root` describes, without moving anything already in
+/// it.
+///
+/// The shape the grid reads off an existing tree is deliberately shallow: a
+/// vertical root is a stack of ROWS, anything else is one row. A tree the user
+/// built by dragging is therefore never rearranged -- it becomes one cell of
+/// the row it already occupies, and the new pane goes beside or below it.
+fn place_in_grid<K>(
+    root: WorkspaceNode<K>,
+    new: WorkspaceNode<K>,
+    columns: usize,
+) -> WorkspaceNode<K> {
+    match root {
+        WorkspaceNode::Split {
+            id,
+            axis: Axis::Vertical,
+            mut children,
+        } => {
+            match children.pop() {
+                // A vertical root with no children cannot be built by any
+                // gesture and would fail `validate`; the new pane simply
+                // replaces it rather than the caller seeing a torn tree.
+                None => new,
+                Some(last) => {
+                    let allocation = last.allocation;
+                    match append_column(last.node, new, columns) {
+                        Ok(row) => {
+                            children.push(SplitChild {
+                                node: row,
+                                allocation,
+                            });
+                        }
+                        Err((row, new)) => {
+                            children.push(SplitChild {
+                                node: row,
+                                allocation,
+                            });
+                            children.push(SplitChild::auto(new));
+                        }
+                    }
+                    WorkspaceNode::Split {
+                        id,
+                        axis: Axis::Vertical,
+                        children,
+                    }
+                }
+            }
+        }
+        row => match append_column(row, new, columns) {
+            Ok(row) => row,
+            Err((row, new)) => WorkspaceNode::Split {
+                id: SplitId::new(),
+                axis: Axis::Vertical,
+                children: vec![SplitChild::auto(row), SplitChild::auto(new)],
+            },
+        },
+    }
+}
+
+/// The widened row, or the row and the pane the caller now has to put on a
+/// second row. Both nodes come back untouched on the refusal so nothing is
+/// dropped and nothing has to be cloned to try again.
+type ColumnAppend<K> = Result<WorkspaceNode<K>, (WorkspaceNode<K>, WorkspaceNode<K>)>;
+
+/// Add one more column to a row, or give both nodes back untouched when the
+/// row is already `columns` wide and the caller has to start another row.
+fn append_column<K>(
+    row: WorkspaceNode<K>,
+    new: WorkspaceNode<K>,
+    columns: usize,
+) -> ColumnAppend<K> {
+    match row {
+        WorkspaceNode::Split {
+            id,
+            axis: Axis::Horizontal,
+            mut children,
+        } => {
+            if children.len() >= columns.max(1) {
+                return Err((
+                    WorkspaceNode::Split {
+                        id,
+                        axis: Axis::Horizontal,
+                        children,
+                    },
+                    new,
+                ));
+            }
+            children.push(SplitChild::auto(new));
+            Ok(WorkspaceNode::Split {
+                id,
+                axis: Axis::Horizontal,
+                children,
+            })
+        }
+        node => {
+            if columns < 2 {
+                return Err((node, new));
+            }
+            Ok(WorkspaceNode::Split {
+                id: SplitId::new(),
+                axis: Axis::Horizontal,
+                children: vec![SplitChild::auto(node), SplitChild::auto(new)],
+            })
+        }
+    }
+}
+
+/// Every pane of a tree, in tree order, taken out of it.
+fn collect_panes<K>(node: WorkspaceNode<K>, panes: &mut Vec<TaskPane<K>>) {
+    match node {
+        WorkspaceNode::Pane(pane) => panes.push(pane),
+        WorkspaceNode::Split { children, .. } => {
+            for child in children {
+                collect_panes(child.node, panes);
+            }
+        }
+    }
+}
+
+/// `panes` laid out left to right in rows of `columns`, as composition A tiles
+/// them. One row is a bare horizontal split; several are a vertical split of
+/// horizontal ones. One pane is one pane, with no split around it.
+fn grid_tree<K>(panes: Vec<TaskPane<K>>, columns: usize) -> Option<WorkspaceNode<K>> {
+    if panes.is_empty() {
+        return None;
+    }
+    let columns = columns.max(1);
+    let mut rows: Vec<WorkspaceNode<K>> = Vec::new();
+    let mut children: Vec<SplitChild<K>> = Vec::with_capacity(columns);
+    for pane in panes {
+        children.push(SplitChild::auto(WorkspaceNode::Pane(pane)));
+        if children.len() == columns {
+            rows.push(grid_row(std::mem::take(&mut children)));
+        }
+    }
+    if !children.is_empty() {
+        rows.push(grid_row(children));
+    }
+    if rows.len() == 1 {
+        return rows.pop();
+    }
+    Some(WorkspaceNode::Split {
+        id: SplitId::new(),
+        axis: Axis::Vertical,
+        children: rows.into_iter().map(SplitChild::auto).collect(),
+    })
+}
+
+/// One row of the grid. A single cell is the pane itself: wrapping it in a
+/// split of one child would fail `validate`'s "a split has more than one
+/// child" rule and would paint a divider with nothing on the other side.
+fn grid_row<K>(mut children: Vec<SplitChild<K>>) -> WorkspaceNode<K> {
+    if children.len() == 1 {
+        return children
+            .pop()
+            .expect("a one-child row has exactly one child")
+            .node;
+    }
+    WorkspaceNode::Split {
+        id: SplitId::new(),
+        axis: Axis::Horizontal,
+        children,
+    }
+}
+
+fn insert_pane_near<K>(
+    node: WorkspaceNode<K>,
+    target: PaneId,
+    pane: TaskPane<K>,
+    axis: Axis,
+    insert_after: bool,
+) -> (WorkspaceNode<K>, bool) {
+    match node {
+        WorkspaceNode::Pane(existing) if existing.id == target => {
+            let (first, second) = if insert_after {
+                (WorkspaceNode::Pane(existing), WorkspaceNode::Pane(pane))
+            } else {
+                (WorkspaceNode::Pane(pane), WorkspaceNode::Pane(existing))
+            };
+            (
+                WorkspaceNode::Split {
+                    id: SplitId::new(),
+                    axis,
+                    children: vec![SplitChild::auto(first), SplitChild::auto(second)],
+                },
+                true,
+            )
+        }
+        WorkspaceNode::Pane(existing) => (WorkspaceNode::Pane(existing), false),
+        WorkspaceNode::Split {
+            id,
+            axis: split_axis,
+            mut children,
+        } => {
+            if split_axis == axis {
+                if let Some(index) = children
+                    .iter()
+                    .position(|child| matches!(&child.node, WorkspaceNode::Pane(existing) if existing.id == target))
+                {
+                    let insert_index = if insert_after { index + 1 } else { index };
+                    children.insert(
+                        insert_index,
+                        SplitChild::auto(WorkspaceNode::Pane(pane)),
+                    );
+                    return (
+                        WorkspaceNode::Split {
+                            id,
+                            axis: split_axis,
+                            children,
+                        },
+                        true,
+                    );
+                }
+            }
+            if let Some(index) = children
+                .iter()
+                .position(|child| contains_pane(&child.node, target))
+            {
+                let child = children.remove(index);
+                let (next_node, inserted) =
+                    insert_pane_near(child.node, target, pane, axis, insert_after);
+                children.insert(
+                    index,
+                    SplitChild {
+                        node: next_node,
+                        allocation: child.allocation,
+                    },
+                );
+                return (
+                    WorkspaceNode::Split {
+                        id,
+                        axis: split_axis,
+                        children,
+                    },
+                    inserted,
+                );
+            }
+            (
+                WorkspaceNode::Split {
+                    id,
+                    axis: split_axis,
+                    children,
+                },
+                false,
+            )
+        }
+    }
+}
+
+fn contains_pane<K>(node: &WorkspaceNode<K>, target: PaneId) -> bool {
+    find_pane(node, target).is_some()
+}
+
+fn remove_pane_node<K>(
+    node: WorkspaceNode<K>,
+    target: PaneId,
+) -> (Option<WorkspaceNode<K>>, Option<TaskPane<K>>) {
+    match node {
+        WorkspaceNode::Pane(pane) if pane.id == target => (None, Some(pane)),
+        WorkspaceNode::Pane(pane) => (Some(WorkspaceNode::Pane(pane)), None),
+        WorkspaceNode::Split { id, axis, children } => {
+            let mut next_children = Vec::with_capacity(children.len());
+            let mut removed = None;
+            for child in children {
+                if removed.is_some() {
+                    next_children.push(child);
+                    continue;
+                }
+                let allocation = child.allocation;
+                let (next_node, found) = remove_pane_node(child.node, target);
+                if let Some(found) = found {
+                    removed = Some(found);
+                }
+                if let Some(next_node) = next_node {
+                    next_children.push(SplitChild {
+                        node: next_node,
+                        allocation,
+                    });
+                }
+            }
+            if removed.is_none() {
+                return (
+                    Some(WorkspaceNode::Split {
+                        id,
+                        axis,
+                        children: next_children,
+                    }),
+                    None,
+                );
+            }
+            let normalized = match next_children.len() {
+                0 => None,
+                1 => Some(next_children.remove(0).node),
+                _ => Some(WorkspaceNode::Split {
+                    id,
+                    axis,
+                    children: next_children,
+                }),
+            };
+            (normalized, removed)
+        }
+    }
+}
+
+fn validate_node<K: Clone + Ord + Eq>(
+    node: &WorkspaceNode<K>,
+    pane_ids: &mut BTreeSet<PaneId>,
+    task_ids: &mut BTreeSet<K>,
+    split_ids: &mut BTreeSet<SplitId>,
+) -> Result<(), WorkspaceError> {
+    match node {
+        WorkspaceNode::Pane(pane) => {
+            if pane.last_focused_at == 0
+                || !pane_ids.insert(pane.id)
+                || !task_ids.insert(pane.task_id.clone())
+            {
+                return Err(WorkspaceError::InvalidTree);
+            }
+        }
+        WorkspaceNode::Split { id, children, .. } => {
+            if children.len() < 2 || !split_ids.insert(*id) {
+                return Err(WorkspaceError::InvalidTree);
+            }
+            for child in children {
+                if !child.allocation.is_valid() {
+                    return Err(WorkspaceError::InvalidTree);
+                }
+                validate_node(&child.node, pane_ids, task_ids, split_ids)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::TaskId;
+    use crate::ui::task_workspace::allocation::{AllocationMetrics, Viewport};
+
+    /// The grid a tree describes, as rows of task ids, or `None` if the tree
+    /// is not a grid at all -- a cell that is itself a split means a pane got
+    /// NESTED instead of tiled, which is the defect these tests exist for.
+    fn grid_rows<K: Clone + Ord + Eq>(workspace: &Workspace<K>) -> Option<Vec<Vec<K>>> {
+        fn row_of<K: Clone>(node: &WorkspaceNode<K>) -> Option<Vec<K>> {
+            match node {
+                WorkspaceNode::Pane(pane) => Some(vec![pane.task_id.clone()]),
+                WorkspaceNode::Split {
+                    axis: Axis::Horizontal,
+                    children,
+                    ..
+                } => children
+                    .iter()
+                    .map(|child| match &child.node {
+                        WorkspaceNode::Pane(pane) => Some(pane.task_id.clone()),
+                        WorkspaceNode::Split { .. } => None,
+                    })
+                    .collect(),
+                WorkspaceNode::Split {
+                    axis: Axis::Vertical,
+                    ..
+                } => None,
+            }
+        }
+        match workspace.root()? {
+            WorkspaceNode::Split {
+                axis: Axis::Vertical,
+                children,
+                ..
+            } => children.iter().map(|child| row_of(&child.node)).collect(),
+            node => row_of(node).map(|row| vec![row]),
+        }
+    }
+
+    /// Composition A: one more panel is one more COLUMN while the canvas holds
+    /// it at the grid width, then a second ROW filling left to right. Never a
+    /// nested split, which is what `insert_after_focused` built and what made
+    /// five panels a ladder of ever-narrower columns.
+    #[test]
+    fn swapping_a_zoomed_panel_keeps_the_same_task_visible() {
+        let mut workspace = Workspace::single(1u32);
+        let first = workspace.focused_pane_id().unwrap();
+        let second = workspace.insert_after_focused(2, Axis::Horizontal).unwrap();
+        workspace.zoom(first).unwrap();
+        workspace.swap_panes(first, second).unwrap();
+        assert_eq!(workspace.zoomed(), Some(second));
+        assert_eq!(
+            workspace.pane(workspace.zoomed().unwrap()).unwrap().task_id,
+            1
+        );
+    }
+
+    #[test]
+    fn panel_size_pin_uses_its_parent_axis_and_preserves_zoom() {
+        use super::super::allocation::Viewport;
+        let mut workspace = Workspace::single(1u32);
+        workspace.insert_after_focused(2, Axis::Horizontal).unwrap();
+        workspace.insert_after_focused(3, Axis::Vertical).unwrap();
+        let metrics = AllocationMetrics::production();
+        let viewport = Viewport::new(1000.0, 800.0);
+        let before = workspace.allocate(viewport, metrics).rect(3).unwrap();
+        workspace.toggle_zoom_focused();
+        workspace
+            .toggle_task_size_pin(3, viewport, metrics)
+            .unwrap();
+        assert_eq!(
+            workspace.task_axis_allocation(&3),
+            Some((
+                Axis::Vertical,
+                Allocation::Pinned {
+                    logical_px: before.height
+                }
+            ))
+        );
+        assert!(
+            workspace.zoomed().is_some(),
+            "measurement must preserve zoom"
+        );
+        workspace
+            .toggle_task_size_pin(3, viewport, metrics)
+            .unwrap();
+        assert_eq!(
+            workspace.task_axis_allocation(&3),
+            Some((Axis::Vertical, Allocation::auto()))
+        );
+        assert!(Workspace::single(1u32)
+            .toggle_task_size_pin(1, viewport, metrics)
+            .is_err());
+    }
+
+    #[test]
+    fn opening_panels_tiles_into_columns_then_a_second_row() {
+        let metrics = AllocationMetrics::production();
+        assert_eq!(grid_columns_for(1100.0, metrics), 3);
+        assert_eq!(grid_columns_for(2000.0, metrics), 5);
+
+        let open = |canvas: f32| {
+            let mut workspace = Workspace::<u32>::single(1);
+            for task in 2..=6u32 {
+                workspace
+                    .insert_into_grid(task, canvas, metrics)
+                    .expect("a new task opens");
+            }
+            workspace
+        };
+
+        let narrow = open(1100.0);
+        assert_eq!(
+            grid_rows(&narrow),
+            Some(vec![vec![1, 2, 3], vec![4, 5, 6]]),
+            "at 1100 px the grid is three columns, then a second row"
+        );
+        let wide = open(2000.0);
+        assert_eq!(
+            grid_rows(&wide),
+            Some(vec![vec![1, 2, 3, 4, 5], vec![6]]),
+            "at 2000 px the grid is five columns before it needs a row"
+        );
+
+        // And the ladder it replaces: `insert_after_focused` nests, which is
+        // why this rule had to exist at all.
+        let mut nested = Workspace::<u32>::single(1);
+        for task in 2..=6u32 {
+            nested
+                .insert_after_focused(task, Axis::Horizontal)
+                .expect("a new task opens");
+        }
+        assert_eq!(
+            grid_rows(&nested),
+            Some(vec![vec![1, 2, 3, 4, 5, 6]]),
+            "the focused-insert path keeps every pane on one row at any width"
+        );
+    }
+
+    /// Every column the grid packs is at or above the pane minimum, which is
+    /// the promise the whole rule is for.
+    #[test]
+    fn a_packed_grid_never_puts_a_column_under_the_pane_minimum() {
+        let metrics = AllocationMetrics::production();
+        for canvas in [400.0_f32, 740.0, 1100.0, 1530.0, 2000.0, 3000.0] {
+            let columns = grid_columns_for(canvas, metrics);
+            assert!(columns >= 1, "at {canvas} px the grid has no column");
+            if columns > 1 {
+                let each = (canvas - metrics.divider * (columns - 1) as f32) / columns as f32;
+                assert!(
+                    each >= metrics.full_min_width,
+                    "at {canvas} px a column is {each} px, under the {} px minimum",
+                    metrics.full_min_width
+                );
+            }
+        }
+        // A canvas too narrow for one column still places the pane.
+        assert_eq!(grid_columns_for(10.0, AllocationMetrics::production()), 1);
+        assert_eq!(
+            grid_columns_for(f32::NAN, AllocationMetrics::production()),
+            1
+        );
+    }
+
+    /// A drag is still a drag: `insert_beside` puts the pane exactly where it
+    /// was aimed, at any depth, and the grid never rearranges what is there.
+    #[test]
+    fn an_explicit_split_still_nests_where_it_was_aimed() {
+        let metrics = AllocationMetrics::production();
+        let mut workspace = Workspace::<u32>::single(1);
+        let first = workspace.focused_pane_id().expect("the one pane");
+        workspace
+            .insert_into_grid(2, 1100.0, metrics)
+            .expect("a second column");
+        workspace
+            .insert_beside(3, first, Edge::Bottom)
+            .expect("a nested split under pane 1");
+        assert_eq!(
+            grid_rows(&workspace),
+            None,
+            "a hand-built nested tree is not a grid, and must not be flattened"
+        );
+        assert_eq!(workspace.pane_count(), 3);
+        // One more opened panel joins the row beside it rather than diving in.
+        workspace
+            .insert_into_grid(4, 1100.0, metrics)
+            .expect("a third column");
+        let Some(WorkspaceNode::Split {
+            axis: Axis::Horizontal,
+            children,
+            ..
+        }) = workspace.root()
+        else {
+            panic!("the root is still the row");
+        };
+        assert_eq!(
+            children.len(),
+            3,
+            "the new pane is a third top-level column"
+        );
+        assert!(
+            matches!(&children[2].node, WorkspaceNode::Pane(pane) if pane.task_id == 4),
+            "and it is the pane itself, not another split"
+        );
+    }
+
+    /// Four panes in a 2x2: 1 top-left, 3 bottom-left, 2 top-right, 4
+    /// bottom-right. Built through the ordinary insert path so the tree is one
+    /// the shell can actually produce, and returned with 1 focused.
+    fn quad() -> Workspace<u32> {
+        let mut workspace = Workspace::single(1u32);
+        workspace
+            .insert_after_focused(2u32, Axis::Horizontal)
+            .expect("second pane");
+        workspace.focus_task(1u32).expect("focus 1");
+        workspace
+            .insert_after_focused(3u32, Axis::Vertical)
+            .expect("third pane");
+        workspace.focus_task(2u32).expect("focus 2");
+        workspace
+            .insert_after_focused(4u32, Axis::Vertical)
+            .expect("fourth pane");
+        workspace.focus_task(1u32).expect("focus 1");
+        workspace
+    }
+
+    fn quad_rects(workspace: &Workspace<u32>) -> AllocatedWorkspace<u32> {
+        workspace.clone().allocate(
+            Viewport::new(1200.0, 800.0),
+            AllocationMetrics::production(),
+        )
+    }
+
+    #[test]
+    fn directional_focus_reads_the_screen_not_the_tree() {
+        let mut workspace = quad();
+        let rects = quad_rects(&workspace);
+        // 1 is top-left: right is 2, down is 3, and there is nothing above or
+        // to the left of it.
+        assert!(workspace.focus_pane_toward(Edge::Right, &rects));
+        assert_eq!(workspace.focused_task(), Some(2));
+        assert!(workspace.focus_pane_toward(Edge::Bottom, &rects));
+        assert_eq!(workspace.focused_task(), Some(4));
+        assert!(workspace.focus_pane_toward(Edge::Left, &rects));
+        assert_eq!(workspace.focused_task(), Some(3));
+        assert!(workspace.focus_pane_toward(Edge::Top, &rects));
+        assert_eq!(workspace.focused_task(), Some(1));
+    }
+
+    #[test]
+    fn directional_focus_at_the_edge_of_the_workspace_is_a_no_op() {
+        let mut workspace = quad();
+        let rects = quad_rects(&workspace);
+        assert!(!workspace.focus_pane_toward(Edge::Left, &rects));
+        assert!(!workspace.focus_pane_toward(Edge::Top, &rects));
+        assert_eq!(workspace.focused_task(), Some(1));
+    }
+
+    #[test]
+    fn moving_a_pane_toward_an_edge_lands_it_past_that_neighbour() {
+        let mut workspace = quad();
+        let rects = quad_rects(&workspace);
+        assert!(workspace.move_pane_toward(Edge::Right, &rects));
+        // The tree still holds every pane and 1 is still the focused one: a
+        // move is a relocation, not a close and not a focus change.
+        let mut ids = workspace.task_ids();
+        ids.sort();
+        assert_eq!(ids, vec![1, 2, 3, 4]);
+        assert_eq!(workspace.focused_task(), Some(1));
+        // 1 now sits to the right of 2, which is what "move right" means.
+        let moved = quad_rects(&workspace);
+        let one = moved.rect(1).expect("pane 1 rect");
+        let two = moved.rect(2).expect("pane 2 rect");
+        assert!(
+            one.x > two.x,
+            "pane 1 at x={} must sit right of pane 2 at x={}",
+            one.x,
+            two.x
+        );
+    }
+
+    #[test]
+    fn moving_a_pane_with_nothing_that_way_leaves_the_tree_alone() {
+        let mut workspace = quad();
+        let rects = quad_rects(&workspace);
+        let before = workspace.clone();
+        assert!(!workspace.move_pane_toward(Edge::Left, &rects));
+        assert_eq!(workspace, before);
+    }
+
+    #[test]
+    fn a_pane_defaults_to_the_conversation_view_and_remembers_a_set_view() {
+        let mut workspace = Workspace::single(1u32);
+        assert_eq!(workspace.view_of(1), Some(PaneView::Conversation));
+        workspace.set_view(1, PaneView::Terminal).expect("set");
+        assert_eq!(workspace.view_of(1), Some(PaneView::Terminal));
+        assert_eq!(
+            workspace.set_view(9, PaneView::Files),
+            Err(WorkspaceError::MissingPane)
+        );
+    }
+
+    #[test]
+    fn a_serialized_pane_without_a_view_field_loads_as_conversation() {
+        let workspace = Workspace::single(1u32);
+        let mut json = serde_json::to_value(&workspace).expect("json");
+        fn strip(value: &mut serde_json::Value) {
+            match value {
+                serde_json::Value::Object(map) => {
+                    map.remove("view");
+                    for nested in map.values_mut() {
+                        strip(nested);
+                    }
+                }
+                serde_json::Value::Array(items) => items.iter_mut().for_each(strip),
+                _ => {}
+            }
+        }
+        strip(&mut json);
+        let restored: Workspace<u32> = serde_json::from_value(json).expect("old file loads");
+        assert_eq!(restored.view_of(1), Some(PaneView::Conversation));
+    }
+
+    #[test]
+    fn compact_manual_from_an_older_file_loads_and_normalises_to_full() {
+        let workspace = Workspace::single(1u32);
+        let json = serde_json::to_string(&workspace)
+            .expect("json")
+            .replace("\"Full\"", "\"CompactManual\"");
+        assert!(
+            json.contains("CompactManual"),
+            "the fixture must actually carry the retired value"
+        );
+        let restored: Workspace<u32> = serde_json::from_str(&json).expect("older file loads");
+        assert_eq!(
+            restored.presentation(1),
+            Some(PanePresentation::Minimised),
+            "the alias maps the retired value"
+        );
+
+        let automatic = serde_json::to_string(&workspace)
+            .expect("json")
+            .replace("\"Full\"", "\"CompactAutomatic\"");
+        let restored: Workspace<u32> = serde_json::from_str(&automatic).expect("older file loads");
+        assert_eq!(restored.presentation(1), Some(PanePresentation::Minimised));
+    }
+
+    #[test]
+    fn zoom_is_transient_but_restoring_the_pane_to_full_is_not() {
+        let mut workspace = Workspace::single(1u32);
+        workspace
+            .insert_after_focused(2u32, Axis::Horizontal)
+            .expect("pane");
+        let before = serde_json::to_string(&workspace).expect("json");
+        let pane = workspace.pane_for_task(2).expect("pane").id;
+
+        workspace.zoom(pane).expect("zoom");
+        assert_eq!(workspace.zoomed(), Some(pane));
+        assert_eq!(workspace.focused_task(), Some(2), "zoom focuses the pane");
+        assert_eq!(
+            serde_json::to_string(&workspace).expect("json"),
+            before,
+            "zoom itself is not serialised, and pane 2 was already Full"
+        );
+
+        // The whole truth: `zoomed` is skipped, but `presentation` is durable
+        // and zooming a strip WRITES Full onto it. Zoom is transient; the
+        // restoration it performs on the way in is not.
+        workspace.unzoom();
+        workspace
+            .set_presentation(1u32, PanePresentation::Minimised)
+            .expect("minimise 1");
+        let strip = workspace.pane_for_task(1).expect("pane").id;
+
+        workspace.zoom(strip).expect("zoom the strip");
+
+        let json = serde_json::to_string(&workspace).expect("json");
+        assert!(
+            !json.contains("zoomed"),
+            "the zoom itself never reaches the file: {json}"
+        );
+        assert!(
+            !json.contains("Minimised"),
+            "and the strip it restored is persisted as Full, not as a strip: {json}"
+        );
+        assert_eq!(
+            workspace.presentation(1u32),
+            Some(PanePresentation::Full),
+            "zooming a strip restores it, and that survives the round trip"
+        );
+        let restored: Workspace<u32> = serde_json::from_str(&json).expect("reload");
+        assert_eq!(restored.zoomed(), None, "no zoom is loaded back");
+        assert_eq!(restored.presentation(1u32), Some(PanePresentation::Full));
+
+        workspace.unzoom();
+        workspace.focus_task(2u32).expect("focus 2");
+
+        workspace.unzoom();
+        assert_eq!(workspace.zoomed(), None);
+        workspace.toggle_zoom_focused();
+        assert_eq!(workspace.zoomed(), Some(pane));
+        workspace.toggle_zoom_focused();
+        assert_eq!(workspace.zoomed(), None, "the toggle turns it off again");
+
+        workspace.zoom(pane).expect("zoom");
+        workspace.remove_pane(pane).expect("remove");
+        assert_eq!(
+            workspace.zoomed(),
+            None,
+            "removing the zoomed pane clears zoom"
+        );
+        assert!(workspace.validate().is_ok());
+    }
+
+    #[test]
+    fn inserting_tasks_preserves_unique_identity_and_focus_history() {
+        let first = TaskId::new();
+        let second = TaskId::new();
+        let mut workspace = TaskWorkspace::single(first);
+        let first_pane = workspace.focused_pane_id().unwrap();
+
+        let second_pane = workspace
+            .insert_after_focused(second, Axis::Horizontal)
+            .unwrap();
+
+        assert_eq!(workspace.focused_task(), Some(second));
+        assert_eq!(workspace.previous_focus(), Some(first_pane));
+        assert_eq!(workspace.pane_count(), 2);
+        assert_eq!(workspace.pane(second_pane).unwrap().task_id, second);
+        assert!(workspace.validate().is_ok());
+    }
+
+    #[test]
+    fn failed_edge_move_keeps_the_original_tree() {
+        let task = TaskId::new();
+        let mut workspace = TaskWorkspace::single(task);
+        let pane = workspace.focused_pane_id().unwrap();
+        let before = workspace.clone();
+
+        assert_eq!(
+            workspace.move_pane(
+                pane,
+                DropTarget::Edge {
+                    pane,
+                    edge: Edge::Left,
+                },
+            ),
+            Err(WorkspaceError::SelfDrop)
+        );
+        assert_eq!(workspace, before);
+    }
+
+    #[test]
+    fn removing_a_pane_collapses_redundant_splits_and_restores_previous_focus() {
+        let first = TaskId::new();
+        let second = TaskId::new();
+        let mut workspace = TaskWorkspace::single(first);
+        let first_pane = workspace.focused_pane_id().unwrap();
+        let second_pane = workspace
+            .insert_after_focused(second, Axis::Vertical)
+            .unwrap();
+
+        workspace.remove_pane(second_pane).unwrap();
+
+        assert_eq!(workspace.pane_count(), 1);
+        assert_eq!(workspace.focused_pane_id(), Some(first_pane));
+        assert!(matches!(workspace.root(), Some(WorkspaceNode::Pane(_))));
+    }
+
+    #[test]
+    fn resizing_a_divider_pins_only_the_manually_adjusted_child() {
+        let first = TaskId::new();
+        let second = TaskId::new();
+        let third = TaskId::new();
+        let mut workspace = TaskWorkspace::single(first);
+        workspace
+            .insert_after_focused(second, Axis::Horizontal)
+            .unwrap();
+        workspace
+            .insert_after_focused(third, Axis::Horizontal)
+            .unwrap();
+        let WorkspaceNode::Split { id, .. } = workspace.root().unwrap() else {
+            panic!("three horizontal tasks must share one split")
+        };
+        let split_id = *id;
+
+        workspace.resize_split_child(split_id, 0, 320.0).unwrap();
+
+        assert_eq!(
+            workspace.split_child_allocation(split_id, 0),
+            Some(Allocation::Pinned { logical_px: 320.0 })
+        );
+        assert_eq!(
+            workspace.split_child_allocation(split_id, 1),
+            Some(Allocation::auto())
+        );
+        assert_eq!(
+            workspace.split_child_allocation(split_id, 2),
+            Some(Allocation::auto())
+        );
+
+        workspace.reset_split_child(split_id, 0).unwrap();
+        assert_eq!(
+            workspace.split_child_allocation(split_id, 0),
+            Some(Allocation::auto())
+        );
+    }
+
+    #[test]
+    fn edge_move_reuses_the_transactional_tree_and_keeps_focus() {
+        let first = TaskId::new();
+        let second = TaskId::new();
+        let third = TaskId::new();
+        let mut workspace = TaskWorkspace::single(first);
+        let first_pane = workspace.focused_pane_id().unwrap();
+        workspace
+            .insert_after_focused(second, Axis::Horizontal)
+            .unwrap();
+        let third_pane = workspace
+            .insert_after_focused(third, Axis::Horizontal)
+            .unwrap();
+
+        workspace
+            .move_pane(
+                third_pane,
+                DropTarget::Edge {
+                    pane: first_pane,
+                    edge: Edge::Top,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(workspace.focused_pane_id(), Some(third_pane));
+        assert_eq!(workspace.task_ids().len(), 3);
+        assert!(workspace.validate().is_ok());
+    }
+
+    #[test]
+    fn plain_replace_preserves_focused_pane_id_compact_and_sibling() {
+        let first = TaskId::new();
+        let second = TaskId::new();
+        let next = TaskId::new();
+        let mut workspace = TaskWorkspace::single(first);
+        workspace
+            .insert_after_focused(second, Axis::Horizontal)
+            .unwrap();
+        let focused_slot = workspace.focused_pane_id().unwrap();
+        workspace
+            .set_presentation(second, PanePresentation::Minimised)
+            .unwrap();
+        let split_id = match workspace.root().unwrap() {
+            WorkspaceNode::Split { id, .. } => *id,
+            _ => panic!("expected split"),
+        };
+        // Pin the first child via resize; pin the focused (last) pane via the
+        // task-axis API because resize_split_child rejects the final index.
+        workspace.resize_split_child(split_id, 0, 420.0).unwrap();
+        workspace.pin_task_axis_size(second, 280.0).unwrap();
+        let before_first_alloc = workspace.split_child_allocation(split_id, 0);
+        let before_second_alloc = workspace.split_child_allocation(split_id, 1);
+
+        workspace.replace_focused_task(next).unwrap();
+
+        assert_eq!(workspace.pane_count(), 2);
+        assert_eq!(workspace.focused_pane_id(), Some(focused_slot));
+        assert_eq!(workspace.focused_task(), Some(next));
+        assert!(workspace.contains_task(first));
+        assert!(!workspace.contains_task(second));
+        assert_eq!(
+            workspace.presentation(next),
+            Some(PanePresentation::Minimised)
+        );
+        assert_eq!(
+            workspace.split_child_allocation(split_id, 0),
+            before_first_alloc
+        );
+        assert_eq!(
+            workspace.split_child_allocation(split_id, 1),
+            before_second_alloc
+        );
+        assert_eq!(
+            workspace.split_child_allocation(split_id, 1),
+            Some(Allocation::Pinned { logical_px: 280.0 })
+        );
+    }
+
+    #[test]
+    fn resize_split_child_keeps_auto_neighbors_and_falls_back_to_lrf() {
+        let first = TaskId::new();
+        let second = TaskId::new();
+        let third = TaskId::new();
+        let mut workspace = TaskWorkspace::single(first);
+        workspace
+            .insert_after_focused(second, Axis::Horizontal)
+            .unwrap();
+        workspace
+            .insert_after_focused(third, Axis::Horizontal)
+            .unwrap();
+        let split_id = match workspace.root().unwrap() {
+            WorkspaceNode::Split { id, .. } => *id,
+            _ => panic!("expected split"),
+        };
+        workspace.pin_task_axis_size(first, 220.0).unwrap();
+        workspace.pin_task_axis_size(second, 220.0).unwrap();
+        workspace.pin_task_axis_size(third, 220.0).unwrap();
+
+        workspace.resize_split_child(split_id, 0, 360.0).unwrap();
+        assert_eq!(
+            workspace.split_child_allocation(split_id, 0),
+            Some(Allocation::Pinned { logical_px: 360.0 })
+        );
+        assert!(
+            matches!(
+                workspace.split_child_allocation(split_id, 1),
+                Some(Allocation::Pinned { logical_px: 220.0 })
+            ) || matches!(
+                workspace.split_child_allocation(split_id, 2),
+                Some(Allocation::Pinned { logical_px: 220.0 })
+            ),
+            "LRF rendering may yield, but saved custom pins must remain unchanged"
+        );
+        assert!(
+            matches!(
+                workspace.split_child_allocation(split_id, 1),
+                Some(Allocation::Pinned { .. })
+            ) && matches!(
+                workspace.split_child_allocation(split_id, 2),
+                Some(Allocation::Pinned { .. })
+            ),
+            "all-pinned resize must not demote peers to Auto"
+        );
+
+        workspace.resize_split_child(split_id, 0, 300.0).unwrap();
+        workspace.resize_split_child(split_id, 0, 400.0).unwrap();
+        workspace.resize_split_child(split_id, 0, 300.0).unwrap();
+        assert_eq!(
+            workspace.split_child_allocation(split_id, 0),
+            Some(Allocation::Pinned { logical_px: 300.0 })
+        );
+        assert!(workspace.validate().is_ok());
+    }
+
+    type HostTaskKey = (String, TaskId);
+
+    fn host_key(host: &str, task: TaskId) -> HostTaskKey {
+        (host.to_string(), task)
+    }
+
+    #[test]
+    fn same_raw_task_id_on_two_hosts_are_distinct_panes() {
+        let shared = TaskId::new();
+        let local = host_key("local", shared);
+        let remote = host_key("remote", shared);
+        let mut workspace = Workspace::single(local.clone());
+        workspace
+            .insert_after_focused(remote.clone(), Axis::Horizontal)
+            .unwrap();
+
+        assert_eq!(workspace.pane_count(), 2);
+        assert!(workspace.contains_task(local.clone()));
+        assert!(workspace.contains_task(remote.clone()));
+        assert_eq!(workspace.focused_task(), Some(remote));
+        assert!(workspace.validate().is_ok());
+        assert_eq!(
+            workspace.insert_after_focused(local, Axis::Vertical),
+            Err(WorkspaceError::DuplicateTask)
+        );
+    }
+
+    #[test]
+    fn host_qualified_focus_replace_and_pins_preserve_geometry_slots() {
+        let shared = TaskId::new();
+        let other = TaskId::new();
+        let local = host_key("alpha", shared);
+        let remote = host_key("beta", shared);
+        let replacement = host_key("beta", other);
+        let mut workspace = Workspace::single(local.clone());
+        workspace
+            .insert_after_focused(remote.clone(), Axis::Horizontal)
+            .unwrap();
+        let focused_slot = workspace.focused_pane_id().unwrap();
+        workspace
+            .set_presentation(remote.clone(), PanePresentation::Minimised)
+            .unwrap();
+        workspace.pin_task_axis_size(remote.clone(), 280.0).unwrap();
+        let split_id = match workspace.root().unwrap() {
+            WorkspaceNode::Split { id, .. } => *id,
+            _ => panic!("expected split"),
+        };
+        let pinned_before = workspace.split_child_allocation(split_id, 1);
+
+        workspace.replace_focused_task(replacement.clone()).unwrap();
+
+        assert_eq!(workspace.focused_pane_id(), Some(focused_slot));
+        assert_eq!(workspace.focused_task(), Some(replacement.clone()));
+        assert!(workspace.contains_task(local));
+        assert!(!workspace.contains_task(remote));
+        assert_eq!(
+            workspace.presentation(replacement.clone()),
+            Some(PanePresentation::Minimised)
+        );
+        assert_eq!(workspace.split_child_allocation(split_id, 1), pinned_before);
+        workspace.focus_task(replacement).unwrap();
+        assert!(workspace.validate().is_ok());
+    }
+
+    #[test]
+    fn host_qualified_workspace_serde_roundtrip_preserves_keys() {
+        let shared = TaskId::new();
+        let local = host_key("desk", shared);
+        let remote = host_key("laptop", shared);
+        let mut workspace = Workspace::single(local.clone());
+        workspace
+            .insert_after_focused(remote.clone(), Axis::Vertical)
+            .unwrap();
+        workspace.pin_task_axis_size(local.clone(), 240.0).unwrap();
+
+        let encoded = serde_json::to_value(&workspace).expect("serialize host workspace");
+        let decoded: Workspace<HostTaskKey> =
+            serde_json::from_value(encoded).expect("deserialize host workspace");
+
+        assert_eq!(decoded.task_ids(), vec![local.clone(), remote.clone()]);
+        assert_eq!(decoded.focused_task(), Some(remote));
+        assert!(!decoded.task_is_unpinned(local));
+        assert!(decoded.validate().is_ok());
+    }
+
+    #[test]
+    fn legacy_task_id_workspace_serde_shape_is_unchanged() {
+        let first = TaskId::new();
+        let second = TaskId::new();
+        let mut workspace = TaskWorkspace::single(first);
+        workspace
+            .insert_after_focused(second, Axis::Horizontal)
+            .unwrap();
+        let value = serde_json::to_value(&workspace).expect("serialize legacy workspace");
+        let root = value.get("root").expect("root");
+        assert!(root.get("Pane").is_some() || root.get("Split").is_some());
+        if let Some(pane) = root.get("Pane") {
+            assert!(pane.get("task_id").and_then(|id| id.as_str()).is_some());
+        } else if let Some(split) = root.get("Split") {
+            let children = split.get("children").and_then(|c| c.as_array()).unwrap();
+            let task_id = &children[0]["node"]["Pane"]["task_id"];
+            assert!(task_id.as_str().is_some(), "TaskId remains a UUID string");
+        }
+        let roundtrip: TaskWorkspace =
+            serde_json::from_value(value).expect("deserialize legacy workspace");
+        assert_eq!(roundtrip.task_ids(), workspace.task_ids());
+    }
+
+    #[test]
+    fn map_task_keys_preserves_geometry_and_rejects_collisions() {
+        let first = TaskId::new();
+        let second = TaskId::new();
+        let mut workspace = TaskWorkspace::single(first);
+        workspace
+            .insert_after_focused(second, Axis::Horizontal)
+            .unwrap();
+        let focused = workspace.focused_pane_id();
+        let previous = workspace.previous_focus();
+        let split_id = match workspace.root().unwrap() {
+            WorkspaceNode::Split { id, .. } => *id,
+            _ => panic!("expected split"),
+        };
+        workspace.pin_task_axis_size(first, 240.0).unwrap();
+        workspace
+            .set_presentation(second, PanePresentation::Minimised)
+            .unwrap();
+        let first_pane = workspace.pane_for_task(first).unwrap().id;
+        let second_pane = workspace.pane_for_task(second).unwrap().id;
+
+        let mapped = workspace
+            .map_task_keys(|task| ("local".to_string(), *task))
+            .expect("map keys");
+        assert_eq!(mapped.focused_pane_id(), focused);
+        assert_eq!(mapped.previous_focus(), previous);
+        assert_eq!(mapped.pane(first_pane).unwrap().id, first_pane);
+        assert_eq!(mapped.pane(second_pane).unwrap().id, second_pane);
+        assert_eq!(
+            mapped.presentation(("local".into(), second)),
+            Some(PanePresentation::Minimised)
+        );
+        assert_eq!(
+            mapped.split_child_allocation(split_id, 0),
+            Some(Allocation::Pinned { logical_px: 240.0 })
+        );
+
+        assert_eq!(
+            workspace.map_task_keys(|_| "same-owner".to_string()),
+            Err(WorkspaceError::DuplicateTask)
+        );
+    }
+}

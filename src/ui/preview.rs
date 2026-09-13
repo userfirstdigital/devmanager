@@ -1,0 +1,1981 @@
+//! Deterministic, isolated native UI preview contracts.
+
+use gpui::{
+    div, px, Action, AppContext, Context, InteractiveElement, IntoElement, KeyBinding,
+    ParentElement, Render, Styled, Window,
+};
+use serde::{Deserialize, Serialize};
+use std::cell::RefCell;
+use std::collections::BTreeSet;
+use std::error::Error;
+use std::ffi::{OsStr, OsString};
+use std::fmt::{Display, Formatter};
+use std::fs;
+use std::path::{Component, Path, PathBuf};
+use std::rc::Rc;
+use std::sync::Arc;
+
+use crate::assets::AppAssets;
+use crate::client::action;
+use crate::terminal::terminal_font;
+use crate::ui::actions::{register_task_cockpit_bindings, TASK_COCKPIT_ACTION_NAMES};
+use crate::ui::native_shell::{
+    isolated_dev_profile, NativeHostBootstrap, NativeHostRuntimeAttachment, NativeShell,
+    ProcessNativeHostBootstrap,
+};
+use crate::ui::preview_capture;
+use crate::ui::tokens::{RuntimePreferencesSnapshot, PREVIEW_SENTINEL};
+
+pub const PREVIEW_SCHEMA: &str = "devmanager.ui.preview/v1";
+pub const MAX_FIXTURE_BYTES: u64 = 256 * 1024;
+pub const PREVIEW_SENTINEL_RGBA: [u8; 4] = [0x91, 0x2b, 0xd4, 0xff];
+const PREVIEW_SENTINEL_SIZE: f32 = 32.0;
+const PREVIEW_GALLERY_INSET_PX: u16 = 16;
+const PREVIEW_USAGE: &str =
+    "usage: devmanager --ui-preview <fixture.json> --output <preview.png> [--settle-ms <0..=5000>]";
+pub const MAX_PREVIEW_SETTLE_MS: u32 = 5_000;
+
+gpui::actions!(devmanager, [PreviewDismiss]);
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreviewFixture {
+    pub schema: String,
+    pub id: String,
+    pub title: String,
+    #[serde(default)]
+    pub capture: PreviewCaptureFixture,
+    pub root: PreviewRootFixture,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PreviewCaptureSetting {
+    #[default]
+    Excluded,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreviewCaptureFixture {
+    pub cursor: PreviewCaptureSetting,
+    pub border: PreviewCaptureSetting,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreviewRootFixture {
+    pub kind: String,
+    pub label: String,
+    #[serde(default)]
+    pub gallery: Option<ComponentGalleryFixture>,
+    #[serde(default)]
+    pub conversation: Option<PreviewConversationFixture>,
+    /// Several seeded tasks, so a `task-cockpit` fixture can reproduce the
+    /// board and the panel grid rather than one bare conversation.
+    ///
+    /// Additive: absent is the empty list, which is exactly the single-task
+    /// behaviour every fixture written before fix wave 2 relies on, so the
+    /// schema stays `devmanager.ui.preview/v1` and `deny_unknown_fields` still
+    /// rejects a typo in the name.
+    #[serde(default)]
+    pub tasks: Vec<PreviewTaskFixture>,
+}
+
+/// The provider that owns a seeded task. The board and the panel title paint
+/// its 11 px grey mark from this.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PreviewTaskProvider {
+    #[default]
+    Claude,
+    Codex,
+    Cursor,
+}
+
+/// What the board row and the panel status line say about a seeded task.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PreviewTaskState {
+    #[default]
+    Idle,
+    Working,
+    Question,
+    Blocked,
+    Done,
+}
+
+/// Which view an opened panel starts on. Only the two the redesign's defects
+/// live in; the dock tools are reachable from the tab row itself.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PreviewTaskView {
+    #[default]
+    Conversation,
+    Terminal,
+}
+
+/// Which side of an already-open panel a new one is split off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PreviewPaneEdge {
+    Left,
+    Right,
+    Above,
+    Below,
+}
+
+impl PreviewPaneEdge {
+    fn edge(self) -> crate::ui::task_workspace::Edge {
+        use crate::ui::task_workspace::Edge;
+        match self {
+            Self::Left => Edge::Left,
+            Self::Right => Edge::Right,
+            Self::Above => Edge::Top,
+            Self::Below => Edge::Bottom,
+        }
+    }
+}
+
+/// Where one panel joins the workspace, for a fixture that needs an exact
+/// tree rather than the flat left-to-right row the plain seeding builds.
+///
+/// This is how a NESTED arrangement gets into a capture at all: the shape a
+/// person builds by dragging is the shape the grid painter has to be proved
+/// against, and without it the harness could only ever render one flat row --
+/// which is exactly the case the painter never got wrong.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreviewPanePlacement {
+    /// The 1-based position in `root.tasks` of the open task this panel is
+    /// split off. It must come earlier in the list and must itself be open.
+    pub beside: usize,
+    pub edge: PreviewPaneEdge,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreviewTaskFixture {
+    pub title: String,
+    #[serde(default)]
+    pub provider: PreviewTaskProvider,
+    #[serde(default)]
+    pub state: PreviewTaskState,
+    /// How long ago this task last moved, in milliseconds. The board prints it
+    /// as the age chip ("4d"), so it is the fixture's clock rather than the
+    /// wall clock.
+    #[serde(default)]
+    pub age_ms: i64,
+    #[serde(default)]
+    pub project: Option<String>,
+    /// Open this task as a panel in the workspace grid.
+    #[serde(default)]
+    pub open: bool,
+    /// The one focused panel. Exactly zero or one task may claim it, and it
+    /// must be open.
+    #[serde(default)]
+    pub focused: bool,
+    #[serde(default)]
+    pub view: PreviewTaskView,
+    /// Where this panel joins the grid. Absent is the plain seeding: one more
+    /// column beside the panel opened before it.
+    #[serde(default)]
+    pub placement: Option<PreviewPanePlacement>,
+    #[serde(default)]
+    pub conversation: Option<PreviewConversationFixture>,
+}
+
+pub const MAX_PREVIEW_TASKS: usize = 24;
+pub const MAX_PREVIEW_OPEN_TASKS: usize = 8;
+/// 400 days. Longer than any age the board has a label for, and short enough
+/// that the seeded timestamp cannot go negative on any machine's clock.
+pub const MAX_PREVIEW_TASK_AGE_MS: i64 = 400 * 24 * 60 * 60 * 1000;
+
+/// The fixture's conversation as the two seed vectors the shell installs.
+///
+/// One conversion for every caller: the same mapping used to be written out
+/// three times, and a role added to the fixture would have had to be added to
+/// all three.
+#[cfg(debug_assertions)]
+fn preview_conversation_seed(
+    conversation: &PreviewConversationFixture,
+) -> (
+    Vec<crate::ui::task_cockpit::timeline::PreviewPlanStep>,
+    Vec<crate::ui::task_cockpit::timeline::PreviewConversationMessage>,
+) {
+    let steps = conversation
+        .plan_steps
+        .iter()
+        .map(|step| crate::ui::task_cockpit::timeline::PreviewPlanStep {
+            step_id: step.step_id.clone(),
+            title: step.title.clone(),
+            status: step.status.clone(),
+        })
+        .collect();
+    let messages = conversation
+        .messages
+        .iter()
+        .map(
+            |message| crate::ui::task_cockpit::timeline::PreviewConversationMessage {
+                role: match message.role.as_str() {
+                    "user" => crate::ui::renderers::MessageRole::User,
+                    "assistant" => crate::ui::renderers::MessageRole::Assistant,
+                    "reasoning" => crate::ui::renderers::MessageRole::Reasoning,
+                    "error" => crate::ui::renderers::MessageRole::Error,
+                    _ => unreachable!("preview conversation role was validated"),
+                },
+                text: message.text.clone(),
+            },
+        )
+        .collect();
+    (steps, messages)
+}
+
+/// The fixture's task list as the shell's own seed type.
+#[cfg(debug_assertions)]
+fn preview_task_seeds(
+    tasks: &[PreviewTaskFixture],
+) -> Vec<crate::ui::native_shell::PreviewTaskSeed> {
+    use crate::ui::native_shell::{PreviewTaskSeed, PreviewTaskSeedState};
+    tasks
+        .iter()
+        .map(|task| {
+            let (plan_steps, messages) = task
+                .conversation
+                .as_ref()
+                .map(preview_conversation_seed)
+                .unwrap_or_default();
+            PreviewTaskSeed {
+                title: task.title.clone(),
+                provider: match task.provider {
+                    PreviewTaskProvider::Claude => crate::providers::ProviderKind::ClaudeCode,
+                    PreviewTaskProvider::Codex => crate::providers::ProviderKind::Codex,
+                    PreviewTaskProvider::Cursor => crate::providers::ProviderKind::Cursor,
+                },
+                state: match task.state {
+                    PreviewTaskState::Idle => PreviewTaskSeedState::Idle,
+                    PreviewTaskState::Working => PreviewTaskSeedState::Working,
+                    PreviewTaskState::Question => PreviewTaskSeedState::Question,
+                    PreviewTaskState::Blocked => PreviewTaskSeedState::Blocked,
+                    PreviewTaskState::Done => PreviewTaskSeedState::Done,
+                },
+                age_ms: task.age_ms,
+                project: task.project.clone(),
+                open: task.open,
+                focused: task.focused,
+                placement: task
+                    .placement
+                    .map(|placement| (placement.beside.saturating_sub(1), placement.edge.edge())),
+                terminal_view: matches!(task.view, PreviewTaskView::Terminal),
+                plan_steps,
+                messages,
+            }
+        })
+        .collect()
+}
+
+pub fn validate_preview_tasks(tasks: &[PreviewTaskFixture]) -> Result<(), String> {
+    if tasks.len() > MAX_PREVIEW_TASKS {
+        return Err(format!(
+            "preview fixtures seed at most {MAX_PREVIEW_TASKS} tasks"
+        ));
+    }
+    let mut titles = BTreeSet::new();
+    let mut open = 0usize;
+    let mut focused = 0usize;
+    for (index, task) in tasks.iter().enumerate() {
+        if task.title.trim().is_empty() || task.title.chars().count() > 512 {
+            return Err("preview task title is empty or oversized".to_string());
+        }
+        if !titles.insert(task.title.as_str()) {
+            return Err("preview task titles must be unique".to_string());
+        }
+        if task.age_ms < 0 || task.age_ms > MAX_PREVIEW_TASK_AGE_MS {
+            return Err("preview task age is out of range".to_string());
+        }
+        if task
+            .project
+            .as_ref()
+            .is_some_and(|label| label.trim().is_empty() || label.chars().count() > 128)
+        {
+            return Err("preview task project label is empty or oversized".to_string());
+        }
+        if task.focused && !task.open {
+            return Err("a focused preview task must also be open".to_string());
+        }
+        if let Some(placement) = task.placement {
+            if !task.open {
+                return Err("only an open preview task may name a placement".to_string());
+            }
+            let beside = placement
+                .beside
+                .checked_sub(1)
+                .ok_or_else(|| "preview placement.beside is 1-based".to_string())?;
+            if beside >= index {
+                return Err(
+                    "preview placement.beside must name an EARLIER task in the list".to_string(),
+                );
+            }
+            if !tasks[beside].open {
+                return Err("preview placement.beside must name an open task".to_string());
+            }
+        }
+        if task.open {
+            open += 1;
+        }
+        if task.focused {
+            focused += 1;
+        }
+        if let Some(conversation) = task.conversation.as_ref() {
+            conversation.validate()?;
+        }
+    }
+    if open > MAX_PREVIEW_OPEN_TASKS {
+        return Err(format!(
+            "preview fixtures open at most {MAX_PREVIEW_OPEN_TASKS} panels"
+        ));
+    }
+    if focused > 1 {
+        return Err("only one preview task may be focused".to_string());
+    }
+    if focused == 0 && open > 0 {
+        return Err("an opened preview workspace needs one focused task".to_string());
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreviewConversationFixture {
+    #[serde(default)]
+    pub plan_steps: Vec<PreviewPlanStepFixture>,
+    #[serde(default)]
+    pub messages: Vec<PreviewMessageFixture>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreviewMessageFixture {
+    pub role: String,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreviewPlanStepFixture {
+    pub step_id: String,
+    pub title: String,
+    pub status: String,
+}
+
+/// How long a seeded conversation may be.
+///
+/// It was 32 until fix wave 3, and 32 short messages do not fill a full-height
+/// panel: the stream-anchoring fixture has to show BOTH halves of the rule --
+/// a short conversation painting from the top with space below it, and a long
+/// one scrolled to its last message -- and the long half is unreachable from a
+/// fixture that cannot overflow the panel it is rendered into.
+pub const MAX_PREVIEW_CONVERSATION_ROWS: usize = 64;
+
+impl PreviewConversationFixture {
+    fn validate(&self) -> Result<(), String> {
+        if (self.plan_steps.is_empty() && self.messages.is_empty())
+            || self.plan_steps.len() > MAX_PREVIEW_CONVERSATION_ROWS
+            || self.messages.len() > MAX_PREVIEW_CONVERSATION_ROWS
+        {
+            return Err(format!(
+                "preview conversation must carry 1..={MAX_PREVIEW_CONVERSATION_ROWS} messages or plan steps"
+            ));
+        }
+        let mut identities = BTreeSet::new();
+        for step in &self.plan_steps {
+            if step.step_id.trim().is_empty()
+                || step.step_id.len() > 128
+                || step.title.trim().is_empty()
+                || step.title.chars().count() > 512
+            {
+                return Err("preview plan step identity or title is invalid".to_string());
+            }
+            if crate::domain::PlanStepStatus::from_wire(&step.status).is_none() {
+                return Err("preview plan step status is unsupported".to_string());
+            }
+            if !identities.insert(step.step_id.as_str()) {
+                return Err("preview plan step identities must be unique".to_string());
+            }
+        }
+        for message in &self.messages {
+            if !matches!(
+                message.role.as_str(),
+                "user" | "assistant" | "reasoning" | "error"
+            ) || message.text.trim().is_empty()
+                || message.text.len() > 64 * 1024
+            {
+                return Err("preview conversation message is invalid".to_string());
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GalleryTheme {
+    Dark,
+    Light,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GalleryDensity {
+    Compact,
+    Comfortable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GalleryState {
+    Default,
+    Hover,
+    Pressed,
+    Focused,
+    Disabled,
+    Loading,
+    Destructive,
+    Selected,
+    Status,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ComponentGallerySamples {
+    pub long_text: String,
+    pub unicode: String,
+    pub missing: String,
+    pub error: String,
+    pub loading: String,
+    pub empty: String,
+    pub overflow: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ComponentGalleryFixture {
+    pub themes: Vec<GalleryTheme>,
+    pub densities: Vec<GalleryDensity>,
+    pub scales: Vec<u16>,
+    pub states: Vec<GalleryState>,
+    pub samples: ComponentGallerySamples,
+}
+
+impl ComponentGalleryFixture {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.themes.len() != 2
+            || !self.themes.contains(&GalleryTheme::Dark)
+            || !self.themes.contains(&GalleryTheme::Light)
+        {
+            return Err("component gallery must cover dark and light themes".to_string());
+        }
+        if self.densities.len() != 2
+            || !self.densities.contains(&GalleryDensity::Compact)
+            || !self.densities.contains(&GalleryDensity::Comfortable)
+        {
+            return Err("component gallery must cover compact and comfortable density".to_string());
+        }
+        if self.scales != [100, 125, 150, 200] {
+            return Err(
+                "component gallery must cover 100, 125, 150, and 200 percent scales".to_string(),
+            );
+        }
+        let required_states = [
+            GalleryState::Default,
+            GalleryState::Hover,
+            GalleryState::Pressed,
+            GalleryState::Focused,
+            GalleryState::Disabled,
+            GalleryState::Loading,
+            GalleryState::Destructive,
+            GalleryState::Selected,
+            GalleryState::Status,
+        ];
+        if self.states.len() != required_states.len()
+            || required_states
+                .iter()
+                .any(|state| !self.states.contains(state))
+        {
+            return Err(
+                "component gallery must cover every reusable interaction state".to_string(),
+            );
+        }
+        for (name, value) in [
+            ("long_text", &self.samples.long_text),
+            ("unicode", &self.samples.unicode),
+            ("missing", &self.samples.missing),
+            ("error", &self.samples.error),
+            ("loading", &self.samples.loading),
+            ("empty", &self.samples.empty),
+            ("overflow", &self.samples.overflow),
+        ] {
+            if value.trim().is_empty() {
+                return Err(format!("component gallery sample {name} must not be blank"));
+            }
+            if value.chars().count() > 4096 || value.len() > 16384 {
+                return Err(format!("component gallery sample {name} is oversized"));
+            }
+        }
+        if self.samples.long_text.chars().count() <= 256 {
+            return Err("component gallery long_text must exercise overflow wrapping".to_string());
+        }
+        if !self
+            .samples
+            .unicode
+            .chars()
+            .any(|character| !character.is_ascii())
+        {
+            return Err("component gallery unicode sample must contain non-ASCII text".to_string());
+        }
+        Ok(())
+    }
+}
+
+fn sanitize_gallery_fixture(mut gallery: ComponentGalleryFixture) -> ComponentGalleryFixture {
+    use crate::ui::components::interaction::redact_sensitive_text;
+
+    for value in [
+        &mut gallery.samples.long_text,
+        &mut gallery.samples.unicode,
+        &mut gallery.samples.missing,
+        &mut gallery.samples.error,
+        &mut gallery.samples.loading,
+        &mut gallery.samples.empty,
+        &mut gallery.samples.overflow,
+    ] {
+        *value = redact_sensitive_text(value);
+    }
+    gallery
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct PreviewPathPolicy {
+    fixture_root: PathBuf,
+    output_root: PathBuf,
+    temp_root: PathBuf,
+}
+
+impl PreviewPathPolicy {
+    pub fn new(
+        fixture_root: impl Into<PathBuf>,
+        output_root: impl Into<PathBuf>,
+        temp_root: impl Into<PathBuf>,
+    ) -> Self {
+        Self {
+            fixture_root: fixture_root.into(),
+            output_root: output_root.into(),
+            temp_root: temp_root.into(),
+        }
+    }
+
+    pub fn for_workspace(workspace_root: impl AsRef<Path>) -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static PREVIEW_TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
+        let workspace_root = workspace_root.as_ref();
+        let run_token = format!(
+            "devmanager-preview-{}-{}",
+            std::process::id(),
+            PREVIEW_TEMP_SEQ.fetch_add(1, Ordering::Relaxed)
+        );
+        Self::new(
+            workspace_root.join("tests/fixtures/ui"),
+            workspace_root.join(".devmanager-next/evidence/phase-05/screenshots"),
+            std::env::temp_dir().join(run_token),
+        )
+    }
+
+    pub fn fixture_root(&self) -> &Path {
+        &self.fixture_root
+    }
+
+    pub fn output_root(&self) -> &Path {
+        &self.output_root
+    }
+
+    pub fn temp_root(&self) -> &Path {
+        &self.temp_root
+    }
+}
+
+impl std::fmt::Debug for PreviewPathPolicy {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("PreviewPathPolicy(REDACTED)")
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct PreviewRequest {
+    fixture_path: PathBuf,
+    output_path: PathBuf,
+    settle_delay_ms: u32,
+    trusted_output_authority: Arc<preview_capture::CaptureOutputAuthority>,
+}
+
+impl std::fmt::Debug for PreviewRequest {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PreviewRequest")
+            .field("paths", &"REDACTED")
+            .field("settle_delay_ms", &self.settle_delay_ms)
+            .finish()
+    }
+}
+
+impl PreviewRequest {
+    pub fn fixture_path(&self) -> &Path {
+        &self.fixture_path
+    }
+
+    pub fn output_path(&self) -> &Path {
+        &self.output_path
+    }
+
+    pub(crate) fn capture_authority(&self) -> &Arc<preview_capture::CaptureOutputAuthority> {
+        &self.trusted_output_authority
+    }
+
+    pub fn settle_delay_ms(&self) -> u32 {
+        self.settle_delay_ms
+    }
+
+    pub fn write_bgra_png_atomic(
+        &self,
+        width: u32,
+        height: u32,
+        bgra: &[u8],
+    ) -> Result<(), preview_capture::PreviewCaptureError> {
+        let lease = preview_capture::CaptureGeneration::new().begin();
+        preview_capture::encode_bgra_png_atomic_with_authority(
+            Arc::clone(&self.trusted_output_authority),
+            width,
+            height,
+            bgra,
+            preview_capture::CaptureDeadline::from_now(preview_capture::FIRST_FRAME_DEADLINE),
+            &lease,
+        )
+    }
+
+    pub fn validate(
+        fixture_path: impl AsRef<Path>,
+        output_path: impl AsRef<Path>,
+        policy: &PreviewPathPolicy,
+    ) -> Result<Self, PreviewError> {
+        let fixture_path = absolute_path(fixture_path.as_ref())?;
+        let output_path = absolute_path(output_path.as_ref())?;
+        let fixture_check = checked_path(&fixture_path)?;
+        let fixture_root = checked_path(policy.fixture_root())?;
+
+        if !is_within(&fixture_check, &fixture_root) {
+            return Err(PreviewError::OutsideApprovedRoot {
+                path: fixture_path,
+                root_kind: "fixture",
+            });
+        }
+        if is_sensitive_path(&fixture_check) {
+            return Err(PreviewError::SensitivePath { path: fixture_path });
+        }
+        if fixture_path.extension().and_then(OsStr::to_str) != Some("json") {
+            return Err(PreviewError::InvalidArgument(
+                "fixture must use the .json extension".into(),
+            ));
+        }
+        match fs::metadata(&fixture_path) {
+            Ok(metadata) if metadata.is_file() => {
+                if metadata.len() > MAX_FIXTURE_BYTES {
+                    return Err(PreviewError::FixtureTooLarge {
+                        path: fixture_path,
+                        bytes: metadata.len(),
+                        max_bytes: MAX_FIXTURE_BYTES,
+                    });
+                }
+            }
+            Ok(_) => {
+                return Err(PreviewError::FixtureNotRegular { path: fixture_path });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(PreviewError::FixtureMissing { path: fixture_path });
+            }
+            Err(error) => {
+                return Err(PreviewError::FixtureIo {
+                    path: fixture_path,
+                    message: error.to_string(),
+                });
+            }
+        }
+
+        let output_check = checked_path(&output_path)?;
+        let output_root = checked_path(policy.output_root())?;
+        let temp_root = checked_path(policy.temp_root())?;
+        let output_is_approved =
+            is_within(&output_check, &output_root) || is_within(&output_check, &temp_root);
+        let trusted_output_root = if is_within(&output_check, &output_root) {
+            output_root.clone()
+        } else {
+            temp_root.clone()
+        };
+        if is_sensitive_path(&output_check) {
+            return Err(PreviewError::SensitivePath { path: output_path });
+        }
+        if !output_is_approved {
+            return Err(PreviewError::OutsideApprovedRoot {
+                path: output_path,
+                root_kind: "output",
+            });
+        }
+        if output_path.extension().and_then(OsStr::to_str) != Some("png") {
+            return Err(PreviewError::InvalidArgument(
+                "output must use the .png extension".into(),
+            ));
+        }
+        if output_path.exists() {
+            return Err(PreviewError::OutputAlreadyExists { path: output_path });
+        }
+
+        let output_parent = output_path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .ok_or_else(|| {
+                PreviewError::InvalidArgument("output must have a parent directory".into())
+            })?;
+        fs::create_dir_all(output_parent).map_err(|error| PreviewError::OutputFailed {
+            reason: preview_capture::bounded_redacted_diagnostic(&error.to_string()),
+        })?;
+        let trusted_output_authority =
+            preview_capture::CaptureOutputAuthority::new(&output_path, &trusted_output_root)
+                .map_err(|error| PreviewError::OutputFailed {
+                    reason: preview_capture::bounded_redacted_diagnostic(&error.to_string()),
+                })?;
+
+        Ok(Self {
+            fixture_path,
+            output_path,
+            settle_delay_ms: 0,
+            trusted_output_authority: Arc::new(trusted_output_authority),
+        })
+    }
+}
+
+pub fn parse_preview_args<I, S>(
+    args: I,
+    policy: &PreviewPathPolicy,
+) -> Result<PreviewRequest, PreviewError>
+where
+    I: IntoIterator<Item = S>,
+    S: Into<OsString>,
+{
+    let mut args = args.into_iter().map(Into::into);
+    let mut fixture = None;
+    let mut output = None;
+    let mut settle_delay_ms = None;
+    let mut saw_argument = false;
+
+    while let Some(argument) = args.next() {
+        saw_argument = true;
+        match argument.to_string_lossy().as_ref() {
+            "--ui-preview" => {
+                if fixture.is_some() {
+                    return Err(PreviewError::Usage(
+                        "--ui-preview may be supplied only once".to_string(),
+                    ));
+                }
+                fixture = Some(PathBuf::from(args.next().ok_or_else(|| {
+                    PreviewError::Usage("--ui-preview requires a fixture path".to_string())
+                })?));
+            }
+            "--output" => {
+                if output.is_some() {
+                    return Err(PreviewError::Usage(
+                        "--output may be supplied only once".to_string(),
+                    ));
+                }
+                output = Some(PathBuf::from(args.next().ok_or_else(|| {
+                    PreviewError::Usage("--output requires a PNG path".to_string())
+                })?));
+            }
+            "--settle-ms" => {
+                if settle_delay_ms.is_some() {
+                    return Err(PreviewError::Usage(
+                        "--settle-ms may be supplied only once".to_string(),
+                    ));
+                }
+                let value = args.next().ok_or_else(|| {
+                    PreviewError::Usage("--settle-ms requires milliseconds".to_string())
+                })?;
+                let value = value.to_string_lossy().parse::<u32>().map_err(|_| {
+                    PreviewError::Usage("--settle-ms must be an unsigned integer".to_string())
+                })?;
+                if value > MAX_PREVIEW_SETTLE_MS {
+                    return Err(PreviewError::Usage(format!(
+                        "--settle-ms must not exceed {MAX_PREVIEW_SETTLE_MS}"
+                    )));
+                }
+                settle_delay_ms = Some(value);
+            }
+            other => {
+                return Err(PreviewError::Usage(format!("unknown argument: {other}")));
+            }
+        }
+    }
+
+    if !saw_argument {
+        return Err(PreviewError::Usage(PREVIEW_USAGE.to_string()));
+    }
+
+    let fixture = fixture.ok_or_else(|| PreviewError::Usage(PREVIEW_USAGE.to_string()))?;
+    let output = output.ok_or_else(|| PreviewError::Usage(PREVIEW_USAGE.to_string()))?;
+    let mut request = PreviewRequest::validate(fixture, output, policy)?;
+    request.settle_delay_ms = settle_delay_ms.unwrap_or_default();
+    Ok(request)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreviewResources {
+    pub asset_paths: Vec<String>,
+    pub font_families: Vec<String>,
+    pub action_ids: Vec<String>,
+}
+
+impl PreviewResources {
+    fn new() -> Self {
+        let font = terminal_font();
+        Self {
+            asset_paths: vec!["icons/sparkles.svg".to_string()],
+            font_families: vec![font.family.to_string()],
+            action_ids: action::catalog()
+                .iter()
+                .map(|descriptor| descriptor.id.to_string())
+                .collect(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreviewRootSnapshot {
+    pub fixture_id: String,
+    pub root_kind: String,
+    pub title: String,
+    pub body: String,
+    pub component_gallery: Option<ComponentGalleryFixture>,
+    pub conversation: Option<PreviewConversationFixture>,
+    pub tasks: Vec<PreviewTaskFixture>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreviewFrameLayout {
+    FullBleed,
+    Inset { padding_px: u16 },
+}
+
+impl PreviewRootSnapshot {
+    fn frame_layout(&self) -> PreviewFrameLayout {
+        if self.root_kind == "task-cockpit" {
+            PreviewFrameLayout::FullBleed
+        } else {
+            PreviewFrameLayout::Inset {
+                padding_px: PREVIEW_GALLERY_INSET_PX,
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreviewInitReport {
+    pub component_init_count: usize,
+    pub assets_registered: bool,
+    pub fonts_registered: bool,
+    pub actions_registered: bool,
+    pub root_constructed: bool,
+    pub native_shell_instantiated: bool,
+    pub production_host_started: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PreviewOutputCapability {
+    HeadlessProjectionOnly,
+    VisibleWindowsNativeCapture,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreviewOutputMetadata {
+    pub schema: String,
+    pub fixture_id: String,
+    pub output_path: PathBuf,
+    pub format: String,
+    pub capability: PreviewOutputCapability,
+    pub output_written: bool,
+    pub host_started: bool,
+}
+
+#[derive(Debug)]
+pub struct PreviewApplication {
+    request: PreviewRequest,
+    workspace_root: PathBuf,
+    root_snapshot: PreviewRootSnapshot,
+    resources: PreviewResources,
+    capture: PreviewCaptureFixture,
+    init_report: RefCell<Option<PreviewInitReport>>,
+    host_started: RefCell<bool>,
+}
+
+impl PreviewApplication {
+    pub fn load(request: PreviewRequest, policy: &PreviewPathPolicy) -> Result<Self, PreviewError> {
+        let settle_delay_ms = request.settle_delay_ms();
+        let mut request = PreviewRequest::validate(
+            request.fixture_path.clone(),
+            request.output_path.clone(),
+            policy,
+        )?;
+        request.settle_delay_ms = settle_delay_ms;
+        let bytes = read_fixture_bytes(&request.fixture_path)?;
+        let fixture: PreviewFixture =
+            serde_json::from_slice(&bytes).map_err(|error| PreviewError::MalformedFixture {
+                path: request.fixture_path.clone(),
+                message: error.to_string(),
+            })?;
+
+        if fixture.schema != PREVIEW_SCHEMA {
+            return Err(PreviewError::UnsupportedSchema {
+                path: request.fixture_path,
+                schema: fixture.schema,
+            });
+        }
+        if fixture.id.trim().is_empty()
+            || fixture.id.chars().count() > 128
+            || fixture.title.trim().is_empty()
+            || fixture.title.chars().count() > 256
+            || fixture.capture.cursor != PreviewCaptureSetting::Excluded
+            || fixture.capture.border != PreviewCaptureSetting::Excluded
+            || !matches!(
+                fixture.root.kind.as_str(),
+                "minimal" | "task-cockpit" | "component_gallery"
+            )
+            || fixture.root.label.trim().is_empty()
+            || fixture.root.label.chars().count() > 256
+        {
+            return Err(PreviewError::MalformedFixture {
+                path: request.fixture_path,
+                message: "fixture fields are empty, oversized, or use an unsupported root".into(),
+            });
+        }
+
+        let component_gallery = match (fixture.root.kind.as_str(), fixture.root.gallery) {
+            ("component_gallery", Some(gallery)) => {
+                gallery
+                    .validate()
+                    .map_err(|message| PreviewError::MalformedFixture {
+                        path: request.fixture_path.clone(),
+                        message,
+                    })?;
+                Some(sanitize_gallery_fixture(gallery))
+            }
+            ("component_gallery", None) => {
+                return Err(PreviewError::MalformedFixture {
+                    path: request.fixture_path,
+                    message: "component gallery roots must carry gallery data".into(),
+                });
+            }
+            ("minimal", Some(_)) | ("task-cockpit", Some(_)) => {
+                return Err(PreviewError::MalformedFixture {
+                    path: request.fixture_path,
+                    message: "non-gallery preview roots cannot carry a component gallery".into(),
+                });
+            }
+            (_, None) => None,
+            (_, Some(_)) => {
+                return Err(PreviewError::MalformedFixture {
+                    path: request.fixture_path,
+                    message: "unsupported preview roots cannot carry a component gallery".into(),
+                });
+            }
+        };
+        let conversation = match (fixture.root.kind.as_str(), fixture.root.conversation) {
+            ("task-cockpit", Some(conversation)) => {
+                conversation
+                    .validate()
+                    .map_err(|message| PreviewError::MalformedFixture {
+                        path: request.fixture_path.clone(),
+                        message,
+                    })?;
+                Some(conversation)
+            }
+            ("task-cockpit", None) | ("minimal", None) | ("component_gallery", None) => None,
+            (_, Some(_)) => {
+                return Err(PreviewError::MalformedFixture {
+                    path: request.fixture_path,
+                    message: "conversation data requires a task-cockpit root".into(),
+                });
+            }
+            (_, None) => None,
+        };
+        let tasks = fixture.root.tasks;
+        if !tasks.is_empty() && fixture.root.kind != "task-cockpit" {
+            return Err(PreviewError::MalformedFixture {
+                path: request.fixture_path,
+                message: "seeded tasks require a task-cockpit root".into(),
+            });
+        }
+        validate_preview_tasks(&tasks).map_err(|message| PreviewError::MalformedFixture {
+            path: request.fixture_path.clone(),
+            message,
+        })?;
+        let is_task_cockpit = fixture.root.kind == "task-cockpit";
+        let safe_title = crate::ui::components::interaction::redact_sensitive_text(&fixture.title);
+        let safe_label =
+            crate::ui::components::interaction::redact_sensitive_text(&fixture.root.label);
+        let body = if is_task_cockpit {
+            format!(
+                "Task Cockpit\nHeader unavailable\nTask Inbox\nContext Dock\nHost unavailable\n{}",
+                safe_title
+            )
+        } else {
+            format!("{safe_label}: {safe_title}")
+        };
+        let root_snapshot = PreviewRootSnapshot {
+            fixture_id: fixture.id,
+            root_kind: fixture.root.kind,
+            body,
+            title: safe_title,
+            component_gallery,
+            conversation,
+            tasks,
+        };
+        Ok(Self {
+            request,
+            workspace_root: preview_workspace_root(policy.fixture_root()),
+            root_snapshot,
+            resources: PreviewResources::new(),
+            capture: fixture.capture,
+            init_report: RefCell::new(None),
+            host_started: RefCell::new(false),
+        })
+    }
+
+    pub fn root_snapshot(&self) -> &PreviewRootSnapshot {
+        &self.root_snapshot
+    }
+
+    pub fn frame_layout(&self) -> PreviewFrameLayout {
+        self.root_snapshot.frame_layout()
+    }
+
+    pub fn settle_delay_ms(&self) -> u32 {
+        self.request.settle_delay_ms()
+    }
+
+    pub fn resources(&self) -> &PreviewResources {
+        &self.resources
+    }
+
+    pub fn capture_cursor(&self) -> PreviewCaptureSetting {
+        self.capture.cursor
+    }
+
+    pub fn capture_border(&self) -> PreviewCaptureSetting {
+        self.capture.border
+    }
+
+    pub fn component_gallery(&self) -> Option<&ComponentGalleryFixture> {
+        self.root_snapshot.component_gallery.as_ref()
+    }
+
+    pub fn output_metadata(&self) -> PreviewOutputMetadata {
+        PreviewOutputMetadata {
+            schema: PREVIEW_SCHEMA.to_string(),
+            fixture_id: self.root_snapshot.fixture_id.clone(),
+            output_path: self.request.output_path.clone(),
+            format: "png".to_string(),
+            capability: if cfg!(windows) {
+                PreviewOutputCapability::VisibleWindowsNativeCapture
+            } else {
+                PreviewOutputCapability::HeadlessProjectionOnly
+            },
+            output_written: false,
+            host_started: *self.host_started.borrow(),
+        }
+    }
+
+    pub fn root(&self) -> PreviewRoot {
+        PreviewRoot::new(self.root_snapshot.clone(), self.workspace_root.clone())
+    }
+
+    pub fn initialize_headless(&self) -> Result<PreviewInitReport, PreviewError> {
+        if let Some(report) = self.init_report.borrow().clone() {
+            return Ok(report);
+        }
+
+        let root_snapshot = self.root_snapshot.clone();
+        let workspace_root = self.workspace_root.clone();
+        let report = Rc::new(RefCell::new(None));
+        let report_slot = Rc::clone(&report);
+        let application = gpui::Application::headless().with_assets(AppAssets::new());
+        application.run(move |cx| {
+            register_preview_environment(cx);
+
+            let assets_registered = cx
+                .asset_source()
+                .list("icons")
+                .map(|paths| paths.iter().any(|path| path.as_ref() == "sparkles.svg"))
+                .unwrap_or(false);
+            let fonts_registered = {
+                let font = terminal_font();
+                let _ = cx.text_system().resolve_font(&font);
+                true
+            };
+            let actions_registered = TASK_COCKPIT_ACTION_NAMES
+                .iter()
+                .all(|name| cx.all_action_names().contains(name))
+                && cx
+                    .all_action_names()
+                    .contains(&PreviewDismiss::name_for_type());
+            let root = match PreviewRoot::new(root_snapshot, workspace_root)
+                .instantiate_native_shell(cx)
+            {
+                Ok(root) => root,
+                Err(_error) => {
+                    crate::ui::finish_headless_test(cx);
+                    return;
+                }
+            };
+            let native_shell_instantiated = root.has_native_shell();
+            let _root_element = root.element();
+            let after = crate::ui::component_init_count();
+
+            *report_slot.borrow_mut() = Some(PreviewInitReport {
+                component_init_count: after,
+                assets_registered,
+                fonts_registered,
+                actions_registered,
+                root_constructed: true,
+                native_shell_instantiated,
+                production_host_started: false,
+            });
+            crate::ui::finish_headless_test(cx);
+        });
+
+        let result = report
+            .borrow_mut()
+            .take()
+            .ok_or_else(|| PreviewError::HeadlessInitializationFailed);
+        if let Ok(report) = &result {
+            *self.init_report.borrow_mut() = Some(report.clone());
+        }
+        result
+    }
+
+    pub fn render_to_output(&self) -> Result<(), PreviewError> {
+        preview_capture::capture_preview(self.root(), &self.request)
+            .map(|_| {
+                *self.host_started.borrow_mut() = self.root_snapshot.root_kind == "task-cockpit";
+            })
+            .map_err(|error| PreviewError::from_capture_error(error, self.request.output_path()))
+    }
+}
+
+pub(crate) fn register_preview_environment(cx: &mut gpui::App) {
+    crate::ui::init(cx);
+    register_task_cockpit_bindings(cx);
+    cx.bind_keys([KeyBinding::new("escape", PreviewDismiss, None)]);
+}
+
+fn preview_workspace_root(fixture_root: &Path) -> PathBuf {
+    let fixture_root = fixture_root.to_path_buf();
+    let Some(fixtures_root) = fixture_root.parent() else {
+        return fixture_root;
+    };
+    let Some(candidate) = fixtures_root.parent() else {
+        return fixture_root;
+    };
+    if candidate.file_name().and_then(OsStr::to_str) == Some("tests") {
+        candidate.parent().unwrap_or(candidate).to_path_buf()
+    } else {
+        candidate.to_path_buf()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PreviewRoot {
+    snapshot: PreviewRootSnapshot,
+    workspace_root: PathBuf,
+    native_shell: Option<gpui::Entity<NativeShell>>,
+}
+
+impl PreviewRoot {
+    fn new(snapshot: PreviewRootSnapshot, workspace_root: PathBuf) -> Self {
+        Self {
+            snapshot,
+            workspace_root,
+            native_shell: None,
+        }
+    }
+
+    pub(crate) fn instantiate_native_shell(
+        mut self,
+        cx: &mut gpui::App,
+    ) -> Result<Self, PreviewError> {
+        if self.snapshot.root_kind != "task-cockpit" {
+            return Ok(self);
+        }
+        let profile = isolated_dev_profile(&self.workspace_root).map_err(|error| {
+            PreviewError::ApplicationFailed {
+                reason: format!("preview native shell profile: {error}"),
+            }
+        })?;
+        let shell = cx.new(|cx| NativeShell::new_for_headless(profile, cx));
+        #[cfg(debug_assertions)]
+        self.seed_shell(&shell, cx);
+        self.native_shell = Some(shell);
+        Ok(self)
+    }
+
+    /// Seed whatever the fixture asked for into a freshly built shell.
+    ///
+    /// One seam for both instantiation paths, so the headless report and the
+    /// captured PNG can never be looking at two differently seeded shells.
+    #[cfg(debug_assertions)]
+    fn seed_shell(&self, shell: &gpui::Entity<NativeShell>, cx: &mut gpui::App) {
+        if !self.snapshot.tasks.is_empty() {
+            let seeds = preview_task_seeds(&self.snapshot.tasks);
+            let _ = shell.update(cx, |shell, cx| shell.install_preview_tasks(&seeds, cx));
+            return;
+        }
+        let Some(conversation) = self.snapshot.conversation.as_ref() else {
+            return;
+        };
+        let (steps, messages) = preview_conversation_seed(conversation);
+        let _ = shell.update(cx, |shell, _cx| {
+            shell.install_preview_conversation(steps, messages)
+        });
+    }
+
+    /// Visible capture owns the one real isolated host/runtime. The host
+    /// attachment is moved into the shell exactly once and is dropped with
+    /// the GPUI entity; no disconnected fake transport is used for capture.
+    pub(crate) fn instantiate_native_shell_for_capture(
+        mut self,
+        cx: &mut gpui::App,
+        deadline: std::time::Instant,
+    ) -> Result<Self, PreviewError> {
+        if self.snapshot.root_kind != "task-cockpit" {
+            return Ok(self);
+        }
+        let profile = isolated_dev_profile(&self.workspace_root).map_err(|error| {
+            PreviewError::ApplicationFailed {
+                reason: format!("preview native shell profile: {error}"),
+            }
+        })?;
+        // A fixture that seeds its own tasks must NOT start a host: the host's
+        // first `ClientModel` would replace the seeded one, and the panels the
+        // fixture asked for would vanish a few hundred milliseconds into the
+        // capture. There is nothing for a host to serve here, so the seeded
+        // capture uses the same headless shell the init report does.
+        let seeded = {
+            #[cfg(debug_assertions)]
+            {
+                !self.snapshot.tasks.is_empty()
+            }
+            #[cfg(not(debug_assertions))]
+            {
+                false
+            }
+        };
+        let shell = if seeded {
+            cx.new(|cx| NativeShell::new_for_headless(profile, cx))
+        } else {
+            let mut bootstrap = ProcessNativeHostBootstrap;
+            let attachment = bootstrap.start_until(&profile, deadline).map_err(|error| {
+                PreviewError::ApplicationFailed {
+                    reason: error.to_string(),
+                }
+            })?;
+            match attachment {
+                NativeHostRuntimeAttachment::Client(runtime) => {
+                    cx.new(|cx| NativeShell::new_with_host_runtime(profile, Some(runtime), cx))
+                }
+                NativeHostRuntimeAttachment::Injected(runtime) => cx.new(|cx| {
+                    NativeShell::new_with_host_runtime_port(
+                        profile,
+                        runtime,
+                        RuntimePreferencesSnapshot::default(),
+                        cx,
+                    )
+                }),
+            }
+        };
+        #[cfg(debug_assertions)]
+        self.seed_shell(&shell, cx);
+        self.native_shell = Some(shell);
+        Ok(self)
+    }
+
+    pub(crate) fn install_window_observers(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(shell) = self.native_shell.clone() {
+            let _ = shell.update(cx, |shell, cx| {
+                shell.install_window_observers(window, cx);
+            });
+        }
+    }
+
+    fn has_native_shell(&self) -> bool {
+        self.native_shell.is_some()
+    }
+
+    pub fn element(&self) -> impl IntoElement {
+        let tokens = RuntimePreferencesSnapshot::default().tokens();
+        let shell = if let Some(native_shell) = self.native_shell.clone() {
+            div()
+                .id("preview-task-cockpit")
+                .size_full()
+                .child(native_shell)
+                .into_any_element()
+        } else if self.snapshot.root_kind == "task-cockpit" {
+            div()
+                .id("preview-task-cockpit")
+                .flex_col()
+                .gap(px(12.0))
+                .child(div().id("preview-shell-title").child("Task Cockpit"))
+                .child(div().id("preview-header").child("Header unavailable"))
+                .child(div().id("preview-inbox").child("Task Inbox"))
+                .child(div().id("preview-dock").child("Context Dock"))
+                .child(div().id("preview-host-state").child("Host unavailable"))
+                .into_any_element()
+        } else {
+            div().child(self.snapshot.body.clone()).into_any_element()
+        };
+        let preview = div()
+            .size_full()
+            .bg(tokens.surfaces.canvas.to_gpui())
+            .text_color(tokens.text.primary.to_gpui())
+            .on_action::<PreviewDismiss>(|_, _, cx: &mut gpui::App| cx.quit());
+        let preview = match self.snapshot.frame_layout() {
+            PreviewFrameLayout::FullBleed => preview,
+            PreviewFrameLayout::Inset { padding_px } => preview.p(px(f32::from(padding_px))),
+        }
+        .child(shell);
+        if self.native_shell.is_none() {
+            preview.child(
+                div()
+                    .flex_none()
+                    .size(px(PREVIEW_SENTINEL_SIZE))
+                    .bg(PREVIEW_SENTINEL.to_gpui()),
+            )
+        } else {
+            preview
+        }
+    }
+}
+
+impl Render for PreviewRoot {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        self.element()
+    }
+}
+
+pub fn run_cli<I, S>(args: I, policy: &PreviewPathPolicy) -> Result<(), PreviewError>
+where
+    I: IntoIterator<Item = S>,
+    S: Into<OsString>,
+{
+    let request = parse_preview_args(args, policy)?;
+    let preview = PreviewApplication::load(request, policy)?;
+    preview.render_to_output()
+}
+
+/// Interactive debug fixture window. It owns no production host and does not
+/// claim a captured PNG; desktop inspection captures the rendered window.
+#[cfg(debug_assertions)]
+pub fn run_live_cli(args: Vec<OsString>, policy: &PreviewPathPolicy) -> Result<(), PreviewError> {
+    if args.len() != 2 || args[0] != "--ui-preview-live" {
+        return Err(PreviewError::InvalidArgument(
+            "usage: devmanager --ui-preview-live <fixture.json>".into(),
+        ));
+    }
+    // Share the bounded fixture/path admission with automated previews. This
+    // reserved output authority is never published by interactive mode.
+    let request = parse_preview_args(
+        [
+            OsString::from("--ui-preview"),
+            args[1].clone(),
+            OsString::from("--output"),
+            policy
+                .output_root()
+                .join("live-preview.png")
+                .into_os_string(),
+        ],
+        policy,
+    )?;
+    let preview = PreviewApplication::load(request, policy)?;
+    let root = preview.root();
+    let errors = Rc::new(RefCell::new(None));
+    let errors_for_app = errors.clone();
+    crate::ui::desktop_application()
+        .with_assets(AppAssets::new())
+        .run(move |cx| {
+            crate::ui::init(cx);
+            crate::ui::actions::register_native_keyboard_bindings(cx);
+            cx.on_window_closed(|cx| {
+                if cx.windows().is_empty() {
+                    cx.quit();
+                }
+            })
+            .detach();
+            let root = match root.instantiate_native_shell(cx) {
+                Ok(root) => root,
+                Err(error) => {
+                    *errors_for_app.borrow_mut() = Some(error);
+                    cx.quit();
+                    return;
+                }
+            };
+            let result = cx.open_window(
+                gpui::WindowOptions {
+                    window_bounds: Some(gpui::WindowBounds::centered(
+                        gpui::size(px(1280.0), px(800.0)),
+                        cx,
+                    )),
+                    titlebar: Some(gpui::TitlebarOptions {
+                        title: Some("DevManager — interactive fixture".into()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                move |window, cx| {
+                    let view = cx.new(|cx| {
+                        let mut root = root;
+                        root.install_window_observers(window, cx);
+                        root
+                    });
+                    cx.new(|cx| gpui_component::Root::new(view, window, cx))
+                },
+            );
+            if let Err(error) = result {
+                *errors_for_app.borrow_mut() = Some(PreviewError::ApplicationFailed {
+                    reason: error.to_string(),
+                });
+                cx.quit();
+            } else {
+                cx.activate(true);
+            }
+        });
+    let result = errors.borrow_mut().take().map_or(Ok(()), Err);
+    result
+}
+
+fn absolute_path(path: &Path) -> Result<PathBuf, PreviewError> {
+    if path.is_absolute() {
+        return Ok(path.to_path_buf());
+    }
+    std::env::current_dir()
+        .map(|current| current.join(path))
+        .map_err(|error| PreviewError::InvalidArgument(error.to_string()))
+}
+
+fn read_fixture_bytes(path: &Path) -> Result<Vec<u8>, PreviewError> {
+    let metadata = fs::metadata(path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            PreviewError::FixtureMissing {
+                path: path.to_path_buf(),
+            }
+        } else {
+            PreviewError::FixtureIo {
+                path: path.to_path_buf(),
+                message: error.to_string(),
+            }
+        }
+    })?;
+    if !metadata.is_file() {
+        return Err(PreviewError::FixtureNotRegular {
+            path: path.to_path_buf(),
+        });
+    }
+    if metadata.len() > MAX_FIXTURE_BYTES {
+        return Err(PreviewError::FixtureTooLarge {
+            path: path.to_path_buf(),
+            bytes: metadata.len(),
+            max_bytes: MAX_FIXTURE_BYTES,
+        });
+    }
+
+    let bytes = fs::read(path).map_err(|error| PreviewError::FixtureIo {
+        path: path.to_path_buf(),
+        message: error.to_string(),
+    })?;
+    if bytes.len() as u64 > MAX_FIXTURE_BYTES {
+        return Err(PreviewError::FixtureTooLarge {
+            path: path.to_path_buf(),
+            bytes: bytes.len() as u64,
+            max_bytes: MAX_FIXTURE_BYTES,
+        });
+    }
+    Ok(bytes)
+}
+
+fn checked_path(path: &Path) -> Result<PathBuf, PreviewError> {
+    let absolute = absolute_path(path)?;
+    let mut suffix = Vec::new();
+    let mut existing = absolute.clone();
+    while !existing.exists() {
+        let Some(name) = existing.file_name() else {
+            return Ok(absolute);
+        };
+        suffix.push(name.to_os_string());
+        let Some(parent) = existing.parent() else {
+            return Ok(absolute);
+        };
+        existing = parent.to_path_buf();
+    }
+
+    let mut checked = fs::canonicalize(existing).map_err(|error| PreviewError::FixtureIo {
+        path: absolute.clone(),
+        message: error.to_string(),
+    })?;
+    for component in suffix.iter().rev() {
+        checked.push(component);
+    }
+    Ok(checked)
+}
+
+pub(crate) fn is_within(path: &Path, root: &Path) -> bool {
+    if path.starts_with(root) {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        let path = path.to_string_lossy().to_ascii_lowercase();
+        let root = root.to_string_lossy().to_ascii_lowercase();
+        let root = root.trim_end_matches(['\\', '/']);
+        return path == root
+            || path
+                .strip_prefix(root)
+                .is_some_and(|suffix| suffix.starts_with(['\\', '/']));
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+pub(crate) fn is_sensitive_path(path: &Path) -> bool {
+    let sensitive_components = [
+        "appdata",
+        "programdata",
+        "program files",
+        "program files (x86)",
+        "install",
+        "installed",
+        "profile",
+        "profiles",
+        "com.userfirst.devmanager",
+    ];
+    let sensitive_names = [
+        "config.json",
+        "remote.json",
+        "session.json",
+        "devmanager.exe",
+        "devmanager-host.exe",
+    ];
+    let is_windows_temp_path = path
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(value) => Some(value.to_string_lossy().to_ascii_lowercase()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .windows(3)
+        .any(|window| window == ["appdata", "local", "temp"]);
+    path.components().any(|component| {
+        let Component::Normal(value) = component else {
+            return false;
+        };
+        let value = value.to_string_lossy().to_ascii_lowercase();
+        (sensitive_components.contains(&value.as_str())
+            && !(value == "appdata" && is_windows_temp_path))
+            || sensitive_names.contains(&value.as_str())
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureUnavailableKind {
+    UnsupportedPlatform,
+    InvalidHwnd,
+    ForeignHwnd,
+    InvalidWindowState { reason: &'static str },
+    DeadlineExceeded,
+    CaptureClosed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PreviewError {
+    Usage(String),
+    InvalidArgument(String),
+    OutsideApprovedRoot {
+        path: PathBuf,
+        root_kind: &'static str,
+    },
+    SensitivePath {
+        path: PathBuf,
+    },
+    FixtureMissing {
+        path: PathBuf,
+    },
+    FixtureNotRegular {
+        path: PathBuf,
+    },
+    FixtureTooLarge {
+        path: PathBuf,
+        bytes: u64,
+        max_bytes: u64,
+    },
+    FixtureIo {
+        path: PathBuf,
+        message: String,
+    },
+    MalformedFixture {
+        path: PathBuf,
+        message: String,
+    },
+    UnsupportedSchema {
+        path: PathBuf,
+        schema: String,
+    },
+    OutputAlreadyExists {
+        path: PathBuf,
+    },
+    HeadlessInitializationFailed,
+    VisibleWindowsCaptureUnavailable {
+        kind: CaptureUnavailableKind,
+        reason: String,
+    },
+    PngFailed {
+        reason: String,
+    },
+    OutputFailed {
+        reason: String,
+    },
+    ForegroundChanged {
+        before: isize,
+        after: isize,
+    },
+    ApplicationFailed {
+        reason: String,
+    },
+    WindowsGraphicsCaptureFailed {
+        reason: String,
+    },
+    CaptureCleanupFailed {
+        primary: Box<Self>,
+        operation: &'static str,
+        reason: String,
+    },
+}
+
+impl PreviewError {
+    pub fn from_capture_error(
+        error: preview_capture::PreviewCaptureError,
+        output_path: &Path,
+    ) -> Self {
+        Self::from_capture_error_at_depth(&error, output_path, 0)
+    }
+
+    fn from_capture_error_at_depth(
+        error: &preview_capture::PreviewCaptureError,
+        output_path: &Path,
+        depth: usize,
+    ) -> Self {
+        let reason = preview_capture::bounded_redacted_diagnostic(&error.to_string());
+        match error {
+            preview_capture::PreviewCaptureError::UnsupportedPlatform => {
+                Self::VisibleWindowsCaptureUnavailable {
+                    kind: CaptureUnavailableKind::UnsupportedPlatform,
+                    reason,
+                }
+            }
+            preview_capture::PreviewCaptureError::InvalidHwnd => {
+                Self::VisibleWindowsCaptureUnavailable {
+                    kind: CaptureUnavailableKind::InvalidHwnd,
+                    reason,
+                }
+            }
+            preview_capture::PreviewCaptureError::ForeignHwnd => {
+                Self::VisibleWindowsCaptureUnavailable {
+                    kind: CaptureUnavailableKind::ForeignHwnd,
+                    reason,
+                }
+            }
+            preview_capture::PreviewCaptureError::InvalidWindowState {
+                reason: window_reason,
+            } => Self::VisibleWindowsCaptureUnavailable {
+                kind: CaptureUnavailableKind::InvalidWindowState {
+                    reason: *window_reason,
+                },
+                reason,
+            },
+            preview_capture::PreviewCaptureError::DeadlineExceeded => {
+                Self::VisibleWindowsCaptureUnavailable {
+                    kind: CaptureUnavailableKind::DeadlineExceeded,
+                    reason,
+                }
+            }
+            preview_capture::PreviewCaptureError::CaptureCancelled => {
+                Self::VisibleWindowsCaptureUnavailable {
+                    kind: CaptureUnavailableKind::CaptureClosed,
+                    reason,
+                }
+            }
+            preview_capture::PreviewCaptureError::CaptureClosed => {
+                Self::VisibleWindowsCaptureUnavailable {
+                    kind: CaptureUnavailableKind::CaptureClosed,
+                    reason,
+                }
+            }
+            preview_capture::PreviewCaptureError::CaptureFailed(message) => {
+                Self::WindowsGraphicsCaptureFailed {
+                    reason: preview_capture::bounded_redacted_diagnostic(message),
+                }
+            }
+            preview_capture::PreviewCaptureError::ApplicationFailed(message) => {
+                Self::ApplicationFailed {
+                    reason: preview_capture::bounded_redacted_diagnostic(message),
+                }
+            }
+            preview_capture::PreviewCaptureError::PngFailed(message) => Self::PngFailed {
+                reason: preview_capture::bounded_redacted_diagnostic(message),
+            },
+            preview_capture::PreviewCaptureError::OutputAlreadyExists => {
+                Self::OutputAlreadyExists {
+                    path: output_path.to_path_buf(),
+                }
+            }
+            preview_capture::PreviewCaptureError::OutputFailed(message) => Self::OutputFailed {
+                reason: preview_capture::bounded_redacted_diagnostic(message),
+            },
+            preview_capture::PreviewCaptureError::ForegroundChanged { before, after } => {
+                Self::ForegroundChanged {
+                    before: *before,
+                    after: *after,
+                }
+            }
+            preview_capture::PreviewCaptureError::CleanupFailed(context) => {
+                let primary = if depth < preview_capture::MAX_CLEANUP_DIAGNOSTIC_DEPTH {
+                    Self::from_capture_error_at_depth(context.primary(), output_path, depth + 1)
+                } else {
+                    Self::WindowsGraphicsCaptureFailed { reason }
+                };
+                Self::CaptureCleanupFailed {
+                    primary: Box::new(primary),
+                    operation: context.operation(),
+                    reason: preview_capture::bounded_redacted_diagnostic(
+                        &context.secondary().to_string(),
+                    ),
+                }
+            }
+        }
+    }
+}
+
+impl Display for PreviewError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        let rendered = match self {
+            Self::Usage(message) => format!("{message}\n{PREVIEW_USAGE}"),
+            Self::InvalidArgument(message) => message.clone(),
+            Self::OutsideApprovedRoot { root_kind, .. } => {
+                format!("{root_kind} path is outside approved roots")
+            }
+            Self::SensitivePath { .. } => "sensitive production path refused".into(),
+            Self::FixtureMissing { .. } => "fixture does not exist".into(),
+            Self::FixtureNotRegular { .. } => "fixture is not a regular file".into(),
+            Self::FixtureTooLarge {
+                bytes, max_bytes, ..
+            } => format!("fixture is too large ({bytes} bytes; max {max_bytes})"),
+            Self::FixtureIo { message, .. } => format!("fixture I/O failed: {message}"),
+            Self::MalformedFixture { message, .. } => format!("malformed fixture: {message}"),
+            Self::UnsupportedSchema { schema, .. } => {
+                format!("unsupported fixture schema {schema}")
+            }
+            Self::OutputAlreadyExists { .. } => "refusing to overwrite existing output".into(),
+            Self::HeadlessInitializationFailed => {
+                "headless preview initialization did not complete".into()
+            }
+            Self::VisibleWindowsCaptureUnavailable { kind, reason } => {
+                format!("visible Windows preview capture unavailable ({kind:?}): {reason}")
+            }
+            Self::PngFailed { reason } => format!("PNG encoding failed: {reason}"),
+            Self::OutputFailed { reason } => format!("PNG output failed: {reason}"),
+            Self::ForegroundChanged { .. } => "foreground window changed during capture".into(),
+            Self::ApplicationFailed { reason } => {
+                format!("GPUI preview application failed: {reason}")
+            }
+            Self::WindowsGraphicsCaptureFailed { reason } => {
+                format!("Windows Graphics Capture failed: {reason}")
+            }
+            Self::CaptureCleanupFailed {
+                primary,
+                operation,
+                reason,
+            } => {
+                format!("{primary}; cleanup {operation} failed: {reason}")
+            }
+        };
+        f.write_str(&preview_capture::bounded_redacted_diagnostic(&rendered))
+    }
+}
+
+impl Error for PreviewError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fixture(tasks_json: &str) -> Result<PreviewFixture, serde_json::Error> {
+        let body = format!(
+            r#"{{"schema":"devmanager.ui.preview/v1","id":"t","title":"t",
+                 "root":{{"kind":"task-cockpit","label":"Task Cockpit","tasks":{tasks_json}}}}}"#
+        );
+        serde_json::from_str(&body)
+    }
+
+    /// The whole point of the extension: one fixture can stand up several
+    /// tasks, each with its own provider, state, age, panel and conversation.
+    #[test]
+    fn a_task_cockpit_fixture_seeds_several_tasks() {
+        let parsed = fixture(
+            r#"[
+              {"title":"one","provider":"claude","state":"idle","age_ms":1000,
+               "open":true,"focused":true,"view":"conversation",
+               "conversation":{"messages":[{"role":"user","text":"hi"}]}},
+              {"title":"two","provider":"codex","state":"blocked","open":true,"view":"terminal"},
+              {"title":"three","provider":"cursor","state":"question"}
+            ]"#,
+        )
+        .expect("the fixture parses");
+        let tasks = &parsed.root.tasks;
+        assert_eq!(tasks.len(), 3, "every seeded task survives the parse");
+        assert_eq!(tasks[0].provider, PreviewTaskProvider::Claude);
+        assert_eq!(tasks[0].state, PreviewTaskState::Idle);
+        assert_eq!(tasks[0].age_ms, 1_000);
+        assert!(tasks[0].open && tasks[0].focused);
+        assert_eq!(tasks[0].view, PreviewTaskView::Conversation);
+        assert_eq!(
+            tasks[0]
+                .conversation
+                .as_ref()
+                .expect("task one carries a conversation")
+                .messages
+                .len(),
+            1
+        );
+        assert_eq!(tasks[1].view, PreviewTaskView::Terminal);
+        assert_eq!(tasks[1].state, PreviewTaskState::Blocked);
+        // The defaults are the quiet ones, so an existing fixture that says
+        // nothing about a field keeps behaving as it did.
+        assert!(!tasks[2].open && !tasks[2].focused);
+        assert_eq!(tasks[2].view, PreviewTaskView::Conversation);
+        assert!(tasks[2].conversation.is_none());
+        validate_preview_tasks(tasks).expect("the seeded tasks validate");
+    }
+
+    /// Additive: a fixture written before the extension parses unchanged, with
+    /// no tasks, which is exactly the single-conversation behaviour it relies
+    /// on.
+    #[test]
+    fn a_fixture_without_tasks_still_parses_and_seeds_none() {
+        let parsed: PreviewFixture = serde_json::from_str(
+            r#"{"schema":"devmanager.ui.preview/v1","id":"t","title":"t",
+                "root":{"kind":"task-cockpit","label":"Task Cockpit"}}"#,
+        )
+        .expect("the older shape parses");
+        assert!(parsed.root.tasks.is_empty());
+        validate_preview_tasks(&parsed.root.tasks).expect("no tasks is valid");
+    }
+
+    /// `deny_unknown_fields` still holds, on the root AND on the new task
+    /// shape: a typo in a field name has to be a parse error, not a silently
+    /// ignored instruction.
+    #[test]
+    fn unknown_fields_are_still_rejected() {
+        assert!(fixture(r#"[{"title":"one","provder":"claude"}]"#).is_err());
+        assert!(serde_json::from_str::<PreviewFixture>(
+            r#"{"schema":"devmanager.ui.preview/v1","id":"t","title":"t",
+                "root":{"kind":"task-cockpit","label":"L","taks":[]}}"#
+        )
+        .is_err());
+    }
+
+    /// The rules that make a seeded workspace paintable at all.
+    #[test]
+    fn the_seed_rules_are_enforced() {
+        let one = |json: &str| fixture(json).expect("parses").root.tasks;
+        // A focused task must be open, or the workspace has a focus with no pane.
+        assert!(validate_preview_tasks(&one(r#"[{"title":"a","focused":true}]"#)).is_err());
+        // Exactly one focus.
+        assert!(validate_preview_tasks(&one(
+            r#"[{"title":"a","open":true,"focused":true},{"title":"b","open":true,"focused":true}]"#
+        ))
+        .is_err());
+        // An opened workspace needs one.
+        assert!(validate_preview_tasks(&one(r#"[{"title":"a","open":true}]"#)).is_err());
+        // Titles identify the seeded rows, so they must be unique and present.
+        assert!(validate_preview_tasks(&one(r#"[{"title":"a"},{"title":"a"}]"#)).is_err());
+        assert!(validate_preview_tasks(&one(r#"[{"title":"  "}]"#)).is_err());
+        // The age is a duration, not a timestamp.
+        assert!(validate_preview_tasks(&one(r#"[{"title":"a","age_ms":-1}]"#)).is_err());
+        // Bounded, so a fixture cannot ask for a thousand panels.
+        let many: Vec<String> = (0..=MAX_PREVIEW_TASKS)
+            .map(|index| format!(r#"{{"title":"t{index}"}}"#))
+            .collect();
+        let many = format!("[{}]", many.join(","));
+        assert!(validate_preview_tasks(&one(&many)).is_err());
+        let open: Vec<String> = (0..=MAX_PREVIEW_OPEN_TASKS)
+            .map(|index| {
+                format!(
+                    r#"{{"title":"t{index}","open":true{}}}"#,
+                    if index == 0 { r#","focused":true"# } else { "" }
+                )
+            })
+            .collect();
+        let open = format!("[{}]", open.join(","));
+        assert!(validate_preview_tasks(&one(&open)).is_err());
+    }
+
+    /// Seeded tasks are a task-cockpit thing. A gallery fixture carrying them
+    /// is a fixture that would silently paint none of them.
+    #[test]
+    fn seeded_tasks_require_a_task_cockpit_root() {
+        let parsed: PreviewFixture = serde_json::from_str(
+            r#"{"schema":"devmanager.ui.preview/v1","id":"t","title":"t",
+                "root":{"kind":"minimal","label":"L","tasks":[{"title":"a"}]}}"#,
+        )
+        .expect("the shape itself parses");
+        assert_eq!(parsed.root.kind, "minimal");
+        assert!(!parsed.root.tasks.is_empty());
+        // `PreviewApplication::load` is what refuses it; this asserts the pair
+        // the refusal is written against.
+    }
+
+    /// The fixtures this wave rendered its evidence from are committed and
+    /// still valid, so a later change that breaks the schema breaks a test
+    /// rather than a capture nobody re-runs.
+    #[test]
+    fn the_committed_panel_fixtures_are_valid() {
+        for body in [
+            include_str!("../../tests/fixtures/ui/task-cockpit-panel-grid.json"),
+            include_str!("../../tests/fixtures/ui/task-cockpit-two-panels.json"),
+            include_str!("../../tests/fixtures/ui/fix-wave-4-nested.json"),
+            include_str!("../../tests/fixtures/ui/fix-wave-4-grid.json"),
+        ] {
+            let parsed: PreviewFixture =
+                serde_json::from_str(body).expect("the committed fixture parses");
+            assert_eq!(parsed.schema, PREVIEW_SCHEMA);
+            assert_eq!(parsed.root.kind, "task-cockpit");
+            assert!(parsed.root.tasks.len() >= 4);
+            validate_preview_tasks(&parsed.root.tasks).expect("the committed fixture validates");
+        }
+    }
+}

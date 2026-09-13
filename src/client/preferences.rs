@@ -1,0 +1,387 @@
+//! Isolated client-local preferences for the native-next client.
+//!
+//! The host owns task truth and `session.json` owns legacy window/tab state.
+//! This store is deliberately a separate file so client presentation state can
+//! be restored without making the legacy desktop session a second task
+//! authority.  Callers must provide the profile-specific root; there is no
+//! implicit production path or environment fallback.
+
+use std::fs::{self, OpenOptions};
+use std::io::{self, Read, Write};
+use std::path::{Path, PathBuf};
+
+use base64::{engine::general_purpose::STANDARD, Engine as _};
+use serde::{Deserialize, Serialize};
+
+const PREFERENCES_SCHEMA: &str = "devmanager.client-preferences/v1";
+const PREFERENCES_FILE_NAME: &str = "inbox-preferences.json";
+const MAX_CURSOR_BYTES: usize = 1_048_576;
+const MAX_PREFERENCE_FILE_BYTES: u64 = 2 * 1024 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClientPreferenceError {
+    Io(String),
+    Encode(String),
+    Decode(String),
+    UnsupportedSchema(String),
+    CursorTooLarge(usize),
+    FileTooLarge { bytes: u64, max_bytes: u64 },
+}
+
+impl std::fmt::Display for ClientPreferenceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(message) => write!(f, "client preference I/O failed: {message}"),
+            Self::Encode(message) => write!(f, "client preference encode failed: {message}"),
+            Self::Decode(message) => write!(f, "client preference decode failed: {message}"),
+            Self::UnsupportedSchema(schema) => {
+                write!(f, "unsupported client preference schema: {schema}")
+            }
+            Self::CursorTooLarge(bytes) => {
+                write!(f, "inbox cursor exceeds {MAX_CURSOR_BYTES} bytes: {bytes}")
+            }
+            Self::FileTooLarge { bytes, max_bytes } => {
+                write!(
+                    f,
+                    "client preference file exceeds {max_bytes} bytes: {bytes}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for ClientPreferenceError {}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PreferencesFile {
+    schema: String,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_cursor",
+        serialize_with = "serialize_cursor"
+    )]
+    inbox_unread_cursor: Option<Vec<u8>>,
+}
+
+/// New files use compact base64 instead of JSON's one-number-per-byte array,
+/// while the deserializer keeps accepting the original array representation.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum CursorWire {
+    Compact(String),
+    Legacy(Vec<u8>),
+}
+
+fn serialize_cursor<S>(cursor: &Option<Vec<u8>>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    match cursor {
+        Some(bytes) => serializer.serialize_some(&STANDARD.encode(bytes)),
+        None => serializer.serialize_none(),
+    }
+}
+
+fn deserialize_cursor<'de, D>(deserializer: D) -> Result<Option<Vec<u8>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let cursor = Option::<CursorWire>::deserialize(deserializer)?;
+    match cursor {
+        None => Ok(None),
+        Some(CursorWire::Compact(encoded)) => STANDARD
+            .decode(encoded)
+            .map(Some)
+            .map_err(serde::de::Error::custom),
+        Some(CursorWire::Legacy(bytes)) => Ok(Some(bytes)),
+    }
+}
+
+/// The only durable client-local file currently owned by the Inbox surface.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InboxPreferenceStore {
+    path: PathBuf,
+}
+
+impl InboxPreferenceStore {
+    /// Construct a store at an explicit file path.  Native-next passes its
+    /// isolated profile root; tests pass a temporary directory.  The method
+    /// intentionally does not inspect `DEVMANAGER_PROFILE` or app globals.
+    pub fn at_path(path: impl Into<PathBuf>) -> Self {
+        Self { path: path.into() }
+    }
+
+    /// Construct the dedicated preference path beneath an already-resolved
+    /// client profile root.  This does not resolve or touch the root itself.
+    pub fn at_profile_root(root: impl AsRef<Path>) -> Self {
+        Self::at_path(root.as_ref().join(PREFERENCES_FILE_NAME))
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Missing files and missing fields are the backwards-compatible default.
+    pub fn load_unread_cursor(&self) -> Result<Option<Vec<u8>>, ClientPreferenceError> {
+        let file = match fs::File::open(&self.path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(ClientPreferenceError::Io(error.to_string())),
+        };
+        let metadata = file
+            .metadata()
+            .map_err(|error| ClientPreferenceError::Io(error.to_string()))?;
+        if metadata.len() > MAX_PREFERENCE_FILE_BYTES {
+            return Err(ClientPreferenceError::FileTooLarge {
+                bytes: metadata.len(),
+                max_bytes: MAX_PREFERENCE_FILE_BYTES,
+            });
+        }
+        let mut bytes = Vec::with_capacity(metadata.len() as usize);
+        file.take(MAX_PREFERENCE_FILE_BYTES.saturating_add(1))
+            .read_to_end(&mut bytes)
+            .map_err(|error| ClientPreferenceError::Io(error.to_string()))?;
+        if bytes.len() as u64 > MAX_PREFERENCE_FILE_BYTES {
+            return Err(ClientPreferenceError::FileTooLarge {
+                bytes: bytes.len() as u64,
+                max_bytes: MAX_PREFERENCE_FILE_BYTES,
+            });
+        }
+        /*
+         * The handle stays open through the bounded read above. This avoids
+         * turning a concurrently growing preference file into an unbounded
+         * allocation between metadata validation and decoding.
+         */
+        let file = match serde_json::from_slice::<PreferencesFile>(&bytes) {
+            Ok(file) => file,
+            Err(error) => return Err(ClientPreferenceError::Decode(error.to_string())),
+        };
+        if file.schema != PREFERENCES_SCHEMA {
+            return Err(ClientPreferenceError::UnsupportedSchema(file.schema));
+        }
+        if let Some(cursor) = &file.inbox_unread_cursor {
+            if cursor.len() > MAX_CURSOR_BYTES {
+                return Err(ClientPreferenceError::CursorTooLarge(cursor.len()));
+            }
+        }
+        Ok(file.inbox_unread_cursor)
+    }
+
+    /// Encode and publish the complete preference file through one atomic
+    /// replace.  A null cursor is a valid reset and is never represented by a
+    /// partially written file.
+    pub fn save_unread_cursor(&self, cursor: Option<&[u8]>) -> Result<(), ClientPreferenceError> {
+        if let Some(cursor) = cursor {
+            if cursor.len() > MAX_CURSOR_BYTES {
+                return Err(ClientPreferenceError::CursorTooLarge(cursor.len()));
+            }
+        }
+        let file = PreferencesFile {
+            schema: PREFERENCES_SCHEMA.to_string(),
+            inbox_unread_cursor: cursor.map(<[u8]>::to_vec),
+        };
+        let bytes = serde_json::to_vec(&file)
+            .map_err(|error| ClientPreferenceError::Encode(error.to_string()))?;
+        if bytes.len() as u64 > MAX_PREFERENCE_FILE_BYTES {
+            return Err(ClientPreferenceError::FileTooLarge {
+                bytes: bytes.len() as u64,
+                max_bytes: MAX_PREFERENCE_FILE_BYTES,
+            });
+        }
+        write_atomically(&self.path, &bytes)
+            .map_err(|error| ClientPreferenceError::Io(format!("{}: {error}", self.path.display())))
+    }
+}
+
+fn write_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("preferences.json");
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let pid = std::process::id();
+    let mut temporary = None;
+    for attempt in 0..10_000u32 {
+        let suffix = if attempt == 0 {
+            format!("{file_name}.devmanager-tmp-{pid}-{stamp}")
+        } else {
+            format!("{file_name}.devmanager-tmp-{pid}-{stamp}-{attempt}")
+        };
+        let candidate = parent.join(suffix);
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(file) => {
+                temporary = Some((candidate, file));
+                break;
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+    }
+    let Some((temporary, mut file)) = temporary else {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "exhausted temporary preference file names",
+        ));
+    };
+    let result = (|| {
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        replace_file(&temporary, path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+#[cfg(windows)]
+fn replace_file(temporary: &Path, destination: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::PCWSTR;
+    use windows::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+
+    let temporary: Vec<u16> = temporary.as_os_str().encode_wide().chain(Some(0)).collect();
+    let destination: Vec<u16> = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    unsafe {
+        MoveFileExW(
+            PCWSTR(temporary.as_ptr()),
+            PCWSTR(destination.as_ptr()),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+        .map_err(io::Error::from)
+    }
+}
+
+#[cfg(not(windows))]
+fn replace_file(temporary: &Path, destination: &Path) -> io::Result<()> {
+    fs::rename(temporary, destination)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_and_legacy_preference_files_restore_to_default() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let store = InboxPreferenceStore::at_profile_root(directory.path());
+        assert_eq!(store.load_unread_cursor().expect("missing is valid"), None);
+        fs::write(
+            store.path(),
+            br#"{"schema":"devmanager.client-preferences/v1"}"#,
+        )
+        .expect("legacy preference file");
+        assert_eq!(
+            store.load_unread_cursor().expect("missing field is valid"),
+            None
+        );
+        fs::write(
+            store.path(),
+            br#"{"schema":"devmanager.client-preferences/v1","inboxUnreadCursor":[1,2,3]}"#,
+        )
+        .expect("legacy array preference file");
+        assert_eq!(
+            store.load_unread_cursor().expect("legacy array is valid"),
+            Some(vec![1, 2, 3])
+        );
+    }
+
+    #[test]
+    fn cursor_round_trip_replaces_one_complete_file() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let store = InboxPreferenceStore::at_profile_root(directory.path());
+        store
+            .save_unread_cursor(Some(&[1, 2, 3]))
+            .expect("save cursor");
+        assert_eq!(
+            store.load_unread_cursor().expect("load cursor"),
+            Some(vec![1, 2, 3])
+        );
+        store.save_unread_cursor(None).expect("clear cursor");
+        assert_eq!(store.load_unread_cursor().expect("load clear"), None);
+        assert!(fs::read_dir(directory.path())
+            .expect("read preference directory")
+            .all(|entry| !entry
+                .expect("directory entry")
+                .file_name()
+                .to_string_lossy()
+                .contains("devmanager-tmp")));
+    }
+
+    #[test]
+    fn maximum_cursor_round_trip_is_encoded_and_bounded_before_publish() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let store = InboxPreferenceStore::at_profile_root(directory.path());
+        let cursor = vec![0x5a; MAX_CURSOR_BYTES];
+
+        store
+            .save_unread_cursor(Some(&cursor))
+            .expect("maximum cursor should fit the encoded preference bound");
+        assert!(
+            fs::metadata(store.path())
+                .expect("preference metadata")
+                .len()
+                <= MAX_PREFERENCE_FILE_BYTES
+        );
+        assert_eq!(
+            store
+                .load_unread_cursor()
+                .expect("maximum cursor round trip"),
+            Some(cursor)
+        );
+        assert!(matches!(
+            store.save_unread_cursor(Some(&vec![0x5a; MAX_CURSOR_BYTES + 1])),
+            Err(ClientPreferenceError::CursorTooLarge(bytes)) if bytes == MAX_CURSOR_BYTES + 1
+        ));
+    }
+
+    #[test]
+    fn invalid_schema_and_oversized_cursor_fail_closed() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let store = InboxPreferenceStore::at_profile_root(directory.path());
+        fs::write(
+            store.path(),
+            br#"{"schema":"devmanager.client-preferences/v2","inboxUnreadCursor":null}"#,
+        )
+        .expect("unsupported schema file");
+        assert!(matches!(
+            store.load_unread_cursor(),
+            Err(ClientPreferenceError::UnsupportedSchema(schema)) if schema.ends_with("/v2")
+        ));
+        assert!(matches!(
+            store.save_unread_cursor(Some(&vec![0u8; MAX_CURSOR_BYTES + 1])),
+            Err(ClientPreferenceError::CursorTooLarge(bytes)) if bytes == MAX_CURSOR_BYTES + 1
+        ));
+    }
+
+    #[test]
+    fn oversized_preference_file_is_rejected_before_unbounded_read() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let store = InboxPreferenceStore::at_profile_root(directory.path());
+        let bytes = MAX_PREFERENCE_FILE_BYTES + 1;
+        let file = std::fs::File::create(store.path()).expect("preference file");
+        file.set_len(bytes).expect("sparse oversized file");
+        assert!(matches!(
+            store.load_unread_cursor(),
+            Err(ClientPreferenceError::FileTooLarge { bytes: actual, max_bytes })
+                if actual == bytes && max_bytes == MAX_PREFERENCE_FILE_BYTES
+        ));
+    }
+}

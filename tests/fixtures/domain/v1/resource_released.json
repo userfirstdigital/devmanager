@@ -1,0 +1,8 @@
+{
+  "schema_version": 1,
+  "event_type": "resource.released",
+  "payload": {
+    "resource_id": "018f60b0-9c1a-7001-8000-000000000057",
+    "runtime_generation": 0
+  }
+}

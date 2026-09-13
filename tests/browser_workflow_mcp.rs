@@ -287,7 +287,8 @@ async fn browser_workflow_malformed_calls_are_typed_and_keep_the_session_alive()
         .await
         .expect("initialize workflow malformed client");
     let host = async move {
-        let mut state = BrowserHostState::new(unique_temp_dir("malformed-host"));
+        let mut state =
+            BrowserHostState::new(unique_temp_dir("malformed-host")).expect("browser host state");
         while let Some(request) = inbox.recv().await {
             let key = request.workspace_key().clone();
             let response = match request.command().clone() {

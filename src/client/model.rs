@@ -1,0 +1,4667 @@
+//! Presentation-independent client model assembled from one pinned snapshot
+//! and advanced by ordered durable events.
+
+use std::cmp::Ordering;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::ops::Bound::{Excluded, Unbounded};
+use std::sync::Arc;
+
+use caseless::Caseless;
+use unicode_normalization::UnicodeNormalization;
+
+use crate::domain::agent::AgentSessionFacts;
+use crate::domain::artifact::ArtifactSummary;
+use crate::domain::event::{apply, DomainEvent, Event};
+use crate::domain::id::{
+    AgentSessionId, ArtifactId, BrowserContextId, OperationId, ResourceId, SnapshotId,
+    SubscriptionId, TaskId,
+};
+use crate::domain::operation::{OperationFacts, OperationState};
+use crate::domain::resource::{OwnerKind, ResourceFacts, ResourceKind};
+use crate::domain::snapshot::{
+    EventPage, SnapshotItem, SnapshotPage, SnapshotSection, TaskSnapshot, TaskSnapshotItem,
+};
+use crate::domain::task::{TaskLifecycle, VisibleTaskStatus};
+
+/// Finite bound on snapshot pages admitted while assembling one model.
+pub const MAX_CLIENT_MODEL_PAGES: usize = 1_024;
+/// Finite bound on snapshot items admitted while assembling one model.
+pub const MAX_CLIENT_MODEL_ITEMS: usize = 100_000;
+/// Finite bound on distinct resume cursors retained per section.
+pub const MAX_CLIENT_MODEL_CURSORS_PER_SECTION: usize = 1_024;
+/// Finite bound on frozen replay pages applied to one model.
+pub const MAX_CLIENT_REPLAY_PAGES: usize = 1_024;
+/// Finite bound on distinct frozen replay continuation cursors.
+pub const MAX_CLIENT_REPLAY_CURSORS: usize = 1_024;
+/// Search input is client-local presentation data, not an unbounded query.
+pub const MAX_CLIENT_SEARCH_CHARS: usize = 160;
+/// Full bounded title truth retained by the client search index. Search input
+/// remains capped at [`MAX_CLIENT_SEARCH_CHARS`], but a title suffix after the
+/// input bound must still be searchable without consulting the host or doing
+/// unbounded work.
+pub const MAX_INDEXED_TITLE_CHARS: usize = MAX_CLIENT_SEARCH_CHARS * 4;
+/// Maximum indexed search identities handed to one bounded UI projection.
+/// The index still reports the complete truthful match count separately.
+pub const MAX_CLIENT_SEARCH_RESULTS: usize = 5_000;
+/// Maximum candidate identities inspected by one input/paint search page.
+/// Longer searches continue from a bounded cursor on a later background turn.
+pub const MAX_CLIENT_SEARCH_WORK: usize = MAX_CLIENT_SEARCH_RESULTS;
+/// Search postings cannot admit more identities than one bounded client
+/// model. This keeps every posting finite while preserving its exact count.
+pub const MAX_CLIENT_SEARCH_POSTING_IDS: usize = MAX_CLIENT_MODEL_ITEMS;
+/// Exact postings cover common longer queries without a candidate scan.
+const MAX_INDEXED_GRAM_CHARS: usize = 8;
+/// Index only a bounded title prefix for substring candidates. The complete
+/// bounded title in [`MAX_INDEXED_TITLE_CHARS`] remains the canonical matching
+/// source; titles beyond that explicit client bound are not retained here.
+const MAX_INDEXED_SUBSTRING_SOURCE_CHARS: usize = 32;
+/// Exact one-scalar totals are kept separately so short substring queries do
+/// not mistake prefix-only postings for exhaustive candidates.
+const MAX_INDEXED_SCALAR_KEYS: usize = 4_096;
+/// Hard resident allocation budget for the compact search index. This includes
+/// the hash table slots, owned key capacities, and posting vector capacities.
+pub const MAX_CLIENT_SEARCH_POSTING_BYTES: usize = 32 * 1024 * 1024;
+/// Maximum key records admitted to the compact substring table. Additional
+/// substrings use the bounded canonical-order continuation scan.
+pub const MAX_CLIENT_SEARCH_INDEX_KEYS: usize = 100_000;
+/// Hard upper bound for the number of compact TaskId identities retained by
+/// one model's postings. The resident byte estimate remains authoritative.
+pub const MAX_CLIENT_SEARCH_POSTING_ENTRIES: usize =
+    MAX_CLIENT_SEARCH_POSTING_BYTES / std::mem::size_of::<TaskId>();
+const MAX_STORED_IDS_PER_POSTING: usize = MAX_CLIENT_SEARCH_RESULTS;
+const REQUIRED_SNAPSHOT_SECTION_COUNT: usize = 5;
+const SNAPSHOT_SECTION_COUNT: usize = 7;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClientModelError {
+    MissingSections,
+    DuplicateSection,
+    SectionItemMismatch,
+    DuplicateItem,
+    SnapshotDrift,
+    SequenceDrift,
+    NonProgressingPage,
+    PageBoundExceeded,
+    ItemBoundExceeded,
+    CursorBoundExceeded,
+    RepeatedCursor,
+    MissingParentTask,
+    InvalidOwnership,
+    InvalidPrimaryAgent,
+    DuplicateOrRegression,
+    ApplyFailed,
+    OperationIdentityMismatch,
+    OperationStateRegression,
+    MissingOperation,
+    ReplayRangeInvalid,
+    ReplayAfterMismatch,
+    ReplayThroughDrift,
+    ReplayRepeatedCursor,
+    ReplayPageBoundExceeded,
+    ReplayNonProgressing,
+    SnapshotBoundaryMismatch,
+    OperationEnvelopeTimestampMismatch,
+}
+
+impl std::fmt::Display for ClientModelError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingSections => {
+                write!(f, "client model is missing required snapshot sections")
+            }
+            Self::DuplicateSection => write!(f, "snapshot section was repeated"),
+            Self::SectionItemMismatch => write!(f, "snapshot page contained a mismatched item"),
+            Self::DuplicateItem => write!(f, "snapshot contained a duplicate item id"),
+            Self::SnapshotDrift => write!(f, "snapshot identity drifted across pages"),
+            Self::SequenceDrift => write!(f, "snapshot through_sequence drifted across pages"),
+            Self::NonProgressingPage => write!(f, "snapshot page did not progress"),
+            Self::PageBoundExceeded => write!(f, "snapshot page bound exceeded"),
+            Self::ItemBoundExceeded => write!(f, "snapshot item bound exceeded"),
+            Self::CursorBoundExceeded => write!(f, "snapshot cursor bound exceeded"),
+            Self::RepeatedCursor => write!(f, "snapshot resume cursor repeated"),
+            Self::MissingParentTask => write!(f, "child snapshot item references a missing task"),
+            Self::InvalidOwnership => write!(f, "snapshot item ownership is invalid"),
+            Self::InvalidPrimaryAgent => write!(f, "primary agent reference is invalid"),
+            Self::DuplicateOrRegression => {
+                write!(f, "durable event sequence duplicated or regressed")
+            }
+            Self::ApplyFailed => write!(f, "durable event could not be applied to the model"),
+            Self::OperationIdentityMismatch => {
+                write!(f, "operation event identity did not match the projection")
+            }
+            Self::OperationStateRegression => {
+                write!(f, "operation state transition is not monotonic")
+            }
+            Self::MissingOperation => {
+                write!(f, "operation outcome referenced an unknown operation")
+            }
+            Self::ReplayRangeInvalid => write!(f, "replay page range is inconsistent"),
+            Self::ReplayAfterMismatch => {
+                write!(f, "replay page after_sequence skipped the applied boundary")
+            }
+            Self::ReplayThroughDrift => {
+                write!(
+                    f,
+                    "replay page through_sequence drifted from the pinned high-water"
+                )
+            }
+            Self::ReplayRepeatedCursor => write!(f, "replay resume cursor repeated"),
+            Self::ReplayPageBoundExceeded => write!(f, "replay page bound exceeded"),
+            Self::ReplayNonProgressing => write!(f, "replay page did not progress"),
+            Self::SnapshotBoundaryMismatch => {
+                write!(
+                    f,
+                    "snapshot continuation after_item did not match the expected boundary"
+                )
+            }
+            Self::OperationEnvelopeTimestampMismatch => write!(
+                f,
+                "operation event envelope occurred_at_ms must equal the fact timestamp"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ClientModelError {}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct SearchPosting {
+    active: Vec<TaskId>,
+    archived: Vec<TaskId>,
+    active_total: usize,
+    archived_total: usize,
+    active_truncated: bool,
+    archived_truncated: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct SearchScalarTotal {
+    active: usize,
+    archived: usize,
+}
+
+impl SearchScalarTotal {
+    fn from_entry(archived: bool) -> Self {
+        if archived {
+            Self {
+                active: 0,
+                archived: 1,
+            }
+        } else {
+            Self {
+                active: 1,
+                archived: 0,
+            }
+        }
+    }
+
+    fn increment(&mut self, archived: bool) {
+        if archived {
+            self.archived = self.archived.saturating_add(1);
+        } else {
+            self.active = self.active.saturating_add(1);
+        }
+    }
+
+    fn decrement(&mut self, archived: bool) {
+        if archived {
+            self.archived = self.archived.saturating_sub(1);
+        } else {
+            self.active = self.active.saturating_sub(1);
+        }
+    }
+
+    fn len(self, archived: bool) -> usize {
+        if archived {
+            self.archived
+        } else {
+            self.active
+        }
+    }
+
+    fn is_empty(self) -> bool {
+        self.active == 0 && self.archived == 0
+    }
+}
+
+impl SearchPosting {
+    fn insert(
+        &mut self,
+        task_id: TaskId,
+        entry: &TaskProjectionEntry,
+        budget_available: bool,
+    ) -> bool {
+        let set = if entry.lifecycle == TaskLifecycle::Archived {
+            &mut self.archived
+        } else {
+            &mut self.active
+        };
+        let truncated = if entry.lifecycle == TaskLifecycle::Archived {
+            &mut self.archived_truncated
+        } else {
+            &mut self.active_truncated
+        };
+        if set.contains(&task_id) {
+            return false;
+        }
+        if entry.lifecycle == TaskLifecycle::Archived {
+            self.archived_total = self.archived_total.saturating_add(1);
+        } else {
+            self.active_total = self.active_total.saturating_add(1);
+        }
+        if set.len() >= MAX_STORED_IDS_PER_POSTING || !budget_available {
+            *truncated = true;
+            return false;
+        }
+        set.push(task_id);
+        true
+    }
+
+    fn remove(&mut self, task_id: TaskId, entry: &TaskProjectionEntry) -> bool {
+        let set = if entry.lifecycle == TaskLifecycle::Archived {
+            &mut self.archived
+        } else {
+            &mut self.active
+        };
+        if entry.lifecycle == TaskLifecycle::Archived {
+            self.archived_total = self.archived_total.saturating_sub(1);
+            if self.archived_total == 0 {
+                self.archived_truncated = false;
+            }
+        } else {
+            self.active_total = self.active_total.saturating_sub(1);
+            if self.active_total == 0 {
+                self.active_truncated = false;
+            }
+        }
+        let Some(index) = set.iter().position(|stored| *stored == task_id) else {
+            return false;
+        };
+        set.remove(index);
+        true
+    }
+
+    fn ids(&self, archived: bool) -> &[TaskId] {
+        if archived {
+            &self.archived
+        } else {
+            &self.active
+        }
+    }
+
+    fn ids_capacity(&self, archived: bool) -> usize {
+        if archived {
+            self.archived.capacity()
+        } else {
+            self.active.capacity()
+        }
+    }
+
+    fn len(&self, archived: bool) -> usize {
+        if archived {
+            self.archived_total
+        } else {
+            self.active_total
+        }
+    }
+
+    fn ids_complete(&self, archived: bool) -> bool {
+        self.ids(archived).len() == self.len(archived)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.active.is_empty()
+            && self.archived.is_empty()
+            && self.active_total == 0
+            && self.archived_total == 0
+            && !self.active_truncated
+            && !self.archived_truncated
+    }
+}
+
+// `HashMap` stores the key/value pair inline in its bucket table. The extra
+// allowance covers control bytes and allocator/node metadata; keeping this
+// conservative is what makes the resident estimate a hard admission fence,
+// rather than a nominal TaskId-only counter.
+const SEARCH_MAP_SLOT_BYTES: usize = std::mem::size_of::<(String, SearchPosting)>() + 32;
+const SEARCH_SCALAR_MAP_SLOT_BYTES: usize = std::mem::size_of::<(char, SearchScalarTotal)>() + 16;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TaskProjectionEntry {
+    lifecycle: TaskLifecycle,
+    attention_rank: u8,
+    occurred_at_ms: i64,
+    revision: u64,
+    lower_title: Arc<str>,
+    title: Arc<str>,
+}
+
+/// Cursor for a bounded continuation search. The cursor is revision-fenced so
+/// a model update cannot make a background result silently skip or duplicate
+/// identities in the newly ordered index. Scope fences prevent an active
+/// continuation from matching settled (or archived) work.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchContinuation {
+    query: String,
+    scope: SearchScope,
+    revision: u64,
+    cursor: Option<TaskOrderKey>,
+    retained_ids: Vec<TaskId>,
+    lower_bound: usize,
+}
+
+/// Which ordered index a bounded search page walks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchScope {
+    Active,
+    Settled,
+    Archived,
+}
+
+impl SearchScope {
+    fn from_archived(archived: bool) -> Self {
+        if archived {
+            Self::Archived
+        } else {
+            Self::Active
+        }
+    }
+
+    fn uses_search_postings(self) -> bool {
+        matches!(self, Self::Active | Self::Archived)
+    }
+
+    fn posting_archived(self) -> bool {
+        matches!(self, Self::Archived)
+    }
+}
+
+impl SearchContinuation {
+    #[cfg(test)]
+    pub(crate) fn with_scope(mut self, scope: SearchScope) -> Self {
+        self.scope = scope;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn bumped_revision(mut self) -> Self {
+        self.revision = self.revision.wrapping_add(1);
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn scope_for_test(&self) -> SearchScope {
+        self.scope
+    }
+}
+
+/// Completion state for one bounded search page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchPageStatus {
+    Complete,
+    Partial,
+    Stale,
+}
+
+/// Search results that never require scanning or cloning an unbounded posting.
+/// `known_total` is a lower bound until `exact_total` is present.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchPage {
+    pub ids: Vec<TaskId>,
+    pub known_total: usize,
+    pub exact_total: Option<usize>,
+    pub work: usize,
+    pub status: SearchPageStatus,
+    pub query_truncated: bool,
+    continuation: Option<SearchContinuation>,
+}
+
+impl SearchPage {
+    pub(crate) fn pending() -> Self {
+        Self {
+            ids: Vec::new(),
+            known_total: 0,
+            exact_total: None,
+            work: 0,
+            status: SearchPageStatus::Partial,
+            query_truncated: false,
+            continuation: None,
+        }
+    }
+
+    pub fn is_complete(&self) -> bool {
+        self.status == SearchPageStatus::Complete
+    }
+
+    pub fn is_partial(&self) -> bool {
+        self.status == SearchPageStatus::Partial
+    }
+
+    pub fn is_stale(&self) -> bool {
+        self.status == SearchPageStatus::Stale
+    }
+
+    pub fn lower_bound(&self) -> usize {
+        self.known_total
+    }
+
+    pub fn continuation(&self) -> Option<&SearchContinuation> {
+        self.continuation.as_ref()
+    }
+}
+
+/// Incremental, client-owned ordering index for Task Cockpit projections.
+///
+/// The task map remains the only task truth. This index only stores bounded,
+/// presentation-independent identity/order metadata so unchanged projections
+/// do not rescan and re-sort every task just to produce the same first page.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskProjectionIndex {
+    revision: u64,
+    entries: BTreeMap<TaskId, TaskProjectionEntry>,
+    active_order: BTreeSet<TaskOrderKey>,
+    settled_order: BTreeSet<TaskOrderKey>,
+    archived_order: BTreeSet<TaskOrderKey>,
+    /// Compact normalized-title substring postings. Each posting stores only
+    /// a bounded TaskId set; title/order strings remain in `entries` and the
+    /// canonical order sets exactly once. Missing or saturated keys use
+    /// bounded fallback scans instead of allocating beyond the resident budget.
+    search: HashMap<String, SearchPosting>,
+    search_scalar_totals: HashMap<char, SearchScalarTotal>,
+    search_scalar_map_bytes: usize,
+    unindexed_suffix_entries: usize,
+    search_posting_entries: usize,
+    search_index_map_bytes: usize,
+    search_index_key_bytes: usize,
+    search_index_posting_storage_bytes: usize,
+    search_index_saturated: bool,
+    full_rebuilds: u64,
+    incremental_updates: u64,
+}
+
+impl TaskProjectionIndex {
+    fn from_tasks(tasks: &BTreeMap<TaskId, TaskSnapshot>, revision: u64) -> Self {
+        let entries = tasks
+            .iter()
+            .map(|(task_id, snapshot)| {
+                (
+                    *task_id,
+                    TaskProjectionEntry::from_snapshot(snapshot, snapshot.task.created_at_ms),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let active_order = BTreeSet::new();
+        let settled_order = BTreeSet::new();
+        let archived_order = BTreeSet::new();
+        let search = HashMap::<String, SearchPosting>::with_capacity(MAX_CLIENT_SEARCH_INDEX_KEYS);
+        let search_index_map_bytes = search.capacity().saturating_mul(SEARCH_MAP_SLOT_BYTES);
+        let search_scalar_totals =
+            HashMap::<char, SearchScalarTotal>::with_capacity(MAX_INDEXED_SCALAR_KEYS);
+        let search_scalar_map_bytes = search_scalar_totals
+            .capacity()
+            .saturating_mul(SEARCH_SCALAR_MAP_SLOT_BYTES);
+        let unindexed_suffix_entries = 0usize;
+        let search_index_key_bytes = 0usize;
+        let search_index_posting_storage_bytes = 0usize;
+        let search_posting_entries: usize = 0;
+        let search_index_saturated = false;
+        let mut index = Self {
+            revision,
+            entries,
+            active_order,
+            settled_order,
+            archived_order,
+            search,
+            search_scalar_totals,
+            search_scalar_map_bytes,
+            unindexed_suffix_entries,
+            search_posting_entries,
+            search_index_map_bytes,
+            search_index_key_bytes,
+            search_index_posting_storage_bytes,
+            search_index_saturated,
+            full_rebuilds: 1,
+            incremental_updates: 0,
+        };
+        let task_ids = index.entries.keys().copied().collect::<Vec<_>>();
+        for task_id in task_ids {
+            let entry = index
+                .entries
+                .get(&task_id)
+                .expect("entry from index")
+                .clone();
+            let key = TaskOrderKey::new(task_id, &entry);
+            match entry.lifecycle {
+                TaskLifecycle::Open | TaskLifecycle::Closing => {
+                    index.active_order.insert(key);
+                }
+                TaskLifecycle::Settled => {
+                    // Done is a separate bounded order; keep it out of active
+                    // search postings so active/archived counts stay unchanged.
+                    index.settled_order.insert(key);
+                    continue;
+                }
+                TaskLifecycle::Archived => {
+                    index.archived_order.insert(key);
+                }
+                TaskLifecycle::Deleted => continue,
+            }
+            index.insert_search_scalar_totals(&entry);
+            index.insert_search_tokens(task_id, &entry);
+        }
+        index
+    }
+
+    fn resident_search_bytes(&self) -> usize {
+        self.search_index_map_bytes
+            .saturating_add(self.search_index_key_bytes)
+            .saturating_add(self.search_index_posting_storage_bytes)
+            .saturating_add(self.search_scalar_map_bytes)
+    }
+
+    fn insert_search_tokens(&mut self, task_id: TaskId, entry: &TaskProjectionEntry) {
+        for token in search_tokens(&entry.lower_title) {
+            self.insert_search_token(task_id, entry, token);
+        }
+    }
+
+    fn insert_search_scalar_totals(&mut self, entry: &TaskProjectionEntry) {
+        let archived = entry.lifecycle == TaskLifecycle::Archived;
+        let mut seen = HashSet::new();
+        for scalar in entry.lower_title.chars() {
+            if !seen.insert(scalar) {
+                continue;
+            }
+            if let Some(total) = self.search_scalar_totals.get_mut(&scalar) {
+                total.increment(archived);
+                continue;
+            }
+            if self.search_scalar_totals.len() >= MAX_INDEXED_SCALAR_KEYS
+                || self
+                    .resident_search_bytes()
+                    .saturating_add(SEARCH_SCALAR_MAP_SLOT_BYTES)
+                    > MAX_CLIENT_SEARCH_POSTING_BYTES
+            {
+                continue;
+            }
+            self.search_scalar_totals
+                .insert(scalar, SearchScalarTotal::from_entry(archived));
+            self.search_scalar_map_bytes = self
+                .search_scalar_totals
+                .capacity()
+                .saturating_mul(SEARCH_SCALAR_MAP_SLOT_BYTES);
+        }
+        if entry.lower_title.chars().count() > MAX_INDEXED_SUBSTRING_SOURCE_CHARS {
+            self.unindexed_suffix_entries = self.unindexed_suffix_entries.saturating_add(1);
+        }
+    }
+
+    fn remove_search_scalar_totals(&mut self, entry: &TaskProjectionEntry) {
+        let archived = entry.lifecycle == TaskLifecycle::Archived;
+        let mut seen = HashSet::new();
+        for scalar in entry.lower_title.chars() {
+            if !seen.insert(scalar) {
+                continue;
+            }
+            let mut empty = false;
+            if let Some(total) = self.search_scalar_totals.get_mut(&scalar) {
+                total.decrement(archived);
+                empty = total.is_empty();
+            }
+            if empty {
+                self.search_scalar_totals.remove(&scalar);
+            }
+        }
+        if entry.lower_title.chars().count() > MAX_INDEXED_SUBSTRING_SOURCE_CHARS {
+            self.unindexed_suffix_entries = self.unindexed_suffix_entries.saturating_sub(1);
+        }
+    }
+
+    fn insert_search_token(&mut self, task_id: TaskId, entry: &TaskProjectionEntry, token: String) {
+        let resident_bytes = self.resident_search_bytes();
+        if let Some(posting) = self.search.get_mut(&token) {
+            let before_capacity = posting.ids_capacity(entry.lifecycle == TaskLifecycle::Archived);
+            let required_capacity = posting
+                .ids(entry.lifecycle == TaskLifecycle::Archived)
+                .len()
+                .eq(&before_capacity)
+                .then(|| next_posting_capacity(before_capacity))
+                .unwrap_or(before_capacity);
+            let additional_bytes = required_capacity
+                .saturating_sub(before_capacity)
+                .saturating_mul(std::mem::size_of::<TaskId>());
+            let stored = posting.insert(
+                task_id,
+                entry,
+                resident_bytes.saturating_add(additional_bytes) <= MAX_CLIENT_SEARCH_POSTING_BYTES,
+            );
+            if stored {
+                self.search_posting_entries = self.search_posting_entries.saturating_add(1);
+                self.search_index_posting_storage_bytes = self
+                    .search_index_posting_storage_bytes
+                    .saturating_add(additional_bytes);
+            }
+            return;
+        }
+
+        if self.search.len() >= MAX_CLIENT_SEARCH_INDEX_KEYS {
+            self.search_index_saturated = true;
+            return;
+        }
+        let key_capacity = token.capacity();
+        let initial_posting_capacity = next_posting_capacity(0);
+        let initial_posting_bytes =
+            initial_posting_capacity.saturating_mul(std::mem::size_of::<TaskId>());
+        if self
+            .resident_search_bytes()
+            .saturating_add(key_capacity)
+            .saturating_add(initial_posting_bytes)
+            > MAX_CLIENT_SEARCH_POSTING_BYTES
+        {
+            self.search_index_saturated = true;
+            return;
+        }
+
+        let mut posting = SearchPosting::default();
+        let stored = posting.insert(task_id, entry, true);
+        self.search_index_key_bytes = self.search_index_key_bytes.saturating_add(key_capacity);
+        self.search_index_posting_storage_bytes =
+            self.search_index_posting_storage_bytes.saturating_add(
+                posting
+                    .ids_capacity(entry.lifecycle == TaskLifecycle::Archived)
+                    .saturating_mul(std::mem::size_of::<TaskId>()),
+            );
+        if stored {
+            self.search_posting_entries = self.search_posting_entries.saturating_add(1);
+        }
+        self.search.insert(token, posting);
+    }
+
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    pub fn active_task_ids(&self) -> Vec<TaskId> {
+        self.active_order.iter().map(|key| key.task_id).collect()
+    }
+
+    pub fn active_count(&self) -> usize {
+        self.active_order.len()
+    }
+
+    pub fn archived_count(&self) -> usize {
+        self.archived_order.len()
+    }
+
+    pub fn settled_count(&self) -> usize {
+        self.settled_order.len()
+    }
+
+    pub fn top_active_task_ids(&self, limit: usize) -> Vec<TaskId> {
+        self.active_order
+            .iter()
+            .take(limit)
+            .map(|key| key.task_id)
+            .collect()
+    }
+
+    pub fn top_settled_task_ids(&self, limit: usize) -> Vec<TaskId> {
+        self.settled_order
+            .iter()
+            .take(limit)
+            .map(|key| key.task_id)
+            .collect()
+    }
+
+    pub fn top_archived_task_ids(&self, limit: usize) -> Vec<TaskId> {
+        self.archived_order
+            .iter()
+            .take(limit)
+            .map(|key| key.task_id)
+            .collect()
+    }
+
+    pub fn archived_task_ids(&self) -> Vec<TaskId> {
+        self.archived_order.iter().map(|key| key.task_id).collect()
+    }
+
+    /// Return the first bounded search page. For a large posting the count is
+    /// a truthful lower bound; callers that need the exact total continue from
+    /// [`Self::search_task_ids_page`]'s cursor off the input/paint path.
+    pub fn search_task_ids(&self, query: &str, archived: bool) -> (Vec<TaskId>, usize) {
+        let (ids, total, _) = self.search_task_ids_with_work(query, archived);
+        (ids, total)
+    }
+
+    /// Return one bounded active/archived search page. The query, scope, and
+    /// index revision fence a continuation so stale background work cannot
+    /// publish another query's results. At most [`MAX_CLIENT_SEARCH_WORK`]
+    /// candidates are inspected.
+    pub fn search_task_ids_page(
+        &self,
+        query: &str,
+        archived: bool,
+        continuation: Option<&SearchContinuation>,
+    ) -> SearchPage {
+        self.search_task_ids_page_scoped(query, SearchScope::from_archived(archived), continuation)
+    }
+
+    /// Bounded settled (Done) search page with the same work/continuation
+    /// contract as active/archived. Settled is never indexed into search
+    /// postings, so every nonempty query walks only `settled_order`.
+    pub fn search_settled_task_ids_page(
+        &self,
+        query: &str,
+        continuation: Option<&SearchContinuation>,
+    ) -> SearchPage {
+        self.search_task_ids_page_scoped(query, SearchScope::Settled, continuation)
+    }
+
+    fn search_task_ids_page_scoped(
+        &self,
+        query: &str,
+        scope: SearchScope,
+        continuation: Option<&SearchContinuation>,
+    ) -> SearchPage {
+        let (query, query_truncated) =
+            normalize_bounded_search_text(query, MAX_CLIENT_SEARCH_CHARS);
+        let query = query.trim().to_string();
+        if let Some(continuation) = continuation {
+            if continuation.query != query
+                || continuation.scope != scope
+                || continuation.revision != self.revision
+            {
+                return SearchPage {
+                    ids: Vec::new(),
+                    known_total: 0,
+                    exact_total: None,
+                    work: 0,
+                    status: SearchPageStatus::Stale,
+                    query_truncated,
+                    continuation: None,
+                };
+            }
+        }
+
+        let order = match scope {
+            SearchScope::Active => &self.active_order,
+            SearchScope::Settled => &self.settled_order,
+            SearchScope::Archived => &self.archived_order,
+        };
+        let posting_archived = scope.posting_archived();
+        let mut ids = continuation
+            .map(|continuation| continuation.retained_ids.clone())
+            .unwrap_or_default();
+        ids.truncate(MAX_CLIENT_SEARCH_RESULTS);
+        let mut count = continuation
+            .map(|continuation| continuation.lower_bound)
+            .unwrap_or_default();
+        let start_cursor = continuation.and_then(|continuation| continuation.cursor.as_ref());
+        let mut last_cursor = start_cursor.cloned();
+        // A posting is only a candidate accelerator. It is exhaustive for an
+        // exact indexed token only after the canonical title `contains` check;
+        // a shorter prefix/gram is never allowed to stand in for the query.
+        // Titles beyond the indexed source prefix fence the posting path too;
+        // their canonical continuation scan remains the correctness source.
+        // Settled has no postings — it always uses the bounded order scan.
+        let query_chars = query.chars().count();
+        let indexed_token = scope
+            .uses_search_postings()
+            .then(|| {
+                (query_chars >= 4)
+                    .then(|| {
+                        search_tokens(&query)
+                            .into_iter()
+                            .filter_map(|token| {
+                                self.search.get(&token).map(|posting| (token, posting))
+                            })
+                            .max_by_key(|(token, _)| token.chars().count())
+                    })
+                    .flatten()
+                    .filter(|(_, _)| self.unindexed_suffix_entries == 0)
+            })
+            .flatten();
+        let first = indexed_token.as_ref().map(|(_, posting)| *posting);
+        let exact_indexed_total = if query.is_empty() {
+            Some(order.len())
+        } else if !scope.uses_search_postings() {
+            None
+        } else if query_chars == 1 {
+            query
+                .chars()
+                .next()
+                .and_then(|scalar| self.search_scalar_totals.get(&scalar))
+                .map(|total| total.len(posting_archived))
+        } else {
+            indexed_token
+                .as_ref()
+                .filter(|(token, _)| *token == query)
+                .map(|(_, posting)| posting.len(posting_archived))
+        };
+
+        // A small complete posting can be materialized and sorted by the
+        // canonical order key without exceeding the page work bound. Common
+        // 9+ character queries over a 100k identical-title posting are not
+        // exact indexed tokens; they stay on the bounded continuation scan
+        // instead of sorting or cloning the saturated posting.
+        if continuation.is_none()
+            && first.is_some_and(|first| {
+                first.len(posting_archived) <= MAX_CLIENT_SEARCH_WORK
+                    && first.ids(posting_archived).len() <= MAX_CLIENT_SEARCH_WORK
+                    && first.ids_complete(posting_archived)
+            })
+        {
+            let first = first.expect("small posting candidate");
+            let mut candidate_keys = first
+                .ids(posting_archived)
+                .iter()
+                .filter_map(|task_id| {
+                    self.entries
+                        .get(task_id)
+                        .map(|entry| TaskOrderKey::new(*task_id, entry))
+                })
+                .collect::<Vec<_>>();
+            candidate_keys.sort_unstable();
+            let mut page_ids =
+                Vec::with_capacity(candidate_keys.len().min(MAX_CLIENT_SEARCH_RESULTS));
+            let mut count = 0usize;
+            for key in &candidate_keys {
+                let matches = self
+                    .entries
+                    .get(&key.task_id)
+                    .is_some_and(|entry| entry.lower_title.contains(&query));
+                if matches {
+                    count = count.saturating_add(1);
+                    if page_ids.len() < MAX_CLIENT_SEARCH_RESULTS {
+                        page_ids.push(key.task_id);
+                    }
+                }
+            }
+            return SearchPage {
+                work: candidate_keys.len(),
+                ids: page_ids,
+                known_total: count,
+                exact_total: Some(count),
+                status: SearchPageStatus::Complete,
+                query_truncated,
+                continuation: None,
+            };
+        }
+        let mut candidates: Box<dyn Iterator<Item = &TaskOrderKey> + '_> =
+            if let Some(cursor) = start_cursor {
+                Box::new(order.range((Excluded(cursor), Unbounded)))
+            } else {
+                Box::new(order.iter())
+            };
+        let exact_single_posting_total = exact_indexed_total;
+        let mut work = 0usize;
+        // A range iterator does not provide a reliable exact size. Scan only
+        // the page budget and treat a full budget as conservatively partial;
+        // the next bounded continuation can prove exhaustion without ever
+        // inspecting a 5,001st candidate.
+        for key in candidates.by_ref().take(MAX_CLIENT_SEARCH_WORK) {
+            work = work.saturating_add(1);
+            last_cursor = Some(key.clone());
+            let matches = self
+                .entries
+                .get(&key.task_id)
+                .is_some_and(|entry| entry.lower_title.contains(&query));
+            if !matches {
+                continue;
+            }
+            count = count.saturating_add(1);
+            if ids.len() < MAX_CLIENT_SEARCH_RESULTS {
+                ids.push(key.task_id);
+            }
+        }
+        let exhausted = work < MAX_CLIENT_SEARCH_WORK;
+        if exhausted {
+            SearchPage {
+                ids,
+                known_total: exact_single_posting_total.unwrap_or(count),
+                exact_total: exact_single_posting_total.or(Some(count)),
+                work,
+                status: SearchPageStatus::Complete,
+                query_truncated,
+                continuation: None,
+            }
+        } else {
+            SearchPage {
+                ids: ids.clone(),
+                known_total: exact_single_posting_total.unwrap_or(count),
+                exact_total: exact_single_posting_total,
+                work,
+                status: SearchPageStatus::Partial,
+                query_truncated,
+                continuation: Some(SearchContinuation {
+                    query,
+                    scope,
+                    revision: self.revision,
+                    cursor: last_cursor,
+                    retained_ids: ids,
+                    lower_bound: count,
+                }),
+            }
+        }
+    }
+
+    /// Search with observable bounded candidate work for diagnostics/tests.
+    /// Exact indexed tokens return the complete truthful total and only the
+    /// retained first page; longer or unindexed queries return a lower bound
+    /// until continued.
+    pub fn search_task_ids_with_work(
+        &self,
+        query: &str,
+        archived: bool,
+    ) -> (Vec<TaskId>, usize, usize) {
+        let page = self.search_task_ids_page(query, archived, None);
+        (
+            page.ids,
+            page.exact_total.unwrap_or(page.known_total),
+            page.work,
+        )
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub fn full_rebuilds(&self) -> u64 {
+        self.full_rebuilds
+    }
+
+    /// Number of keyed updates since construction. This is intentionally an
+    /// observable counter: production diagnostics can prove that a live event
+    /// updates one index entry instead of rebuilding a 100k-task list.
+    pub fn incremental_updates(&self) -> u64 {
+        self.incremental_updates
+    }
+
+    /// Number of retained numeric posting identities. This is maintained
+    /// incrementally so diagnostics do not walk the index or affect search
+    /// hot-path work.
+    pub fn search_index_posting_entries(&self) -> usize {
+        self.search_posting_entries
+    }
+
+    /// Conservative resident allocation estimate for the compact search index.
+    /// It includes the actual hash-table capacity, owned key capacities, and
+    /// posting vector capacities; it is suitable for admission and diagnostics,
+    /// not merely a count of TaskId payload bytes.
+    pub fn search_index_resident_bytes(&self) -> usize {
+        self.resident_search_bytes()
+    }
+
+    pub fn search_index_keys(&self) -> usize {
+        self.search.len()
+    }
+
+    pub fn search_index_saturated(&self) -> bool {
+        self.search_index_saturated
+    }
+
+    fn set_revision(&mut self, revision: u64) {
+        self.revision = revision;
+    }
+
+    fn update_task(&mut self, snapshot: &TaskSnapshot, occurred_at_ms: i64) {
+        let task_id = snapshot.task.id;
+        self.remove_task_id(task_id);
+        let entry = TaskProjectionEntry::from_snapshot(snapshot, occurred_at_ms);
+        let key = TaskOrderKey::new(task_id, &entry);
+        self.entries.insert(task_id, entry);
+        match self.entries[&task_id].lifecycle {
+            TaskLifecycle::Open | TaskLifecycle::Closing => {
+                self.active_order.insert(key.clone());
+            }
+            TaskLifecycle::Settled => {
+                self.settled_order.insert(key.clone());
+                self.incremental_updates = self.incremental_updates.saturating_add(1);
+                return;
+            }
+            TaskLifecycle::Archived => {
+                self.archived_order.insert(key.clone());
+            }
+            TaskLifecycle::Deleted => {
+                self.incremental_updates = self.incremental_updates.saturating_add(1);
+                return;
+            }
+        }
+        let entry = self
+            .entries
+            .get(&task_id)
+            .expect("inserted task projection entry")
+            .clone();
+        self.insert_search_scalar_totals(&entry);
+        self.insert_search_tokens(task_id, &entry);
+        self.incremental_updates = self.incremental_updates.saturating_add(1);
+    }
+
+    fn remove_task_id(&mut self, task_id: TaskId) {
+        if let Some(entry) = self.entries.remove(&task_id) {
+            let key = TaskOrderKey::new(task_id, &entry);
+            self.active_order.remove(&key);
+            self.settled_order.remove(&key);
+            self.archived_order.remove(&key);
+            if matches!(
+                entry.lifecycle,
+                TaskLifecycle::Settled | TaskLifecycle::Deleted
+            ) {
+                return;
+            }
+            self.remove_search_scalar_totals(&entry);
+            for token in search_tokens(&entry.lower_title) {
+                let mut empty = false;
+                if let Some(posting) = self.search.get_mut(&token) {
+                    let was_stored = posting.remove(task_id, &entry);
+                    empty = posting.is_empty();
+                    if was_stored {
+                        self.search_posting_entries = self.search_posting_entries.saturating_sub(1);
+                    }
+                }
+                if empty {
+                    if let Some((removed_key, posting)) = self.search.remove_entry(&token) {
+                        self.search_index_key_bytes = self
+                            .search_index_key_bytes
+                            .saturating_sub(removed_key.capacity());
+                        self.search_index_posting_storage_bytes =
+                            self.search_index_posting_storage_bytes.saturating_sub(
+                                posting
+                                    .active
+                                    .capacity()
+                                    .saturating_add(posting.archived.capacity())
+                                    .saturating_mul(std::mem::size_of::<TaskId>()),
+                            );
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn search_tokens(value: &str) -> Vec<String> {
+    let chars = value
+        .chars()
+        .take(MAX_INDEXED_SUBSTRING_SOURCE_CHARS)
+        .collect::<Vec<_>>();
+    let mut tokens = BTreeSet::new();
+    let prefix_len = MAX_INDEXED_GRAM_CHARS.min(chars.len());
+    for length in 1..=prefix_len {
+        tokens.insert(chars[..length].iter().collect::<String>());
+    }
+    for start in 1..chars.len() {
+        for length in 4..=MAX_INDEXED_GRAM_CHARS.min(chars.len().saturating_sub(start)) {
+            tokens.insert(chars[start..start + length].iter().collect::<String>());
+        }
+    }
+    tokens.into_iter().collect()
+}
+
+fn next_posting_capacity(capacity: usize) -> usize {
+    if capacity == 0 {
+        4
+    } else {
+        capacity.saturating_mul(2)
+    }
+}
+
+/// Apply bounded Unicode compatibility caseless matching semantics: the same
+/// NFD/default-fold/NFKD/default-fold/NFKD sequence used by the pinned
+/// `caseless` crate. Source scalars are admitted first so hostile input never
+/// starts an unbounded fold; the fold then expands (for example `İ` → `i` +
+/// combining dot) and the same caller bound is applied to that expanded
+/// output. Title indexing and UI query input therefore share one
+/// representation at the 160-char search boundary when they use the same
+/// `max_chars`.
+pub fn normalize_bounded_search_text(value: &str, max_chars: usize) -> (String, bool) {
+    if max_chars == 0 {
+        return (String::new(), value.chars().next().is_some());
+    }
+    let source_truncated = value.chars().nth(max_chars).is_some();
+    let mut normalized = value
+        .chars()
+        .take(max_chars)
+        .nfd()
+        .default_case_fold()
+        .nfkd()
+        .default_case_fold()
+        .nfkd();
+    let mut output = String::new();
+    output.reserve(max_chars);
+    for ch in normalized.by_ref().take(max_chars) {
+        output.push(ch);
+    }
+    let output_truncated = normalized.next().is_some();
+    (output, source_truncated || output_truncated)
+}
+
+impl TaskProjectionEntry {
+    fn from_snapshot(snapshot: &TaskSnapshot, occurred_at_ms: i64) -> Self {
+        let title = snapshot
+            .task
+            .title
+            .chars()
+            .take(MAX_INDEXED_TITLE_CHARS)
+            .collect::<String>();
+        let lower_title =
+            normalize_bounded_search_text(&snapshot.task.title, MAX_INDEXED_TITLE_CHARS).0;
+        Self {
+            lifecycle: snapshot.task.lifecycle,
+            attention_rank: attention_rank(snapshot.visible_status()),
+            occurred_at_ms,
+            revision: snapshot.task.revision,
+            lower_title: Arc::from(lower_title),
+            title: Arc::from(title),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct TaskOrderKey {
+    task_id: TaskId,
+    attention_rank: u8,
+    occurred_at_ms: i64,
+    revision: u64,
+    lower_title: Arc<str>,
+    title: Arc<str>,
+}
+
+impl TaskOrderKey {
+    fn new(task_id: TaskId, entry: &TaskProjectionEntry) -> Self {
+        Self {
+            task_id,
+            attention_rank: entry.attention_rank,
+            occurred_at_ms: entry.occurred_at_ms,
+            revision: entry.revision,
+            lower_title: Arc::clone(&entry.lower_title),
+            title: Arc::clone(&entry.title),
+        }
+    }
+}
+
+impl Ord for TaskOrderKey {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.attention_rank
+            .cmp(&other.attention_rank)
+            .then_with(|| other.occurred_at_ms.cmp(&self.occurred_at_ms))
+            .then_with(|| other.revision.cmp(&self.revision))
+            .then_with(|| self.lower_title.cmp(&other.lower_title))
+            .then_with(|| self.title.cmp(&other.title))
+            .then_with(|| self.task_id.cmp(&other.task_id))
+    }
+}
+
+impl PartialOrd for TaskOrderKey {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+fn attention_rank(status: VisibleTaskStatus) -> u8 {
+    match status {
+        VisibleTaskStatus::Disconnected => 0,
+        VisibleTaskStatus::Failed => 1,
+        VisibleTaskStatus::UncertainOutcome => 2,
+        VisibleTaskStatus::NeedsApproval => 3,
+        VisibleTaskStatus::NeedsAnswer => 4,
+        VisibleTaskStatus::Working => 5,
+        VisibleTaskStatus::Settling => 6,
+        VisibleTaskStatus::ReadyForReview => 7,
+        VisibleTaskStatus::Idle => 8,
+    }
+}
+
+/// A task's primary agent must be a Primary agent WHEN THE SNAPSHOT SHIPPED IT.
+///
+/// The startup projection withholds a Settled or Archived task's agent rows
+/// until the user selects it, so a missing primary there is the expected state
+/// rather than a corrupt one. For an Open or Closing task the row is always
+/// shipped, so a missing primary is still a projection fault.
+fn validate_primary_agent(task: &TaskSnapshot) -> Result<(), ClientModelError> {
+    let Some(primary) = task.primary_agent_id else {
+        return Ok(());
+    };
+    match task.agents.get(&primary) {
+        Some(agent) => {
+            if matches!(agent.role, crate::domain::agent::AgentRole::Primary) {
+                Ok(())
+            } else {
+                Err(ClientModelError::InvalidPrimaryAgent)
+            }
+        }
+        None => {
+            if task_detail_ships_at_startup(task.task.lifecycle) {
+                Err(ClientModelError::InvalidPrimaryAgent)
+            } else {
+                Ok(())
+            }
+        }
+    }
+}
+
+/// The client half of the kernel's startup projection predicate.
+///
+/// Kept as one named predicate so the two halves cannot drift: the kernel
+/// withholds exactly the lifecycles this returns false for.
+pub fn task_detail_ships_at_startup(lifecycle: crate::domain::task::TaskLifecycle) -> bool {
+    use crate::domain::task::TaskLifecycle;
+    matches!(lifecycle, TaskLifecycle::Open | TaskLifecycle::Closing)
+}
+
+/// Validated presentation-independent client projection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientModel {
+    tasks: BTreeMap<TaskId, TaskSnapshot>,
+    host_resources: BTreeMap<ResourceId, ResourceFacts>,
+    operations: BTreeMap<OperationId, OperationFacts>,
+    /// Metadata-only artifact index from snapshot pages / durable events.
+    /// TaskSnapshot.artifacts is cleared after ArtifactRegistered staging so the
+    /// public client model never retains inline bodies or content refs.
+    artifact_summaries: BTreeMap<ArtifactId, ArtifactSummary>,
+    last_applied_sequence: u64,
+    replay_through: Option<u64>,
+    replay_page_count: usize,
+    replay_cursors: HashSet<Vec<u8>>,
+    task_projection_index: TaskProjectionIndex,
+    /// Tasks whose withheld detail sections have been admitted this session.
+    /// Empty at startup: an Open/Closing task never needs an entry because its
+    /// detail always ships.
+    admitted_task_detail: BTreeSet<TaskId>,
+}
+
+/// Bounded Tasks-only inbox preview. Never a substitute for [`ClientModel`]:
+/// it carries only fully paged task snapshots and the pinned through-sequence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskInboxPreview {
+    tasks: BTreeMap<TaskId, TaskSnapshot>,
+    through_sequence: u64,
+}
+
+impl TaskInboxPreview {
+    pub fn tasks(&self) -> &BTreeMap<TaskId, TaskSnapshot> {
+        &self.tasks
+    }
+
+    pub fn through_sequence(&self) -> u64 {
+        self.through_sequence
+    }
+
+    pub fn task_ids(&self) -> impl Iterator<Item = TaskId> + '_ {
+        self.tasks.keys().copied()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_tasks_for_test(
+        tasks: BTreeMap<TaskId, TaskSnapshot>,
+        through_sequence: u64,
+    ) -> Self {
+        Self {
+            tasks,
+            through_sequence,
+        }
+    }
+}
+
+fn task_snapshot_from_item(item: TaskSnapshotItem) -> TaskSnapshot {
+    let task_id = item.task.id;
+    TaskSnapshot {
+        task: item.task,
+        connectivity: item.connectivity,
+        attention: item.attention,
+        activity: item.activity,
+        review_readiness: item.review_readiness,
+        agents: BTreeMap::new(),
+        primary_agent_id: None,
+        artifacts: BTreeMap::new(),
+        resources: BTreeMap::new(),
+        provider_sessions: BTreeMap::new(),
+        browser: {
+            let mut browser = crate::domain::browser::BrowserBook::new();
+            let _ = browser.open_task(task_id);
+            browser
+        },
+        terminal_facts: Default::default(),
+        terminal_strip: Default::default(),
+    }
+}
+
+impl ClientModel {
+    pub fn tasks(&self) -> &BTreeMap<TaskId, TaskSnapshot> {
+        &self.tasks
+    }
+
+    /// Return one already assembled task without exposing another projection
+    /// source to UI code.
+    pub fn task(&self, task_id: TaskId) -> Option<&TaskSnapshot> {
+        self.tasks.get(&task_id)
+    }
+
+    pub fn host_resources(&self) -> &BTreeMap<ResourceId, ResourceFacts> {
+        &self.host_resources
+    }
+
+    pub fn operations(&self) -> &BTreeMap<OperationId, OperationFacts> {
+        &self.operations
+    }
+
+    pub fn artifact_summaries(&self) -> &BTreeMap<ArtifactId, ArtifactSummary> {
+        &self.artifact_summaries
+    }
+
+    pub fn last_applied_sequence(&self) -> u64 {
+        self.last_applied_sequence
+    }
+
+    pub fn task_projection_index(&self) -> &TaskProjectionIndex {
+        &self.task_projection_index
+    }
+
+    pub fn task_projection_index_len(&self) -> usize {
+        self.task_projection_index.len()
+    }
+
+    pub fn task_projection_index_rebuilds(&self) -> u64 {
+        self.task_projection_index.full_rebuilds()
+    }
+
+    pub fn task_projection_index_incremental_updates(&self) -> u64 {
+        self.task_projection_index.incremental_updates()
+    }
+
+    pub fn task_projection_index_search_posting_entries(&self) -> usize {
+        self.task_projection_index.search_index_posting_entries()
+    }
+
+    pub fn task_projection_index_search_saturated(&self) -> bool {
+        self.task_projection_index.search_index_saturated()
+    }
+
+    pub fn task_projection_index_search_resident_bytes(&self) -> usize {
+        self.task_projection_index.search_index_resident_bytes()
+    }
+
+    pub fn task_projection_index_search_index_keys(&self) -> usize {
+        self.task_projection_index.search_index_keys()
+    }
+
+    pub fn task_last_occurred_at_ms(&self, task_id: TaskId) -> Option<i64> {
+        self.task_projection_index
+            .entries
+            .get(&task_id)
+            .map(|entry| entry.occurred_at_ms)
+    }
+
+    pub fn search_task_ids(&self, query: &str, archived: bool) -> (Vec<TaskId>, usize) {
+        self.task_projection_index.search_task_ids(query, archived)
+    }
+
+    pub fn search_task_ids_page(
+        &self,
+        query: &str,
+        archived: bool,
+        continuation: Option<&SearchContinuation>,
+    ) -> SearchPage {
+        self.task_projection_index
+            .search_task_ids_page(query, archived, continuation)
+    }
+
+    pub fn search_settled_task_ids_page(
+        &self,
+        query: &str,
+        continuation: Option<&SearchContinuation>,
+    ) -> SearchPage {
+        self.task_projection_index
+            .search_settled_task_ids_page(query, continuation)
+    }
+
+    pub fn search_task_ids_with_work(
+        &self,
+        query: &str,
+        archived: bool,
+    ) -> (Vec<TaskId>, usize, usize) {
+        self.task_projection_index
+            .search_task_ids_with_work(query, archived)
+    }
+
+    /// Native dock chrome may read Task identity from the client model.
+    /// This is not a BrowserService settle path and carries no HWND/pixels.
+    pub fn browser_dock_view(&self, task_id: TaskId) -> Option<ClientBrowserDockView> {
+        let snapshot = self.tasks.get(&task_id)?;
+        let browser = snapshot.browser.identity_snapshot();
+        let binding =
+            crate::domain::native_browser::NativeBrowserSessionProjection::from_snapshot(snapshot)
+                .ok()
+                .flatten();
+        let context = binding.as_ref().and_then(|binding| {
+            browser
+                .contexts
+                .iter()
+                .find(|context| context.context_id == binding.context_id)
+        });
+        let selected_tab_id = binding.as_ref().map(|binding| binding.tab_id);
+        let selected_tab =
+            selected_tab_id.and_then(|tab_id| browser.tabs.iter().find(|tab| tab.tab_id == tab_id));
+        let resource_id = binding.as_ref().map(|binding| binding.resource_id);
+        Some(ClientBrowserDockView {
+            task_id,
+            title: snapshot.task.title.clone(),
+            agent_session_id: snapshot.primary_agent_id,
+            context_id: context.map(|context| context.context_id),
+            resource_id,
+            selected_tab_id,
+            generation: context.map(|context| context.generation),
+            shareable_url: selected_tab.and_then(|tab| {
+                crate::domain::browser::BrowserSnapshotRow::Tab(tab.clone()).shareable_url()
+            }),
+            tab_count: browser
+                .tabs
+                .iter()
+                .filter(|tab| tab.task_id == task_id && !tab.closed)
+                .count(),
+        })
+    }
+
+    /// Fail-closed Task Cockpit workspace/git/files/ssh/service surface map.
+    ///
+    /// Missing tasks return `None`. Absolute workspace paths are never copied
+    /// into this projection. ServiceControl start/stop/restart and typed
+    /// TaskCockpit query ids (including logs/health) are advertised from the
+    /// shared catalog; write/mutate/ssh-action remain catalog-unavailable.
+    pub fn task_cockpit_surfaces(&self, task_id: TaskId) -> Option<TaskCockpitSurfaceProjection> {
+        if !self.tasks.contains_key(&task_id) {
+            return None;
+        }
+        Some(TaskCockpitSurfaceProjection {
+            task_id,
+            surfaces: crate::client::action::cockpit_surface_descriptors().to_vec(),
+        })
+    }
+
+    /// Shared bound check for frozen replay continuation cursors/pages.
+    pub fn check_replay_continuation_bounds(
+        page_count: usize,
+        max_pages: usize,
+        seen_cursors: &HashSet<Vec<u8>>,
+        next_cursor: &Vec<u8>,
+    ) -> Result<(), ClientModelError> {
+        if page_count >= max_pages {
+            return Err(ClientModelError::ReplayPageBoundExceeded);
+        }
+        if seen_cursors.len() >= MAX_CLIENT_REPLAY_CURSORS {
+            return Err(ClientModelError::CursorBoundExceeded);
+        }
+        if seen_cursors.contains(next_cursor) {
+            return Err(ClientModelError::ReplayRepeatedCursor);
+        }
+        Ok(())
+    }
+
+    /// Apply one durable event. Sequences must be strictly greater than the
+    /// current cursor; ordinary numeric gaps are allowed.
+    ///
+    /// Stages only the affected task/operation entries; never clones the whole model.
+    pub fn apply_event(&mut self, event: &DomainEvent) -> Result<(), ClientModelError> {
+        self.apply_one_event(event)
+    }
+
+    /// Whether this task's detail sections are present in the model.
+    ///
+    /// An Open or Closing task is always complete because startup ships it. A
+    /// Settled or Archived task is complete only once a task-scoped snapshot
+    /// has been admitted for it.
+    pub fn task_detail_admitted(&self, task_id: TaskId) -> bool {
+        self.tasks.get(&task_id).is_some_and(|task| {
+            task_detail_ships_at_startup(task.task.lifecycle)
+                || self.admitted_task_detail.contains(&task_id)
+        })
+    }
+
+    /// Admit one task-scoped snapshot's detail rows for `task_id`.
+    ///
+    /// Every page must name the task's own rows; a row for another task is a
+    /// scope violation and rejects the whole admission, so a partly applied
+    /// detail can never be observed. Re-admitting an already-admitted task
+    /// replaces its detail rather than colliding with it, which is what a
+    /// durable event on that task makes necessary.
+    pub fn admit_task_detail_pages(
+        &mut self,
+        task_id: TaskId,
+        pages: &[SnapshotPage],
+    ) -> Result<(), ClientModelError> {
+        let mut candidate = self.clone();
+        candidate.admit_task_detail_pages_inner(task_id, pages)?;
+        *self = candidate;
+        Ok(())
+    }
+
+    fn admit_task_detail_pages_inner(
+        &mut self,
+        task_id: TaskId,
+        pages: &[SnapshotPage],
+    ) -> Result<(), ClientModelError> {
+        if !self.tasks.contains_key(&task_id) {
+            return Err(ClientModelError::MissingParentTask);
+        }
+        let browser_pages = pages.iter().any(|page| {
+            matches!(
+                page.section,
+                SnapshotSection::BrowserContexts | SnapshotSection::BrowserTabs
+            )
+        });
+        if browser_pages
+            && [
+                SnapshotSection::BrowserContexts,
+                SnapshotSection::BrowserTabs,
+            ]
+            .into_iter()
+            .any(|section| {
+                !pages
+                    .iter()
+                    .any(|page| page.section == section && page.next_cursor.is_none())
+            })
+        {
+            return Err(ClientModelError::MissingSections);
+        }
+        {
+            let task = self
+                .tasks
+                .get_mut(&task_id)
+                .ok_or(ClientModelError::MissingParentTask)?;
+            task.agents.clear();
+            task.resources.clear();
+            if browser_pages {
+                task.browser = crate::domain::browser::BrowserBook::new();
+                task.browser
+                    .open_task(task_id)
+                    .map_err(|_| ClientModelError::InvalidOwnership)?;
+            }
+        }
+        self.artifact_summaries
+            .retain(|_, summary| summary.task_id != task_id);
+
+        for page in pages {
+            for item in &page.items {
+                match (page.section, item) {
+                    (SnapshotSection::AgentSessions, SnapshotItem::AgentSession(agent)) => {
+                        if agent.task_id != task_id {
+                            return Err(ClientModelError::InvalidOwnership);
+                        }
+                        let task = self
+                            .tasks
+                            .get_mut(&task_id)
+                            .ok_or(ClientModelError::MissingParentTask)?;
+                        if task.agents.insert(agent.id, agent.clone()).is_some() {
+                            return Err(ClientModelError::DuplicateItem);
+                        }
+                    }
+                    (SnapshotSection::Resources, SnapshotItem::Resource(resource)) => {
+                        resource
+                            .validate()
+                            .map_err(|_| ClientModelError::InvalidOwnership)?;
+                        if resource.task_id != Some(task_id) {
+                            return Err(ClientModelError::InvalidOwnership);
+                        }
+                        let task = self
+                            .tasks
+                            .get_mut(&task_id)
+                            .ok_or(ClientModelError::MissingParentTask)?;
+                        if task
+                            .resources
+                            .insert(resource.id, resource.clone())
+                            .is_some()
+                        {
+                            return Err(ClientModelError::DuplicateItem);
+                        }
+                    }
+                    (SnapshotSection::Artifacts, SnapshotItem::Artifact(summary)) => {
+                        if summary.task_id != task_id {
+                            return Err(ClientModelError::InvalidOwnership);
+                        }
+                        if self
+                            .artifact_summaries
+                            .insert(summary.id, summary.clone())
+                            .is_some()
+                        {
+                            return Err(ClientModelError::DuplicateItem);
+                        }
+                    }
+                    (SnapshotSection::BrowserContexts, SnapshotItem::BrowserContext(context)) => {
+                        if context.task_id != task_id {
+                            return Err(ClientModelError::InvalidOwnership);
+                        }
+                        self.tasks
+                            .get_mut(&task_id)
+                            .ok_or(ClientModelError::MissingParentTask)?
+                            .browser
+                            .project_context_view(context)
+                            .map_err(|_| ClientModelError::InvalidOwnership)?;
+                    }
+                    (SnapshotSection::BrowserTabs, SnapshotItem::BrowserTab(tab)) => {
+                        if tab.task_id != task_id {
+                            return Err(ClientModelError::InvalidOwnership);
+                        }
+                        self.tasks
+                            .get_mut(&task_id)
+                            .ok_or(ClientModelError::MissingParentTask)?
+                            .browser
+                            .project_tab_view(tab)
+                            .map_err(|_| ClientModelError::InvalidOwnership)?;
+                    }
+                    _ => return Err(ClientModelError::SectionItemMismatch),
+                }
+            }
+        }
+
+        let task = self
+            .tasks
+            .get(&task_id)
+            .ok_or(ClientModelError::MissingParentTask)?
+            .clone();
+        validate_primary_agent(&task)?;
+        let occurred_at_ms = self.task_last_occurred_at_ms(task_id).unwrap_or_default();
+        self.task_projection_index
+            .update_task(&task, occurred_at_ms);
+        self.admitted_task_detail.insert(task_id);
+        Ok(())
+    }
+
+    /// Forget one task's admitted detail so the next selection refetches it.
+    ///
+    /// A durable event for the task can change its agents or resources, and the
+    /// event stream alone cannot reconstruct rows the snapshot never shipped.
+    pub fn invalidate_task_detail(&mut self, task_id: TaskId) {
+        self.admitted_task_detail.remove(&task_id);
+    }
+
+    /// Apply every event on a frozen/live replay page, then advance the applied
+    /// cursor to `through_sequence` when the page completes the frozen range.
+    ///
+    /// One page-level candidate clone preserves page transactionality; events are
+    /// applied through [`Self::apply_one_event`] (no per-event model clone).
+    pub fn apply_replay_page(&mut self, page: &EventPage) -> Result<(), ClientModelError> {
+        let mut candidate = self.clone();
+        candidate.apply_replay_page_inner(page)?;
+        *self = candidate;
+        Ok(())
+    }
+
+    fn apply_replay_page_inner(&mut self, page: &EventPage) -> Result<(), ClientModelError> {
+        if page.through_sequence < page.after_sequence {
+            return Err(ClientModelError::ReplayRangeInvalid);
+        }
+        if page.after_sequence != self.last_applied_sequence {
+            return Err(ClientModelError::ReplayAfterMismatch);
+        }
+        match self.replay_through {
+            Some(pinned) if pinned != page.through_sequence => {
+                return Err(ClientModelError::ReplayThroughDrift);
+            }
+            Some(_) => {}
+            None => self.replay_through = Some(page.through_sequence),
+        }
+        if page.events.is_empty() && page.next_cursor.is_some() {
+            return Err(ClientModelError::ReplayNonProgressing);
+        }
+        if let Some(cursor) = &page.next_cursor {
+            Self::check_replay_continuation_bounds(
+                self.replay_page_count,
+                MAX_CLIENT_REPLAY_PAGES,
+                &self.replay_cursors,
+                cursor,
+            )?;
+            self.replay_cursors.insert(cursor.clone());
+        }
+        self.replay_page_count = self
+            .replay_page_count
+            .checked_add(1)
+            .ok_or(ClientModelError::ReplayPageBoundExceeded)?;
+        if self.replay_page_count > MAX_CLIENT_REPLAY_PAGES {
+            return Err(ClientModelError::ReplayPageBoundExceeded);
+        }
+
+        for event in &page.events {
+            if event.sequence <= page.after_sequence || event.sequence > page.through_sequence {
+                return Err(ClientModelError::ReplayRangeInvalid);
+            }
+            // Intentionally call apply_one_event (staged entry updates only), not a
+            // full-model-cloning wrapper, so a large page does not clone per event.
+            self.apply_one_event(event)?;
+        }
+        if page.next_cursor.is_none() {
+            if page.through_sequence < self.last_applied_sequence {
+                return Err(ClientModelError::ReplayRangeInvalid);
+            }
+            self.last_applied_sequence = page.through_sequence;
+            self.task_projection_index
+                .set_revision(page.through_sequence);
+            self.replay_through = None;
+            self.replay_page_count = 0;
+            self.replay_cursors.clear();
+        }
+        Ok(())
+    }
+
+    /// Validate and commit one event by staging only affected task/operation facts.
+    fn apply_one_event(&mut self, event: &DomainEvent) -> Result<(), ClientModelError> {
+        if event.sequence <= self.last_applied_sequence {
+            return Err(ClientModelError::DuplicateOrRegression);
+        }
+        let staged = self.stage_event(event)?;
+        if let Some((task_id, snapshot)) = staged.task {
+            self.tasks.insert(task_id, snapshot.clone());
+            self.task_projection_index
+                .update_task(&snapshot, event.occurred_at_ms);
+            // The event stream cannot reconstruct rows the startup snapshot
+            // never shipped, so a task whose detail was fetched on selection
+            // must be refetched rather than left half-current.
+            self.admitted_task_detail.remove(&task_id);
+        }
+        if let Some((operation_id, facts)) = staged.operation {
+            self.operations.insert(operation_id, facts);
+        }
+        if let Some(summary) = staged.artifact_summary {
+            self.artifact_summaries.insert(summary.id, summary);
+        }
+        self.last_applied_sequence = event.sequence;
+        self.task_projection_index.set_revision(event.sequence);
+        Ok(())
+    }
+
+    fn stage_event(&self, event: &DomainEvent) -> Result<StagedEventCommit, ClientModelError> {
+        self.require_operation_envelope_timestamp(event)?;
+        match &event.payload {
+            Event::OperationAccepted(fact) => {
+                let task = if let Some(task_id) = event.task_id {
+                    let current = self.tasks.get(&task_id).cloned();
+                    let next = apply(current, event).map_err(|_| ClientModelError::ApplyFailed)?;
+                    Some((task_id, next))
+                } else {
+                    None
+                };
+                if self.operations.contains_key(&fact.operation_id) {
+                    return Err(ClientModelError::OperationStateRegression);
+                }
+                Ok(StagedEventCommit {
+                    task,
+                    operation: Some((
+                        fact.operation_id,
+                        OperationFacts {
+                            id: fact.operation_id,
+                            command_id: fact.command_id,
+                            task_id: event.task_id,
+                            state: OperationState::Accepted,
+                            accepted_at_ms: fact.accepted_at_ms,
+                        },
+                    )),
+                    artifact_summary: None,
+                })
+            }
+            Event::OperationSettled(fact) => {
+                let task = self.stage_task_passthrough(event)?;
+                let operation = self.stage_operation_outcome(
+                    fact.operation_id,
+                    fact.command_id,
+                    event.task_id,
+                    fact.settled_at_ms,
+                    Some(&fact.source),
+                    OperationState::Settled {
+                        settled_at_ms: fact.settled_at_ms,
+                        result_event_ids: fact.result_event_ids.clone(),
+                    },
+                )?;
+                Ok(StagedEventCommit {
+                    task,
+                    operation: Some(operation),
+                    artifact_summary: None,
+                })
+            }
+            Event::OperationFailed(fact) => {
+                let task = self.stage_task_passthrough(event)?;
+                let operation = self.stage_operation_outcome(
+                    fact.operation_id,
+                    fact.command_id,
+                    event.task_id,
+                    fact.settled_at_ms,
+                    Some(&fact.source),
+                    OperationState::Failed {
+                        settled_at_ms: fact.settled_at_ms,
+                        code: fact.code,
+                    },
+                )?;
+                Ok(StagedEventCommit {
+                    task,
+                    operation: Some(operation),
+                    artifact_summary: None,
+                })
+            }
+            Event::OperationCancelled(fact) => {
+                let task = self.stage_task_passthrough(event)?;
+                let operation = self.stage_operation_outcome(
+                    fact.operation_id,
+                    fact.command_id,
+                    event.task_id,
+                    fact.settled_at_ms,
+                    None,
+                    OperationState::Cancelled {
+                        settled_at_ms: fact.settled_at_ms,
+                        reason: fact.reason,
+                    },
+                )?;
+                Ok(StagedEventCommit {
+                    task,
+                    operation: Some(operation),
+                    artifact_summary: None,
+                })
+            }
+            Event::OperationUncertain(fact) => {
+                let task = self.stage_task_passthrough(event)?;
+                let operation = self.stage_operation_outcome(
+                    fact.operation_id,
+                    fact.command_id,
+                    event.task_id,
+                    fact.observed_at_ms,
+                    None,
+                    OperationState::Uncertain {
+                        observed_at_ms: fact.observed_at_ms,
+                        code: fact.code,
+                    },
+                )?;
+                Ok(StagedEventCommit {
+                    task,
+                    operation: Some(operation),
+                    artifact_summary: None,
+                })
+            }
+            Event::TaskCreated { task, .. } => {
+                if self.tasks.contains_key(&task.id) {
+                    return Err(ClientModelError::ApplyFailed);
+                }
+                let next = apply(None, event).map_err(|_| ClientModelError::ApplyFailed)?;
+                Ok(StagedEventCommit {
+                    task: Some((task.id, next)),
+                    operation: None,
+                    artifact_summary: None,
+                })
+            }
+            Event::ArtifactRegistered { artifact }
+            | Event::SpecialistHandoffRecorded { artifact, .. } => {
+                if self.artifact_summaries.contains_key(&artifact.id) {
+                    return Err(ClientModelError::DuplicateItem);
+                }
+                let task_id = event.task_id.ok_or(ClientModelError::ApplyFailed)?;
+                let current = self.tasks.get(&task_id).cloned();
+                let mut next = apply(current, event).map_err(|_| ClientModelError::ApplyFailed)?;
+                // Domain apply inserts full ArtifactFacts for revision correctness;
+                // the public client model retains metadata-only summaries.
+                let summary = ArtifactSummary::from_facts(artifact)
+                    .map_err(|_| ClientModelError::ApplyFailed)?;
+                next.artifacts.remove(&artifact.id);
+                Ok(StagedEventCommit {
+                    task: Some((task_id, next)),
+                    operation: None,
+                    artifact_summary: Some(summary),
+                })
+            }
+            Event::HostCloseBegun { .. } | Event::HostCleanupBranchCompleted { .. } => {
+                Ok(StagedEventCommit {
+                    task: None,
+                    operation: None,
+                    artifact_summary: None,
+                })
+            }
+            // The purge sweep redacts a deleted task's events in place
+            // rather than deleting the rows, so a client resuming across
+            // the purged range receives these instead of a history gap.
+            // They name no task; the catch-all below would read that
+            // absent task id as ApplyFailed and poison the session.
+            Event::Purged => Ok(StagedEventCommit {
+                task: None,
+                operation: None,
+                artifact_summary: None,
+            }),
+            _ => {
+                let task_id = event.task_id.ok_or(ClientModelError::ApplyFailed)?;
+                let current = self.tasks.get(&task_id).cloned();
+                let next = apply(current, event).map_err(|_| ClientModelError::ApplyFailed)?;
+                Ok(StagedEventCommit {
+                    task: Some((task_id, next)),
+                    operation: None,
+                    artifact_summary: None,
+                })
+            }
+        }
+    }
+
+    fn require_operation_envelope_timestamp(
+        &self,
+        event: &DomainEvent,
+    ) -> Result<(), ClientModelError> {
+        let _ = self;
+        let expected = match &event.payload {
+            Event::OperationAccepted(fact) => fact.accepted_at_ms,
+            Event::OperationSettled(fact) => fact.settled_at_ms,
+            Event::OperationFailed(fact) => fact.settled_at_ms,
+            Event::OperationCancelled(fact) => fact.settled_at_ms,
+            Event::OperationUncertain(fact) => fact.observed_at_ms,
+            _ => return Ok(()),
+        };
+        if event.occurred_at_ms != expected {
+            return Err(ClientModelError::OperationEnvelopeTimestampMismatch);
+        }
+        Ok(())
+    }
+
+    fn stage_task_passthrough(
+        &self,
+        event: &DomainEvent,
+    ) -> Result<Option<(TaskId, TaskSnapshot)>, ClientModelError> {
+        let Some(task_id) = event.task_id else {
+            return Ok(None);
+        };
+        let current = self.tasks.get(&task_id).cloned();
+        let next = apply(current, event).map_err(|_| ClientModelError::ApplyFailed)?;
+        Ok(Some((task_id, next)))
+    }
+
+    fn stage_operation_outcome(
+        &self,
+        operation_id: OperationId,
+        command_id: crate::domain::id::CommandId,
+        task_id: Option<TaskId>,
+        outcome_at_ms: i64,
+        source: Option<&crate::domain::operation::OutcomeSource>,
+        next_state: OperationState,
+    ) -> Result<(OperationId, OperationFacts), ClientModelError> {
+        use crate::domain::operation::OutcomeSource;
+
+        let mut operation = self
+            .operations
+            .get(&operation_id)
+            .cloned()
+            .ok_or(ClientModelError::MissingOperation)?;
+        if operation.command_id != command_id || operation.task_id != task_id {
+            return Err(ClientModelError::OperationIdentityMismatch);
+        }
+        if outcome_at_ms < operation.accepted_at_ms {
+            return Err(ClientModelError::OperationStateRegression);
+        }
+
+        let next_kind = match &next_state {
+            OperationState::Settled { .. } => "settled",
+            OperationState::Failed { .. } => "failed",
+            OperationState::Cancelled { .. } => "cancelled",
+            OperationState::Uncertain { .. } => "uncertain",
+            OperationState::Accepted => {
+                return Err(ClientModelError::OperationStateRegression);
+            }
+        };
+
+        match (&operation.state, source, next_kind) {
+            (OperationState::Accepted, None, "cancelled" | "uncertain") => {}
+            (OperationState::Accepted, Some(OutcomeSource::Dispatch), "settled" | "failed") => {}
+            (
+                OperationState::Uncertain { observed_at_ms, .. },
+                Some(OutcomeSource::VerifiedReconciliation { .. }),
+                "settled" | "failed",
+            ) => {
+                if outcome_at_ms < *observed_at_ms {
+                    return Err(ClientModelError::OperationStateRegression);
+                }
+            }
+            (
+                OperationState::Accepted,
+                Some(OutcomeSource::VerifiedReconciliation { .. }),
+                "settled" | "failed",
+            ) => {
+                return Err(ClientModelError::OperationStateRegression);
+            }
+            (
+                OperationState::Uncertain { .. },
+                Some(OutcomeSource::Dispatch),
+                "settled" | "failed",
+            ) => {
+                return Err(ClientModelError::OperationStateRegression);
+            }
+            _ => return Err(ClientModelError::OperationStateRegression),
+        }
+
+        operation.state = next_state;
+        Ok((operation_id, operation))
+    }
+}
+
+struct StagedEventCommit {
+    task: Option<(TaskId, TaskSnapshot)>,
+    operation: Option<(OperationId, OperationFacts)>,
+    artifact_summary: Option<ArtifactSummary>,
+}
+
+#[derive(Debug, Default)]
+struct SectionAssembly {
+    started: bool,
+    finished: bool,
+    seen_cursors: HashSet<Vec<u8>>,
+    expected_after: Option<crate::domain::snapshot::SnapshotItemKey>,
+}
+
+fn section_index(section: SnapshotSection) -> usize {
+    match section {
+        SnapshotSection::Tasks => 0,
+        SnapshotSection::AgentSessions => 1,
+        SnapshotSection::Artifacts => 2,
+        SnapshotSection::Resources => 3,
+        SnapshotSection::Operations => 4,
+        SnapshotSection::BrowserContexts => 5,
+        SnapshotSection::BrowserTabs => 6,
+    }
+}
+
+fn snapshot_item_key(item: &SnapshotItem) -> crate::domain::snapshot::SnapshotItemKey {
+    match item {
+        SnapshotItem::Task(task) => crate::domain::snapshot::SnapshotItemKey::Task(task.task.id),
+        SnapshotItem::AgentSession(agent) => {
+            crate::domain::snapshot::SnapshotItemKey::AgentSession(agent.id)
+        }
+        SnapshotItem::Artifact(artifact) => {
+            crate::domain::snapshot::SnapshotItemKey::Artifact(artifact.id)
+        }
+        SnapshotItem::Resource(resource) => {
+            crate::domain::snapshot::SnapshotItemKey::Resource(resource.id)
+        }
+        SnapshotItem::Operation(operation) => {
+            crate::domain::snapshot::SnapshotItemKey::Operation(operation.id)
+        }
+        SnapshotItem::BrowserContext(context) => {
+            crate::domain::snapshot::SnapshotItemKey::BrowserContext(context.context_id)
+        }
+        SnapshotItem::BrowserTab(tab) => {
+            crate::domain::snapshot::SnapshotItemKey::BrowserTab(tab.tab_id)
+        }
+    }
+}
+
+/// Pure builder that admits bounded snapshot pages from one pinned view.
+#[derive(Debug)]
+pub struct ClientModelBuilder {
+    snapshot_id: Option<SnapshotId>,
+    through_sequence: Option<u64>,
+    page_count: usize,
+    item_count: usize,
+    sections: [SectionAssembly; SNAPSHOT_SECTION_COUNT],
+    tasks: BTreeMap<TaskId, TaskSnapshotItem>,
+    agents: BTreeMap<AgentSessionId, AgentSessionFacts>,
+    artifacts: BTreeMap<ArtifactId, ArtifactSummary>,
+    resources: BTreeMap<ResourceId, ResourceFacts>,
+    operations: BTreeMap<OperationId, OperationFacts>,
+    browser_contexts: BTreeMap<BrowserContextId, crate::domain::browser::BrowserContextView>,
+    browser_tabs: BTreeMap<crate::domain::id::BrowserTabId, crate::domain::browser::BrowserTabView>,
+}
+
+impl Default for ClientModelBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ClientModelBuilder {
+    pub fn new() -> Self {
+        Self {
+            snapshot_id: None,
+            through_sequence: None,
+            page_count: 0,
+            item_count: 0,
+            sections: Default::default(),
+            tasks: BTreeMap::new(),
+            agents: BTreeMap::new(),
+            artifacts: BTreeMap::new(),
+            resources: BTreeMap::new(),
+            operations: BTreeMap::new(),
+            browser_contexts: BTreeMap::new(),
+            browser_tabs: BTreeMap::new(),
+        }
+    }
+
+    pub fn ingest_page(&mut self, page: SnapshotPage) -> Result<(), ClientModelError> {
+        if self.page_count >= MAX_CLIENT_MODEL_PAGES {
+            return Err(ClientModelError::PageBoundExceeded);
+        }
+        self.page_count += 1;
+
+        match self.snapshot_id {
+            Some(expected) if expected != page.snapshot_id => {
+                return Err(ClientModelError::SnapshotDrift);
+            }
+            Some(_) => {}
+            None => self.snapshot_id = Some(page.snapshot_id),
+        }
+        match self.through_sequence {
+            Some(expected) if expected != page.through_sequence => {
+                return Err(ClientModelError::SequenceDrift);
+            }
+            Some(_) => {}
+            None => self.through_sequence = Some(page.through_sequence),
+        }
+
+        let section_idx = section_index(page.section);
+        {
+            let section = &mut self.sections[section_idx];
+            if section.finished {
+                return Err(ClientModelError::DuplicateSection);
+            }
+            if !section.started {
+                if page.after_item.is_some() {
+                    return Err(ClientModelError::NonProgressingPage);
+                }
+                section.started = true;
+            } else {
+                match (&section.expected_after, &page.after_item) {
+                    (Some(expected), Some(actual)) if expected == actual => {}
+                    _ => return Err(ClientModelError::SnapshotBoundaryMismatch),
+                }
+            }
+        }
+
+        if page.items.is_empty() && page.next_cursor.is_some() {
+            return Err(ClientModelError::NonProgressingPage);
+        }
+
+        for item in &page.items {
+            if self.item_count >= MAX_CLIENT_MODEL_ITEMS {
+                return Err(ClientModelError::ItemBoundExceeded);
+            }
+            self.item_count += 1;
+            self.admit_item(page.section, item)?;
+        }
+
+        let last_key = page.items.last().map(snapshot_item_key);
+        let section = &mut self.sections[section_idx];
+        match page.next_cursor {
+            Some(cursor) => {
+                if section.seen_cursors.len() >= MAX_CLIENT_MODEL_CURSORS_PER_SECTION {
+                    return Err(ClientModelError::CursorBoundExceeded);
+                }
+                if !section.seen_cursors.insert(cursor) {
+                    return Err(ClientModelError::RepeatedCursor);
+                }
+                let Some(last_key) = last_key else {
+                    return Err(ClientModelError::NonProgressingPage);
+                };
+                section.expected_after = Some(last_key);
+            }
+            None => {
+                section.expected_after = None;
+                section.finished = true;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn finish(self) -> Result<ClientModel, ClientModelError> {
+        if self.sections[..REQUIRED_SNAPSHOT_SECTION_COUNT]
+            .iter()
+            .any(|section| !section.finished)
+        {
+            return Err(ClientModelError::MissingSections);
+        }
+        let browser_sections = &self.sections[REQUIRED_SNAPSHOT_SECTION_COUNT..];
+        if browser_sections.iter().any(|section| section.started)
+            && browser_sections.iter().any(|section| !section.finished)
+        {
+            return Err(ClientModelError::MissingSections);
+        }
+        self.finish_assembled()
+    }
+
+    /// Finish after a fully paged Tasks section only. Returns a dedicated
+    /// [`TaskInboxPreview`]; never constructs [`ClientModel`].
+    pub fn finish_tasks_preview(self) -> Result<TaskInboxPreview, ClientModelError> {
+        let tasks_idx = section_index(SnapshotSection::Tasks);
+        if !self.sections[tasks_idx].finished {
+            return Err(ClientModelError::MissingSections);
+        }
+        for (idx, section) in self.sections.iter().enumerate() {
+            if idx != tasks_idx && section.started {
+                return Err(ClientModelError::DuplicateSection);
+            }
+        }
+        let through_sequence = self
+            .through_sequence
+            .ok_or(ClientModelError::MissingSections)?;
+        let mut tasks = BTreeMap::new();
+        for (task_id, item) in self.tasks {
+            tasks.insert(task_id, task_snapshot_from_item(item));
+        }
+        Ok(TaskInboxPreview {
+            tasks,
+            through_sequence,
+        })
+    }
+
+    fn finish_assembled(self) -> Result<ClientModel, ClientModelError> {
+        let through_sequence = self
+            .through_sequence
+            .ok_or(ClientModelError::MissingSections)?;
+
+        let mut tasks = BTreeMap::new();
+        for (task_id, item) in self.tasks {
+            let primary_agent_id = item.primary_agent_id;
+            let mut snapshot = task_snapshot_from_item(item);
+            snapshot.primary_agent_id = primary_agent_id;
+            tasks.insert(task_id, snapshot);
+        }
+
+        for (agent_id, agent) in self.agents {
+            let task = tasks
+                .get_mut(&agent.task_id)
+                .ok_or(ClientModelError::MissingParentTask)?;
+            if task.agents.insert(agent_id, agent).is_some() {
+                return Err(ClientModelError::DuplicateItem);
+            }
+        }
+
+        for (context_id, context) in self.browser_contexts {
+            let task = tasks
+                .get_mut(&context.task_id)
+                .ok_or(ClientModelError::MissingParentTask)?;
+            task.browser
+                .project_context_view(&context)
+                .map_err(|_| ClientModelError::InvalidOwnership)?;
+            if task.browser.context_view(context_id).is_none() {
+                return Err(ClientModelError::ApplyFailed);
+            }
+        }
+
+        for (tab_id, tab) in self.browser_tabs {
+            let task = tasks
+                .get_mut(&tab.task_id)
+                .ok_or(ClientModelError::MissingParentTask)?;
+            task.browser
+                .project_tab_view(&tab)
+                .map_err(|_| ClientModelError::InvalidOwnership)?;
+            if task.browser.tab_view(tab_id).is_none() {
+                return Err(ClientModelError::ApplyFailed);
+            }
+        }
+
+        // Snapshot ArtifactSummary items never invent content_ref into TaskSnapshot.
+        for summary in self.artifacts.values() {
+            if !tasks.contains_key(&summary.task_id) {
+                return Err(ClientModelError::MissingParentTask);
+            }
+        }
+
+        let mut host_resources = BTreeMap::new();
+        for (resource_id, resource) in self.resources {
+            match resource.owner_kind {
+                OwnerKind::Host => {
+                    if resource.task_id.is_some() {
+                        return Err(ClientModelError::InvalidOwnership);
+                    }
+                    if host_resources.insert(resource_id, resource).is_some() {
+                        return Err(ClientModelError::DuplicateItem);
+                    }
+                }
+                OwnerKind::Task => {
+                    let task_id = resource.task_id.ok_or(ClientModelError::InvalidOwnership)?;
+                    let task = tasks
+                        .get_mut(&task_id)
+                        .ok_or(ClientModelError::MissingParentTask)?;
+                    if task.resources.insert(resource_id, resource).is_some() {
+                        return Err(ClientModelError::DuplicateItem);
+                    }
+                }
+            }
+        }
+
+        for task in tasks.values() {
+            validate_primary_agent(task)?;
+        }
+
+        for operation in self.operations.values() {
+            if let Some(task_id) = operation.task_id {
+                if !tasks.contains_key(&task_id) {
+                    return Err(ClientModelError::MissingParentTask);
+                }
+            }
+        }
+
+        let task_projection_index = TaskProjectionIndex::from_tasks(&tasks, through_sequence);
+
+        Ok(ClientModel {
+            tasks,
+            host_resources,
+            operations: self.operations,
+            artifact_summaries: self.artifacts,
+            last_applied_sequence: through_sequence,
+            replay_through: None,
+            replay_page_count: 0,
+            replay_cursors: HashSet::new(),
+            task_projection_index,
+            admitted_task_detail: BTreeSet::new(),
+        })
+    }
+
+    fn admit_item(
+        &mut self,
+        section: SnapshotSection,
+        item: &SnapshotItem,
+    ) -> Result<(), ClientModelError> {
+        match (section, item) {
+            (SnapshotSection::Tasks, SnapshotItem::Task(task_item)) => {
+                if self
+                    .tasks
+                    .insert(task_item.task.id, task_item.clone())
+                    .is_some()
+                {
+                    return Err(ClientModelError::DuplicateItem);
+                }
+            }
+            (SnapshotSection::AgentSessions, SnapshotItem::AgentSession(agent)) => {
+                if self.agents.insert(agent.id, agent.clone()).is_some() {
+                    return Err(ClientModelError::DuplicateItem);
+                }
+            }
+            (SnapshotSection::Artifacts, SnapshotItem::Artifact(artifact)) => {
+                if self
+                    .artifacts
+                    .insert(artifact.id, artifact.clone())
+                    .is_some()
+                {
+                    return Err(ClientModelError::DuplicateItem);
+                }
+            }
+            (SnapshotSection::Resources, SnapshotItem::Resource(resource)) => {
+                resource
+                    .validate()
+                    .map_err(|_| ClientModelError::InvalidOwnership)?;
+                if self
+                    .resources
+                    .insert(resource.id, resource.clone())
+                    .is_some()
+                {
+                    return Err(ClientModelError::DuplicateItem);
+                }
+            }
+            (SnapshotSection::Operations, SnapshotItem::Operation(operation)) => {
+                if self
+                    .operations
+                    .insert(operation.id, operation.clone())
+                    .is_some()
+                {
+                    return Err(ClientModelError::DuplicateItem);
+                }
+            }
+            (SnapshotSection::BrowserContexts, SnapshotItem::BrowserContext(context)) => {
+                if self
+                    .browser_contexts
+                    .insert(context.context_id, context.clone())
+                    .is_some()
+                {
+                    return Err(ClientModelError::DuplicateItem);
+                }
+            }
+            (SnapshotSection::BrowserTabs, SnapshotItem::BrowserTab(tab)) => {
+                if self.browser_tabs.insert(tab.tab_id, tab.clone()).is_some() {
+                    return Err(ClientModelError::DuplicateItem);
+                }
+            }
+            _ => return Err(ClientModelError::SectionItemMismatch),
+        }
+        Ok(())
+    }
+}
+
+/// Presentation-only browser dock DTO. Assembled from Task identity or
+/// bounded browser snapshot pages; never a host-effect settler.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientBrowserDockView {
+    pub task_id: TaskId,
+    pub title: String,
+    pub agent_session_id: Option<AgentSessionId>,
+    pub context_id: Option<BrowserContextId>,
+    pub resource_id: Option<ResourceId>,
+    pub selected_tab_id: Option<crate::domain::id::BrowserTabId>,
+    pub generation: Option<u64>,
+    pub shareable_url: Option<String>,
+    pub tab_count: usize,
+}
+
+impl ClientBrowserDockView {
+    pub fn from_browser_pages(
+        task_id: TaskId,
+        pages: &[crate::domain::browser::BrowserSnapshotPage],
+    ) -> Result<Self, ClientModelError> {
+        let mut generation = None;
+        let mut shareable_url = None;
+        let mut tab_count = 0usize;
+        for page in pages {
+            for row in &page.items {
+                if row.task_id() != Some(task_id) {
+                    return Err(ClientModelError::InvalidOwnership);
+                }
+                if let Some(row_generation) = row.generation() {
+                    generation = Some(row_generation);
+                }
+                if let Some(url) = row.shareable_url() {
+                    shareable_url = Some(url);
+                }
+                if row.tab_id().is_some() && !row.closed() {
+                    tab_count = tab_count.saturating_add(1);
+                }
+            }
+        }
+        Ok(Self {
+            task_id,
+            title: String::new(),
+            agent_session_id: None,
+            context_id: None,
+            resource_id: None,
+            selected_tab_id: None,
+            generation,
+            shareable_url,
+            tab_count,
+        })
+    }
+}
+
+/// Task-scoped cockpit surface projection. Carries no host paths or secrets.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskCockpitSurfaceProjection {
+    pub task_id: TaskId,
+    pub surfaces: Vec<crate::client::action::CockpitSurfaceDescriptor>,
+}
+
+impl TaskCockpitSurfaceProjection {
+    pub fn available_service_controls(&self) -> impl Iterator<Item = &str> + '_ {
+        self.surfaces.iter().filter_map(|surface| {
+            if surface.kind == crate::client::action::CockpitSurfaceKind::Services
+                && surface.available
+            {
+                surface.action_id
+            } else {
+                None
+            }
+        })
+    }
+
+    pub fn unavailable_workspace_surfaces(
+        &self,
+    ) -> impl Iterator<Item = &crate::client::action::CockpitSurfaceDescriptor> + '_ {
+        self.surfaces.iter().filter(|surface| {
+            !surface.available
+                && matches!(
+                    surface.kind,
+                    crate::client::action::CockpitSurfaceKind::Workspace
+                        | crate::client::action::CockpitSurfaceKind::Git
+                        | crate::client::action::CockpitSurfaceKind::Files
+                        | crate::client::action::CockpitSurfaceKind::Ssh
+                )
+        })
+    }
+}
+
+/// One-hour freshness bound shared with the native top-bar quota projection.
+pub const PROVIDER_QUOTA_MAX_AGE_MS: i64 = 60 * 60 * 1_000;
+
+/// Reject unavailable, future, or older-than-one-hour quota observations.
+pub fn quota_observation_is_fresh(observed_at_ms: Option<i64>, now_ms: i64) -> bool {
+    let Some(observed_at_ms) = observed_at_ms else {
+        return false;
+    };
+    match now_ms.checked_sub(observed_at_ms) {
+        Some(age) => (0..=PROVIDER_QUOTA_MAX_AGE_MS).contains(&age),
+        None => false,
+    }
+}
+
+/// Keep the newest in-window observation per provider label. Missing detail is
+/// omitted rather than replaced with a placeholder.
+pub fn one_fresh_quota_per_provider(
+    observations: &[(String, Option<String>, i64)],
+    now_ms: i64,
+) -> Vec<(String, String)> {
+    let mut latest = BTreeMap::<String, (i64, String)>::new();
+    for (provider, detail, observed_at_ms) in observations {
+        if !quota_observation_is_fresh(Some(*observed_at_ms), now_ms) {
+            continue;
+        }
+        let Some(detail) = detail.as_ref().filter(|detail| !detail.trim().is_empty()) else {
+            continue;
+        };
+        let replace = latest
+            .get(provider)
+            .is_none_or(|(current, _)| *observed_at_ms >= *current);
+        if replace {
+            latest.insert(provider.clone(), (*observed_at_ms, detail.clone()));
+        }
+    }
+    latest
+        .into_iter()
+        .map(|(provider, (_, detail))| (provider, detail))
+        .collect()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamAdmissionReject {
+    SubscriptionMismatch,
+    ResourceMismatch,
+    GenerationMismatch { expected: u64, actual: u64 },
+    ZeroSequence,
+    StaleSequence { last: u64, actual: u64 },
+    SequenceGap { last: u64, actual: u64 },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdmittedStreamFrame {
+    pub resource_id: ResourceId,
+    pub generation: u64,
+    pub sequence: u64,
+    pub output: Option<String>,
+}
+
+/// Admit a live [`crate::protocol::StreamFrame`] against exact subscription,
+/// resource, generation, and sequence fences. Provider conversation identity
+/// is never inferred from this ephemeral PTY/resource stream.
+pub fn admit_subscription_stream(
+    expected_subscription: SubscriptionId,
+    expected_resource: ResourceId,
+    expected_generation: u64,
+    last_sequence: u64,
+    frame: &crate::protocol::StreamFrame,
+) -> Result<AdmittedStreamFrame, StreamAdmissionReject> {
+    if frame.subscription_id != expected_subscription {
+        return Err(StreamAdmissionReject::SubscriptionMismatch);
+    }
+    if frame.stream.resource_id() != expected_resource {
+        return Err(StreamAdmissionReject::ResourceMismatch);
+    }
+    if frame.generation != expected_generation {
+        return Err(StreamAdmissionReject::GenerationMismatch {
+            expected: expected_generation,
+            actual: frame.generation,
+        });
+    }
+    if frame.sequence == 0 {
+        return Err(StreamAdmissionReject::ZeroSequence);
+    }
+    if last_sequence != 0 && frame.sequence <= last_sequence {
+        return Err(StreamAdmissionReject::StaleSequence {
+            last: last_sequence,
+            actual: frame.sequence,
+        });
+    }
+    if last_sequence != 0 && frame.sequence != last_sequence.saturating_add(1) {
+        return Err(StreamAdmissionReject::SequenceGap {
+            last: last_sequence,
+            actual: frame.sequence,
+        });
+    }
+    if last_sequence == 0 && frame.sequence != 1 {
+        return Err(StreamAdmissionReject::SequenceGap {
+            last: last_sequence,
+            actual: frame.sequence,
+        });
+    }
+    let output = std::str::from_utf8(&frame.payload).ok().map(str::to_owned);
+    Ok(AdmittedStreamFrame {
+        resource_id: expected_resource,
+        generation: frame.generation,
+        sequence: frame.sequence,
+        output,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::agent::{AgentRole, AgentSessionFacts, AgentSessionLifecycle};
+    use crate::domain::artifact::{ArtifactKind, ArtifactSummary, PrivacyClass};
+    use crate::domain::event::{
+        OperationAcceptedFact, OperationCancelledFact, OperationFailedFact, OperationSettledFact,
+        OperationUncertainFact,
+    };
+    use crate::domain::id::{
+        AgentSessionId, ArtifactId, CommandId, EnvironmentId, EventId, OperationId, ProjectId,
+        ResourceId, SnapshotId, TaskId,
+    };
+    use crate::domain::operation::{
+        CancellationReason, OperationErrorCode, OperationState, OperationUncertaintyCode,
+        OutcomeSource,
+    };
+    use crate::domain::resource::{
+        OwnerKind, ResourceFacts, ResourceKind, ResourceLifecycle, ResourceRecipe,
+    };
+    use crate::domain::task::{
+        ReviewReadiness, TaskActivity, TaskAssignment, TaskAttention, TaskConnectivity, TaskFacts,
+        TaskLifecycle, WorkspaceRef,
+    };
+    use crate::providers::ProviderKind;
+
+    fn fixed_uuid_v7(tail: u8) -> [u8; 16] {
+        [
+            0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, tail,
+        ]
+    }
+
+    fn snapshot_id(tail: u8) -> SnapshotId {
+        SnapshotId::from_bytes(fixed_uuid_v7(tail)).expect("snapshot id")
+    }
+    fn task_id(tail: u8) -> TaskId {
+        TaskId::from_bytes(fixed_uuid_v7(tail)).expect("task id")
+    }
+    fn agent_id(tail: u8) -> AgentSessionId {
+        AgentSessionId::from_bytes(fixed_uuid_v7(tail)).expect("agent id")
+    }
+    fn artifact_id(tail: u8) -> ArtifactId {
+        ArtifactId::from_bytes(fixed_uuid_v7(tail)).expect("artifact id")
+    }
+    fn resource_id(tail: u8) -> ResourceId {
+        ResourceId::from_bytes(fixed_uuid_v7(tail)).expect("resource id")
+    }
+    fn operation_id(tail: u8) -> OperationId {
+        OperationId::from_bytes(fixed_uuid_v7(tail)).expect("operation id")
+    }
+    fn command_id(tail: u8) -> CommandId {
+        CommandId::from_bytes(fixed_uuid_v7(tail)).expect("command id")
+    }
+    fn event_id(tail: u8) -> EventId {
+        EventId::from_bytes(fixed_uuid_v7(tail)).expect("event id")
+    }
+    fn env_id(tail: u8) -> EnvironmentId {
+        EnvironmentId::from_bytes(fixed_uuid_v7(tail)).expect("env id")
+    }
+    fn project_id(tail: u8) -> ProjectId {
+        ProjectId::from_bytes(fixed_uuid_v7(tail)).expect("project id")
+    }
+
+    fn task_facts(id: TaskId, title: &str) -> TaskFacts {
+        TaskFacts {
+            id,
+            environment_id: env_id(0x10),
+            title: title.into(),
+            description: None,
+            project_id: project_id(0x11),
+            workspace: WorkspaceRef::Main,
+            assignment: TaskAssignment::LocalOwner,
+            lifecycle: TaskLifecycle::Open,
+            action_epoch: 0,
+            revision: 1,
+            created_at_ms: 1_725_000_000_000,
+        }
+    }
+
+    fn task_item(id: TaskId, title: &str, primary: Option<AgentSessionId>) -> TaskSnapshotItem {
+        TaskSnapshotItem {
+            task: task_facts(id, title),
+            connectivity: TaskConnectivity::Connected,
+            attention: TaskAttention::None,
+            activity: TaskActivity::Idle,
+            review_readiness: ReviewReadiness::NotReady,
+            primary_agent_id: primary,
+        }
+    }
+
+    fn page(
+        snapshot: SnapshotId,
+        through: u64,
+        section: SnapshotSection,
+        after: Option<crate::domain::snapshot::SnapshotItemKey>,
+        items: Vec<SnapshotItem>,
+        next: Option<Vec<u8>>,
+    ) -> SnapshotPage {
+        SnapshotPage {
+            snapshot_id: snapshot,
+            through_sequence: through,
+            section,
+            after_item: after,
+            items,
+            encoded_bytes: 1,
+            next_cursor: next,
+        }
+    }
+
+    fn empty_section_pages(snapshot: SnapshotId, through: u64) -> Vec<SnapshotPage> {
+        [
+            SnapshotSection::AgentSessions,
+            SnapshotSection::Artifacts,
+            SnapshotSection::Resources,
+            SnapshotSection::Operations,
+        ]
+        .into_iter()
+        .map(|section| page(snapshot, through, section, None, Vec::new(), None))
+        .collect()
+    }
+
+    fn assemble_all_sections(
+        snapshot: SnapshotId,
+        through: u64,
+        task_pages: Vec<SnapshotPage>,
+        extras: Vec<SnapshotPage>,
+    ) -> ClientModel {
+        let mut builder = ClientModelBuilder::new();
+        for page in task_pages {
+            builder.ingest_page(page).expect("ingest task page");
+        }
+        for page in &extras {
+            builder
+                .ingest_page(page.clone())
+                .expect("ingest section page");
+        }
+        for page in empty_section_pages(snapshot, through) {
+            if extras
+                .iter()
+                .any(|existing| existing.section == page.section)
+            {
+                continue;
+            }
+            builder.ingest_page(page).expect("ingest empty section");
+        }
+        builder.finish().expect("finish model")
+    }
+
+    fn settled_task_item(
+        id: TaskId,
+        title: &str,
+        primary: Option<AgentSessionId>,
+    ) -> TaskSnapshotItem {
+        let mut item = task_item(id, title, primary);
+        item.task.lifecycle = TaskLifecycle::Settled;
+        item
+    }
+
+    fn detail_agent(task: TaskId, agent: AgentSessionId) -> AgentSessionFacts {
+        AgentSessionFacts {
+            id: agent,
+            task_id: task,
+            role: AgentRole::Primary,
+            provider_kind: ProviderKind::Codex,
+            provider_session_id: None,
+            lifecycle: AgentSessionLifecycle::Open,
+            runtime_generation: 0,
+            revision: 1,
+        }
+    }
+
+    fn detail_resource(task: TaskId, resource: ResourceId) -> ResourceFacts {
+        ResourceFacts {
+            id: resource,
+            task_id: Some(task),
+            owner_kind: OwnerKind::Task,
+            resource_kind: ResourceKind::Terminal,
+            recipe: ResourceRecipe::terminal(120, 40),
+            lifecycle: ResourceLifecycle::Active,
+            runtime_generation: 0,
+            updated_at_ms: 1,
+        }
+    }
+
+    #[test]
+    fn startup_model_admits_a_settled_task_with_no_children() {
+        // Catches: the startup projection withholding a settled task's agent
+        // row being read as a corrupt primary-agent binding.
+        let snap = snapshot_id(0xE0);
+        let task = task_id(0xE1);
+        let agent = agent_id(0xE2);
+        let model = assemble_all_sections(
+            snap,
+            1,
+            vec![page(
+                snap,
+                1,
+                SnapshotSection::Tasks,
+                None,
+                vec![SnapshotItem::Task(settled_task_item(
+                    task,
+                    "Settled",
+                    Some(agent),
+                ))],
+                None,
+            )],
+            Vec::new(),
+        );
+        let projected = model.task(task).expect("settled task is listed");
+        assert!(projected.agents.is_empty());
+        assert!(projected.resources.is_empty());
+        assert!(!model.task_detail_admitted(task));
+    }
+
+    #[test]
+    fn open_task_still_requires_its_primary_agent_row() {
+        // Catches: relaxing the primary-agent check for every lifecycle rather
+        // than only the ones whose detail the startup projection withholds.
+        let snap = snapshot_id(0xE3);
+        let task = task_id(0xE4);
+        let agent = agent_id(0xE5);
+        let mut builder = ClientModelBuilder::new();
+        builder
+            .ingest_page(page(
+                snap,
+                1,
+                SnapshotSection::Tasks,
+                None,
+                vec![SnapshotItem::Task(task_item(task, "Open", Some(agent)))],
+                None,
+            ))
+            .expect("ingest task page");
+        for section_page in empty_section_pages(snap, 1) {
+            builder.ingest_page(section_page).expect("ingest empty");
+        }
+        assert_eq!(
+            builder.finish().err(),
+            Some(ClientModelError::InvalidPrimaryAgent)
+        );
+    }
+
+    #[test]
+    fn task_detail_admission_is_idempotent_and_event_invalidated() {
+        // Catches: a second selection refetching, and a durable event leaving
+        // detail that the event stream cannot itself reconstruct marked fresh.
+        let snap = snapshot_id(0xE6);
+        let task = task_id(0xE7);
+        let agent = agent_id(0xE8);
+        let resource = resource_id(0xE9);
+        let mut model = assemble_all_sections(
+            snap,
+            1,
+            vec![page(
+                snap,
+                1,
+                SnapshotSection::Tasks,
+                None,
+                vec![SnapshotItem::Task(settled_task_item(
+                    task,
+                    "Settled",
+                    Some(agent),
+                ))],
+                None,
+            )],
+            Vec::new(),
+        );
+        assert!(!model.task_detail_admitted(task));
+
+        let detail = vec![
+            page(
+                snap,
+                1,
+                SnapshotSection::AgentSessions,
+                None,
+                vec![SnapshotItem::AgentSession(detail_agent(task, agent))],
+                None,
+            ),
+            page(
+                snap,
+                1,
+                SnapshotSection::Resources,
+                None,
+                vec![SnapshotItem::Resource(detail_resource(task, resource))],
+                None,
+            ),
+        ];
+        model
+            .admit_task_detail_pages(task, &detail)
+            .expect("admit task detail");
+        assert!(model.task_detail_admitted(task));
+        let projected = model.task(task).expect("task");
+        assert_eq!(projected.agents.len(), 1);
+        assert_eq!(projected.resources.len(), 1);
+
+        // Re-admitting the same rows replaces rather than collides, which is
+        // what a post-invalidation refetch does.
+        model
+            .admit_task_detail_pages(task, &detail)
+            .expect("re-admit task detail");
+        assert_eq!(model.task(task).expect("task").agents.len(), 1);
+
+        // A row belonging to another task is a scope violation.
+        let other = task_id(0xEA);
+        let foreign = vec![page(
+            snap,
+            1,
+            SnapshotSection::AgentSessions,
+            None,
+            vec![SnapshotItem::AgentSession(detail_agent(
+                other,
+                agent_id(0xEB),
+            ))],
+            None,
+        )];
+        assert_eq!(
+            model.admit_task_detail_pages(task, &foreign).err(),
+            Some(ClientModelError::InvalidOwnership)
+        );
+        // Refused wholesale: the earlier detail is untouched.
+        assert_eq!(model.task(task).expect("task").agents.len(), 1);
+
+        // A durable event for the task retires the admission.
+        model
+            .apply_event(&DomainEvent {
+                id: event_id(0xEC),
+                task_id: Some(task),
+                sequence: 2,
+                task_revision: Some(2),
+                occurred_at_ms: 2,
+                payload: Event::TaskRenamed {
+                    title: "Renamed".into(),
+                },
+            })
+            .expect("apply rename");
+        assert!(!model.task_detail_admitted(task));
+    }
+
+    #[test]
+    fn assembles_all_sections_with_nested_ownership() {
+        let snap = snapshot_id(0x01);
+        let through = 9;
+        let task = task_id(0x21);
+        let agent = agent_id(0x22);
+        let artifact = artifact_id(0x23);
+        let task_resource = resource_id(0x24);
+        let host_resource = resource_id(0x25);
+        let operation = operation_id(0x26);
+
+        let mut builder = ClientModelBuilder::new();
+        builder
+            .ingest_page(page(
+                snap,
+                through,
+                SnapshotSection::Tasks,
+                None,
+                vec![SnapshotItem::Task(task_item(task, "Nested", Some(agent)))],
+                None,
+            ))
+            .expect("tasks page");
+
+        builder
+            .ingest_page(page(
+                snap,
+                through,
+                SnapshotSection::AgentSessions,
+                None,
+                vec![SnapshotItem::AgentSession(AgentSessionFacts {
+                    id: agent,
+                    task_id: task,
+                    role: AgentRole::Primary,
+                    provider_kind: ProviderKind::ClaudeCode,
+                    provider_session_id: Some("sess-1".parse().unwrap()),
+                    lifecycle: AgentSessionLifecycle::Open,
+                    runtime_generation: 0,
+                    revision: 0,
+                })],
+                None,
+            ))
+            .expect("agents");
+        builder
+            .ingest_page(page(
+                snap,
+                through,
+                SnapshotSection::Artifacts,
+                None,
+                vec![SnapshotItem::Artifact(ArtifactSummary {
+                    id: artifact,
+                    task_id: task,
+                    kind: ArtifactKind::Finding,
+                    label: "note".into(),
+                    sha256: [1u8; 32],
+                    privacy_class: PrivacyClass::LocalOnly,
+                    created_at_ms: 1,
+                })],
+                None,
+            ))
+            .expect("artifacts");
+        builder
+            .ingest_page(page(
+                snap,
+                through,
+                SnapshotSection::Resources,
+                None,
+                vec![
+                    SnapshotItem::Resource(ResourceFacts {
+                        id: task_resource,
+                        task_id: Some(task),
+                        owner_kind: OwnerKind::Task,
+                        resource_kind: ResourceKind::Terminal,
+                        recipe: ResourceRecipe::terminal(80, 24),
+                        lifecycle: ResourceLifecycle::Active,
+                        runtime_generation: 0,
+                        updated_at_ms: 1,
+                    }),
+                    SnapshotItem::Resource(ResourceFacts {
+                        id: host_resource,
+                        task_id: None,
+                        owner_kind: OwnerKind::Host,
+                        resource_kind: ResourceKind::Service,
+                        recipe: ResourceRecipe::Service {
+                            command: "echo host".into(),
+                        },
+                        lifecycle: ResourceLifecycle::Active,
+                        runtime_generation: 0,
+                        updated_at_ms: 1,
+                    }),
+                ],
+                None,
+            ))
+            .expect("resources");
+        builder
+            .ingest_page(page(
+                snap,
+                through,
+                SnapshotSection::Operations,
+                None,
+                vec![SnapshotItem::Operation(OperationFacts {
+                    id: operation,
+                    command_id: command_id(0x27),
+                    task_id: Some(task),
+                    state: OperationState::Accepted,
+                    accepted_at_ms: 1,
+                })],
+                None,
+            ))
+            .expect("operations");
+
+        let model = builder.finish().expect("assembled model");
+        assert_eq!(model.last_applied_sequence(), through);
+        let nested = model.tasks().get(&task).expect("task present");
+        assert_eq!(nested.agents.len(), 1);
+        assert_eq!(nested.primary_agent_id, Some(agent));
+        assert!(nested.artifacts.is_empty());
+        assert!(model.artifact_summaries().contains_key(&artifact));
+        assert!(nested.resources.contains_key(&task_resource));
+        assert!(!nested.resources.contains_key(&host_resource));
+        assert!(model.host_resources().contains_key(&host_resource));
+        assert_eq!(
+            model.operations().get(&operation).map(|op| &op.state),
+            Some(&OperationState::Accepted)
+        );
+    }
+
+    #[test]
+    fn artifact_registered_event_retains_summary_only_without_inline_body() {
+        // Catches: apply_event keeping full ArtifactFacts (inline body) in TaskSnapshot.
+        use crate::domain::artifact::{ArtifactContentRef, ArtifactFacts};
+        use sha2::{Digest, Sha256};
+
+        let snap = snapshot_id(0xA0);
+        let task = task_id(0xA1);
+        let mut model = assemble_all_sections(
+            snap,
+            1,
+            vec![page(
+                snap,
+                1,
+                SnapshotSection::Tasks,
+                None,
+                vec![SnapshotItem::Task(task_item(task, "Live", None))],
+                None,
+            )],
+            Vec::new(),
+        );
+        assert_eq!(model.last_applied_sequence(), 1);
+        assert!(model.tasks().get(&task).expect("task").artifacts.is_empty());
+
+        const BODY: &str = "CLIENT_MODEL_INLINE_BODY_TOKEN_2_5E";
+        let artifact = artifact_id(0xA2);
+        let mut hasher = Sha256::new();
+        hasher.update(BODY.as_bytes());
+        let digest: [u8; 32] = hasher.finalize().into();
+        let facts = ArtifactFacts {
+            id: artifact,
+            task_id: task,
+            kind: ArtifactKind::Evidence,
+            label: "LiveEvidence".into(),
+            content_ref: ArtifactContentRef::inline_utf8(BODY).expect("body"),
+            sha256: digest,
+            privacy_class: PrivacyClass::LocalOnly,
+            created_at_ms: 2,
+        };
+        model
+            .apply_event(&DomainEvent {
+                id: event_id(0xA3),
+                task_id: Some(task),
+                sequence: 2,
+                task_revision: Some(2),
+                occurred_at_ms: 2,
+                payload: Event::ArtifactRegistered {
+                    artifact: facts.clone(),
+                },
+            })
+            .expect("artifact registration applies");
+
+        assert_eq!(model.last_applied_sequence(), 2);
+        let nested = model.tasks().get(&task).expect("task present");
+        assert_eq!(nested.task.revision, 2);
+        assert!(
+            nested.artifacts.is_empty(),
+            "task snapshot must not retain full artifact facts"
+        );
+        let summary = model
+            .artifact_summaries()
+            .get(&artifact)
+            .expect("summary retained");
+        assert_eq!(summary.id, artifact);
+        assert_eq!(summary.sha256, digest);
+        assert_eq!(summary.label, "LiveEvidence");
+        let model_debug = format!("{model:?}");
+        assert!(
+            !model_debug.contains(BODY),
+            "public client model must not retain distinctive inline body"
+        );
+        let encoded = rmp_serde::to_vec_named(summary).expect("encode summary");
+        assert!(
+            !encoded
+                .windows(BODY.len())
+                .any(|window| window == BODY.as_bytes()),
+            "summary encoding must omit body"
+        );
+    }
+
+    #[test]
+    fn artifact_registered_rejects_snapshot_duplicate_id_without_mutation() {
+        // Catches: live ArtifactRegistered overwriting a snapshot-held summary ID.
+        use crate::domain::artifact::{ArtifactContentRef, ArtifactFacts};
+        use sha2::{Digest, Sha256};
+
+        let snap = snapshot_id(0xB0);
+        let task = task_id(0xB1);
+        let artifact = artifact_id(0xB2);
+        const ORIGINAL_LABEL: &str = "SnapshotHeld";
+        let original_digest = [0x11u8; 32];
+        let mut model = assemble_all_sections(
+            snap,
+            1,
+            vec![page(
+                snap,
+                1,
+                SnapshotSection::Tasks,
+                None,
+                vec![SnapshotItem::Task(task_item(task, "Dup", None))],
+                None,
+            )],
+            vec![page(
+                snap,
+                1,
+                SnapshotSection::Artifacts,
+                None,
+                vec![SnapshotItem::Artifact(ArtifactSummary {
+                    id: artifact,
+                    task_id: task,
+                    kind: ArtifactKind::Finding,
+                    label: ORIGINAL_LABEL.into(),
+                    sha256: original_digest,
+                    privacy_class: PrivacyClass::LocalOnly,
+                    created_at_ms: 1,
+                })],
+                None,
+            )],
+        );
+        assert_eq!(model.last_applied_sequence(), 1);
+        assert_eq!(model.tasks().get(&task).expect("task").task.revision, 1);
+        assert_eq!(
+            model
+                .artifact_summaries()
+                .get(&artifact)
+                .expect("summary")
+                .label,
+            ORIGINAL_LABEL
+        );
+
+        const BODY: &str = "SNAPSHOT_DUP_BODY_TOKEN";
+        let mut hasher = Sha256::new();
+        hasher.update(BODY.as_bytes());
+        let digest: [u8; 32] = hasher.finalize().into();
+        let err = model.apply_event(&DomainEvent {
+            id: event_id(0xB3),
+            task_id: Some(task),
+            sequence: 2,
+            task_revision: Some(2),
+            occurred_at_ms: 2,
+            payload: Event::ArtifactRegistered {
+                artifact: ArtifactFacts {
+                    id: artifact,
+                    task_id: task,
+                    kind: ArtifactKind::Evidence,
+                    label: "Overwritten".into(),
+                    content_ref: ArtifactContentRef::inline_utf8(BODY).expect("body"),
+                    sha256: digest,
+                    privacy_class: PrivacyClass::LocalOnly,
+                    created_at_ms: 2,
+                },
+            },
+        });
+        assert_eq!(err, Err(ClientModelError::DuplicateItem));
+        assert_eq!(model.last_applied_sequence(), 1);
+        assert_eq!(model.tasks().get(&task).expect("task").task.revision, 1);
+        let summary = model
+            .artifact_summaries()
+            .get(&artifact)
+            .expect("original summary retained");
+        assert_eq!(summary.label, ORIGINAL_LABEL);
+        assert_eq!(summary.sha256, original_digest);
+    }
+
+    #[test]
+    fn artifact_registered_rejects_live_duplicate_id_without_mutation() {
+        // Catches: second live ArtifactRegistered silently overwriting the first summary.
+        use crate::domain::artifact::{ArtifactContentRef, ArtifactFacts};
+        use sha2::{Digest, Sha256};
+
+        let snap = snapshot_id(0xC0);
+        let task = task_id(0xC1);
+        let artifact = artifact_id(0xC2);
+        let mut model = assemble_all_sections(
+            snap,
+            1,
+            vec![page(
+                snap,
+                1,
+                SnapshotSection::Tasks,
+                None,
+                vec![SnapshotItem::Task(task_item(task, "LiveDup", None))],
+                None,
+            )],
+            Vec::new(),
+        );
+
+        let body_a = "LIVE_DUP_BODY_A";
+        let mut hasher = Sha256::new();
+        hasher.update(body_a.as_bytes());
+        let digest_a: [u8; 32] = hasher.finalize().into();
+        model
+            .apply_event(&DomainEvent {
+                id: event_id(0xC3),
+                task_id: Some(task),
+                sequence: 2,
+                task_revision: Some(2),
+                occurred_at_ms: 2,
+                payload: Event::ArtifactRegistered {
+                    artifact: ArtifactFacts {
+                        id: artifact,
+                        task_id: task,
+                        kind: ArtifactKind::Evidence,
+                        label: "First".into(),
+                        content_ref: ArtifactContentRef::inline_utf8(body_a).expect("body"),
+                        sha256: digest_a,
+                        privacy_class: PrivacyClass::LocalOnly,
+                        created_at_ms: 2,
+                    },
+                },
+            })
+            .expect("first registration");
+        assert_eq!(model.last_applied_sequence(), 2);
+        assert_eq!(model.tasks().get(&task).expect("task").task.revision, 2);
+
+        let body_b = "LIVE_DUP_BODY_B";
+        let mut hasher = Sha256::new();
+        hasher.update(body_b.as_bytes());
+        let digest_b: [u8; 32] = hasher.finalize().into();
+        let err = model.apply_event(&DomainEvent {
+            id: event_id(0xC4),
+            task_id: Some(task),
+            sequence: 3,
+            task_revision: Some(3),
+            occurred_at_ms: 3,
+            payload: Event::ArtifactRegistered {
+                artifact: ArtifactFacts {
+                    id: artifact,
+                    task_id: task,
+                    kind: ArtifactKind::Evidence,
+                    label: "Second".into(),
+                    content_ref: ArtifactContentRef::inline_utf8(body_b).expect("body"),
+                    sha256: digest_b,
+                    privacy_class: PrivacyClass::LocalOnly,
+                    created_at_ms: 3,
+                },
+            },
+        });
+        assert_eq!(err, Err(ClientModelError::DuplicateItem));
+        assert_eq!(model.last_applied_sequence(), 2);
+        assert_eq!(model.tasks().get(&task).expect("task").task.revision, 2);
+        let summary = model
+            .artifact_summaries()
+            .get(&artifact)
+            .expect("first summary retained");
+        assert_eq!(summary.label, "First");
+        assert_eq!(summary.sha256, digest_a);
+    }
+
+    #[test]
+    fn applies_exact_events_allows_gaps_rejects_duplicates_and_regressions() {
+        let snap = snapshot_id(0x02);
+        let task = task_id(0x31);
+        let mut model = assemble_all_sections(
+            snap,
+            1,
+            vec![page(
+                snap,
+                1,
+                SnapshotSection::Tasks,
+                None,
+                vec![SnapshotItem::Task(task_item(task, "Gap", None))],
+                None,
+            )],
+            Vec::new(),
+        );
+        assert_eq!(model.last_applied_sequence(), 1);
+
+        let renamed = DomainEvent {
+            id: event_id(0x32),
+            task_id: Some(task),
+            sequence: 4,
+            task_revision: Some(2),
+            occurred_at_ms: 2,
+            payload: Event::TaskRenamed {
+                title: "Gap filled".into(),
+            },
+        };
+        model.apply_event(&renamed).expect("gap 1 -> 4 is valid");
+        assert_eq!(model.last_applied_sequence(), 4);
+        assert_eq!(model.tasks()[&task].task.title, "Gap filled");
+
+        assert_eq!(
+            model.apply_event(&renamed),
+            Err(ClientModelError::DuplicateOrRegression)
+        );
+        let regression = DomainEvent {
+            id: event_id(0x33),
+            task_id: Some(task),
+            sequence: 3,
+            task_revision: Some(3),
+            occurred_at_ms: 3,
+            payload: Event::TaskAttentionSet {
+                attention: TaskAttention::NeedsAnswer,
+            },
+        };
+        assert_eq!(
+            model.apply_event(&regression),
+            Err(ClientModelError::DuplicateOrRegression)
+        );
+        assert_eq!(model.last_applied_sequence(), 4);
+    }
+
+    #[test]
+    fn operation_terminal_state_is_monotonic() {
+        let snap = snapshot_id(0x03);
+        let task = task_id(0x41);
+        let operation = operation_id(0x42);
+        let command = command_id(0x43);
+        let mut model = assemble_all_sections(
+            snap,
+            2,
+            vec![page(
+                snap,
+                2,
+                SnapshotSection::Tasks,
+                None,
+                vec![SnapshotItem::Task(task_item(task, "Ops", None))],
+                None,
+            )],
+            vec![page(
+                snap,
+                2,
+                SnapshotSection::Operations,
+                None,
+                vec![SnapshotItem::Operation(OperationFacts {
+                    id: operation,
+                    command_id: command,
+                    task_id: Some(task),
+                    state: OperationState::Accepted,
+                    accepted_at_ms: 1,
+                })],
+                None,
+            )],
+        );
+
+        let settled = DomainEvent {
+            id: event_id(0x44),
+            task_id: Some(task),
+            sequence: 5,
+            task_revision: None,
+            occurred_at_ms: 5,
+            payload: Event::OperationSettled(
+                OperationSettledFact::with_source(
+                    command,
+                    operation,
+                    5,
+                    vec![event_id(0x45)],
+                    None,
+                    None,
+                    None,
+                    OutcomeSource::Dispatch,
+                )
+                .expect("settled"),
+            ),
+        };
+        model.apply_event(&settled).expect("accepted -> settled");
+        assert!(matches!(
+            model.operations()[&operation].state,
+            OperationState::Settled { .. }
+        ));
+
+        let failed = DomainEvent {
+            id: event_id(0x46),
+            task_id: Some(task),
+            sequence: 6,
+            task_revision: None,
+            occurred_at_ms: 6,
+            payload: Event::OperationFailed(
+                OperationFailedFact::with_source(
+                    command,
+                    operation,
+                    6,
+                    OperationErrorCode::SideEffectFailed,
+                    None,
+                    None,
+                    None,
+                    OutcomeSource::Dispatch,
+                )
+                .expect("failed"),
+            ),
+        };
+        assert_eq!(
+            model.apply_event(&failed),
+            Err(ClientModelError::OperationStateRegression)
+        );
+        assert_eq!(model.last_applied_sequence(), 5);
+        assert!(matches!(
+            model.operations()[&operation].state,
+            OperationState::Settled { .. }
+        ));
+    }
+
+    #[test]
+    fn replay_page_advances_cursor_to_through_sequence_on_completion() {
+        let snap = snapshot_id(0x04);
+        let task = task_id(0x51);
+        let mut model = assemble_all_sections(
+            snap,
+            3,
+            vec![page(
+                snap,
+                3,
+                SnapshotSection::Tasks,
+                None,
+                vec![SnapshotItem::Task(task_item(task, "Replay", None))],
+                None,
+            )],
+            Vec::new(),
+        );
+
+        let page = EventPage {
+            after_sequence: 3,
+            through_sequence: 7,
+            events: vec![DomainEvent {
+                id: event_id(0x52),
+                task_id: Some(task),
+                sequence: 5,
+                task_revision: Some(2),
+                occurred_at_ms: 5,
+                payload: Event::TaskRenamed {
+                    title: "Replayed".into(),
+                },
+            }],
+            next_cursor: None,
+        };
+        model.apply_replay_page(&page).expect("replay page");
+        assert_eq!(model.last_applied_sequence(), 7);
+        assert_eq!(model.tasks()[&task].task.title, "Replayed");
+    }
+
+    #[test]
+    fn rejects_operation_accepted_duplicate_identity_mismatch() {
+        let snap = snapshot_id(0x05);
+        let task = task_id(0x61);
+        let mut model = assemble_all_sections(
+            snap,
+            1,
+            vec![page(
+                snap,
+                1,
+                SnapshotSection::Tasks,
+                None,
+                vec![SnapshotItem::Task(task_item(task, "Accept", None))],
+                None,
+            )],
+            Vec::new(),
+        );
+
+        let operation = operation_id(0x62);
+        let command = command_id(0x63);
+        let accepted = DomainEvent {
+            id: event_id(0x64),
+            task_id: Some(task),
+            sequence: 2,
+            task_revision: None,
+            occurred_at_ms: 2,
+            payload: Event::OperationAccepted(
+                OperationAcceptedFact::new(command, operation, 2, None, None, None)
+                    .expect("accepted"),
+            ),
+        };
+        model.apply_event(&accepted).expect("first accept");
+        assert_eq!(
+            model.apply_event(&DomainEvent {
+                id: event_id(0x65),
+                task_id: Some(task),
+                sequence: 3,
+                task_revision: None,
+                occurred_at_ms: 3,
+                payload: Event::OperationAccepted(
+                    OperationAcceptedFact::new(command, operation, 3, None, None, None)
+                        .expect("dup"),
+                ),
+            }),
+            Err(ClientModelError::OperationStateRegression)
+        );
+    }
+
+    #[test]
+    fn failed_task_event_leaves_model_byte_equal() {
+        let snap = snapshot_id(0x10);
+        let task = task_id(0x71);
+        let mut model = assemble_all_sections(
+            snap,
+            1,
+            vec![page(
+                snap,
+                1,
+                SnapshotSection::Tasks,
+                None,
+                vec![SnapshotItem::Task(task_item(task, "Stable", None))],
+                None,
+            )],
+            Vec::new(),
+        );
+        let before = model.clone();
+        let bad = DomainEvent {
+            id: event_id(0x72),
+            task_id: Some(task),
+            sequence: 2,
+            task_revision: Some(99),
+            occurred_at_ms: 2,
+            payload: Event::TaskRenamed {
+                title: "Should not stick".into(),
+            },
+        };
+        assert_eq!(model.apply_event(&bad), Err(ClientModelError::ApplyFailed));
+        assert_eq!(model, before);
+        assert!(model.tasks().contains_key(&task));
+        assert_eq!(model.last_applied_sequence(), 1);
+    }
+
+    #[test]
+    fn failed_operation_identity_leaves_model_byte_equal() {
+        let snap = snapshot_id(0x11);
+        let task = task_id(0x73);
+        let operation = operation_id(0x74);
+        let command = command_id(0x75);
+        let mut model = assemble_all_sections(
+            snap,
+            2,
+            vec![page(
+                snap,
+                2,
+                SnapshotSection::Tasks,
+                None,
+                vec![SnapshotItem::Task(task_item(task, "OpStable", None))],
+                None,
+            )],
+            vec![page(
+                snap,
+                2,
+                SnapshotSection::Operations,
+                None,
+                vec![SnapshotItem::Operation(OperationFacts {
+                    id: operation,
+                    command_id: command,
+                    task_id: Some(task),
+                    state: OperationState::Accepted,
+                    accepted_at_ms: 1,
+                })],
+                None,
+            )],
+        );
+        let before = model.clone();
+        let bad = DomainEvent {
+            id: event_id(0x76),
+            task_id: Some(task),
+            sequence: 3,
+            task_revision: None,
+            occurred_at_ms: 3,
+            payload: Event::OperationSettled(
+                OperationSettledFact::with_source(
+                    command_id(0x77),
+                    operation,
+                    3,
+                    vec![event_id(0x78)],
+                    None,
+                    None,
+                    None,
+                    OutcomeSource::Dispatch,
+                )
+                .expect("settled"),
+            ),
+        };
+        assert_eq!(
+            model.apply_event(&bad),
+            Err(ClientModelError::OperationIdentityMismatch)
+        );
+        assert_eq!(model, before);
+    }
+
+    #[test]
+    fn uncertain_reconciliation_follows_kernel_source_and_time_rules() {
+        let snap = snapshot_id(0x12);
+        let task = task_id(0x80);
+        let operation = operation_id(0x81);
+        let command = command_id(0x82);
+        let mut model = assemble_all_sections(
+            snap,
+            2,
+            vec![page(
+                snap,
+                2,
+                SnapshotSection::Tasks,
+                None,
+                vec![SnapshotItem::Task(task_item(task, "Reconcile", None))],
+                None,
+            )],
+            vec![page(
+                snap,
+                2,
+                SnapshotSection::Operations,
+                None,
+                vec![SnapshotItem::Operation(OperationFacts {
+                    id: operation,
+                    command_id: command,
+                    task_id: Some(task),
+                    state: OperationState::Accepted,
+                    accepted_at_ms: 10,
+                })],
+                None,
+            )],
+        );
+
+        let rejected_verified_from_accepted = DomainEvent {
+            id: event_id(0x83),
+            task_id: Some(task),
+            sequence: 3,
+            task_revision: None,
+            occurred_at_ms: 20,
+            payload: Event::OperationSettled(
+                OperationSettledFact::with_source(
+                    command,
+                    operation,
+                    20,
+                    vec![event_id(0x84)],
+                    None,
+                    None,
+                    None,
+                    OutcomeSource::verified_reconciliation(0, "ext-1").expect("source"),
+                )
+                .expect("settled"),
+            ),
+        };
+        let before = model.clone();
+        assert_eq!(
+            model.apply_event(&rejected_verified_from_accepted),
+            Err(ClientModelError::OperationStateRegression)
+        );
+        assert_eq!(model, before);
+
+        model
+            .apply_event(&DomainEvent {
+                id: event_id(0x85),
+                task_id: Some(task),
+                sequence: 3,
+                task_revision: None,
+                occurred_at_ms: 20,
+                payload: Event::OperationUncertain(
+                    OperationUncertainFact::new(
+                        command,
+                        operation,
+                        20,
+                        OperationUncertaintyCode::AmbiguousDispatch,
+                        None,
+                        None,
+                        None,
+                    )
+                    .expect("uncertain"),
+                ),
+            })
+            .expect("accepted -> uncertain");
+
+        let before_bad_time = model.clone();
+        let early_reconcile = DomainEvent {
+            id: event_id(0x86),
+            task_id: Some(task),
+            sequence: 4,
+            task_revision: None,
+            occurred_at_ms: 15,
+            payload: Event::OperationSettled(
+                OperationSettledFact::with_source(
+                    command,
+                    operation,
+                    15,
+                    vec![event_id(0x87)],
+                    None,
+                    None,
+                    None,
+                    OutcomeSource::verified_reconciliation(0, "ext-2").expect("source"),
+                )
+                .expect("settled"),
+            ),
+        };
+        assert_eq!(
+            model.apply_event(&early_reconcile),
+            Err(ClientModelError::OperationStateRegression)
+        );
+        assert_eq!(model, before_bad_time);
+
+        let before_dispatch = model.clone();
+        let dispatch_from_uncertain = DomainEvent {
+            id: event_id(0x88),
+            task_id: Some(task),
+            sequence: 4,
+            task_revision: None,
+            occurred_at_ms: 30,
+            payload: Event::OperationSettled(
+                OperationSettledFact::with_source(
+                    command,
+                    operation,
+                    30,
+                    vec![event_id(0x89)],
+                    None,
+                    None,
+                    None,
+                    OutcomeSource::Dispatch,
+                )
+                .expect("settled"),
+            ),
+        };
+        assert_eq!(
+            model.apply_event(&dispatch_from_uncertain),
+            Err(ClientModelError::OperationStateRegression)
+        );
+        assert_eq!(model, before_dispatch);
+
+        model
+            .apply_event(&DomainEvent {
+                id: event_id(0x8a),
+                task_id: Some(task),
+                sequence: 4,
+                task_revision: None,
+                occurred_at_ms: 30,
+                payload: Event::OperationSettled(
+                    OperationSettledFact::with_source(
+                        command,
+                        operation,
+                        30,
+                        vec![event_id(0x8b)],
+                        None,
+                        None,
+                        None,
+                        OutcomeSource::verified_reconciliation(0, "ext-3").expect("source"),
+                    )
+                    .expect("settled"),
+                ),
+            })
+            .expect("uncertain -> settled via verified reconciliation");
+        assert!(matches!(
+            model.operations()[&operation].state,
+            OperationState::Settled {
+                settled_at_ms: 30,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn replay_chain_rejects_after_skip_and_through_drift() {
+        let snap = snapshot_id(0x13);
+        let task = task_id(0x90);
+        let mut model = assemble_all_sections(
+            snap,
+            3,
+            vec![page(
+                snap,
+                3,
+                SnapshotSection::Tasks,
+                None,
+                vec![SnapshotItem::Task(task_item(task, "Chain", None))],
+                None,
+            )],
+            Vec::new(),
+        );
+        let before = model.clone();
+        assert_eq!(
+            model.apply_replay_page(&EventPage {
+                after_sequence: 5,
+                through_sequence: 9,
+                events: vec![],
+                next_cursor: None,
+            }),
+            Err(ClientModelError::ReplayAfterMismatch)
+        );
+        assert_eq!(model, before);
+
+        model
+            .apply_replay_page(&EventPage {
+                after_sequence: 3,
+                through_sequence: 9,
+                events: vec![DomainEvent {
+                    id: event_id(0x91),
+                    task_id: Some(task),
+                    sequence: 5,
+                    task_revision: Some(2),
+                    occurred_at_ms: 5,
+                    payload: Event::TaskRenamed {
+                        title: "Page one".into(),
+                    },
+                }],
+                next_cursor: Some(vec![0x01]),
+            })
+            .expect("first frozen page");
+        assert_eq!(model.last_applied_sequence(), 5);
+
+        let mid = model.clone();
+        assert_eq!(
+            model.apply_replay_page(&EventPage {
+                after_sequence: 5,
+                through_sequence: 10,
+                events: vec![DomainEvent {
+                    id: event_id(0x92),
+                    task_id: Some(task),
+                    sequence: 8,
+                    task_revision: Some(3),
+                    occurred_at_ms: 8,
+                    payload: Event::TaskAttentionSet {
+                        attention: TaskAttention::NeedsAnswer,
+                    },
+                }],
+                next_cursor: None,
+            }),
+            Err(ClientModelError::ReplayThroughDrift)
+        );
+        assert_eq!(model, mid);
+    }
+
+    #[test]
+    fn replay_chain_rejects_repeated_cursor_and_page_bound() {
+        let snap = snapshot_id(0x14);
+        let task = task_id(0x93);
+        let mut model = assemble_all_sections(
+            snap,
+            1,
+            vec![page(
+                snap,
+                1,
+                SnapshotSection::Tasks,
+                None,
+                vec![SnapshotItem::Task(task_item(task, "Bound", None))],
+                None,
+            )],
+            Vec::new(),
+        );
+        let cursor = vec![0xaa];
+        model
+            .apply_replay_page(&EventPage {
+                after_sequence: 1,
+                through_sequence: 4,
+                events: vec![DomainEvent {
+                    id: event_id(0x94),
+                    task_id: Some(task),
+                    sequence: 2,
+                    task_revision: Some(2),
+                    occurred_at_ms: 2,
+                    payload: Event::TaskRenamed {
+                        title: "First".into(),
+                    },
+                }],
+                next_cursor: Some(cursor.clone()),
+            })
+            .expect("open continuing page");
+        let before = model.clone();
+        assert_eq!(
+            model.apply_replay_page(&EventPage {
+                after_sequence: 2,
+                through_sequence: 4,
+                events: vec![DomainEvent {
+                    id: event_id(0x95),
+                    task_id: Some(task),
+                    sequence: 3,
+                    task_revision: Some(3),
+                    occurred_at_ms: 3,
+                    payload: Event::TaskRenamed {
+                        title: "Loop".into(),
+                    },
+                }],
+                next_cursor: Some(cursor),
+            }),
+            Err(ClientModelError::ReplayRepeatedCursor)
+        );
+        assert_eq!(model, before);
+
+        let err = ClientModel::check_replay_continuation_bounds(
+            MAX_CLIENT_REPLAY_PAGES,
+            MAX_CLIENT_REPLAY_PAGES,
+            &HashSet::new(),
+            &vec![1],
+        );
+        assert_eq!(err, Err(ClientModelError::ReplayPageBoundExceeded));
+        let err = ClientModel::check_replay_continuation_bounds(
+            1,
+            MAX_CLIENT_REPLAY_PAGES,
+            &{
+                let mut seen = HashSet::new();
+                seen.insert(vec![9]);
+                seen
+            },
+            &vec![9],
+        );
+        assert_eq!(err, Err(ClientModelError::ReplayRepeatedCursor));
+    }
+
+    #[test]
+    fn snapshot_continuation_rejects_mismatched_after_item() {
+        let snap = snapshot_id(0x16);
+        let first = task_id(0xa0);
+        let second = task_id(0xa1);
+        let spoofed = task_id(0xa2);
+        let mut builder = ClientModelBuilder::new();
+        builder
+            .ingest_page(page(
+                snap,
+                4,
+                SnapshotSection::Tasks,
+                None,
+                vec![SnapshotItem::Task(task_item(first, "One", None))],
+                Some(vec![0x01]),
+            ))
+            .expect("first page");
+        let err = builder.ingest_page(page(
+            snap,
+            4,
+            SnapshotSection::Tasks,
+            Some(crate::domain::snapshot::SnapshotItemKey::Task(spoofed)),
+            vec![SnapshotItem::Task(task_item(second, "Two", None))],
+            None,
+        ));
+        assert_eq!(err, Err(ClientModelError::SnapshotBoundaryMismatch));
+        assert!(builder.finish().is_err());
+    }
+
+    #[test]
+    fn operation_envelope_timestamps_must_match_facts() {
+        let snap = snapshot_id(0x20);
+        let task = task_id(0xc0);
+        let operation = operation_id(0xc1);
+        let command = command_id(0xc2);
+        let mut model = assemble_all_sections(
+            snap,
+            2,
+            vec![page(
+                snap,
+                2,
+                SnapshotSection::Tasks,
+                None,
+                vec![SnapshotItem::Task(task_item(task, "Envelope", None))],
+                None,
+            )],
+            vec![page(
+                snap,
+                2,
+                SnapshotSection::Operations,
+                None,
+                vec![SnapshotItem::Operation(OperationFacts {
+                    id: operation,
+                    command_id: command,
+                    task_id: Some(task),
+                    state: OperationState::Accepted,
+                    accepted_at_ms: 10,
+                })],
+                None,
+            )],
+        );
+
+        let before = model.clone();
+        assert_eq!(
+            model.apply_event(&DomainEvent {
+                id: event_id(0xc3),
+                task_id: Some(task),
+                sequence: 3,
+                task_revision: None,
+                occurred_at_ms: 99,
+                payload: Event::OperationAccepted(
+                    OperationAcceptedFact::new(
+                        command_id(0xc4),
+                        operation_id(0xc5),
+                        3,
+                        None,
+                        None,
+                        None
+                    )
+                    .expect("accepted"),
+                ),
+            }),
+            Err(ClientModelError::OperationEnvelopeTimestampMismatch)
+        );
+        assert_eq!(model, before);
+
+        assert_eq!(
+            model.apply_event(&DomainEvent {
+                id: event_id(0xc6),
+                task_id: Some(task),
+                sequence: 3,
+                task_revision: None,
+                occurred_at_ms: 11,
+                payload: Event::OperationSettled(
+                    OperationSettledFact::with_source(
+                        command,
+                        operation,
+                        10,
+                        vec![event_id(0xc7)],
+                        None,
+                        None,
+                        None,
+                        OutcomeSource::Dispatch,
+                    )
+                    .expect("settled"),
+                ),
+            }),
+            Err(ClientModelError::OperationEnvelopeTimestampMismatch)
+        );
+        assert_eq!(model, before);
+
+        assert_eq!(
+            model.apply_event(&DomainEvent {
+                id: event_id(0xc8),
+                task_id: Some(task),
+                sequence: 3,
+                task_revision: None,
+                occurred_at_ms: 12,
+                payload: Event::OperationFailed(
+                    OperationFailedFact::with_source(
+                        command,
+                        operation,
+                        10,
+                        OperationErrorCode::SideEffectFailed,
+                        None,
+                        None,
+                        None,
+                        OutcomeSource::Dispatch,
+                    )
+                    .expect("failed"),
+                ),
+            }),
+            Err(ClientModelError::OperationEnvelopeTimestampMismatch)
+        );
+        assert_eq!(model, before);
+
+        assert_eq!(
+            model.apply_event(&DomainEvent {
+                id: event_id(0xc9),
+                task_id: Some(task),
+                sequence: 3,
+                task_revision: None,
+                occurred_at_ms: 13,
+                payload: Event::OperationCancelled(
+                    OperationCancelledFact::new(
+                        command,
+                        operation,
+                        10,
+                        CancellationReason::Superseded,
+                        None,
+                        None,
+                        None,
+                    )
+                    .expect("cancelled"),
+                ),
+            }),
+            Err(ClientModelError::OperationEnvelopeTimestampMismatch)
+        );
+        assert_eq!(model, before);
+
+        assert_eq!(
+            model.apply_event(&DomainEvent {
+                id: event_id(0xca),
+                task_id: Some(task),
+                sequence: 3,
+                task_revision: None,
+                occurred_at_ms: 14,
+                payload: Event::OperationUncertain(
+                    OperationUncertainFact::new(
+                        command,
+                        operation,
+                        10,
+                        OperationUncertaintyCode::AmbiguousDispatch,
+                        None,
+                        None,
+                        None,
+                    )
+                    .expect("uncertain"),
+                ),
+            }),
+            Err(ClientModelError::OperationEnvelopeTimestampMismatch)
+        );
+        assert_eq!(model, before);
+
+        model
+            .apply_event(&DomainEvent {
+                id: event_id(0xcb),
+                task_id: Some(task),
+                sequence: 3,
+                task_revision: None,
+                occurred_at_ms: 20,
+                payload: Event::OperationUncertain(
+                    OperationUncertainFact::new(
+                        command,
+                        operation,
+                        20,
+                        OperationUncertaintyCode::AmbiguousDispatch,
+                        None,
+                        None,
+                        None,
+                    )
+                    .expect("uncertain"),
+                ),
+            })
+            .expect("matching uncertain envelope remains valid");
+        assert!(matches!(
+            model.operations()[&operation].state,
+            OperationState::Uncertain {
+                observed_at_ms: 20,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn replay_page_late_failure_leaves_public_model_unchanged() {
+        let snap = snapshot_id(0x21);
+        let task = task_id(0xd0);
+        let mut model = assemble_all_sections(
+            snap,
+            3,
+            vec![page(
+                snap,
+                3,
+                SnapshotSection::Tasks,
+                None,
+                vec![SnapshotItem::Task(task_item(task, "LateFail", None))],
+                None,
+            )],
+            Vec::new(),
+        );
+        let before = model.clone();
+        let err = model.apply_replay_page(&EventPage {
+            after_sequence: 3,
+            through_sequence: 8,
+            events: vec![
+                DomainEvent {
+                    id: event_id(0xd1),
+                    task_id: Some(task),
+                    sequence: 5,
+                    task_revision: Some(2),
+                    occurred_at_ms: 5,
+                    payload: Event::TaskRenamed {
+                        title: "Should roll back".into(),
+                    },
+                },
+                DomainEvent {
+                    id: event_id(0xd2),
+                    task_id: Some(task),
+                    sequence: 6,
+                    task_revision: Some(99),
+                    occurred_at_ms: 6,
+                    payload: Event::TaskRenamed {
+                        title: "Bad revision".into(),
+                    },
+                },
+            ],
+            next_cursor: None,
+        });
+        assert_eq!(err, Err(ClientModelError::ApplyFailed));
+        assert_eq!(model, before);
+        assert_eq!(model.tasks()[&task].task.title, "LateFail");
+        assert_eq!(model.last_applied_sequence(), 3);
+    }
+
+    #[test]
+    fn task_cockpit_surfaces_fail_closed_for_unknown_task_and_omit_paths() {
+        let snap = snapshot_id(0x41);
+        let through = 1;
+        let task = task_id(0x42);
+        let model = assemble_all_sections(
+            snap,
+            through,
+            vec![page(
+                snap,
+                through,
+                SnapshotSection::Tasks,
+                None,
+                vec![SnapshotItem::Task(task_item(task, "Cockpit", None))],
+                None,
+            )],
+            Vec::new(),
+        );
+        assert!(model.task_cockpit_surfaces(task_id(0x99)).is_none());
+        let projection = model
+            .task_cockpit_surfaces(task)
+            .expect("selected task surfaces");
+        assert_eq!(projection.task_id, task);
+        let controls: Vec<_> = projection.available_service_controls().collect();
+        assert!(controls.contains(&crate::client::action::ACTION_SERVICE_START));
+        assert!(controls.contains(&crate::client::action::ACTION_SERVICE_LOGS));
+        assert_eq!(projection.unavailable_workspace_surfaces().count(), 2);
+        assert!(!format!("{projection:?}").contains('\\'));
+        assert!(!format!("{projection:?}").contains("C:"));
+    }
+
+    #[test]
+    fn stream_admission_rejects_stale_foreign_and_mismatched_generation() {
+        use crate::protocol::{StreamFrame, StreamKey, StreamPayloadKind};
+
+        let subscription = crate::domain::id::SubscriptionId::from_bytes(fixed_uuid_v7(0xd1))
+            .expect("subscription");
+        let resource = resource_id(0xd2);
+        let frame = StreamFrame {
+            subscription_id: subscription,
+            stream: StreamKey::from(resource),
+            generation: 4,
+            sequence: 1,
+            payload_kind: StreamPayloadKind::new(3).expect("kind"),
+            schema_version: 1,
+            payload: b"hello terminal".to_vec(),
+        };
+        let admitted = admit_subscription_stream(subscription, resource, 4, 0, &frame)
+            .expect("first live frame");
+        assert_eq!(admitted.output.as_deref(), Some("hello terminal"));
+
+        let mut stale = frame.clone();
+        stale.sequence = 1;
+        assert_eq!(
+            admit_subscription_stream(subscription, resource, 4, 1, &stale),
+            Err(StreamAdmissionReject::StaleSequence { last: 1, actual: 1 })
+        );
+
+        let mut foreign = frame.clone();
+        foreign.subscription_id =
+            crate::domain::id::SubscriptionId::from_bytes(fixed_uuid_v7(0xd3)).expect("foreign");
+        assert_eq!(
+            admit_subscription_stream(subscription, resource, 4, 0, &foreign),
+            Err(StreamAdmissionReject::SubscriptionMismatch)
+        );
+
+        let mut generation = frame.clone();
+        generation.generation = 9;
+        assert_eq!(
+            admit_subscription_stream(subscription, resource, 4, 0, &generation),
+            Err(StreamAdmissionReject::GenerationMismatch {
+                expected: 4,
+                actual: 9
+            })
+        );
+    }
+
+    #[test]
+    fn quota_age_keeps_one_fresh_observation_per_provider() {
+        let now = 1_725_000_000_000;
+        let hour = PROVIDER_QUOTA_MAX_AGE_MS;
+        let visible = one_fresh_quota_per_provider(
+            &[
+                ("claude".into(), Some("55% remaining".into()), now),
+                ("claude".into(), Some("12% remaining".into()), now - 1_000),
+                ("codex".into(), None, now),
+                ("gemini".into(), Some("stale".into()), now - hour - 1),
+            ],
+            now,
+        );
+        assert_eq!(visible, vec![("claude".into(), "55% remaining".into())]);
+        assert!(!quota_observation_is_fresh(None, now));
+        assert!(!quota_observation_is_fresh(Some(now + 5), now));
+    }
+
+    #[test]
+    fn finish_tasks_preview_returns_dedicated_type_not_client_model() {
+        let snap = snapshot_id(0xe1);
+        let first = task_id(0xe2);
+        let second = task_id(0xe3);
+        let mut builder = ClientModelBuilder::new();
+        builder
+            .ingest_page(page(
+                snap,
+                7,
+                SnapshotSection::Tasks,
+                None,
+                vec![SnapshotItem::Task(task_item(first, "Preview A", None))],
+                Some(vec![1]),
+            ))
+            .expect("first tasks page");
+        builder
+            .ingest_page(page(
+                snap,
+                7,
+                SnapshotSection::Tasks,
+                Some(crate::domain::snapshot::SnapshotItemKey::Task(first)),
+                vec![SnapshotItem::Task(task_item(second, "Preview B", None))],
+                None,
+            ))
+            .expect("second tasks page");
+
+        let incomplete = {
+            let mut incomplete = ClientModelBuilder::new();
+            incomplete
+                .ingest_page(page(
+                    snap,
+                    7,
+                    SnapshotSection::Tasks,
+                    None,
+                    vec![SnapshotItem::Task(task_item(first, "Preview A", None))],
+                    None,
+                ))
+                .expect("tasks");
+            incomplete
+        };
+        assert!(matches!(
+            incomplete.finish(),
+            Err(ClientModelError::MissingSections)
+        ));
+
+        let preview = builder
+            .finish_tasks_preview()
+            .expect("tasks-only preview must finish");
+        // Dedicated type: through_sequence + tasks only; not ClientModel APIs.
+        assert_eq!(preview.through_sequence(), 7);
+        assert_eq!(preview.tasks().len(), 2);
+        assert!(preview.tasks().contains_key(&first));
+        assert!(preview.tasks().contains_key(&second));
+        let ids: Vec<_> = preview.task_ids().collect();
+        assert_eq!(ids.len(), 2);
+    }
+
+    #[test]
+    fn finish_tasks_preview_rejects_started_browser_sections() {
+        use crate::domain::browser::{BrowserContextView, BrowserHealth};
+        use crate::domain::id::BrowserContextId;
+        use std::collections::{BTreeMap, BTreeSet};
+
+        let snap = snapshot_id(0xe4);
+        let task = task_id(0xe5);
+        let context = BrowserContextId::from_bytes([
+            0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0xe6,
+        ])
+        .expect("context");
+        let mut builder = ClientModelBuilder::new();
+        builder
+            .ingest_page(page(
+                snap,
+                9,
+                SnapshotSection::Tasks,
+                None,
+                vec![SnapshotItem::Task(task_item(task, "Only tasks", None))],
+                None,
+            ))
+            .expect("tasks");
+        builder
+            .ingest_page(page(
+                snap,
+                9,
+                SnapshotSection::BrowserContexts,
+                None,
+                vec![SnapshotItem::BrowserContext(BrowserContextView {
+                    context_id: context,
+                    task_id: task,
+                    generation: 1,
+                    selected_tab_id: None,
+                    health: BrowserHealth::Healthy,
+                    closed: false,
+                    permissions: BTreeMap::new(),
+                    linked_artifacts: BTreeSet::new(),
+                    recipe_id: None,
+                    recording_id: None,
+                })],
+                None,
+            ))
+            .expect("browser contexts must ingest");
+        assert!(
+            matches!(
+                builder.finish_tasks_preview(),
+                Err(ClientModelError::DuplicateSection)
+            ),
+            "started browser sections must fail Tasks-only preview"
+        );
+    }
+
+    #[test]
+    fn settled_order_tracks_open_settled_reopen_without_redefining_active() {
+        let snap = snapshot_id(0xD0);
+        let open_id = task_id(0xD1);
+        let archived_id = task_id(0xD2);
+        let deleted_id = task_id(0xD3);
+        let mut open_item = task_item(open_id, "Active then Done", None);
+        open_item.task.lifecycle = TaskLifecycle::Open;
+        let mut archived_item = task_item(archived_id, "Archived stays history", None);
+        archived_item.task.lifecycle = TaskLifecycle::Archived;
+        let mut deleted_item = task_item(deleted_id, "Deleted stays gone", None);
+        deleted_item.task.lifecycle = TaskLifecycle::Deleted;
+
+        let mut model = assemble_all_sections(
+            snap,
+            1,
+            vec![page(
+                snap,
+                1,
+                SnapshotSection::Tasks,
+                None,
+                vec![
+                    SnapshotItem::Task(open_item),
+                    SnapshotItem::Task(archived_item),
+                    SnapshotItem::Task(deleted_item),
+                ],
+                None,
+            )],
+            Vec::new(),
+        );
+        let index = model.task_projection_index();
+        assert_eq!(index.active_count(), 1);
+        assert_eq!(index.settled_count(), 0);
+        assert_eq!(index.archived_count(), 1);
+        assert_eq!(index.top_active_task_ids(8), vec![open_id]);
+        assert!(index.top_settled_task_ids(8).is_empty());
+
+        model
+            .apply_event(&DomainEvent {
+                id: event_id(0xD4),
+                task_id: Some(open_id),
+                sequence: 2,
+                task_revision: Some(2),
+                occurred_at_ms: 1_725_000_000_500,
+                payload: Event::TaskSettled,
+            })
+            .expect("open -> settled");
+        let index = model.task_projection_index();
+        assert_eq!(index.active_count(), 0);
+        assert_eq!(index.settled_count(), 1);
+        assert_eq!(index.archived_count(), 1);
+        assert_eq!(index.top_settled_task_ids(8), vec![open_id]);
+        assert_eq!(
+            model.task_last_occurred_at_ms(open_id),
+            Some(1_725_000_000_500)
+        );
+
+        model
+            .apply_event(&DomainEvent {
+                id: event_id(0xD5),
+                task_id: Some(open_id),
+                sequence: 3,
+                task_revision: Some(3),
+                occurred_at_ms: 1_725_000_000_900,
+                payload: Event::TaskReopened,
+            })
+            .expect("settled -> open");
+        let index = model.task_projection_index();
+        assert_eq!(index.active_count(), 1);
+        assert_eq!(index.settled_count(), 0);
+        assert_eq!(index.top_active_task_ids(8), vec![open_id]);
+
+        let settled_snap = snapshot_id(0xD6);
+        let settled_id = task_id(0xD7);
+        let mut settled_item = task_item(settled_id, "Fresh Done snapshot", None);
+        settled_item.task.lifecycle = TaskLifecycle::Settled;
+        let fresh = assemble_all_sections(
+            settled_snap,
+            4,
+            vec![page(
+                settled_snap,
+                4,
+                SnapshotSection::Tasks,
+                None,
+                vec![SnapshotItem::Task(settled_item)],
+                None,
+            )],
+            Vec::new(),
+        );
+        let index = fresh.task_projection_index();
+        assert_eq!(index.active_count(), 0);
+        assert_eq!(index.settled_count(), 1);
+        assert_eq!(index.top_settled_task_ids(1), vec![settled_id]);
+    }
+
+    fn settled_search_fixture(non_match_count: usize) -> (ClientModel, TaskId) {
+        let snap = snapshot_id(0xE0);
+        let needle = task_id(0xEF);
+        let mut items = Vec::with_capacity(non_match_count.saturating_add(1));
+        // Newest-first order: high created_at_ms first. Needle is oldest so it
+        // falls beyond the first MAX_CLIENT_SEARCH_WORK settled candidates.
+        // Filler namespace uses variant byte 0x81 so index tails cannot collide
+        // with helper task_id(0xEF) (variant 0x80).
+        for index in 0..non_match_count {
+            let id = TaskId::from_bytes({
+                let mut bytes = fixed_uuid_v7(0xE1);
+                bytes[8] = 0x81;
+                bytes[9..].copy_from_slice(&(index as u64).to_be_bytes()[1..]);
+                bytes
+            })
+            .expect("settled filler");
+            let mut item = task_item(id, &format!("filler-{index}"), None);
+            item.task.lifecycle = TaskLifecycle::Settled;
+            item.task.created_at_ms = (non_match_count as i64)
+                .saturating_add(1)
+                .saturating_add(index as i64);
+            items.push(SnapshotItem::Task(item));
+        }
+        let mut needle_item = task_item(needle, "settled-needle-match", None);
+        needle_item.task.lifecycle = TaskLifecycle::Settled;
+        needle_item.task.created_at_ms = 1;
+        items.push(SnapshotItem::Task(needle_item));
+        let mut seen = std::collections::BTreeSet::new();
+        for item in &items {
+            let SnapshotItem::Task(task) = item else {
+                panic!("settled search fixture expects only tasks");
+            };
+            assert!(
+                seen.insert(task.task.id),
+                "settled search fixture TaskId collision: {}",
+                task.task.id
+            );
+        }
+        assert_eq!(seen.len(), non_match_count.saturating_add(1));
+        let model = assemble_all_sections(
+            snap,
+            1,
+            vec![page(snap, 1, SnapshotSection::Tasks, None, items, None)],
+            Vec::new(),
+        );
+        (model, needle)
+    }
+
+    #[test]
+    fn settled_search_page_bounds_work_continues_and_rejects_stale_scope() {
+        let (model, needle) = settled_search_fixture(MAX_CLIENT_SEARCH_WORK);
+        let index = model.task_projection_index();
+        assert_eq!(
+            index.settled_count(),
+            MAX_CLIENT_SEARCH_WORK.saturating_add(1)
+        );
+
+        let first = index.search_settled_task_ids_page("needle", None);
+        assert!(first.is_partial(), "first page must stop at work budget");
+        assert_eq!(first.work, MAX_CLIENT_SEARCH_WORK);
+        assert!(
+            !first.ids.contains(&needle),
+            "match beyond first page must remain undiscovered until continued"
+        );
+        assert!(first.exact_total.is_none());
+        let continuation = first
+            .continuation()
+            .cloned()
+            .expect("partial settled page must expose continuation");
+        assert_eq!(continuation.scope_for_test(), SearchScope::Settled);
+
+        let stale_active = index.search_settled_task_ids_page(
+            "needle",
+            Some(&continuation.clone().with_scope(SearchScope::Active)),
+        );
+        assert!(
+            stale_active.is_stale(),
+            "active continuation must not drive settled"
+        );
+
+        let stale_query = index.search_settled_task_ids_page("other", Some(&continuation));
+        assert!(stale_query.is_stale());
+
+        let stale_revision = index
+            .search_settled_task_ids_page("needle", Some(&continuation.clone().bumped_revision()));
+        assert!(stale_revision.is_stale());
+
+        let active_with_settled_cont =
+            index.search_task_ids_page("needle", false, Some(&continuation));
+        assert!(
+            active_with_settled_cont.is_stale(),
+            "settled continuation must not match active"
+        );
+        let archived_with_settled_cont =
+            index.search_task_ids_page("needle", true, Some(&continuation));
+        assert!(archived_with_settled_cont.is_stale());
+
+        let second = index.search_settled_task_ids_page("needle", Some(&continuation));
+        assert!(second.is_complete());
+        assert!(
+            second.work <= MAX_CLIENT_SEARCH_WORK,
+            "continuation work stays bounded"
+        );
+        assert!(
+            second.ids.contains(&needle),
+            "later settled match must become discoverable"
+        );
+        assert_eq!(second.exact_total, Some(1));
+        assert!(
+            second.ids.iter().all(|id| {
+                model
+                    .tasks()
+                    .get(id)
+                    .is_some_and(|snap| snap.task.lifecycle == TaskLifecycle::Settled)
+            }),
+            "settled search must not contaminate with active/archive rows"
+        );
+        assert!(
+            index
+                .search_task_ids_page("needle", false, None)
+                .ids
+                .is_empty(),
+            "active search must not see settled-only titles"
+        );
+        assert!(
+            index
+                .search_task_ids_page("needle", true, None)
+                .ids
+                .is_empty(),
+            "archived search must not see settled-only titles"
+        );
+    }
+}

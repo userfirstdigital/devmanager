@@ -1,0 +1,234 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>01-composition-A</title>
+<style>
+  body { margin:0; padding:28px 32px; background:#0c0c0e; color:#e6e6ea; font: 14px/1.45 "Segoe UI", system-ui, sans-serif; }
+  h2 { margin:0 0 6px; font-size:20px; }
+  h3 { font-size:15px; }
+  .subtitle { color:#9a9aa3; margin:0 0 18px; max-width:1100px; }
+  .options { margin-top:10px; }
+  .option { display:flex; gap:10px; align-items:flex-start; border:1px solid #2c2c33; border-radius:8px; padding:8px 10px; max-width:300px; }
+  .option .letter { font-weight:700; color:#9a9aa3; min-width:16px; }
+  .option h3 { margin:0 0 2px; font-size:13px; }
+  .option p { margin:0; color:#9a9aa3; font-size:12px; }
+  .option[data-choice="a"] { border-color:#f2b441; }
+  .option[data-choice="a"] .letter::after { content:" CHOSEN"; color:#f2b441; font-size:10px; letter-spacing:.06em; }
+  div:has(> .options > .option:not([data-choice="a"])) { opacity:.38; }
+  div:has(> .options > .option[data-choice="a"]) { opacity:1; }
+</style></head><body>
+<h2>Where does the board live when eight agents are running?</h2>
+<p class="subtitle">Three compositions, same content: your six open tasks plus two more, real titles, the new status line, panel chrome and subagent tabs. Click the one that feels right, then tell me in the terminal what is wrong with it.</p>
+
+<style>
+  .dm { background:#0e0e10; color:#e6e6ea; font: 12px/1.35 "Segoe UI", system-ui, sans-serif; border:1px solid #26262b; border-radius:10px; overflow:hidden; }
+  .dm * { box-sizing:border-box; }
+  .dm-top { height:34px; display:flex; align-items:center; gap:14px; padding:0 12px; border-bottom:1px solid #1f1f24; color:#9a9aa3; font-size:11.5px; }
+  .dm-top .brand { color:#e6e6ea; font-weight:600; }
+  .dm-top .spacer { flex:1; }
+  .dm-top .kbd { border:1px solid #2c2c33; border-radius:4px; padding:1px 6px; font-size:10.5px; color:#8a8a94; }
+  .dm-body { display:flex; }
+  .board { width:236px; flex:none; border-right:1px solid #1f1f24; background:#101013; display:flex; flex-direction:column; }
+  .board.top { width:auto; border-right:0; border-bottom:1px solid #1f1f24; flex-direction:row; }
+  .board .hd { display:flex; align-items:center; gap:8px; padding:8px 10px 6px; color:#9a9aa3; font-size:10.5px; letter-spacing:.04em; text-transform:uppercase; }
+  .board .hd b { color:#e6e6ea; letter-spacing:0; text-transform:none; font-size:12px; }
+  .board .new { margin-left:auto; border:1px solid #3a3a46; border-radius:6px; padding:2px 8px; color:#e6e6ea; font-size:11px; }
+  .grp { padding:2px 0 6px; }
+  .grp .g { display:flex; align-items:center; gap:6px; padding:6px 10px 3px; color:#8a8a94; font-size:10.5px; text-transform:uppercase; letter-spacing:.06em; }
+  .grp .g .n { color:#6b6b74; }
+  .row { display:grid; grid-template-columns:8px 1fr auto; gap:0 8px; align-items:center; padding:5px 10px; }
+  .row .t { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; color:#e6e6ea; }
+  .row .m { grid-column:2; color:#6b6b74; font-size:10.5px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .row .age { color:#8a8a94; font-size:10.5px; grid-row:1 / span 2; align-self:start; padding-top:1px; }
+  .dot { width:7px; height:7px; border-radius:50%; background:#3a3a46; }
+  .dot.you { background:#f2b441; box-shadow:0 0 0 3px rgba(242,180,65,.18); }
+  .dot.blocked { background:#e5484d; box-shadow:0 0 0 3px rgba(229,72,77,.18); }
+  .dot.run { background:#6b6b74; }
+  .row.you .t { color:#fff; }
+  .row.sel { background:#17171c; }
+  .done-hd { color:#6b6b74; }
+  .grid { flex:1; display:grid; gap:6px; padding:6px; background:#0e0e10; }
+  .g4 { grid-template-columns:repeat(4, 1fr); grid-auto-rows:150px; }
+  .g3 { grid-template-columns:repeat(3, 1fr); grid-auto-rows:150px; }
+  .pane { background:#151518; border:1px solid #26262b; border-radius:8px; display:flex; flex-direction:column; min-width:0; overflow:hidden; }
+  .pane.focus { border-color:#7c7cf0; box-shadow:0 0 0 1px #7c7cf0 inset; }
+  .pane.you { border-color:#5a4a20; }
+  .pane.blocked { border-color:#5a2528; }
+  .pane.pinned { grid-column:span 2; }
+  .ph { display:flex; align-items:center; gap:8px; padding:6px 8px 0; min-width:0; }
+  .ph .title { font-weight:600; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; min-width:0; flex:1; }
+  .ph .ic { color:#6b6b74; font-size:11px; flex:none; }
+  .ph .ic.pin { color:#9a9aa3; }
+  .ph .act { flex:none; border:1px solid #2c2c33; border-radius:5px; padding:1px 7px; font-size:10.5px; color:#c9c9d1; }
+  .ph .act.primary { border-color:#f2b441; color:#f2b441; }
+  .ph .menu { flex:none; color:#8a8a94; font-size:13px; line-height:1; padding:0 2px; }
+  .st { display:flex; align-items:center; gap:8px; padding:3px 8px 0; font-size:10.5px; color:#9a9aa3; white-space:nowrap; overflow:hidden; }
+  .st .s { display:flex; align-items:center; gap:5px; }
+  .st .s.you { color:#f2b441; }
+  .st .s.blocked { color:#e5484d; }
+  .st .sep { color:#3a3a46; }
+  .st .prog { margin-left:auto; color:#8a8a94; }
+  .st .prog i { display:inline-block; width:38px; height:4px; border-radius:2px; background:#26262b; vertical-align:middle; margin-left:4px; position:relative; }
+  .st .prog i::after { content:""; position:absolute; left:0; top:0; bottom:0; width:var(--p); background:#8a8a94; border-radius:2px; }
+  .tabs { display:flex; gap:2px; padding:5px 8px 0; font-size:10.5px; color:#8a8a94; overflow:hidden; white-space:nowrap; }
+  .tabs span { padding:2px 7px; border-radius:5px 5px 0 0; }
+  .tabs span.on { background:#1c1c21; color:#e6e6ea; }
+  .tabs span.sub { color:#9a9aa3; }
+  .tabs span.sub::before { content:"•"; color:#7fb07f; margin-right:4px; }
+  .tabs span.sub.done::before { color:#3a3a46; }
+  .tabs .more { color:#6b6b74; }
+  .stream { flex:1; background:#111114; margin:0 8px 8px; border-radius:6px; border:1px solid #1f1f24; padding:6px 8px; font: 10.5px/1.45 "Cascadia Mono", Consolas, monospace; color:#c9c9d1; overflow:hidden; }
+  .stream .u { color:#8a8a94; }
+  .stream .a { color:#e6e6ea; }
+  .stream .cmd { color:#9ec1e0; }
+  .stream .warn { color:#f2b441; }
+  .stream .err { color:#e5484d; }
+  .stream .q { background:#1f1a10; border:1px solid #4a3c1a; border-radius:5px; padding:4px 6px; margin-top:4px; color:#f2d08a; font-family:"Segoe UI", system-ui, sans-serif; }
+  .stream .q b { color:#f2b441; }
+  .stream .cursor { display:inline-block; width:6px; height:11px; background:#c9c9d1; vertical-align:-2px; }
+  .term { font: 10.5px/1.45 "Cascadia Mono", Consolas, monospace; color:#c9c9d1; }
+  .term .p { color:#7fb07f; }
+  .zoomnote { color:#8a8a94; font-size:11px; margin-top:6px; }
+  .strip { display:flex; gap:6px; padding:6px; overflow:hidden; }
+  .strip .row { padding:6px 8px; border:1px solid #26262b; border-radius:6px; background:#151518; min-width:200px; grid-template-columns:8px 1fr; }
+  .strip .row .age { grid-row:1; grid-column:2; justify-self:end; }
+  .strip .row .m { grid-column:2; }
+  .sw { position:absolute; left:50%; top:60px; transform:translateX(-50%); width:520px; background:#151518; border:1px solid #3a3a46; border-radius:10px; box-shadow:0 20px 60px rgba(0,0,0,.6); z-index:2; }
+  .sw .in { padding:10px 12px; border-bottom:1px solid #26262b; color:#8a8a94; font-size:12px; }
+  .sw .row { padding:7px 12px; }
+  .rel { position:relative; }
+  .caption { color:#9a9aa3; font-size:12px; margin:6px 0 18px; }
+</style>
+
+<!-- ============================================================ A ============================================================ -->
+<div class="section">
+  <h3>A · Board as a left column, panels tile beside it</h3>
+  <div class="dm">
+    <div class="dm-top"><span class="brand">DevManager</span><span>All projects</span><span class="spacer"></span><span class="kbd">⌘K switch</span><span class="kbd">Z zoom</span><span class="kbd">⌘↑↓←→ focus</span></div>
+    <div class="dm-body">
+      <div class="board">
+        <div class="hd"><b>Board</b><span class="new">+ New task</span></div>
+        <div class="grp">
+          <div class="g">Needs you <span class="n">2</span></div>
+          <div class="row you"><span class="dot you"></span><span class="t">are there any migrations left to run against dev or prod db?</span><span class="age">4m</span><span class="m">Asked a question · command · Claude</span></div>
+          <div class="row you"><span class="dot blocked"></span><span class="t">Build the Snake backend in snake-game/backend</span><span class="age">2m</span><span class="m">Provider rejected the session · Snake Game · Codex</span></div>
+          <div class="g">Working <span class="n">4</span></div>
+          <div class="row sel"><span class="dot run"></span><span class="t">Snake Frontend</span><span class="age">12s</span><span class="m">Running cargo test · 5/6 steps · Claude</span></div>
+          <div class="row"><span class="dot run"></span><span class="t">Reply with exactly OPTIONS_ARGS_LIVE</span><span class="age">40s</span><span class="m">Editing src/kernel/purge.rs · Codex</span></div>
+          <div class="row"><span class="dot run"></span><span class="t">Port herdr zoom toggle to the workspace</span><span class="age">8s</span><span class="m">Thinking · 2 subagents · Claude</span></div>
+          <div class="row"><span class="dot run"></span><span class="t">Startup latency: name the lane cost</span><span class="age">1m</span><span class="m">Reading host-stderr.log · Claude</span></div>
+          <div class="g">Idle <span class="n">2</span></div>
+          <div class="row"><span class="dot"></span><span class="t">hi there</span><span class="age">18m</span><span class="m">Last reply 18m ago · Codex</span></div>
+          <div class="row"><span class="dot"></span><span class="t">New task</span><span class="age">31m</span><span class="m">No messages yet · Claude</span></div>
+          <div class="g done-hd">Done <span class="n">3</span> <span style="margin-left:auto">▸</span></div>
+        </div>
+      </div>
+      <div class="grid g4">
+        <div class="pane you">
+          <div class="ph"><span class="ic">◐</span><span class="title">are there any migrations left to run…</span><span class="act primary">Answer</span><span class="menu">⋯</span></div>
+          <div class="st"><span class="s you">● Waiting for you · asked a question</span><span class="sep">·</span><span>4m</span><span class="prog">2/3<i style="--p:66%"></i></span></div>
+          <div class="tabs"><span class="on">Conversation</span><span>Terminal</span><span>Files</span><span>Git</span></div>
+          <div class="stream"><div class="a">PROD → integration_entity.{last_seen_at, synced_at}</div><div class="a">DEV → same. Its later siblings are applied on both.</div><div class="q"><b>Question</b> Apply 20261112020000 to prod now, or hold until the API freeze?</div></div>
+        </div>
+        <div class="pane blocked">
+          <div class="ph"><span class="ic">◐</span><span class="title">Build the Snake backend in snake-game/…</span><span class="act">Retry</span><span class="menu">⋯</span></div>
+          <div class="st"><span class="s blocked">● Blocked · provider rejected the session</span><span class="sep">·</span><span>2m</span><span class="prog">0/4<i style="--p:0%"></i></span></div>
+          <div class="tabs"><span class="on">Conversation</span><span>Terminal</span><span>Files</span><span>Git</span></div>
+          <div class="stream"><div class="err">codex: session 01a058f7 could not be resumed: ProviderRejected</div><div class="u">Retry with a fresh session, or open the terminal to see the provider's output.</div></div>
+        </div>
+        <div class="pane focus pinned">
+          <div class="ph"><span class="ic pin">⊟</span><span class="title">Snake Frontend</span><span class="ic">⤢</span><span class="act">Done</span><span class="menu">⋯</span></div>
+          <div class="st"><span class="s">▶ Running · cargo test --lib ui::</span><span class="sep">·</span><span>12s</span><span class="prog">5/6<i style="--p:83%"></i></span></div>
+          <div class="tabs"><span class="on">Conversation</span><span>Terminal</span><span>Files</span><span>Git</span><span class="sub">code-reviewer</span><span class="sub done">Explore</span></div>
+          <div class="stream"><div class="u">› make the snake speed up every 5 apples</div><div class="a">Added a tick-rate ramp in game/loop.ts; the speed floor is 60 ms so it never becomes unplayable.</div><div class="cmd">$ cargo test --lib ui::</div><div>running 112 tests … 98 passed <span class="cursor"></span></div></div>
+        </div>
+        <div class="pane">
+          <div class="ph"><span class="ic">◐</span><span class="title">Reply with exactly OPTIONS_ARGS_LIVE</span><span class="act">Done</span><span class="menu">⋯</span></div>
+          <div class="st"><span class="s">✎ Editing · src/kernel/purge.rs</span><span class="sep">·</span><span>40s</span><span class="prog">3/5<i style="--p:60%"></i></span></div>
+          <div class="tabs"><span class="on">Conversation</span><span>Terminal</span><span>Files</span><span>Git</span></div>
+          <div class="stream"><div class="a">Redacting the task's events in place keeps replay contiguous; I am NULLing task_id and operation_id on each row.</div><div class="cmd">edit src/kernel/purge.rs +48 −3</div></div>
+        </div>
+        <div class="pane">
+          <div class="ph"><span class="ic">◐</span><span class="title">Port herdr zoom toggle to the workspace</span><span class="act">Done</span><span class="menu">⋯</span></div>
+          <div class="st"><span class="s">◌ Thinking</span><span class="sep">·</span><span>8s</span><span class="prog">1/4<i style="--p:25%"></i></span></div>
+          <div class="tabs"><span class="on">Conversation</span><span>Terminal</span><span>Files</span><span class="sub">Explore</span><span class="sub">Plan</span></div>
+          <div class="stream"><div class="u">› zoom should be one key and reversible</div><div class="a">Reading herdr's TileLayout first; its per-tab zoomed flag is the shape we want.</div></div>
+        </div>
+        <div class="pane">
+          <div class="ph"><span class="ic">◐</span><span class="title">Startup latency: name the lane cost</span><span class="act">Done</span><span class="menu">⋯</span></div>
+          <div class="st"><span class="s">▶ Reading · host-stderr.log</span><span class="sep">·</span><span>1m</span><span class="prog">2/2<i style="--p:100%"></i></span></div>
+          <div class="tabs"><span>Conversation</span><span class="on">Terminal</span><span>Files</span><span>Git</span></div>
+          <div class="stream term"><div><span class="p">❯</span> grep -c "slow maintenance tick" host-stderr.log</div><div>412</div><div><span class="p">❯</span> awk '/cs\./' host-stderr.log | tail -3</div><div>cs.identity_sync=1094ms cs.journal_flush=12ms</div></div>
+        </div>
+        <div class="pane">
+          <div class="ph"><span class="ic">◐</span><span class="title">hi there</span><span class="act">Done</span><span class="menu">⋯</span></div>
+          <div class="st"><span class="s">○ Idle · last reply 18m ago</span><span class="prog">—</span></div>
+          <div class="tabs"><span class="on">Conversation</span><span>Terminal</span><span>Files</span><span>Git</span></div>
+          <div class="stream"><div class="u">› hi there</div><div class="a">Hi. What would you like to work on?</div></div>
+        </div>
+      </div>
+    </div>
+  </div>
+  <p class="caption">The board is one panel; drag its edge narrower or close it and the grid takes the room. "Snake Frontend" is pinned at double width (⊟) and keeps that; the rest reflow. Colour appears only on the two rows that need you. Zoom (⤢ or Z) fills the window with the focused panel; Escape returns.</p>
+  <div class="options" style="margin-top:0"><div class="option" data-choice="a" onclick="toggleSelect(this)"><div class="letter">A</div><div class="content"><h3>Board as a column</h3><p>Always visible, scannable top to bottom, costs 236 px of width.</p></div></div></div>
+</div>
+
+<!-- ============================================================ B ============================================================ -->
+<div class="section">
+  <h3>B · Board as a strip across the top, panels below</h3>
+  <div class="dm">
+    <div class="dm-top"><span class="brand">DevManager</span><span>All projects</span><span class="spacer"></span><span class="kbd">⌘K switch</span><span class="kbd">Z zoom</span></div>
+    <div class="board top">
+      <div class="strip">
+        <div class="row you"><span class="dot you"></span><span class="t">are there any migrations left…</span><span class="age">4m</span><span class="m">Asked a question</span></div>
+        <div class="row you"><span class="dot blocked"></span><span class="t">Build the Snake backend</span><span class="age">2m</span><span class="m">Provider rejected</span></div>
+        <div class="row sel"><span class="dot run"></span><span class="t">Snake Frontend</span><span class="age">12s</span><span class="m">Running cargo test · 5/6</span></div>
+        <div class="row"><span class="dot run"></span><span class="t">Reply with exactly OPTIONS…</span><span class="age">40s</span><span class="m">Editing purge.rs · 3/5</span></div>
+        <div class="row"><span class="dot run"></span><span class="t">Port herdr zoom toggle</span><span class="age">8s</span><span class="m">Thinking · 2 subagents</span></div>
+        <div class="row"><span class="dot"></span><span class="t">hi there</span><span class="age">18m</span><span class="m">Idle</span></div>
+        <div class="row" style="min-width:90px;color:#6b6b74"><span></span><span class="t" style="color:#6b6b74">+2 · Done 3 ▸</span></div>
+      </div>
+    </div>
+    <div class="grid g4" style="grid-auto-rows:120px">
+      <div class="pane you"><div class="ph"><span class="ic">◐</span><span class="title">are there any migrations left…</span><span class="act primary">Answer</span><span class="menu">⋯</span></div><div class="st"><span class="s you">● Waiting for you · asked a question</span><span class="sep">·</span><span>4m</span></div><div class="stream"><div class="q"><b>Question</b> Apply 20261112020000 to prod now, or hold?</div></div></div>
+      <div class="pane blocked"><div class="ph"><span class="ic">◐</span><span class="title">Build the Snake backend</span><span class="act">Retry</span><span class="menu">⋯</span></div><div class="st"><span class="s blocked">● Blocked · provider rejected</span><span class="sep">·</span><span>2m</span></div><div class="stream"><div class="err">ProviderRejected</div></div></div>
+      <div class="pane focus pinned"><div class="ph"><span class="ic pin">⊟</span><span class="title">Snake Frontend</span><span class="ic">⤢</span><span class="act">Done</span><span class="menu">⋯</span></div><div class="st"><span class="s">▶ Running · cargo test --lib ui::</span><span class="sep">·</span><span>12s</span><span class="prog">5/6<i style="--p:83%"></i></span></div><div class="stream"><div class="cmd">$ cargo test --lib ui::</div><div>running 112 tests … 98 passed <span class="cursor"></span></div></div></div>
+      <div class="pane"><div class="ph"><span class="ic">◐</span><span class="title">Reply with exactly OPTIONS…</span><span class="act">Done</span><span class="menu">⋯</span></div><div class="st"><span class="s">✎ Editing · purge.rs</span><span class="sep">·</span><span>40s</span></div><div class="stream"><div class="cmd">edit src/kernel/purge.rs +48 −3</div></div></div>
+      <div class="pane"><div class="ph"><span class="ic">◐</span><span class="title">Port herdr zoom toggle</span><span class="act">Done</span><span class="menu">⋯</span></div><div class="st"><span class="s">◌ Thinking</span><span class="sep">·</span><span>8s</span></div><div class="stream"><div class="a">Reading herdr's TileLayout…</div></div></div>
+      <div class="pane"><div class="ph"><span class="ic">◐</span><span class="title">Startup latency: name the lane cost</span><span class="act">Done</span><span class="menu">⋯</span></div><div class="st"><span class="s">▶ Reading · host-stderr.log</span><span class="sep">·</span><span>1m</span></div><div class="stream term"><div><span class="p">❯</span> grep -c "slow maintenance tick"</div><div>412</div></div></div>
+      <div class="pane"><div class="ph"><span class="ic">◐</span><span class="title">hi there</span><span class="act">Done</span><span class="menu">⋯</span></div><div class="st"><span class="s">○ Idle</span><span class="sep">·</span><span>18m</span></div><div class="stream"><div class="a">Hi. What would you like to work on?</div></div></div>
+    </div>
+  </div>
+  <p class="caption">Full width for the panels; the strip is one line per task and scrolls sideways past eight. Faster to scan when everything is "working", worse when three things need you at once.</p>
+  <div class="options" style="margin-top:0"><div class="option" data-choice="b" onclick="toggleSelect(this)"><div class="letter">B</div><div class="content"><h3>Board as a top strip</h3><p>Panels get the full width; the board becomes a horizontal ticker.</p></div></div></div>
+</div>
+
+<!-- ============================================================ C ============================================================ -->
+<div class="section">
+  <h3>C · No standing board: panels fill the window, the board is a summonable switcher</h3>
+  <div class="dm rel">
+    <div class="dm-top"><span class="brand">DevManager</span><span>All projects</span><span class="spacer"></span><span class="kbd" style="color:#f2b441;border-color:#5a4a20">2 need you</span><span class="kbd">⌘K board</span><span class="kbd">Z zoom</span></div>
+    <div class="sw">
+      <div class="in">Type to filter · ↑↓ move · Enter open · needs-you first</div>
+      <div class="row you"><span class="dot you"></span><span class="t">are there any migrations left to run against dev or prod db?</span><span class="age">4m</span><span class="m">Asked a question · command · Claude</span></div>
+      <div class="row you"><span class="dot blocked"></span><span class="t">Build the Snake backend in snake-game/backend</span><span class="age">2m</span><span class="m">Provider rejected the session · Codex</span></div>
+      <div class="row sel"><span class="dot run"></span><span class="t">Snake Frontend</span><span class="age">12s</span><span class="m">Running cargo test · 5/6 steps</span></div>
+      <div class="row"><span class="dot run"></span><span class="t">Reply with exactly OPTIONS_ARGS_LIVE</span><span class="age">40s</span><span class="m">Editing src/kernel/purge.rs</span></div>
+      <div class="row"><span class="dot"></span><span class="t">hi there</span><span class="age">18m</span><span class="m">Idle</span></div>
+      <div class="row done-hd"><span></span><span class="t" style="color:#6b6b74">Done · 3</span><span class="age">▸</span></div>
+    </div>
+    <div class="grid g4" style="grid-auto-rows:150px;opacity:.55">
+      <div class="pane you"><div class="ph"><span class="ic">◐</span><span class="title">are there any migrations left…</span><span class="act primary">Answer</span><span class="menu">⋯</span></div><div class="st"><span class="s you">● Waiting for you · asked a question</span><span class="sep">·</span><span>4m</span></div><div class="stream"><div class="q"><b>Question</b> Apply 20261112020000 to prod now, or hold?</div></div></div>
+      <div class="pane blocked"><div class="ph"><span class="ic">◐</span><span class="title">Build the Snake backend</span><span class="act">Retry</span><span class="menu">⋯</span></div><div class="st"><span class="s blocked">● Blocked · provider rejected</span><span class="sep">·</span><span>2m</span></div><div class="stream"><div class="err">ProviderRejected</div></div></div>
+      <div class="pane focus pinned"><div class="ph"><span class="ic pin">⊟</span><span class="title">Snake Frontend</span><span class="ic">⤢</span><span class="act">Done</span><span class="menu">⋯</span></div><div class="st"><span class="s">▶ Running · cargo test --lib ui::</span><span class="sep">·</span><span>12s</span><span class="prog">5/6<i style="--p:83%"></i></span></div><div class="stream"><div class="cmd">$ cargo test --lib ui::</div><div>running 112 tests … 98 passed</div></div></div>
+      <div class="pane"><div class="ph"><span class="ic">◐</span><span class="title">Reply with exactly OPTIONS…</span><span class="act">Done</span><span class="menu">⋯</span></div><div class="st"><span class="s">✎ Editing · purge.rs</span><span class="sep">·</span><span>40s</span></div><div class="stream"><div class="cmd">edit src/kernel/purge.rs +48 −3</div></div></div>
+      <div class="pane"><div class="ph"><span class="ic">◐</span><span class="title">Port herdr zoom toggle</span><span class="act">Done</span><span class="menu">⋯</span></div><div class="st"><span class="s">◌ Thinking</span><span class="sep">·</span><span>8s</span></div><div class="stream"><div class="a">Reading herdr's TileLayout…</div></div></div>
+      <div class="pane"><div class="ph"><span class="ic">◐</span><span class="title">Startup latency: name the lane cost</span><span class="act">Done</span><span class="menu">⋯</span></div><div class="st"><span class="s">▶ Reading · host-stderr.log</span><span class="sep">·</span><span>1m</span></div><div class="stream term"><div><span class="p">❯</span> grep -c "slow maintenance tick"</div><div>412</div></div></div>
+      <div class="pane"><div class="ph"><span class="ic">◐</span><span class="title">hi there</span><span class="act">Done</span><span class="menu">⋯</span></div><div class="st"><span class="s">○ Idle</span><span class="sep">·</span><span>18m</span></div><div class="stream"><div class="a">Hi. What would you like to work on?</div></div></div>
+    </div>
+  </div>
+  <p class="caption">Every pixel goes to the streams. The top bar keeps a permanent "2 need you" count so nothing is missed, and ⌘K summons the board as a switcher with needs-you first. Best when the open panels <em>are</em> the board; worst when you keep more tasks than panels.</p>
+  <div class="options" style="margin-top:0"><div class="option" data-choice="c" onclick="toggleSelect(this)"><div class="letter">C</div><div class="content"><h3>Summonable board</h3><p>No standing list; a needs-you count in the bar and a switcher on demand.</p></div></div></div>
+</div>
+
+<p class="subtitle" style="margin-top:8px">Shared by all three: the status line (needs you and why · doing now · time in state · progress), view tabs plus one tab per running subagent, one primary action and a ⋯ menu, pinned panels keep their size, and colour only where something wants you.</p>
+
+</body></html>

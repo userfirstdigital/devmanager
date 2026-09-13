@@ -1,8 +1,12 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use super::super::{
+    defer_unowned_remote_worker, remote_worker_admission_pool, RemoteWorker,
+    RemoteWorkerAdmissionPool,
+};
 use crate::remote::presentation::StableSessionKey;
 
 const DEFAULT_MAX_WORKERS: usize = 64;
@@ -28,11 +32,16 @@ pub(crate) struct WebInputExecutor {
 
 struct WebInputExecutorInner {
     workers: Mutex<HashMap<StableSessionKey, WebInputWorker>>,
+    handles: Mutex<HashMap<u64, RemoteWorker>>,
+    completion_tx: mpsc::Sender<u64>,
+    completion_rx: Mutex<mpsc::Receiver<u64>>,
+    stopping: AtomicBool,
     max_workers: usize,
     queue_capacity: usize,
     idle_timeout: Duration,
     next_worker_id: AtomicU64,
     budget: Arc<WebInputBudget>,
+    worker_pool: Arc<RemoteWorkerAdmissionPool>,
 }
 
 #[derive(Clone)]
@@ -121,9 +130,32 @@ impl WebInputExecutor {
         max_bytes: usize,
         idle_timeout: Duration,
     ) -> Self {
+        Self::with_budget_and_worker_pool(
+            max_workers,
+            queue_capacity,
+            max_items,
+            max_bytes,
+            idle_timeout,
+            remote_worker_admission_pool(),
+        )
+    }
+
+    fn with_budget_and_worker_pool(
+        max_workers: usize,
+        queue_capacity: usize,
+        max_items: usize,
+        max_bytes: usize,
+        idle_timeout: Duration,
+        worker_pool: Arc<RemoteWorkerAdmissionPool>,
+    ) -> Self {
+        let (completion_tx, completion_rx) = mpsc::channel();
         Self {
             inner: Arc::new(WebInputExecutorInner {
                 workers: Mutex::new(HashMap::new()),
+                handles: Mutex::new(HashMap::new()),
+                completion_tx,
+                completion_rx: Mutex::new(completion_rx),
+                stopping: AtomicBool::new(false),
                 max_workers: max_workers.max(1),
                 queue_capacity: queue_capacity.max(1),
                 idle_timeout,
@@ -133,6 +165,7 @@ impl WebInputExecutor {
                     max_items: max_items.max(1),
                     max_bytes: max_bytes.max(1),
                 }),
+                worker_pool,
             }),
         }
     }
@@ -143,6 +176,10 @@ impl WebInputExecutor {
         retained_bytes: usize,
         job: impl FnOnce() + Send + 'static,
     ) -> Result<(), WebInputDispatchError> {
+        self.reap_completed_workers();
+        if self.inner.stopping.load(Ordering::Acquire) {
+            return Err(WebInputDispatchError::WorkerUnavailable);
+        }
         let Some(reservation) = self.inner.budget.reserve(retained_bytes) else {
             return Err(WebInputDispatchError::BudgetExceeded);
         };
@@ -158,6 +195,12 @@ impl WebInputExecutor {
                 .workers
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
+            // Shutdown takes this same registry lock after flipping the
+            // stopping bit, so a dispatch that raced the lifecycle boundary
+            // cannot create a worker after the owner has drained the map.
+            if self.inner.stopping.load(Ordering::Acquire) {
+                return Err(WebInputDispatchError::WorkerUnavailable);
+            }
             if let Some(worker) = workers.get(&key) {
                 let job = pending.take().expect("web input job dispatched once");
                 match worker.sender.try_send(job) {
@@ -180,15 +223,137 @@ impl WebInputExecutor {
             let weak = Arc::downgrade(&self.inner);
             let worker_key = key.clone();
             let idle_timeout = self.inner.idle_timeout;
-            let spawn = std::thread::Builder::new()
-                .name(format!("web-input-{id}"))
-                .spawn(move || run_worker(weak, worker_key, id, receiver, idle_timeout));
-            if spawn.is_err() {
+            let completion_tx = self.inner.completion_tx.clone();
+            let spawn = RemoteWorker::try_spawn_with_pool(
+                self.inner.worker_pool.clone(),
+                format!("web-input-{id}"),
+                None,
+                move || run_worker(weak, worker_key, id, receiver, idle_timeout, completion_tx),
+            );
+            let Ok(worker) = spawn else {
                 return Err(WebInputDispatchError::WorkerUnavailable);
-            }
+            };
             workers.insert(key.clone(), WebInputWorker { id, sender });
+            self.inner
+                .handles
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(id, worker);
         }
         Err(WebInputDispatchError::WorkerUnavailable)
+    }
+
+    /// Stop accepting work, release queued jobs, and join every worker that
+    /// exits before the shared lifecycle deadline. Any callback that ignores
+    /// its own deadline remains in this owned handle map as visible residue;
+    /// it is never detached or silently abandoned.
+    pub(crate) fn shutdown_until(&self, deadline: Instant) -> usize {
+        self.inner.stopping.store(true, Ordering::Release);
+        let workers = std::mem::take(
+            &mut *self
+                .inner
+                .workers
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        );
+        drop(workers);
+        self.reap_completed_workers();
+        self.join_completed_until(deadline)
+    }
+
+    pub(in crate::remote) fn take_unfinished_workers(&self) -> Vec<RemoteWorker> {
+        self.inner
+            .handles
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .drain()
+            .map(|(_, worker)| worker)
+            .collect()
+    }
+
+    fn join_completed_until(&self, deadline: Instant) -> usize {
+        loop {
+            let remaining = self
+                .inner
+                .handles
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .len();
+            if remaining == 0 {
+                return 0;
+            }
+            let wait = deadline.saturating_duration_since(Instant::now());
+            if wait.is_zero() {
+                return remaining;
+            }
+            let event = self
+                .inner
+                .completion_rx
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .recv_timeout(wait);
+            match event {
+                Ok(id) => {
+                    if let Some(worker) = self
+                        .inner
+                        .handles
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .remove(&id)
+                    {
+                        let _ = worker.join();
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    return self
+                        .inner
+                        .handles
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .len();
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return self
+                        .inner
+                        .handles
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .len();
+                }
+            }
+        }
+    }
+
+    fn reap_completed_workers(&self) {
+        let mut ids = {
+            let receiver = self
+                .inner
+                .completion_rx
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            std::iter::from_fn(|| receiver.try_recv().ok()).collect::<Vec<_>>()
+        };
+        ids.extend(
+            self.inner
+                .handles
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .iter()
+                .filter_map(|(id, worker)| worker.is_finished().then_some(*id)),
+        );
+        ids.sort_unstable();
+        ids.dedup();
+        for id in ids {
+            if let Some(worker) = self
+                .inner
+                .handles
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(&id)
+            {
+                let _ = worker.join();
+            }
+        }
     }
 
     #[cfg(test)]
@@ -211,13 +376,45 @@ impl WebInputExecutor {
     }
 }
 
+impl Drop for WebInputExecutorInner {
+    fn drop(&mut self) {
+        self.stopping.store(true, Ordering::Release);
+        self.workers
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+        for (_, worker) in self
+            .handles
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .drain()
+        {
+            defer_unowned_remote_worker(worker);
+        }
+    }
+}
+
 fn run_worker(
     executor: Weak<WebInputExecutorInner>,
     key: StableSessionKey,
     id: u64,
     receiver: mpsc::Receiver<AccountedWebInputJob>,
     idle_timeout: Duration,
+    completion_tx: mpsc::Sender<u64>,
 ) {
+    struct Completion {
+        id: u64,
+        tx: mpsc::Sender<u64>,
+    }
+    impl Drop for Completion {
+        fn drop(&mut self) {
+            let _ = self.tx.send(self.id);
+        }
+    }
+    let _completion = Completion {
+        id,
+        tx: completion_tx,
+    };
     loop {
         match receiver.recv_timeout(idle_timeout) {
             Ok(job) => run_accounted_job(job),
@@ -388,5 +585,73 @@ mod tests {
         executor
             .dispatch(StableSessionKey::from_tab("a"), 10, || {})
             .unwrap();
+    }
+
+    #[test]
+    fn shutdown_joins_paused_input_worker_without_detaching_it() {
+        let executor = WebInputExecutor::new(1, 1, Duration::from_secs(60));
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(0);
+        executor
+            .dispatch(StableSessionKey::from_tab("paused"), 0, move || {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            })
+            .expect("input worker should start");
+        entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("input callback should enter before shutdown");
+        assert_eq!(
+            executor.shutdown_until(Instant::now() + Duration::from_millis(50)),
+            1,
+            "paused input worker should remain visible after its owner deadline"
+        );
+        let workers = executor.take_unfinished_workers();
+        assert_eq!(
+            workers.len(),
+            1,
+            "paused input worker handle must stay owned"
+        );
+        release_tx.send(()).unwrap();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn worker_admission_is_reserved_before_input_thread_spawn() {
+        let pool = Arc::new(RemoteWorkerAdmissionPool::new(1));
+        let executor = WebInputExecutor::with_budget_and_worker_pool(
+            2,
+            1,
+            2,
+            2,
+            Duration::from_secs(60),
+            pool.clone(),
+        );
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(0);
+        executor
+            .dispatch(StableSessionKey::from_tab("first"), 0, move || {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            })
+            .unwrap();
+        entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("admitted input worker should start");
+
+        assert_eq!(
+            executor.dispatch(StableSessionKey::from_tab("second"), 0, || {}),
+            Err(WebInputDispatchError::WorkerUnavailable)
+        );
+        assert_eq!(pool.in_use(), 1);
+
+        release_tx.send(()).unwrap();
+        assert_eq!(
+            executor.shutdown_until(Instant::now() + Duration::from_secs(1)),
+            0
+        );
+        assert_eq!(pool.in_use(), 0);
     }
 }

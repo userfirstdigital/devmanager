@@ -2,6 +2,7 @@ use crate::persistence;
 use crate::services::platform_service;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::MutexGuard;
@@ -14,6 +15,10 @@ static TEST_PID_FILE_OVERRIDE_LOCK: Mutex<()> = Mutex::new(());
 static TEST_PID_FILE_OVERRIDE: Mutex<Option<PathBuf>> = Mutex::new(None);
 
 const LEDGER_VERSION: u32 = 1;
+const MAX_LEDGER_FILE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_LEDGER_SESSIONS: usize = 1_024;
+const MAX_LEDGER_DESCENDANTS_PER_SESSION: usize = 4_096;
+const MAX_LEDGER_HOST_STRING_BYTES: usize = 32 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ManagedProcessRecord {
@@ -89,6 +94,21 @@ enum TrackedProcessState {
     ReusedPid,
 }
 
+/// Result of reconciling process identities left by an earlier DevManager
+/// instance.
+///
+/// A persisted PID ledger is observation only. Once the instance that owned a
+/// process Job has exited, the ledger cannot recreate the exact Job/fence
+/// capability required to terminate that process safely.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OrphanedProcessReconciliation {
+    Clear,
+    ExactAuthorityUnavailable {
+        retained_sessions: usize,
+        retained_processes: usize,
+    },
+}
+
 #[doc(hidden)]
 pub struct TestPidFileGuard {
     _lock: MutexGuard<'static, ()>,
@@ -126,19 +146,31 @@ fn pid_file_path() -> Result<PathBuf, String> {
 }
 
 fn read_ledger_from_path(path: &Path) -> ManagedProcessLedgerFile {
-    let contents = match std::fs::read_to_string(path) {
-        Ok(contents) => contents,
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
         Err(_) => return ManagedProcessLedgerFile::default(),
     };
+    let mut contents = String::new();
+    let read_limit = u64::try_from(MAX_LEDGER_FILE_BYTES + 1).expect("ledger bound fits u64");
+    match file.take(read_limit).read_to_string(&mut contents) {
+        Ok(_) if contents.len() <= MAX_LEDGER_FILE_BYTES => {}
+        Err(_) => return ManagedProcessLedgerFile::default(),
+        Ok(_) => return ManagedProcessLedgerFile::default(),
+    }
     match serde_json::from_str::<StoredLedgerFile>(&contents) {
         Ok(StoredLedgerFile::Current(mut ledger)) => {
             ledger.version = LEDGER_VERSION;
-            ledger
+            if validate_ledger_bounds(&ledger).is_ok() {
+                ledger
+            } else {
+                ManagedProcessLedgerFile::default()
+            }
         }
         Ok(StoredLedgerFile::LegacyPids(pids)) => ManagedProcessLedgerFile {
             version: LEDGER_VERSION,
             sessions: pids
                 .into_iter()
+                .take(MAX_LEDGER_SESSIONS)
                 .map(|pid| {
                     let entry = ManagedProcessRecord::legacy(pid);
                     (entry.session_id.clone(), entry)
@@ -149,7 +181,55 @@ fn read_ledger_from_path(path: &Path) -> ManagedProcessLedgerFile {
     }
 }
 
+fn validate_optional_string(value: Option<&str>, field: &str) -> Result<(), String> {
+    if value.is_some_and(|value| value.len() > MAX_LEDGER_HOST_STRING_BYTES) {
+        Err(format!("PID ledger {field} exceeds host string bound"))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_record_bounds(record: &ManagedProcessRecord) -> Result<(), String> {
+    for (field, value) in [
+        ("session id", record.session_id.as_str()),
+        ("session kind", record.session_kind.as_str()),
+        ("program", record.program.as_str()),
+    ] {
+        if value.len() > MAX_LEDGER_HOST_STRING_BYTES {
+            return Err(format!("PID ledger {field} exceeds host string bound"));
+        }
+    }
+    validate_optional_string(record.process_name.as_deref(), "process name")?;
+    validate_optional_string(record.project_id.as_deref(), "project id")?;
+    validate_optional_string(record.command_id.as_deref(), "command id")?;
+    validate_optional_string(record.tab_id.as_deref(), "tab id")?;
+    if record.descendant_processes.len() > MAX_LEDGER_DESCENDANTS_PER_SESSION {
+        return Err("PID ledger descendant set exceeds fixed bound".to_string());
+    }
+    for descendant in &record.descendant_processes {
+        validate_optional_string(
+            descendant.process_name.as_deref(),
+            "descendant process name",
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_ledger_bounds(ledger: &ManagedProcessLedgerFile) -> Result<(), String> {
+    if ledger.sessions.len() > MAX_LEDGER_SESSIONS {
+        return Err("PID ledger session set exceeds fixed bound".to_string());
+    }
+    for (session_id, record) in &ledger.sessions {
+        if session_id.len() > MAX_LEDGER_HOST_STRING_BYTES || session_id != &record.session_id {
+            return Err("PID ledger session key is invalid".to_string());
+        }
+        validate_record_bounds(record)?;
+    }
+    Ok(())
+}
+
 fn write_ledger_to_path(path: &Path, ledger: &ManagedProcessLedgerFile) -> Result<(), String> {
+    validate_ledger_bounds(ledger)?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|error| format!("Failed to create PID ledger directory: {error}"))?;
@@ -157,6 +237,9 @@ fn write_ledger_to_path(path: &Path, ledger: &ManagedProcessLedgerFile) -> Resul
     let temp_path = path.with_extension("json.tmp");
     let contents = serde_json::to_string_pretty(ledger)
         .map_err(|error| format!("Failed to serialize PID ledger: {error}"))?;
+    if contents.len() > MAX_LEDGER_FILE_BYTES {
+        return Err("Serialized PID ledger exceeds fixed file bound".to_string());
+    }
     std::fs::write(&temp_path, contents)
         .map_err(|error| format!("Failed to write PID ledger temp file: {error}"))?;
     if let Err(error) = std::fs::rename(&temp_path, path) {
@@ -209,6 +292,87 @@ fn mutate_ledger_if_changed(
         write_ledger_to_path(&path, &ledger)?;
     }
     Ok(changed)
+}
+
+fn remaining_before(deadline: Instant, operation: &str) -> Result<Duration, String> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        Err(format!("{operation} exceeded teardown absolute deadline"))
+    } else {
+        Ok(remaining)
+    }
+}
+
+fn lock_pid_ledger_before(deadline: Instant) -> Result<MutexGuard<'static, ()>, String> {
+    loop {
+        let remaining = remaining_before(deadline, "PID ledger lock")?;
+        match PID_FILE_ACCESS_LOCK.try_lock() {
+            Ok(guard) => {
+                remaining_before(deadline, "PID ledger lock")?;
+                return Ok(guard);
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {
+                thread::sleep(remaining.min(Duration::from_millis(1)));
+            }
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err("PID ledger lock poisoned".to_string());
+            }
+        }
+    }
+}
+
+fn pid_file_path_before(deadline: Instant) -> Result<PathBuf, String> {
+    remaining_before(deadline, "PID ledger path lookup")?;
+    let override_path = loop {
+        let remaining = remaining_before(deadline, "PID ledger override lookup")?;
+        match TEST_PID_FILE_OVERRIDE.try_lock() {
+            Ok(path) => break path.clone(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                thread::sleep(remaining.min(Duration::from_millis(1)));
+            }
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err("PID ledger override lock poisoned".to_string());
+            }
+        }
+    };
+    if let Some(path) = override_path {
+        remaining_before(deadline, "PID ledger path lookup")?;
+        return Ok(path);
+    }
+    let config_dir = persistence::app_config_dir()
+        .map_err(|_| "Could not determine config directory".to_string())?;
+    remaining_before(deadline, "PID ledger path lookup")?;
+    Ok(config_dir.join("running-pids.json"))
+}
+
+/// Removes the exact session ledger observation only after the Job-backed
+/// registry has authoritatively settled ACTIVE_PROCESS_ZERO and released the
+/// matching fence. No PID scan is performed: the Job is the membership truth,
+/// while this file is merely durable observability state.
+pub(crate) fn release_session_root_after_job_zero(
+    session_id: &str,
+    root_pid: u32,
+    absolute_deadline: Instant,
+) -> Result<(), String> {
+    if session_id.is_empty() || session_id.len() > MAX_LEDGER_HOST_STRING_BYTES || root_pid == 0 {
+        return Err("PID ledger exact release identity is invalid".to_string());
+    }
+    let path = pid_file_path_before(absolute_deadline)?;
+    let _guard = lock_pid_ledger_before(absolute_deadline)?;
+    remaining_before(absolute_deadline, "PID ledger exact release read")?;
+    let mut ledger = read_ledger_from_path(&path);
+    remaining_before(absolute_deadline, "PID ledger exact release read")?;
+    let matches_root = ledger
+        .sessions
+        .get(session_id)
+        .is_some_and(|entry| entry.pid == root_pid);
+    if matches_root {
+        ledger.sessions.remove(session_id);
+        remaining_before(absolute_deadline, "PID ledger exact release write")?;
+        write_ledger_to_path(&path, &ledger)?;
+        remaining_before(absolute_deadline, "PID ledger exact release write")?;
+    }
+    Ok(())
 }
 
 fn tracked_process_identity_state_with<F>(
@@ -265,6 +429,25 @@ fn normalize_descendant_processes(
     descendants.sort_by_key(|identity| identity.pid);
     descendants.dedup_by(|left, right| left.pid == right.pid);
     descendants
+}
+
+fn validate_descendant_input(
+    session_id: &str,
+    descendants: &[platform_service::ProcessIdentity],
+) -> Result<(), String> {
+    if session_id.len() > MAX_LEDGER_HOST_STRING_BYTES {
+        return Err("PID ledger session id exceeds host string bound".to_string());
+    }
+    if descendants.len() > MAX_LEDGER_DESCENDANTS_PER_SESSION {
+        return Err("PID ledger descendant input exceeds fixed bound".to_string());
+    }
+    for descendant in descendants {
+        validate_optional_string(
+            descendant.process_name.as_deref(),
+            "descendant process name",
+        )?;
+    }
+    Ok(())
 }
 
 fn active_processes_in_record_with<F>(
@@ -380,55 +563,57 @@ where
     Ok(remaining)
 }
 
-fn cleanup_orphaned_processes_with_path<F, G>(
+fn reconcile_orphaned_process_ledger_with_path<F>(
     path: &Path,
     mut identify_process: F,
-    mut kill_process_tree: G,
-) where
+) -> Result<OrphanedProcessReconciliation, String>
+where
     F: FnMut(u32) -> Option<platform_service::ProcessIdentity>,
-    G: FnMut(u32) -> Result<(), String>,
 {
     let mut ledger = read_ledger_from_path(path);
     if ledger.sessions.is_empty() {
-        return;
+        return Ok(OrphanedProcessReconciliation::Clear);
     }
 
     let mut retained = BTreeMap::new();
+    let mut retained_processes = 0usize;
     for (session_id, entry) in ledger.sessions {
-        let root_live = tracked_process_identity_state_with(
-            &root_process_identity(&entry),
-            &mut identify_process,
-        ) == TrackedProcessState::VerifiedRunning;
         let Some(active_entry) = active_processes_in_record_with(&entry, &mut identify_process)
         else {
             continue;
         };
-
-        if root_live {
-            let _ = kill_process_tree(entry.pid);
-        } else {
-            for descendant in &active_entry.descendant_processes {
-                let _ = kill_process_tree(descendant.pid);
-            }
-        }
-
-        if let Some(active_after_kill) =
-            active_processes_in_record_with(&entry, &mut identify_process)
-        {
-            retained.insert(session_id, active_after_kill);
-        }
+        retained_processes = retained_processes
+            .checked_add(active_pids_in_record_with(&active_entry, &mut identify_process).len())
+            .ok_or_else(|| "Orphan process count overflowed".to_string())?;
+        retained.insert(session_id, active_entry);
     }
 
     ledger.sessions = retained;
-    let _ = write_ledger_to_path(path, &ledger);
+    let retained_sessions = ledger.sessions.len();
+    write_ledger_to_path(path, &ledger)?;
+    if retained_sessions == 0 {
+        Ok(OrphanedProcessReconciliation::Clear)
+    } else {
+        Ok(OrphanedProcessReconciliation::ExactAuthorityUnavailable {
+            retained_sessions,
+            retained_processes,
+        })
+    }
 }
 
 pub fn track_session_process(record: ManagedProcessRecord) -> Result<(), String> {
-    mutate_ledger(|ledger| {
+    validate_record_bounds(&record)?;
+    mutate_ledger(|ledger| -> Result<(), String> {
         ledger.version = LEDGER_VERSION;
+        if !ledger.sessions.contains_key(&record.session_id)
+            && ledger.sessions.len() >= MAX_LEDGER_SESSIONS
+        {
+            return Err("PID ledger session capacity exhausted".to_string());
+        }
         ledger.sessions.insert(record.session_id.clone(), record);
+        Ok(())
     })
-    .map(|_| ())
+    .and_then(|result| result)
 }
 
 fn retain_verified_descendant_identities(
@@ -438,6 +623,9 @@ fn retain_verified_descendant_identities(
     mut is_verified: impl FnMut(&TrackedProcessIdentity) -> bool,
 ) -> Vec<TrackedProcessIdentity> {
     for identity in prior {
+        if current.len() >= MAX_LEDGER_DESCENDANTS_PER_SESSION {
+            break;
+        }
         if identity.pid == root_pid || current.iter().any(|entry| entry.pid == identity.pid) {
             continue;
         }
@@ -477,6 +665,7 @@ pub fn sync_session_descendant_processes_with_system(
     descendants: Vec<platform_service::ProcessIdentity>,
     system: &sysinfo::System,
 ) -> Result<(), String> {
+    validate_descendant_input(session_id, &descendants)?;
     mutate_ledger_if_changed(|ledger| {
         let Some(entry) = ledger.sessions.get_mut(session_id) else {
             return false;
@@ -504,6 +693,7 @@ pub fn sync_session_descendant_processes(
     root_pid: u32,
     descendants: Vec<platform_service::ProcessIdentity>,
 ) -> Result<(), String> {
+    validate_descendant_input(session_id, &descendants)?;
     let mut system = sysinfo::System::new();
     system.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
     sync_session_descendant_processes_with_system(session_id, root_pid, descendants, &system)
@@ -517,6 +707,7 @@ pub fn release_session_root_with_system(
     surviving_descendants: Vec<platform_service::ProcessIdentity>,
     system: &sysinfo::System,
 ) -> Result<(), String> {
+    validate_descendant_input(session_id, &surviving_descendants)?;
     mutate_ledger_if_changed(|ledger| {
         let Some(entry) = ledger.sessions.get(session_id) else {
             return false;
@@ -548,6 +739,7 @@ pub fn release_session_root(
     root_pid: u32,
     surviving_descendants: Vec<platform_service::ProcessIdentity>,
 ) -> Result<(), String> {
+    validate_descendant_input(session_id, &surviving_descendants)?;
     let mut system = sysinfo::System::new();
     system.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
     release_session_root_with_system(session_id, root_pid, surviving_descendants, &system)
@@ -667,19 +859,12 @@ pub fn prune_inactive_entries() -> Result<usize, String> {
     prune_inactive_entries_with_path(&path, platform_service::capture_process_identity)
 }
 
-pub fn cleanup_orphaned_processes() {
-    let path = match pid_file_path() {
-        Ok(path) => path,
-        Err(_) => return,
-    };
+pub(crate) fn reconcile_orphaned_process_ledger() -> Result<OrphanedProcessReconciliation, String> {
+    let path = pid_file_path()?;
     let _guard = PID_FILE_ACCESS_LOCK
         .lock()
         .unwrap_or_else(|error| error.into_inner());
-    cleanup_orphaned_processes_with_path(
-        &path,
-        platform_service::capture_process_identity,
-        platform_service::kill_process_tree,
-    );
+    reconcile_orphaned_process_ledger_with_path(&path, platform_service::capture_process_identity)
 }
 
 #[cfg(test)]
@@ -712,7 +897,64 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_orphaned_processes_kills_running_pids_and_prunes_reused_entries() {
+    fn ledger_record_rejects_unbounded_descendants_and_host_strings() {
+        let mut too_many_descendants = record("bounded", 1, 1);
+        too_many_descendants.descendant_processes = (0..=MAX_LEDGER_DESCENDANTS_PER_SESSION)
+            .map(|offset| TrackedProcessIdentity {
+                pid: u32::try_from(offset + 2).expect("bounded test pid"),
+                started_at_unix_secs: 1,
+                process_name: None,
+            })
+            .collect();
+        assert!(validate_record_bounds(&too_many_descendants).is_err());
+
+        let mut oversized_string = record("bounded", 1, 1);
+        oversized_string.program = "x".repeat(MAX_LEDGER_HOST_STRING_BYTES + 1);
+        assert!(validate_record_bounds(&oversized_string).is_err());
+    }
+
+    #[test]
+    fn release_session_root_rejects_oversized_descendant_input() {
+        let temp = tempfile::tempdir().expect("bounded release ledger root");
+        let _guard = use_test_pid_file(temp.path().join("running-pids.json"));
+        let descendants = (0..=MAX_LEDGER_DESCENDANTS_PER_SESSION)
+            .map(|offset| {
+                identity(
+                    u32::try_from(offset + 2).expect("bounded test pid"),
+                    u64::try_from(offset + 1).expect("bounded test creation time"),
+                )
+            })
+            .collect();
+
+        let error = release_session_root_with_system(
+            "bounded-release",
+            1,
+            descendants,
+            &sysinfo::System::new(),
+        )
+        .expect_err("release input must be bounded before ledger mutation");
+
+        assert!(error.contains("descendant input exceeds fixed bound"));
+    }
+
+    #[test]
+    fn ledger_reader_rejects_oversized_files_before_json_decode() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "devmanager-pid-ledger-bound-tests-{}",
+            std::process::id()
+        ));
+        let path = temp_dir.join("running-pids.json");
+        let _ = fs::remove_dir_all(&temp_dir);
+        fs::create_dir_all(&temp_dir).expect("create bounded ledger test dir");
+        fs::write(&path, vec![b' '; MAX_LEDGER_FILE_BYTES + 1])
+            .expect("write oversized ledger fixture");
+
+        assert!(read_ledger_from_path(&path).sessions.is_empty());
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn orphan_reconciliation_never_reconstructs_termination_authority_from_pids() {
         let temp_dir =
             std::env::temp_dir().join(format!("devmanager-pid-file-tests-{}", std::process::id()));
         let path = temp_dir.join("running-pids.json");
@@ -755,24 +997,27 @@ mod tests {
                 },
             ),
         ]));
-        let mut killed = Vec::new();
-        cleanup_orphaned_processes_with_path(
-            &path,
-            |pid| running.borrow().get(&pid).cloned(),
-            |pid| {
-                killed.push(pid);
-                running.borrow_mut().remove(&pid);
-                Ok(())
-            },
-        );
+        let result = reconcile_orphaned_process_ledger_with_path(&path, |pid| {
+            running.borrow().get(&pid).cloned()
+        })
+        .expect("reconcile orphan ledger");
 
-        killed.sort_unstable();
-        assert_eq!(killed, vec![11, 33]);
-        assert!(read_ledger_from_path(&path).sessions.is_empty());
+        assert_eq!(
+            result,
+            OrphanedProcessReconciliation::ExactAuthorityUnavailable {
+                retained_sessions: 2,
+                retained_processes: 2,
+            }
+        );
+        let retained = read_ledger_from_path(&path).sessions;
+        assert_eq!(retained.len(), 2);
+        assert!(retained.contains_key("server-11"));
+        assert!(retained.contains_key("server-33"));
+        assert!(!retained.contains_key("server-22"));
     }
 
     #[test]
-    fn cleanup_orphaned_processes_keeps_entries_that_still_refuse_to_die() {
+    fn orphan_reconciliation_reports_verified_live_entries_as_authority_unavailable() {
         let temp_dir = std::env::temp_dir().join(format!(
             "devmanager-pid-retain-tests-{}",
             std::process::id()
@@ -792,10 +1037,15 @@ mod tests {
             started_at_unix_secs: 444,
             process_name: Some("proc-44".to_string()),
         };
-        cleanup_orphaned_processes_with_path(
-            &path,
-            |_| Some(running.clone()),
-            |_| Err("still running".to_string()),
+        let result = reconcile_orphaned_process_ledger_with_path(&path, |_| Some(running.clone()))
+            .expect("reconcile orphan ledger");
+
+        assert_eq!(
+            result,
+            OrphanedProcessReconciliation::ExactAuthorityUnavailable {
+                retained_sessions: 1,
+                retained_processes: 1,
+            }
         );
 
         let remaining = read_ledger_from_path(&path)
@@ -897,7 +1147,36 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_orphaned_processes_kills_surviving_descendants_when_root_is_gone() {
+    fn release_after_authoritative_job_zero_removes_the_whole_exact_session() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "devmanager-pid-job-zero-release-tests-{}",
+            std::process::id()
+        ));
+        let path = temp_dir.join("running-pids.json");
+        let _ = fs::remove_dir_all(&temp_dir);
+        fs::create_dir_all(&temp_dir).unwrap();
+        let _guard = use_test_pid_file(path);
+
+        let mut tracked = record("terminal-10", 10, 100);
+        tracked.descendant_processes = vec![TrackedProcessIdentity {
+            pid: 21,
+            started_at_unix_secs: 210,
+            process_name: Some("stale-observation".to_string()),
+        }];
+        track_session_process(tracked).unwrap();
+
+        release_session_root_after_job_zero(
+            "terminal-10",
+            10,
+            Instant::now() + Duration::from_secs(1),
+        )
+        .expect("authoritative zero releases exact session ledger entry");
+
+        assert!(tracked_processes().is_empty());
+    }
+
+    #[test]
+    fn orphan_reconciliation_retains_verified_descendants_without_raw_pid_kill() {
         let temp_dir = std::env::temp_dir().join(format!(
             "devmanager-pid-descendant-cleanup-tests-{}",
             std::process::id()
@@ -929,20 +1208,23 @@ mod tests {
             (21, identity(21, 210)),
             (22, identity(22, 220)),
         ]));
-        let mut killed = Vec::new();
-        cleanup_orphaned_processes_with_path(
-            &path,
-            |pid| running.borrow().get(&pid).cloned(),
-            |pid| {
-                killed.push(pid);
-                running.borrow_mut().remove(&pid);
-                Ok(())
-            },
-        );
+        let result = reconcile_orphaned_process_ledger_with_path(&path, |pid| {
+            running.borrow().get(&pid).cloned()
+        })
+        .expect("reconcile orphan ledger");
 
-        killed.sort_unstable();
-        assert_eq!(killed, vec![21, 22]);
-        assert!(read_ledger_from_path(&path).sessions.is_empty());
+        assert_eq!(
+            result,
+            OrphanedProcessReconciliation::ExactAuthorityUnavailable {
+                retained_sessions: 1,
+                retained_processes: 2,
+            }
+        );
+        let retained = read_ledger_from_path(&path)
+            .sessions
+            .remove("server-11")
+            .expect("live descendants remain observable");
+        assert_eq!(retained.descendant_processes.len(), 2);
     }
 
     #[test]

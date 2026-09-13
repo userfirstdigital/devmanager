@@ -31,15 +31,16 @@ function base64Url(bytes: Uint8Array): string {
 }
 
 function pushDependencies(overrides: Partial<PushBrowserDependencies> = {}) {
-  const vapidPublicKey = Uint8Array.from(
-    { length: 65 },
-    (_, index) => (index === 0 ? 4 : index),
+  const vapidPublicKey = Uint8Array.from({ length: 65 }, (_, index) =>
+    index === 0 ? 4 : index,
   );
-  const p256dh = Uint8Array.from(
-    { length: 65 },
-    (_, index) => (index === 0 ? 4 : index),
+  const p256dh = Uint8Array.from({ length: 65 }, (_, index) =>
+    index === 0 ? 4 : index,
   ).buffer;
-  const auth = Uint8Array.from({ length: 16 }, (_, index) => 255 - index).buffer;
+  const auth = Uint8Array.from(
+    { length: 16 },
+    (_, index) => 255 - index,
+  ).buffer;
   const subscription = {
     endpoint: "https://web.push.apple.com/Q1/test-endpoint",
     options: { applicationServerKey: null as ArrayBuffer | null },
@@ -109,9 +110,10 @@ describe("Web Push setup", () => {
     expect(
       notificationAvailability({ ...ready, secureContext: false }),
     ).toEqual({ supported: false, reason: "insecure" });
-    expect(
-      notificationAvailability({ ...ready, standalone: false }),
-    ).toEqual({ supported: false, reason: "notInstalled" });
+    expect(notificationAvailability({ ...ready, standalone: false })).toEqual({
+      supported: false,
+      reason: "notInstalled",
+    });
     expect(
       notificationAvailability({ ...ready, pushManagerAvailable: false }),
     ).toEqual({ supported: false, reason: "unsupported" });
@@ -164,7 +166,10 @@ describe("Web Push setup", () => {
         },
       });
     fetch.mockImplementation(async (input, init) => {
-      if (String(input) === "/api/push" && (!init?.method || init.method === "GET")) {
+      if (
+        String(input) === "/api/push" &&
+        (!init?.method || init.method === "GET")
+      ) {
         return response({
           publicKey: base64Url(vapidPublicKey),
           enabled: true,
@@ -244,7 +249,9 @@ describe("Web Push setup", () => {
           ),
         },
       });
-    subscription.options.applicationServerKey = new Uint8Array([4, 1, 2]).buffer;
+    subscription.options.applicationServerKey = new Uint8Array([
+      4, 1, 2,
+    ]).buffer;
     pushManager.getSubscription.mockResolvedValue(subscription);
     fetch.mockImplementation(async (input, init) => {
       if (String(input) === "/api/push" && !init?.method) {
@@ -285,22 +292,30 @@ describe("Web Push setup", () => {
       p256dh,
       auth,
     } = pushDependencies();
-    subscription.options.applicationServerKey = vapidPublicKey.buffer as ArrayBuffer;
+    subscription.options.applicationServerKey =
+      vapidPublicKey.buffer as ArrayBuffer;
     pushManager.getSubscription.mockResolvedValue(subscription);
-    const fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-      if (String(input) === "/api/push" && (!init?.method || init.method === "GET")) {
-        return response({
-          publicKey: base64Url(vapidPublicKey),
-          enabled: true,
-          subscribed: hostRegistration !== null,
-        });
-      }
-      if (String(input) === "/api/push" && init?.method === "POST") {
-        hostRegistration = JSON.parse(String(init.body)) as typeof hostRegistration;
-        return response({ enabled: true });
-      }
-      throw new Error(`unexpected request: ${String(input)}`);
-    });
+    const fetch = vi.fn(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        if (
+          String(input) === "/api/push" &&
+          (!init?.method || init.method === "GET")
+        ) {
+          return response({
+            publicKey: base64Url(vapidPublicKey),
+            enabled: true,
+            subscribed: hostRegistration !== null,
+          });
+        }
+        if (String(input) === "/api/push" && init?.method === "POST") {
+          hostRegistration = JSON.parse(
+            String(init.body),
+          ) as typeof hostRegistration;
+          return response({ enabled: true });
+        }
+        throw new Error(`unexpected request: ${String(input)}`);
+      },
+    );
     dependencies.fetch = fetch;
 
     await expect(readPushRegistrationState(dependencies)).resolves.toEqual({
@@ -366,8 +381,7 @@ describe("Web Push setup", () => {
       vapidPublicKey,
       p256dh,
       auth,
-    } =
-      pushDependencies();
+    } = pushDependencies();
 
     await expect(enablePushNotifications(dependencies)).resolves.toEqual({
       publicKey: base64Url(vapidPublicKey),
@@ -375,7 +389,9 @@ describe("Web Push setup", () => {
       subscribed: true,
     });
 
-    expect(dependencies.notification.requestPermission).toHaveBeenCalledTimes(1);
+    expect(dependencies.notification.requestPermission).toHaveBeenCalledTimes(
+      1,
+    );
     expect(pushManager.subscribe).toHaveBeenCalledWith({
       userVisibleOnly: true,
       applicationServerKey: vapidPublicKey,
@@ -405,7 +421,8 @@ describe("Web Push setup", () => {
       p256dh,
       auth,
     } = pushDependencies();
-    subscription.options.applicationServerKey = vapidPublicKey.buffer as ArrayBuffer;
+    subscription.options.applicationServerKey =
+      vapidPublicKey.buffer as ArrayBuffer;
     fetch.mockImplementation(async (input, init) => {
       if (String(input) === "/api/push" && !init?.method) {
         return response({
@@ -636,32 +653,32 @@ describe("app badge", () => {
     expect(
       notificationClickDestination(
         {
-          route: "/session/tab/tab-1",
+          route: "/tasks/tab%3Atab-1",
           runtimeInstanceId: "runtime-1",
         },
         "https://devmanager.test",
       ),
     ).toBe(
-      "https://devmanager.test/sessions?notificationRuntime=runtime-1&notificationRoute=%2Fsession%2Ftab%2Ftab-1",
+      "https://devmanager.test/tasks?notificationRuntime=runtime-1&notificationRoute=%2Ftasks%2Ftab%253Atab-1",
     );
   });
 
-  it("sends missing or malformed runtime handoffs to Sessions", () => {
+  it("sends missing or malformed runtime handoffs to Tasks", () => {
     expect(
       notificationClickDestination(
-        { route: "/session/tab/tab-1" },
+        { route: "/tasks/tab%3Atab-1" },
         "https://devmanager.test",
       ),
-    ).toBe("https://devmanager.test/sessions");
+    ).toBe("https://devmanager.test/tasks");
     expect(
       notificationClickDestination(
         {
-          route: "/session/tab/tab-1",
+          route: "/tasks/tab%3Atab-1",
           runtimeInstanceId: "runtime\nspoof",
         },
         "https://devmanager.test",
       ),
-    ).toBe("https://devmanager.test/sessions");
+    ).toBe("https://devmanager.test/tasks");
   });
 
   it("keeps stable routing and action metadata without copying arbitrary content", () => {
@@ -669,7 +686,7 @@ describe("app badge", () => {
       {
         title: "DevManager needs input",
         body: "Project · Claude",
-        route: "/session/tab/tab-1",
+        route: "/tasks/tab%3Atab-1",
         tag: "devmanager-event-1",
         eventId: "event-1",
         runtimeInstanceId: "runtime-1",
@@ -683,9 +700,9 @@ describe("app badge", () => {
       title: "DevManager needs input",
       body: "Project · Claude",
       tag: "devmanager-event-1",
-      route: "/session/tab/tab-1",
+      route: "/tasks/tab%3Atab-1",
       data: {
-        route: "/session/tab/tab-1",
+        route: "/tasks/tab%3Atab-1",
         eventId: "event-1",
         runtimeInstanceId: "runtime-1",
         action: "needsInput",

@@ -1,8 +1,23 @@
+use crate::domain::id::{OperationId, ResourceId};
+#[cfg(any(windows, target_os = "linux"))]
+use crate::domain::resource::ResourceKind;
 use crate::models::{DefaultTerminal, MacTerminalProfile};
+use crate::process::identity::ProcessOwner;
+use crate::process::job::JobMemberObservation;
+#[cfg(any(windows, target_os = "linux"))]
+use crate::process::launcher::{
+    prepare_suspended_pty, validate_terminal_launch_source_bounds, LaunchIntent,
+};
+use crate::process::registry::ManagedProcessFence;
+#[cfg(any(windows, target_os = "linux"))]
+use crate::process::teardown::{
+    ManagedTerminalActorHandles, ManagedTerminalIo, ManagedTerminalTeardown,
+};
+use crate::process::teardown::{TeardownCompletionStore, MAX_MANAGED_TERMINAL_PORTS};
 use crate::services::{pid_file, platform_service};
 use crate::state::{
-    PromptMarkKind, RuntimeState, SessionDimensions, SessionExitState, SessionKind,
-    SessionRuntimeState, SessionStatus, ShellIntegrationKind,
+    PromptMarkKind, ResourceSnapshot, RuntimeState, SessionDimensions, SessionExitState,
+    SessionKind, SessionRuntimeState, SessionStatus, ShellIntegrationKind,
 };
 use alacritty_terminal::event::{Event, EventListener, WindowSize};
 use alacritty_terminal::grid::{Dimensions, Scroll};
@@ -14,19 +29,128 @@ use alacritty_terminal::vte::ansi::{
     Color as AnsiColor, CursorShape, NamedColor, Processor, Rgb, StdSyncHandler,
 };
 use arboard::Clipboard;
-use portable_pty::{native_pty_system, Child, ChildKiller, CommandBuilder, MasterPty, PtySize};
+use portable_pty::{native_pty_system, Child, MasterPty, PtySize, SlavePty};
+#[cfg(not(any(windows, target_os = "linux")))]
+use portable_pty::{ChildKiller, CommandBuilder};
 use serde::{Deserialize, Serialize};
+#[cfg(any(windows, target_os = "linux"))]
+use std::collections::BTreeMap;
 use std::collections::HashMap;
+#[cfg(any(windows, target_os = "linux"))]
+use std::ffi::{OsStr, OsString};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(any(windows, target_os = "linux"))]
+use std::sync::MutexGuard;
+#[cfg(any(windows, target_os = "linux"))]
+use std::sync::RwLockWriteGuard;
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread;
 use std::time::Duration;
 
 const MAX_TERMINAL_CLIPBOARD_BYTES: usize = 1024 * 1024;
 const MAX_REMOTE_REPLAY_BYTES: usize = 4 * 1024 * 1024;
+const MAX_TERMINAL_INPUT_BYTES: usize = 4 * 1024 * 1024;
+/// First pause after a PTY read returns EOF or an error while the child is
+/// still alive. ConPTY surfaces transient EOFs and broken-pipe errors around
+/// sleep/resume; only a confirmed child exit may end the reader.
+const READER_RETRY_INITIAL_BACKOFF: Duration = Duration::from_millis(10);
+const READER_RETRY_MAX_BACKOFF: Duration = Duration::from_millis(250);
+/// Poll cadence when `Child::wait` itself fails and child liveness has to be
+/// re-observed through `try_wait` before any teardown is allowed.
+const WAIT_FALLBACK_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+#[cfg(all(test, any(windows, target_os = "linux")))]
+static FAIL_NEXT_WAIT_ACTOR_SPAWN: AtomicBool = AtomicBool::new(false);
+#[cfg(all(test, any(windows, target_os = "linux")))]
+static FAIL_NEXT_INPUT_ADMISSION_OPEN: AtomicBool = AtomicBool::new(false);
+
+/// Exact host-issued launch and teardown authority for one terminal runtime.
+/// The terminal layer cannot invent Task ownership, resource generations, or
+/// action epochs; the native host/task service must supply all of them.
+#[derive(Clone)]
+pub(crate) struct TerminalLaunchAuthority {
+    owner: ProcessOwner,
+    resource_id: ResourceId,
+    runtime_generation: u64,
+    operation_id: OperationId,
+    action_epoch: u64,
+    ports: Vec<u16>,
+    completion_store: TeardownCompletionStore,
+    #[cfg(target_os = "linux")]
+    provider_executable: Option<crate::providers::capabilities::ProviderExecutable>,
+}
+
+impl TerminalLaunchAuthority {
+    pub(crate) fn new(
+        owner: ProcessOwner,
+        resource_id: ResourceId,
+        runtime_generation: u64,
+        operation_id: OperationId,
+        action_epoch: u64,
+        ports: Vec<u16>,
+        completion_store: TeardownCompletionStore,
+    ) -> Result<Self, String> {
+        if runtime_generation == 0 || action_epoch == 0 {
+            return Err("terminal launch generation and action epoch must be non-zero".to_string());
+        }
+        if ports.len() > MAX_MANAGED_TERMINAL_PORTS {
+            return Err(format!(
+                "terminal launch port set exceeds {MAX_MANAGED_TERMINAL_PORTS} entries"
+            ));
+        }
+        let mut ports = ports;
+        ports.sort_unstable();
+        ports.dedup();
+        Ok(Self {
+            owner,
+            resource_id,
+            runtime_generation,
+            operation_id,
+            action_epoch,
+            ports,
+            completion_store,
+            #[cfg(target_os = "linux")]
+            provider_executable: None,
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn with_provider_executable(
+        mut self,
+        executable: crate::providers::capabilities::ProviderExecutable,
+    ) -> Self {
+        self.provider_executable = Some(executable);
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn identity_for_test(&self) -> (ProcessOwner, ResourceId, u64, u64) {
+        (
+            self.owner,
+            self.resource_id,
+            self.runtime_generation,
+            self.action_epoch,
+        )
+    }
+}
+
 type SessionStateNotifier = Arc<dyn Fn() + Send + Sync>;
-type SessionOutputNotifier = Arc<dyn Fn(Vec<u8>, TerminalModeSnapshot) + Send + Sync>;
+/// Shared PTY-output observer. Process-manager and terminal-service sinks both
+/// observe the single reader; neither creates a second parser.
+pub type TerminalOutputSink = Arc<dyn Fn(Vec<u8>, TerminalModeSnapshot) + Send + Sync>;
+type SessionOutputNotifier = TerminalOutputSink;
+
+/// Lifecycle observer for EOF / read failure / child exit on the one reader.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TerminalLifecycleEvent {
+    ReaderEof,
+    ReaderFailed { summary: String },
+    ChildExited { summary: String, code: Option<u32> },
+}
+
+pub type TerminalLifecycleSink = Arc<dyn Fn(TerminalLifecycleEvent) + Send + Sync>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum TerminalBackend {
@@ -65,6 +189,11 @@ pub struct TerminalCellSnapshot {
     pub hidden: bool,
     pub has_hyperlink: bool,
     pub default_background: bool,
+    /// When true, paint may replace [`Self::foreground`] with the active theme
+    /// terminal foreground. Older snapshots omit this field and deserialize as
+    /// `false`, preserving their stored color literally.
+    #[serde(default)]
+    pub default_foreground: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -90,6 +219,7 @@ impl TerminalCellSnapshot {
             hidden: false,
             has_hyperlink: false,
             default_background: true,
+            default_foreground: true,
         }
     }
 }
@@ -114,7 +244,7 @@ impl TerminalModeSnapshot {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TerminalScreenSnapshot {
     pub cells: Vec<TerminalIndexedCellSnapshot>,
     pub lines: Vec<Vec<TerminalCellSnapshot>>,
@@ -125,7 +255,37 @@ pub struct TerminalScreenSnapshot {
     pub rows: usize,
     pub cols: usize,
     pub mode: TerminalModeSnapshot,
+    /// Plain-text rows immediately ABOVE the viewport -- older scrollback --
+    /// oldest first, so `margin_above.last()` is the row directly above
+    /// `lines[0]`. Empty when the viewport is already at the top of history.
+    ///
+    /// This is the retained-window margin: it exists so a wheel notch can be
+    /// painted from memory instead of costing a host round trip. It is text
+    /// only, matching `text_lines`, because a styled grid for three viewports
+    /// does not fit the wire's collection caps -- a locally-scrolled row
+    /// therefore paints in the default style until the host's own reply for
+    /// that position lands and replaces it.
+    ///
+    /// ADDITIVE: `#[serde(default)]` and `TerminalScreenSnapshot` carries no
+    /// `deny_unknown_fields`, so an older host simply sends nothing here and a
+    /// newer host's extra rows are ignored by an older client. Neither
+    /// direction changes the meaning of any existing field.
+    #[serde(default)]
+    pub margin_above: Vec<String>,
+    /// Plain-text rows immediately BELOW the viewport -- newer rows, toward
+    /// the live prompt -- oldest first, so `margin_below[0]` is the row
+    /// directly below the last viewport row. Empty at the bottom.
+    #[serde(default)]
+    pub margin_below: Vec<String>,
 }
+
+/// How many rows of scrollback the host attaches above and below the viewport.
+///
+/// One viewport each way, capped: a wheel gesture is three lines a notch, so
+/// this is roughly ten notches of local scrolling in either direction before
+/// the client has to wait for the host again. The cap stops a very tall
+/// terminal from tripling an already-large reply.
+pub const TERMINAL_MARGIN_ROWS: usize = 48;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TerminalSearchMatch {
@@ -181,6 +341,7 @@ impl Dimensions for TerminalSize {
 struct SessionEventProxy {
     session_id: String,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
+    input_admission: Arc<AtomicBool>,
     runtime_state: Arc<RwLock<RuntimeState>>,
     dimensions: Arc<Mutex<SessionDimensions>>,
     debug_enabled: bool,
@@ -189,10 +350,8 @@ struct SessionEventProxy {
 
 impl SessionEventProxy {
     fn write_to_pty(&self, text: &str) {
-        if let Ok(mut writer) = self.writer.lock() {
-            let _ = writer.write_all(text.as_bytes());
-            let _ = writer.flush();
-        }
+        let _ =
+            write_composite_pty_payload(&self.writer, &self.input_admission, b"", text.as_bytes());
     }
 
     fn with_runtime(&self, f: impl FnOnce(&mut SessionRuntimeState)) {
@@ -208,11 +367,12 @@ impl SessionEventProxy {
             .dimensions
             .lock()
             .unwrap_or_else(|err| err.into_inner());
+        let (cell_width, cell_height) = reported_cell_size(*dimensions);
         WindowSize {
             num_lines: dimensions.rows,
             num_cols: dimensions.cols,
-            cell_width: dimensions.cell_width,
-            cell_height: dimensions.cell_height,
+            cell_width,
+            cell_height,
         }
     }
 
@@ -301,13 +461,64 @@ impl EventListener for SessionEventProxy {
     }
 }
 
+#[cfg(not(any(windows, target_os = "linux")))]
+#[derive(Default)]
+struct TerminalActorHandles {
+    reader: Option<thread::JoinHandle<()>>,
+    waiter: Option<thread::JoinHandle<()>>,
+}
+
+#[cfg(any(windows, target_os = "linux"))]
+type TerminalActorHandles = ManagedTerminalActorHandles;
+
+#[derive(Default)]
+struct TerminalActorStartGate {
+    released: Mutex<bool>,
+    changed: Condvar,
+}
+
+impl TerminalActorStartGate {
+    fn wait(&self) {
+        let mut released = self
+            .released
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        while !*released {
+            released = self
+                .changed
+                .wait(released)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+    }
+
+    fn release(&self) {
+        *self
+            .released
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+        self.changed.notify_all();
+    }
+}
+
 pub struct TerminalSession {
     session_id: String,
     term: Arc<Mutex<Term<SessionEventProxy>>>,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
-    master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
+    input_admission: Arc<AtomicBool>,
+    master: Arc<Mutex<Option<Box<dyn MasterPty + Send>>>>,
+    actors: Arc<Mutex<TerminalActorHandles>>,
+    #[cfg(not(any(windows, target_os = "linux")))]
     killer: Arc<Mutex<Box<dyn ChildKiller + Send + Sync>>>,
+    #[cfg(not(any(windows, target_os = "linux")))]
     process_job: Arc<Mutex<Option<platform_service::ManagedProcessJob>>>,
+    #[cfg(any(windows, target_os = "linux"))]
+    teardown: Arc<Mutex<Option<Arc<ManagedTerminalTeardown>>>>,
+    #[cfg(any(windows, target_os = "linux"))]
+    lifecycle: Mutex<()>,
+    #[cfg(any(windows, target_os = "linux"))]
+    retired: AtomicBool,
+    #[cfg(all(test, any(windows, target_os = "linux")))]
+    managed_resource_publication_barrier: Mutex<Option<ManagedResourcePublicationTestBarrier>>,
     runtime_state: Arc<RwLock<RuntimeState>>,
     dimensions: Arc<Mutex<SessionDimensions>>,
     event_proxy: SessionEventProxy,
@@ -315,10 +526,76 @@ pub struct TerminalSession {
     scrolling_history: Arc<RwLock<usize>>,
     replay_buffer: Arc<Mutex<Vec<u8>>>,
     output_notifier: Option<SessionOutputNotifier>,
+    /// Extra observer for the host TerminalService. Shares the one PTY reader.
+    service_output_sink: Arc<Mutex<Option<TerminalOutputSink>>>,
+    /// Lifecycle observer for EOF/read-failure/child-exit on the one reader.
+    service_lifecycle_sink: Arc<Mutex<Option<TerminalLifecycleSink>>>,
+    /// Non-Windows attachment identity published by the launch authority.
+    #[cfg(not(any(windows, target_os = "linux")))]
+    service_attachment_pin: Mutex<Option<(ResourceId, u64)>>,
+}
+
+#[cfg(all(test, any(windows, target_os = "linux")))]
+struct ManagedResourcePublicationTestBarrier {
+    validated: std::sync::mpsc::SyncSender<()>,
+    resume: std::sync::mpsc::Receiver<()>,
+}
+
+/// Opaque read-only result of one exact Job query. The retained teardown Arc
+/// is deliberately private: accounting can carry this proof back to the
+/// session for publication validation but cannot invoke teardown itself.
+pub(crate) struct ManagedProcessObservationCapture {
+    #[cfg(any(windows, target_os = "linux"))]
+    teardown: Arc<ManagedTerminalTeardown>,
+    fence: ManagedProcessFence,
+}
+
+impl std::fmt::Debug for ManagedProcessObservationCapture {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ManagedProcessObservationCapture")
+            .field("fence", &self.fence)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ManagedProcessObservationCapture {
+    pub(crate) fn fence(&self) -> &ManagedProcessFence {
+        &self.fence
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct ManagedProcessObservationQuery {
+    capture: ManagedProcessObservationCapture,
+    members: Result<Vec<JobMemberObservation>, String>,
+}
+
+impl ManagedProcessObservationQuery {
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        ManagedProcessObservationCapture,
+        Result<Vec<JobMemberObservation>, String>,
+    ) {
+        (self.capture, self.members)
+    }
+}
+
+#[cfg(any(windows, target_os = "linux"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ManagedResourceSamplePublication {
+    Published {
+        dirty_changed: bool,
+        cleared_unreaped: bool,
+    },
+    StaleGeneration {
+        dirty_changed: bool,
+    },
 }
 
 impl TerminalSession {
-    pub fn spawn(
+    pub(crate) fn spawn(
         session_id: impl Into<String>,
         cwd: PathBuf,
         dimensions: SessionDimensions,
@@ -330,6 +607,7 @@ impl TerminalSession {
         debug_enabled: bool,
         state_notifier: Option<SessionStateNotifier>,
         output_notifier: Option<SessionOutputNotifier>,
+        authority: TerminalLaunchAuthority,
     ) -> Result<Self, String> {
         let session_id = session_id.into();
         let backend = TerminalBackend::PortablePtyFeedingAlacritty;
@@ -357,6 +635,7 @@ impl TerminalSession {
                 true,
                 state_notifier.clone(),
                 output_notifier.clone(),
+                authority.clone(),
             ) {
                 Ok(session) => return Ok(session),
                 Err(error) => last_error = Some(format!("{}: {}", candidate.program, error)),
@@ -366,7 +645,7 @@ impl TerminalSession {
         Err(last_error.unwrap_or_else(|| "No shell candidate could be spawned".to_string()))
     }
 
-    pub fn spawn_command(
+    pub(crate) fn spawn_command(
         session_id: impl Into<String>,
         cwd: PathBuf,
         dimensions: SessionDimensions,
@@ -379,6 +658,7 @@ impl TerminalSession {
         debug_enabled: bool,
         state_notifier: Option<SessionStateNotifier>,
         output_notifier: Option<SessionOutputNotifier>,
+        authority: TerminalLaunchAuthority,
     ) -> Result<Self, String> {
         let session_id = session_id.into();
         spawn_with_command(
@@ -396,6 +676,7 @@ impl TerminalSession {
             true,
             state_notifier,
             output_notifier,
+            authority,
         )
     }
 
@@ -408,7 +689,143 @@ impl TerminalSession {
     }
 
     pub fn write_bytes(&self, bytes: &[u8]) -> Result<(), String> {
-        write_composite_pty_payload(&self.writer, b"", bytes)
+        write_composite_pty_payload(&self.writer, &self.input_admission, b"", bytes)
+    }
+
+    /// Queue one provider-automation key boundary without flushing the
+    /// ConPTY writer. SessionStart hooks must return before the provider TUI
+    /// can read input; flushing from the host during that hook can otherwise
+    /// deadlock the hook acknowledgement against the provider reader.
+    pub(crate) fn write_provider_bytes(&self, bytes: &[u8]) -> Result<(), String> {
+        write_composite_pty_payload_inner(&self.writer, &self.input_admission, b"", bytes, false)
+    }
+
+    /// Install or replace the TerminalService observer on the existing reader.
+    /// Does not spawn a second reader or parser; process-manager notifiers stay.
+    pub fn install_service_output_sink(&self, sink: TerminalOutputSink) -> Result<(), String> {
+        let mut slot = self
+            .service_output_sink
+            .lock()
+            .map_err(|_| "terminal service output sink poisoned".to_string())?;
+        *slot = Some(sink);
+        Ok(())
+    }
+
+    pub fn clear_service_output_sink(&self) -> Result<(), String> {
+        let mut slot = self
+            .service_output_sink
+            .lock()
+            .map_err(|_| "terminal service output sink poisoned".to_string())?;
+        *slot = None;
+        Ok(())
+    }
+
+    pub fn install_service_lifecycle_sink(
+        &self,
+        sink: TerminalLifecycleSink,
+    ) -> Result<(), String> {
+        let mut slot = self
+            .service_lifecycle_sink
+            .lock()
+            .map_err(|_| "terminal service lifecycle sink poisoned".to_string())?;
+        *slot = Some(sink);
+        Ok(())
+    }
+
+    pub fn clear_service_lifecycle_sink(&self) -> Result<(), String> {
+        let mut slot = self
+            .service_lifecycle_sink
+            .lock()
+            .map_err(|_| "terminal service lifecycle sink poisoned".to_string())?;
+        *slot = None;
+        Ok(())
+    }
+
+    /// Current typed attachment fence. Windows uses the managed process fence;
+    /// non-Windows uses the generation published by the launch authority.
+    pub fn current_attachment_fence(&self) -> Result<(ResourceId, u64), String> {
+        #[cfg(any(windows, target_os = "linux"))]
+        {
+            let fence = self
+                .managed_process_fence()?
+                .ok_or_else(|| "managed terminal fence is missing".to_string())?;
+            Ok((
+                fence.resource().resource_id,
+                fence.resource().runtime_generation,
+            ))
+        }
+        #[cfg(not(any(windows, target_os = "linux")))]
+        {
+            let pin = self
+                .service_attachment_pin
+                .lock()
+                .map_err(|_| "terminal attachment pin poisoned".to_string())?;
+            (*pin).ok_or_else(|| "terminal attachment fence is missing".to_string())
+        }
+    }
+
+    /// Exact generation-fenced teardown for the host TerminalService.
+    /// Requires the caller-supplied expected fence; never closes a newer or
+    /// missing generation. Non-Windows remains fail-closed on the same check.
+    pub fn close_exact_for_service(
+        &self,
+        expected_resource_id: ResourceId,
+        expected_generation: u64,
+        closed_by_user: bool,
+    ) -> Result<(), String> {
+        let (current_resource_id, current_generation) = self.current_attachment_fence()?;
+        if current_resource_id != expected_resource_id || current_generation != expected_generation
+        {
+            return Err(
+                "managed terminal generation changed before teardown admission".to_string(),
+            );
+        }
+        #[cfg(any(windows, target_os = "linux"))]
+        {
+            let fence = self
+                .managed_process_fence()?
+                .ok_or_else(|| "managed terminal fence is missing".to_string())?;
+            if fence.resource().resource_id != expected_resource_id
+                || fence.resource().runtime_generation != expected_generation
+            {
+                return Err(
+                    "managed terminal generation changed before teardown admission".to_string(),
+                );
+            }
+            self.close_managed_process_exact(&fence, closed_by_user)
+        }
+        #[cfg(not(any(windows, target_os = "linux")))]
+        {
+            self.close(closed_by_user)
+        }
+    }
+
+    /// Bound host scrollback to exactly `max_lines` (minimum 1). Unlike
+    /// `set_scrollback_lines`, this does not clamp upward to 100.
+    pub fn bound_history_exact(&self, max_lines: usize) {
+        let max_lines = max_lines.max(1);
+        if let Ok(mut scrollback) = self.scrolling_history.write() {
+            *scrollback = max_lines;
+        }
+        if let Ok(mut term) = self.term.lock() {
+            term.set_options(configured_term(max_lines));
+        }
+        self.event_proxy.with_runtime(|session| {
+            session.display_offset = session.display_offset.min(max_lines);
+            session.mark_dirty();
+        });
+    }
+
+    pub fn session_view(&self) -> Option<TerminalSessionView> {
+        let runtime = self
+            .runtime_state
+            .read()
+            .ok()
+            .and_then(|runtime| runtime.sessions.get(&self.session_id).cloned())?;
+        Some(TerminalSessionView {
+            runtime,
+            screen: self.snapshot(),
+        })
     }
 
     pub fn write_text(&self, text: &str) -> Result<(), String> {
@@ -416,6 +833,7 @@ impl TerminalSession {
     }
 
     pub fn paste_text(&self, text: &str) -> Result<(), String> {
+        validate_terminal_input_source_bounds(b"", text.as_bytes())?;
         let bracketed_paste = {
             let term = self
                 .term
@@ -424,31 +842,36 @@ impl TerminalSession {
             term.mode().contains(TermMode::BRACKETED_PASTE)
         };
 
-        if bracketed_paste {
-            self.write_text(&format!(
-                "\u{1b}[200~{}\u{1b}[201~",
-                sanitize_bracketed_paste_text(text)
-            ))
-        } else {
-            self.write_text(&normalize_plain_paste_text(text))
-        }
+        let payload = prepare_paste_payload("", text, bracketed_paste)?;
+        write_composite_pty_payload(&self.writer, &self.input_admission, b"", &payload)
     }
 
     /// Writes a user-origin text boundary and its DevManager prefix as one PTY
     /// payload. Callers commit attachment delivery only after this succeeds.
     pub fn write_user_text(&self, prefix: &str, text: &str) -> Result<(), String> {
-        write_composite_pty_payload(&self.writer, prefix.as_bytes(), text.as_bytes())
+        write_composite_pty_payload(
+            &self.writer,
+            &self.input_admission,
+            prefix.as_bytes(),
+            text.as_bytes(),
+        )
     }
 
     /// Writes a user-origin raw byte boundary and its DevManager prefix as one
     /// PTY payload.
     pub fn write_user_bytes(&self, prefix: &str, bytes: &[u8]) -> Result<(), String> {
-        write_composite_pty_payload(&self.writer, prefix.as_bytes(), bytes)
+        write_composite_pty_payload(
+            &self.writer,
+            &self.input_admission,
+            prefix.as_bytes(),
+            bytes,
+        )
     }
 
     /// Pastes user-origin text while keeping the DevManager prefix outside the
     /// terminal's bracketed-paste markers.
     pub fn paste_user_text(&self, prefix: &str, text: &str) -> Result<(), String> {
+        validate_terminal_input_source_bounds(prefix.as_bytes(), text.as_bytes())?;
         let bracketed_paste = {
             let term = self
                 .term
@@ -456,17 +879,19 @@ impl TerminalSession {
                 .map_err(|_| "Terminal state poisoned".to_string())?;
             term.mode().contains(TermMode::BRACKETED_PASTE)
         };
-        let payload = composite_paste_payload(prefix, text, bracketed_paste);
-        write_composite_pty_payload(&self.writer, b"", &payload)
+        let payload = prepare_paste_payload(prefix, text, bracketed_paste)?;
+        write_composite_pty_payload(&self.writer, &self.input_admission, b"", &payload)
     }
 
     pub fn resize(&self, dimensions: SessionDimensions) -> Result<(), String> {
         {
-            let master = self
+            let mut master = self
                 .master
                 .lock()
                 .map_err(|_| "PTY master poisoned".to_string())?;
             master
+                .as_mut()
+                .ok_or_else(|| "PTY master is closed".to_string())?
                 .resize(pty_size(dimensions))
                 .map_err(|error| format!("Failed to resize PTY: {error}"))?;
         }
@@ -612,7 +1037,47 @@ impl TerminalSession {
     }
 
     pub fn close(&self, closed_by_user: bool) -> Result<(), String> {
-        if let Ok(mut runtime) = self.runtime_state.write() {
+        #[cfg(any(windows, target_os = "linux"))]
+        {
+            let _lifecycle = lock_terminal_lifecycle(&self.lifecycle)?;
+            self.close_managed_current(closed_by_user)
+        }
+        #[cfg(not(any(windows, target_os = "linux")))]
+        {
+            self.note_close_requested(closed_by_user);
+            self.sync_tracked_descendants();
+            let killer_deadline = std::time::Instant::now()
+                .checked_add(terminal_actor_cancellation_timeout())
+                .ok_or_else(|| "terminal killer cancellation deadline overflow".to_string())?;
+            // Revoke admission while holding the writer lock before asking
+            // the child capability to terminate. Writers recheck admission
+            // under this same lock, so none can slip through between teardown
+            // initiation and process termination.
+            drain_terminal_input_until(&self.input_admission, &self.writer, killer_deadline)?;
+            let kill_result = lock_terminal_actor_resource_until(
+                &self.killer,
+                killer_deadline,
+                "terminal session killer",
+            )?
+            .kill();
+            if let Err(error) = kill_result {
+                // kill(2) reports an already-exited child as ESRCH, which Rust
+                // does not classify as ErrorKind::NotFound. Still join both
+                // owned actors below before reporting successful teardown.
+                if error.kind() != std::io::ErrorKind::NotFound
+                    && error.raw_os_error() != Some(libc::ESRCH)
+                {
+                    return Err(format!("Failed to terminate shell session: {error}"));
+                }
+            }
+            self.detach_pty_and_join_actors()
+        }
+    }
+
+    fn note_close_requested(&self, closed_by_user: bool) {
+        // Runtime status is a projection, never process authority. Do not let
+        // a contended UI/background read delay the exact Job teardown path.
+        if let Ok(mut runtime) = self.runtime_state.try_write() {
             if let Some(session) = runtime.sessions.get_mut(&self.session_id) {
                 session.status = SessionStatus::Stopping;
                 session.exit = Some(SessionExitState {
@@ -628,22 +1093,79 @@ impl TerminalSession {
                 session.mark_dirty();
             }
         }
-
-        self.sync_tracked_descendants();
-        let kill_result = self
-            .killer
-            .lock()
-            .map_err(|_| "Session killer poisoned".to_string())
-            .and_then(|mut killer| {
-                killer
-                    .kill()
-                    .map_err(|error| format!("Failed to terminate shell session: {error}"))
-            });
-        self.drop_managed_process_job();
-        kill_result
     }
 
-    pub fn restart_command(
+    #[cfg(any(windows, target_os = "linux"))]
+    fn close_managed_teardown(teardown: &ManagedTerminalTeardown) -> Result<(), String> {
+        let report = teardown.close()?;
+        if report.outcome() == crate::process::teardown::TeardownOutcome::Closed {
+            Ok(())
+        } else {
+            Err(format!(
+                "Terminal teardown did not close: {:?}; errors: {:?}",
+                report.outcome(),
+                report.errors()
+            ))
+        }
+    }
+
+    #[cfg(any(windows, target_os = "linux"))]
+    fn close_managed_current(&self, closed_by_user: bool) -> Result<(), String> {
+        self.note_close_requested(closed_by_user);
+        let teardown = lock_terminal_teardown_slot(&self.teardown)?
+            .clone()
+            .ok_or_else(|| "Managed terminal teardown authority is missing".to_string())?;
+        Self::close_managed_teardown(&teardown)
+    }
+
+    /// Closes only the exact terminal generation selected by the caller. A
+    /// concurrent restart can replace the session slot, but can never cause a
+    /// stale diagnostic action to terminate that replacement.
+    #[cfg(any(windows, target_os = "linux"))]
+    pub(crate) fn close_managed_process_exact(
+        &self,
+        expected: &ManagedProcessFence,
+        closed_by_user: bool,
+    ) -> Result<(), String> {
+        let _lifecycle = lock_terminal_lifecycle(&self.lifecycle)?;
+        let teardown = lock_terminal_teardown_slot(&self.teardown)?
+            .clone()
+            .ok_or_else(|| "Managed terminal teardown authority is missing".to_string())?;
+        if !teardown.matches_fence(expected) {
+            return Err(
+                "Managed terminal generation changed before teardown admission".to_string(),
+            );
+        }
+        if self.retired.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        self.note_close_requested(closed_by_user);
+        Self::close_managed_teardown(&teardown)?;
+        self.retired.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    #[cfg(not(any(windows, target_os = "linux")))]
+    fn detach_pty_and_join_actors(&self) -> Result<(), String> {
+        detach_pty_and_join_actor_slots(
+            &self.input_admission,
+            &self.writer,
+            &self.master,
+            &self.actors,
+        )
+    }
+
+    #[cfg(test)]
+    fn live_actor_count_for_test(&self) -> usize {
+        self.actors
+            .lock()
+            .map(|actors| {
+                usize::from(actors.reader.is_some()) + usize::from(actors.waiter.is_some())
+            })
+            .unwrap_or(usize::MAX)
+    }
+
+    pub(crate) fn restart_command(
         &self,
         cwd: PathBuf,
         dimensions: SessionDimensions,
@@ -652,43 +1174,88 @@ impl TerminalSession {
         env: HashMap<String, String>,
         log_file_path: Option<PathBuf>,
         track_pid: bool,
+        authority: TerminalLaunchAuthority,
     ) -> Result<(), String> {
-        self.sync_tracked_descendants();
-        self.drop_managed_process_job();
+        #[cfg(not(any(windows, target_os = "linux")))]
+        self.validate_service_restart_fence(&authority)?;
+        #[cfg(any(windows, target_os = "linux"))]
+        let _lifecycle = lock_terminal_lifecycle(&self.lifecycle)?;
+        #[cfg(any(windows, target_os = "linux"))]
+        if self.retired.load(Ordering::Acquire) {
+            return Err("Managed terminal generation is retired".to_string());
+        }
+        #[cfg(any(windows, target_os = "linux"))]
+        self.close_managed_current(false)?;
+        #[cfg(not(any(windows, target_os = "linux")))]
+        self.close(false)?;
 
         let pty_system = native_pty_system();
         let pair = pty_system
             .openpty(pty_size(dimensions))
             .map_err(|error| error.to_string())?;
-        let mut command = CommandBuilder::new(program.clone());
-        if let Some(valid_cwd) = existing_directory(&cwd) {
-            command.cwd(valid_cwd);
-        }
-        if !args.is_empty() {
-            command.args(args.clone());
-        }
-        apply_terminal_env_defaults(&mut command, env);
-
-        let child = pair
-            .slave
-            .spawn_command(command)
-            .map_err(|error| format!("Failed to spawn command: {error}"))?;
+        #[cfg(any(windows, target_os = "linux"))]
+        let io = ManagedTerminalIo::new(
+            Arc::clone(&self.writer),
+            Arc::clone(&self.master),
+            Arc::clone(&self.actors),
+            Arc::clone(&self.input_admission),
+        );
+        #[cfg(any(windows, target_os = "linux"))]
+        let (child, teardown) = spawn_suspended_managed_terminal(
+            &*pair.slave,
+            &self.session_id,
+            &cwd,
+            &program,
+            &args,
+            env,
+            authority,
+            Arc::clone(&io),
+            self.session_id.starts_with("provider-"),
+        )?;
+        #[cfg(not(any(windows, target_os = "linux")))]
+        let child = {
+            let mut command = CommandBuilder::new(program.clone());
+            if let Some(valid_cwd) = existing_directory(&cwd) {
+                command.cwd(valid_cwd);
+            }
+            if !args.is_empty() {
+                command.args(args.clone());
+            }
+            apply_terminal_env_defaults(&mut command, env);
+            pair.slave
+                .spawn_command(command)
+                .map_err(|error| format!("Failed to spawn command: {error}"))?
+        };
 
         let pid = child.process_id();
+        #[cfg(not(any(windows, target_os = "linux")))]
         let mut cleanup_killer = child.clone_killer();
+        #[cfg(any(windows, target_os = "linux"))]
+        let teardown_handle = Arc::new(Mutex::new(Some(teardown.clone())));
+        #[cfg(not(any(windows, target_os = "linux")))]
         let mut process_job = attach_managed_process_job(pid);
 
         let writer = match pair.master.take_writer() {
             Ok(writer) => writer,
             Err(error) => {
-                cleanup_failed_spawn(&mut cleanup_killer);
+                cleanup_failed_spawn(
+                    #[cfg(not(any(windows, target_os = "linux")))]
+                    &mut cleanup_killer,
+                    #[cfg(any(windows, target_os = "linux"))]
+                    &teardown,
+                );
                 return Err(format!("Failed to acquire PTY writer: {error}"));
             }
         };
         let reader = match pair.master.try_clone_reader() {
             Ok(reader) => reader,
             Err(error) => {
-                cleanup_failed_spawn(&mut cleanup_killer);
+                cleanup_failed_spawn(
+                    #[cfg(not(any(windows, target_os = "linux")))]
+                    &mut cleanup_killer,
+                    #[cfg(any(windows, target_os = "linux"))]
+                    &teardown,
+                );
                 return Err(format!("Failed to clone PTY reader: {error}"));
             }
         };
@@ -698,7 +1265,12 @@ impl TerminalSession {
             let mut writer_slot = match self.writer.lock() {
                 Ok(writer_slot) => writer_slot,
                 Err(_) => {
-                    cleanup_failed_spawn(&mut cleanup_killer);
+                    cleanup_failed_spawn(
+                        #[cfg(not(any(windows, target_os = "linux")))]
+                        &mut cleanup_killer,
+                        #[cfg(any(windows, target_os = "linux"))]
+                        &teardown,
+                    );
                     return Err("PTY writer poisoned".to_string());
                 }
             };
@@ -708,28 +1280,48 @@ impl TerminalSession {
             let mut master_slot = match self.master.lock() {
                 Ok(master_slot) => master_slot,
                 Err(_) => {
-                    cleanup_failed_spawn(&mut cleanup_killer);
+                    cleanup_failed_spawn(
+                        #[cfg(not(any(windows, target_os = "linux")))]
+                        &mut cleanup_killer,
+                        #[cfg(any(windows, target_os = "linux"))]
+                        &teardown,
+                    );
                     return Err("PTY master poisoned".to_string());
                 }
             };
-            *master_slot = pair.master;
+            *master_slot = Some(pair.master);
         }
         {
+            #[cfg(not(any(windows, target_os = "linux")))]
             let mut killer_slot = match self.killer.lock() {
                 Ok(killer_slot) => killer_slot,
                 Err(_) => {
-                    cleanup_failed_spawn(&mut cleanup_killer);
+                    cleanup_failed_spawn(
+                        #[cfg(not(any(windows, target_os = "linux")))]
+                        &mut cleanup_killer,
+                        #[cfg(any(windows, target_os = "linux"))]
+                        &teardown,
+                    );
+                    #[cfg(not(any(windows, target_os = "linux")))]
                     drop(process_job.take());
                     return Err("Session killer poisoned".to_string());
                 }
             };
-            *killer_slot = child.clone_killer();
+            #[cfg(not(any(windows, target_os = "linux")))]
+            {
+                *killer_slot = child.clone_killer();
+            }
         }
         {
             let mut current_dimensions = match self.dimensions.lock() {
                 Ok(current_dimensions) => current_dimensions,
                 Err(_) => {
-                    cleanup_failed_spawn(&mut cleanup_killer);
+                    cleanup_failed_spawn(
+                        #[cfg(not(any(windows, target_os = "linux")))]
+                        &mut cleanup_killer,
+                        #[cfg(any(windows, target_os = "linux"))]
+                        &teardown,
+                    );
                     return Err("Size lock poisoned".to_string());
                 }
             };
@@ -739,7 +1331,12 @@ impl TerminalSession {
             let mut term = match self.term.lock() {
                 Ok(term) => term,
                 Err(_) => {
-                    cleanup_failed_spawn(&mut cleanup_killer);
+                    cleanup_failed_spawn(
+                        #[cfg(not(any(windows, target_os = "linux")))]
+                        &mut cleanup_killer,
+                        #[cfg(any(windows, target_os = "linux"))]
+                        &teardown,
+                    );
                     return Err("Terminal state poisoned".to_string());
                 }
             };
@@ -763,7 +1360,12 @@ impl TerminalSession {
             if let Err(error) =
                 track_managed_process(&self.runtime_state, &self.session_id, pid, &program)
             {
-                cleanup_failed_spawn(&mut cleanup_killer);
+                cleanup_failed_spawn(
+                    #[cfg(not(any(windows, target_os = "linux")))]
+                    &mut cleanup_killer,
+                    #[cfg(any(windows, target_os = "linux"))]
+                    &teardown,
+                );
                 return Err(error);
             }
         }
@@ -771,19 +1373,62 @@ impl TerminalSession {
         if let Ok(mut replay) = self.replay_buffer.lock() {
             replay.clear();
         }
+        #[cfg(not(any(windows, target_os = "linux")))]
         {
             let mut job_slot = match self.process_job.lock() {
                 Ok(job_slot) => job_slot,
                 Err(_) => {
-                    cleanup_failed_spawn(&mut cleanup_killer);
+                    cleanup_failed_spawn(
+                        #[cfg(not(any(windows, target_os = "linux")))]
+                        &mut cleanup_killer,
+                        #[cfg(any(windows, target_os = "linux"))]
+                        &teardown,
+                    );
                     drop(process_job.take());
                     return Err("Process job poisoned".to_string());
                 }
             };
             *job_slot = process_job.take();
         }
+        #[cfg(any(windows, target_os = "linux"))]
+        {
+            let mut teardown_slot = lock_terminal_teardown_slot(&self.teardown).map_err(|_| {
+                cleanup_failed_spawn(&teardown);
+                "Session teardown poisoned".to_string()
+            })?;
+            *teardown_slot = teardown_handle
+                .lock()
+                .map_err(|_| {
+                    cleanup_failed_spawn(&teardown);
+                    "Session teardown poisoned".to_string()
+                })?
+                .clone();
+        }
 
-        spawn_reader_thread(
+        let mut actor_slots = match self.actors.lock() {
+            Ok(actor_slots) => actor_slots,
+            Err(_) => {
+                cleanup_failed_spawn(
+                    #[cfg(not(any(windows, target_os = "linux")))]
+                    &mut cleanup_killer,
+                    #[cfg(any(windows, target_os = "linux"))]
+                    &teardown,
+                );
+                return Err("Terminal actor handles poisoned".to_string());
+            }
+        };
+        if actor_slots.reader.is_some() || actor_slots.waiter.is_some() {
+            cleanup_failed_spawn(
+                #[cfg(not(any(windows, target_os = "linux")))]
+                &mut cleanup_killer,
+                #[cfg(any(windows, target_os = "linux"))]
+                &teardown,
+            );
+            return Err("previous terminal actors were not joined before restart".to_string());
+        }
+        let start_gate = Arc::new(TerminalActorStartGate::default());
+        let child_exited = Arc::new(AtomicBool::new(false));
+        let reader_actor = match spawn_reader_thread(
             self.session_id.clone(),
             reader,
             self.term.clone(),
@@ -792,26 +1437,82 @@ impl TerminalSession {
             self.event_proxy.debug_enabled,
             self.event_proxy.state_notifier.clone(),
             self.output_notifier.clone(),
+            Arc::clone(&self.service_output_sink),
+            Arc::clone(&self.service_lifecycle_sink),
             self.replay_buffer.clone(),
-        );
-        spawn_wait_thread(
+            Arc::clone(&start_gate),
+            Arc::clone(&child_exited),
+        ) {
+            Ok(actor) => actor,
+            Err(error) => {
+                drop(actor_slots);
+                cleanup_failed_spawn(
+                    #[cfg(not(any(windows, target_os = "linux")))]
+                    &mut cleanup_killer,
+                    #[cfg(any(windows, target_os = "linux"))]
+                    &teardown,
+                );
+                return Err(error);
+            }
+        };
+        actor_slots.reader = Some(reader_actor);
+        let wait_actor = match spawn_wait_thread(
             self.session_id.clone(),
             child,
             pid,
+            #[cfg(any(windows, target_os = "linux"))]
+            teardown_handle,
+            #[cfg(not(any(windows, target_os = "linux")))]
             self.process_job.clone(),
             self.runtime_state.clone(),
             self.event_proxy.debug_enabled,
             self.event_proxy.state_notifier.clone(),
-        );
+            Arc::clone(&self.service_lifecycle_sink),
+            Arc::clone(&start_gate),
+            Arc::clone(&child_exited),
+        ) {
+            Ok(actor) => actor,
+            Err(error) => {
+                drop(actor_slots);
+                // No wait actor exists to publish child exit; publish it here so
+                // the reader treats the cleanup-closed PTY as final.
+                child_exited.store(true, Ordering::Release);
+                start_gate.release();
+                cleanup_failed_spawn(
+                    #[cfg(not(any(windows, target_os = "linux")))]
+                    &mut cleanup_killer,
+                    #[cfg(any(windows, target_os = "linux"))]
+                    &teardown,
+                );
+                #[cfg(not(any(windows, target_os = "linux")))]
+                if let Err(join_error) = self.detach_pty_and_join_actors() {
+                    eprintln!(
+                        "terminal session `{}` setup cleanup could not join actors: {join_error}",
+                        self.session_id
+                    );
+                }
+                return Err(error);
+            }
+        };
+        actor_slots.waiter = Some(wait_actor);
+        drop(actor_slots);
+        start_gate.release();
+        #[cfg(any(windows, target_os = "linux"))]
+        if let Err(error) = open_managed_terminal_input(&io) {
+            cleanup_failed_spawn(&teardown);
+            return Err(error);
+        }
+        #[cfg(not(any(windows, target_os = "linux")))]
+        self.input_admission.store(true, Ordering::Release);
+
+        #[cfg(not(any(windows, target_os = "linux")))]
+        self.publish_service_attachment_fence(&authority)?;
 
         self.event_proxy.debug_log(format!("respawned {}", program));
         Ok(())
     }
 
-    fn drop_managed_process_job(&self) {
-        drop_managed_process_job(&self.process_job);
-    }
-
+    #[cfg(not(any(windows, target_os = "linux")))]
     fn sync_tracked_descendants(&self) {
         let root_pid = self.runtime_state.read().ok().and_then(|runtime| {
             runtime
@@ -926,6 +1627,7 @@ impl TerminalReplica {
             writer: Arc::new(Mutex::new(
                 Box::new(std::io::sink()) as Box<dyn Write + Send>
             )),
+            input_admission: Arc::new(AtomicBool::new(false)),
             runtime_state: runtime_state.clone(),
             dimensions: dimensions.clone(),
             debug_enabled: false,
@@ -1059,11 +1761,38 @@ impl TerminalReplica {
         };
         terminal_buffer_lines(&term).join("\n")
     }
+
+    /// Bound replica scrollback to the exact host-admitted limit.
+    pub fn bound_history_exact(&self, max_lines: usize) {
+        let max_lines = max_lines.max(1);
+        let mut term = match self.term.lock() {
+            Ok(term) => term,
+            Err(error) => error.into_inner(),
+        };
+        term.set_options(configured_term(max_lines));
+    }
+
+    pub fn snapshot(&self) -> TerminalScreenSnapshot {
+        let term = match self.term.lock() {
+            Ok(term) => term,
+            Err(error) => error.into_inner(),
+        };
+        snapshot_term(&term)
+    }
 }
 
 impl Drop for TerminalSession {
     fn drop(&mut self) {
-        let _ = self.close(false);
+        if let Err(error) = self.close(false) {
+            eprintln!(
+                "terminal session `{}` dropped before bounded teardown completed: {error}",
+                self.session_id
+            );
+            // Never abort the host for one session's teardown miss. This
+            // session's kill-on-close Job handle closes with it, so its own
+            // tree still ends; aborting would take every other terminal the
+            // host owns down with it. The diagnostic above records the miss.
+        }
     }
 }
 
@@ -1213,6 +1942,210 @@ fn shell_candidates(
     }
 }
 
+/// A plain shell's resolved launch: the exact executable and its arguments.
+///
+/// [`TerminalSession::spawn`] resolves this lazily by trying each candidate in
+/// turn. The durable `OpenShellTerminal` path cannot: it has to write one
+/// exact program into `ResourceFacts` before anything spawns, so it needs the
+/// same candidate order settled up front.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ResolvedShellLaunch {
+    pub program: PathBuf,
+    pub args: Vec<String>,
+}
+
+/// Windows PowerShell 5.1 is excluded from a plain shell's candidate list.
+///
+/// Measured under the managed (ConPTY) launch path during Task 7:
+/// `powershell.exe -NoLogo` exits about three seconds in with `0xFFFF0000`,
+/// which reaches a client as a shell that opened and immediately died. A raw
+/// `CreateProcess` of the same binary survives, so the resolver cannot detect
+/// this — the exclusion is the measurement, recorded here rather than
+/// rediscovered per shell. `pwsh` and `cmd.exe` both survive the managed path.
+const PLAIN_SHELL_EXCLUDED_PROGRAMS: &[&str] = &["powershell.exe", "powershell"];
+
+/// The candidate programs that take [`pwsh_shell_args`] as a plain shell.
+///
+/// `powershell.exe` is excluded from plain shells outright (see above), so
+/// PowerShell 5.1 never reaches the hook and is not listed here.
+const PLAIN_SHELL_PWSH_PROGRAMS: &[&str] = &["pwsh", "pwsh.exe"];
+
+/// Resolve the first shell candidate whose executable exists for `cwd`.
+///
+/// This is the plain-shell counterpart of the candidate loop in
+/// [`TerminalSession::spawn`]. Failure names every program that was tried, so
+/// a client sees which shells were unavailable rather than a bare refusal.
+pub(crate) fn resolve_plain_shell_launch(
+    preferred_terminal: Option<&DefaultTerminal>,
+    mac_profile: Option<&MacTerminalProfile>,
+    shell_integration_enabled: bool,
+    cwd: &Path,
+) -> Result<ResolvedShellLaunch, String> {
+    let (candidates, excluded) =
+        plain_shell_candidates(preferred_terminal, mac_profile, shell_integration_enabled);
+    // A user who wrote `default_terminal = powershell` gets a different shell
+    // than they asked for. Silently substituting one is how a setting becomes
+    // a mystery; say it once, here, where the substitution happens.
+    if !excluded.is_empty() && matches!(preferred_terminal, Some(DefaultTerminal::Powershell)) {
+        eprintln!(
+            "default_terminal=powershell is not used for task shells (exits 0xFFFF0000 under \
+             managed ConPTY); trying {}",
+            candidates
+                .iter()
+                .map(|candidate| candidate.program.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    let mut tried = Vec::new();
+    for candidate in candidates {
+        tried.push(candidate.program.clone());
+        if let Ok(program) = resolve_shell_program(&candidate.program, cwd) {
+            return Ok(ResolvedShellLaunch {
+                program,
+                args: candidate.args,
+            });
+        }
+    }
+    Err(no_shell_found_message(&tried, &excluded))
+}
+
+/// The refusal text for a plain shell that resolved nothing.
+///
+/// Names what was never considered as well as what was: a message listing only
+/// the tried programs reads as "powershell was not installed either", which
+/// sends the reader off installing a shell that is deliberately excluded.
+/// Separate from the resolver so the wording can be asserted without depending
+/// on which shells the machine running the test happens to have.
+fn no_shell_found_message(tried: &[String], excluded: &[String]) -> String {
+    let excluded_note = if excluded.is_empty() {
+        String::new()
+    } else {
+        format!(" ({} excluded)", excluded.join(", "))
+    };
+    format!("no shell found; tried: {}{excluded_note}", tried.join(", "))
+}
+
+/// The ordered candidates a plain shell is allowed to try, in the settings'
+/// own order minus the excluded programs and any duplicate, plus the distinct
+/// program names the exclusion removed.
+///
+/// Split out from the resolver so the exclusion can be proved without a real
+/// filesystem: a resolver that only ever reported "found something" could not
+/// show which candidates it refused to consider.
+fn plain_shell_candidates(
+    preferred_terminal: Option<&DefaultTerminal>,
+    mac_profile: Option<&MacTerminalProfile>,
+    shell_integration_enabled: bool,
+) -> (Vec<ShellCandidate>, Vec<String>) {
+    let mut allowed: Vec<ShellCandidate> = Vec::new();
+    let mut excluded: Vec<String> = Vec::new();
+    for candidate in shell_candidates(preferred_terminal, mac_profile, shell_integration_enabled) {
+        if PLAIN_SHELL_EXCLUDED_PROGRAMS
+            .iter()
+            .any(|program| candidate.program.eq_ignore_ascii_case(program))
+        {
+            if !excluded.iter().any(|seen| seen == &candidate.program) {
+                excluded.push(candidate.program);
+            }
+            continue;
+        }
+        // The prompt hook is a plain-shell concern only, so it is applied here
+        // rather than in `shell_candidates`, which provider terminals share.
+        let candidate = if PLAIN_SHELL_PWSH_PROGRAMS
+            .iter()
+            .any(|program| candidate.program.eq_ignore_ascii_case(program))
+        {
+            ShellCandidate {
+                program: candidate.program,
+                args: pwsh_shell_args(shell_integration_enabled),
+            }
+        } else {
+            candidate
+        };
+        if allowed
+            .iter()
+            .any(|existing| existing.program == candidate.program)
+        {
+            continue;
+        }
+        allowed.push(candidate);
+    }
+    (allowed, excluded)
+}
+
+#[cfg(any(windows, target_os = "linux"))]
+fn resolve_shell_program(program: &str, cwd: &Path) -> Result<PathBuf, String> {
+    resolve_terminal_executable(program, cwd)
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+fn resolve_shell_program(program: &str, cwd: &Path) -> Result<PathBuf, String> {
+    let supplied = PathBuf::from(program);
+    if supplied.is_absolute() || supplied.components().count() > 1 {
+        let candidate = if supplied.is_absolute() {
+            supplied
+        } else {
+            cwd.join(supplied)
+        };
+        return candidate.canonicalize().map_err(|error| {
+            format!(
+                "Failed to resolve shell executable `{}`: {error}",
+                candidate.display()
+            )
+        });
+    }
+    crate::diagnostics::resolve::resolve_all(program)
+        .into_iter()
+        .next()
+        .ok_or_else(|| format!("Shell executable `{program}` was not found on PATH"))?
+        .canonicalize()
+        .map_err(|error| format!("Failed to canonicalize shell executable `{program}`: {error}"))
+}
+
+/// The PowerShell prompt hook one PLAIN SHELL is launched with.
+///
+/// PowerShell does not update its Win32 current directory on `Set-Location`,
+/// so without this neither rung of the live-cwd ladder moves for the default
+/// Windows shell: the PTY stream carries no cwd report, and the root process
+/// PEB still names the launch directory forever. The hook feeds both rungs --
+/// `[Environment]::CurrentDirectory` is the PEB, the OSC 9;9 report is the
+/// parser -- so a machine where either one is unavailable still reports.
+///
+/// It captures the session's existing `prompt` and calls it FIRST, so `$?`
+/// still describes the user's own last command when that prompt reads it, and
+/// returns what the original returned with the report prefixed. The user's
+/// profile is never edited; this lives entirely in the launched session.
+///
+/// Only the `FileSystem` provider reports. `Set-Location HKLM:` moves the
+/// PowerShell location somewhere with no filesystem path, and a registry path
+/// would be refused as a cwd fact anyway for never being absolute.
+///
+/// Written without a single backslash on purpose: the OSC string terminator's
+/// second byte is spelled `[char]92`, so no quoting layer between here and
+/// `CreateProcess` can eat an escape.
+const PWSH_PROMPT_HOOK: &str = "$__dmPrompt = $function:prompt; function global:prompt { $__dmOut = & $__dmPrompt; $__dmLoc = $ExecutionContext.SessionState.Path.CurrentLocation; if ($__dmLoc.Provider.Name -eq 'FileSystem') { [Environment]::CurrentDirectory = $__dmLoc.ProviderPath; $__dmOut = ([char]27 + ']9;9;' + $__dmLoc.ProviderPath + [char]27 + [char]92) + $__dmOut }; $__dmOut }";
+
+/// The arguments one plain shell's `pwsh` is launched with.
+///
+/// The counterpart of [`bash_shell_args`], and applied in exactly one place:
+/// [`plain_shell_candidates`]. Provider terminals keep `-NoLogo` alone -- a
+/// provider owns its own shell contract and does not report cwd through this
+/// ladder. With shell integration off the arguments are unchanged from before,
+/// which is also the escape hatch if a hook ever misbehaves.
+pub fn pwsh_shell_args(shell_integration_enabled: bool) -> Vec<String> {
+    if !shell_integration_enabled {
+        return vec!["-NoLogo".to_string()];
+    }
+    // `-Command` consumes everything after it, so it must come last.
+    vec![
+        "-NoLogo".to_string(),
+        "-NoExit".to_string(),
+        "-Command".to_string(),
+        PWSH_PROMPT_HOOK.to_string(),
+    ]
+}
+
 pub fn bash_shell_args(shell_integration_enabled: bool) -> Vec<String> {
     if shell_integration_enabled {
         let wrapper = crate::assets::ghostty_resources_dir()
@@ -1305,6 +2238,27 @@ fn snapshot_term(term: &Term<SessionEventProxy>) -> TerminalScreenSnapshot {
         });
     }
 
+    let margin = TERMINAL_MARGIN_ROWS.min(rows.max(1));
+    let viewport_top = -(display_offset as i32);
+    let grid = term.grid();
+    // `Grid: Index<Line>` spans `-history_size ..= screen_lines - 1`, with the
+    // viewport starting at `-display_offset`. Both margins are clamped to that
+    // range, so an empty vector means "there is nothing there", never "we did
+    // not look".
+    let margin_above = collect_margin_text(
+        grid,
+        (viewport_top - margin as i32).max(-(history_size as i32)),
+        viewport_top,
+        cols,
+    );
+    let viewport_bottom = viewport_top + rows as i32;
+    let margin_below = collect_margin_text(
+        grid,
+        viewport_bottom,
+        (viewport_bottom + margin as i32).min(term.screen_lines() as i32),
+        cols,
+    );
+
     TerminalScreenSnapshot {
         cells: indexed_cells,
         lines: grid_lines,
@@ -1315,7 +2269,42 @@ fn snapshot_term(term: &Term<SessionEventProxy>) -> TerminalScreenSnapshot {
         rows,
         cols,
         mode,
+        margin_above,
+        margin_below,
     }
+}
+
+/// Plain text for grid lines `[start, end)`, oldest first.
+///
+/// Mirrors the text `compact_terminal_screen_for_wire` builds for the viewport
+/// so the client can append these rows to `text_lines` without a second
+/// decoding rule.
+fn collect_margin_text(
+    grid: &alacritty_terminal::grid::Grid<Cell>,
+    start: i32,
+    end: i32,
+    cols: usize,
+) -> Vec<String> {
+    if end <= start {
+        return Vec::new();
+    }
+    (start..end)
+        .map(|line| {
+            let row = &grid[Line(line)];
+            let mut text = String::with_capacity(cols);
+            for column in 0..cols {
+                let cell = &row[alacritty_terminal::index::Column(column)];
+                if cell.flags.contains(Flags::WIDE_CHAR_SPACER)
+                    || cell.flags.contains(Flags::LEADING_WIDE_CHAR_SPACER)
+                {
+                    continue;
+                }
+                text.push(renderable_char(cell));
+                text.extend(cell.zerowidth().unwrap_or(&[]).iter().copied());
+            }
+            text
+        })
+        .collect()
 }
 
 fn configured_term(scrolling_history: usize) -> TermConfig {
@@ -1325,6 +2314,7 @@ fn configured_term(scrolling_history: usize) -> TermConfig {
     }
 }
 
+#[cfg(not(any(windows, target_os = "linux")))]
 fn apply_terminal_env_defaults(command: &mut CommandBuilder, env: HashMap<String, String>) {
     command.env_remove("NO_COLOR");
     command.env_remove("NODE_DISABLE_COLORS");
@@ -1378,24 +2368,89 @@ fn composite_paste_payload(prefix: &str, text: &str, bracketed_paste: bool) -> V
     payload
 }
 
+fn prepare_paste_payload(
+    prefix: &str,
+    text: &str,
+    bracketed_paste: bool,
+) -> Result<Vec<u8>, String> {
+    validate_terminal_input_source_bounds(prefix.as_bytes(), text.as_bytes())?;
+    Ok(composite_paste_payload(prefix, text, bracketed_paste))
+}
+
+fn validate_terminal_input_source_bounds(prefix: &[u8], input: &[u8]) -> Result<(), String> {
+    let total = prefix
+        .len()
+        .checked_add(input.len())
+        .ok_or_else(|| "PTY input byte count overflow".to_string())?;
+    if total > MAX_TERMINAL_INPUT_BYTES {
+        return Err(format!(
+            "PTY input exceeds {MAX_TERMINAL_INPUT_BYTES} bytes"
+        ));
+    }
+    Ok(())
+}
+
 fn write_composite_pty_payload(
     writer: &Arc<Mutex<Box<dyn Write + Send>>>,
+    input_admission: &AtomicBool,
     prefix: &[u8],
     input: &[u8],
 ) -> Result<(), String> {
-    let mut payload = Vec::with_capacity(prefix.len().saturating_add(input.len()));
-    payload.extend_from_slice(prefix);
-    payload.extend_from_slice(input);
+    write_composite_pty_payload_inner(writer, input_admission, prefix, input, true)
+}
+
+fn write_composite_pty_payload_inner(
+    writer: &Arc<Mutex<Box<dyn Write + Send>>>,
+    input_admission: &AtomicBool,
+    prefix: &[u8],
+    input: &[u8],
+    flush: bool,
+) -> Result<(), String> {
+    validate_terminal_input_source_bounds(prefix, input)?;
+    let total = prefix.len() + input.len();
     let mut writer = writer
         .lock()
         .map_err(|_| "PTY writer poisoned".to_string())?;
+    if !input_admission.load(Ordering::Acquire) {
+        return Err("PTY input is closed for terminal teardown".to_string());
+    }
+    let mut payload = Vec::with_capacity(total);
+    payload.extend_from_slice(prefix);
+    payload.extend_from_slice(input);
     writer
         .write_all(&payload)
         .map_err(|error| format!("Failed to write to PTY: {error}"))?;
-    writer
-        .flush()
-        .map_err(|error| format!("Failed to flush PTY input: {error}"))?;
+    if flush {
+        writer
+            .flush()
+            .map_err(|error| format!("Failed to flush PTY input: {error}"))?;
+    }
     Ok(())
+}
+
+fn drain_terminal_input_until(
+    input_admission: &AtomicBool,
+    writer: &Arc<Mutex<Box<dyn Write + Send>>>,
+    absolute_deadline: std::time::Instant,
+) -> Result<(), String> {
+    loop {
+        if std::time::Instant::now() >= absolute_deadline {
+            return Err("terminal input drain exceeded its absolute deadline".to_string());
+        }
+        match writer.try_lock() {
+            Ok(_writer) => {
+                input_admission.store(false, Ordering::Release);
+                if std::time::Instant::now() >= absolute_deadline {
+                    return Err("terminal input drain exceeded its absolute deadline".to_string());
+                }
+                return Ok(());
+            }
+            Err(std::sync::TryLockError::WouldBlock) => thread::yield_now(),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err("terminal PTY writer poisoned".to_string())
+            }
+        }
+    }
 }
 
 fn normalize_plain_paste_text(text: &str) -> String {
@@ -1459,17 +2514,163 @@ fn write_system_clipboard_text(text: &str) -> Result<(), String> {
         .map_err(|error| format!("Failed to write clipboard: {error}"))
 }
 
+/// Cell size reported downstream (to the PTY and to the emulator's own window
+/// queries). It must be the pitch the client actually paints on, or the host's
+/// column arithmetic and the painted grid describe different grids.
+///
+/// `dimensions` only carries a rounded `u16`, which cannot express a fractional
+/// advance, so the measured advance from
+/// [`crate::terminal::view::measured_terminal_cell_advance`] is the authority
+/// and the stored value stands in only where nothing has measured (headless
+/// hosts and tests).
+fn reported_cell_size(dimensions: SessionDimensions) -> (u16, u16) {
+    let cell_width = crate::terminal::view::measured_terminal_cell_advance(
+        crate::terminal::view::TERMINAL_FONT_SIZE,
+    )
+    .map(|advance| advance.round().max(1.0) as u16)
+    .unwrap_or(dimensions.cell_width);
+    (cell_width, dimensions.cell_height)
+}
+
 fn pty_size(dimensions: SessionDimensions) -> PtySize {
+    let (cell_width, cell_height) = reported_cell_size(dimensions);
     PtySize {
         rows: dimensions.rows,
         cols: dimensions.cols,
-        pixel_width: dimensions.cell_width,
-        pixel_height: dimensions.cell_height,
+        pixel_width: cell_width,
+        pixel_height: cell_height,
     }
 }
 
 fn existing_directory(path: &Path) -> Option<&Path> {
     path.is_dir().then_some(path)
+}
+
+#[cfg(any(windows, target_os = "linux"))]
+fn resolve_terminal_executable(program: &str, cwd: &Path) -> Result<PathBuf, String> {
+    let supplied = PathBuf::from(program);
+    if supplied.is_absolute() || supplied.components().count() > 1 {
+        let candidate = if supplied.is_absolute() {
+            supplied
+        } else {
+            cwd.join(supplied)
+        };
+        return candidate.canonicalize().map_err(|error| {
+            format!(
+                "Failed to resolve terminal executable `{}`: {error}",
+                candidate.display()
+            )
+        });
+    }
+    crate::diagnostics::resolve::resolve_all(program)
+        .into_iter()
+        .next()
+        .ok_or_else(|| format!("Terminal executable `{program}` was not found on PATH"))?
+        .canonicalize()
+        .map_err(|error| format!("Failed to canonicalize terminal executable `{program}`: {error}"))
+}
+
+#[cfg(any(windows, target_os = "linux"))]
+fn managed_terminal_cwd(requested: &Path) -> Result<PathBuf, String> {
+    if let Some(cwd) = existing_directory(requested) {
+        return cwd
+            .canonicalize()
+            .map_err(|error| format!("Failed to resolve terminal cwd: {error}"));
+    }
+    if let Some(profile) =
+        std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(PathBuf::from)
+    {
+        if profile.is_dir() {
+            return profile
+                .canonicalize()
+                .map_err(|error| format!("Failed to resolve terminal profile cwd: {error}"));
+        }
+    }
+    std::env::current_dir().map_err(|error| format!("Failed to resolve terminal cwd: {error}"))
+}
+
+#[cfg(any(windows, target_os = "linux"))]
+fn spawn_suspended_managed_terminal(
+    slave: &dyn SlavePty,
+    session_id: &str,
+    cwd: &Path,
+    program: &str,
+    args: &[String],
+    env: HashMap<String, String>,
+    mut authority: TerminalLaunchAuthority,
+    io: Arc<ManagedTerminalIo>,
+    replace_environment: bool,
+) -> Result<(Box<dyn Child + Send + Sync>, Arc<ManagedTerminalTeardown>), String> {
+    // Reject caller-controlled strings and collections before path resolution
+    // or duplicate native-string allocations. Reserve the eight fixed
+    // terminal defaults, then validate their exact augmented values below.
+    authority.ports = crate::process::teardown::validate_terminal_teardown_inputs(
+        session_id,
+        authority.action_epoch,
+        &authority.ports,
+    )?;
+    validate_terminal_launch_source_bounds(
+        OsStr::new(program),
+        cwd.as_os_str(),
+        program,
+        args,
+        &env,
+        8,
+    )
+    .map_err(|error| format!("Invalid managed terminal launch: {error}"))?;
+    let cwd = managed_terminal_cwd(cwd)?;
+    let executable = resolve_terminal_executable(program, &cwd)?;
+    let environment = if replace_environment {
+        // Provider sealed map already includes required transport keys.
+        env
+    } else {
+        with_terminal_env_defaults(env)
+    };
+    validate_terminal_launch_source_bounds(
+        executable.as_os_str(),
+        cwd.as_os_str(),
+        program,
+        args,
+        &environment,
+        0,
+    )
+    .map_err(|error| format!("Invalid managed terminal launch: {error}"))?;
+    let environment: BTreeMap<OsString, OsString> = environment
+        .into_iter()
+        .map(|(key, value)| (key.into(), value.into()))
+        .collect();
+    let intent = LaunchIntent {
+        resource_id: authority.resource_id,
+        generation: authority.runtime_generation,
+        owner: authority.owner,
+        kind: ResourceKind::Terminal,
+        executable,
+        args: args.iter().map(OsString::from).collect(),
+        cwd,
+        environment,
+        replace_environment,
+        display_label: program.to_string(),
+    };
+    #[cfg(windows)]
+    let pending = prepare_suspended_pty(slave, intent);
+    #[cfg(target_os = "linux")]
+    let pending = crate::process::launcher::prepare_attested_linux_pty(
+        slave,
+        intent,
+        authority.provider_executable.as_ref(),
+    );
+    let pending =
+        pending.map_err(|error| format!("Failed to prepare managed terminal: {error}"))?;
+    let (teardown, child) = ManagedTerminalTeardown::from_pending_launch(
+        pending,
+        authority.operation_id,
+        authority.action_epoch,
+        authority.completion_store,
+        session_id.to_string(),
+        authority.ports,
+        Arc::clone(&io),
+    )?;
+    Ok((child.into_child(), teardown))
 }
 
 fn session_kind_label(kind: SessionKind) -> &'static str {
@@ -1524,8 +2725,160 @@ fn track_managed_process(
     })
 }
 
+#[cfg(any(windows, target_os = "linux"))]
+fn cleanup_failed_spawn(teardown: &Arc<ManagedTerminalTeardown>) {
+    // The suspended launcher does not return until Job registration and resume
+    // are one committed handoff. Every later setup failure therefore has exact
+    // coordinator authority; a raw PTY ChildKiller is never minted on Windows.
+    // A cleanup miss is reported, never escalated to a host abort: the
+    // kill-on-close Job handle still ends this launch's tree when it drops,
+    // and aborting would kill every other terminal the host owns.
+    match teardown.close() {
+        Ok(report) if report.outcome() == crate::process::teardown::TeardownOutcome::Closed => {
+            if !teardown.actors_joined() {
+                eprintln!(
+                    "managed terminal setup cleanup returned before all actors joined; continuing without aborting the host"
+                );
+            }
+        }
+        Ok(report) => {
+            eprintln!(
+                "managed terminal setup cleanup did not close exactly: {:?}; continuing without aborting the host",
+                report.errors()
+            );
+        }
+        Err(error) => {
+            eprintln!(
+                "managed terminal setup cleanup failed: {error}; continuing without aborting the host"
+            );
+        }
+    }
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
 fn cleanup_failed_spawn(cleanup_killer: &mut Box<dyn ChildKiller + Send + Sync>) {
     let _ = cleanup_killer.kill();
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+fn detach_pty_and_join_actor_slots(
+    input_admission: &AtomicBool,
+    writer: &Arc<Mutex<Box<dyn Write + Send>>>,
+    master: &Arc<Mutex<Option<Box<dyn MasterPty + Send>>>>,
+    actors: &Arc<Mutex<TerminalActorHandles>>,
+) -> Result<(), String> {
+    let cancellation_deadline = std::time::Instant::now()
+        .checked_add(terminal_actor_cancellation_timeout())
+        .ok_or_else(|| "terminal actor cancellation deadline overflow".to_string())?;
+    detach_pty_and_join_actor_slots_until(
+        input_admission,
+        writer,
+        master,
+        actors,
+        cancellation_deadline,
+    )
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+fn detach_pty_and_join_actor_slots_until(
+    input_admission: &AtomicBool,
+    writer: &Arc<Mutex<Box<dyn Write + Send>>>,
+    master: &Arc<Mutex<Option<Box<dyn MasterPty + Send>>>>,
+    actors: &Arc<Mutex<TerminalActorHandles>>,
+    cancellation_deadline: std::time::Instant,
+) -> Result<(), String> {
+    // Acquire every ownership slot before mutating any PTY handle. If a
+    // caller is still using one of these slots, fail closed without detaching
+    // a different live reader/writer/waiter.
+    let mut writer =
+        lock_terminal_actor_resource_until(writer, cancellation_deadline, "terminal PTY writer")?;
+    input_admission.store(false, Ordering::Release);
+    let mut master =
+        lock_terminal_actor_resource_until(master, cancellation_deadline, "terminal PTY master")?;
+    let mut actors = lock_terminal_actor_resource_until(
+        actors,
+        cancellation_deadline,
+        "terminal actor handles",
+    )?;
+    let current = thread::current().id();
+    for handle in [&actors.reader, &actors.waiter].into_iter().flatten() {
+        if handle.thread().id() == current {
+            return Err("terminal actor attempted to synchronously join itself".to_string());
+        }
+    }
+
+    // Dropping the host PTY handles is the cancellation boundary for the
+    // blocking reader. The process wait actor is terminal after the child is
+    // killed or exits. Keep the JoinHandles in `actors` until both are known
+    // to have stopped; a timeout must never silently detach a live actor.
+    let old_writer = std::mem::replace(&mut *writer, Box::new(std::io::sink()));
+    master.take();
+    drop(old_writer);
+    drop(master);
+    drop(writer);
+
+    while [&actors.reader, &actors.waiter]
+        .into_iter()
+        .flatten()
+        .any(|handle| !handle.is_finished())
+        && std::time::Instant::now() < cancellation_deadline
+    {
+        thread::yield_now();
+    }
+    if [&actors.reader, &actors.waiter]
+        .into_iter()
+        .flatten()
+        .any(|handle| !handle.is_finished())
+    {
+        return Err("terminal actor did not acknowledge bounded PTY cancellation".to_string());
+    }
+
+    let mut join_error = None;
+    if let Some(reader) = actors.reader.take() {
+        if reader.join().is_err() {
+            join_error = Some("terminal reader actor panicked".to_string());
+        }
+    }
+    if let Some(waiter) = actors.waiter.take() {
+        if waiter.join().is_err() && join_error.is_none() {
+            join_error = Some("terminal wait actor panicked".to_string());
+        }
+    }
+    if let Some(error) = join_error {
+        return Err(error);
+    }
+    Ok(())
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+fn lock_terminal_actor_resource_until<'a, T>(
+    resource: &'a Mutex<T>,
+    deadline: std::time::Instant,
+    label: &str,
+) -> Result<std::sync::MutexGuard<'a, T>, String> {
+    loop {
+        match resource.try_lock() {
+            Ok(guard) => return Ok(guard),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                if std::time::Instant::now() >= deadline {
+                    return Err(format!(
+                        "{label} remained contended during bounded teardown"
+                    ));
+                }
+                thread::yield_now();
+            }
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(format!("{label} poisoned"));
+            }
+        }
+    }
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+fn terminal_actor_cancellation_timeout() -> Duration {
+    // Real PTY tests exercise the production deadline. The deliberate lock-
+    // contention fixture supplies its own short deadline to the same join path.
+    Duration::from_secs(5)
 }
 
 fn initialize_runtime_entry(
@@ -1563,47 +2916,256 @@ fn spawn_reader_thread(
     debug_enabled: bool,
     state_notifier: Option<SessionStateNotifier>,
     output_notifier: Option<SessionOutputNotifier>,
+    service_output_sink: Arc<Mutex<Option<TerminalOutputSink>>>,
+    service_lifecycle_sink: Arc<Mutex<Option<TerminalLifecycleSink>>>,
     replay_buffer: Arc<Mutex<Vec<u8>>>,
-) {
-    thread::spawn(move || {
-        let mut parser = Processor::<StdSyncHandler>::new();
-        let mut shell_sequences = ShellSequenceParser::default();
-        let mut buffer = [0_u8; 4096];
+    start_gate: Arc<TerminalActorStartGate>,
+    child_exited: Arc<AtomicBool>,
+) -> Result<thread::JoinHandle<()>, String> {
+    thread::Builder::new()
+        .name(format!("terminal-reader-{session_id}"))
+        .spawn(move || {
+            start_gate.wait();
+            let mut parser = Processor::<StdSyncHandler>::new();
+            let mut shell_sequences = ShellSequenceParser::default();
+            let mut buffer = [0_u8; 4096];
+            let mut retry_backoff = READER_RETRY_INITIAL_BACKOFF;
 
-        loop {
-            match reader.read(&mut buffer) {
-                Ok(0) => {
-                    if debug_enabled {
-                        eprintln!("[terminal:{session_id}] PTY reader reached EOF");
+            loop {
+                match reader.read(&mut buffer) {
+                    Ok(0) => {
+                        if !child_exited.load(Ordering::Acquire) {
+                            // Transient EOF with a live child (ConPTY around
+                            // sleep/resume). Keep the terminal; retry the read.
+                            if debug_enabled {
+                                eprintln!(
+                                    "[terminal:{session_id}] PTY reader EOF while child alive; retrying in {retry_backoff:?}"
+                                );
+                            }
+                            thread::sleep(retry_backoff);
+                            retry_backoff = (retry_backoff * 2).min(READER_RETRY_MAX_BACKOFF);
+                            continue;
+                        }
+                        if debug_enabled {
+                            eprintln!("[terminal:{session_id}] PTY reader reached EOF");
+                        }
+                        notify_service_lifecycle(
+                            &service_lifecycle_sink,
+                            TerminalLifecycleEvent::ReaderEof,
+                        );
+                        break;
                     }
-                    break;
+                    Ok(bytes_read) => {
+                        retry_backoff = READER_RETRY_INITIAL_BACKOFF;
+                        let mode = apply_terminal_output_chunk(
+                            &session_id,
+                            &buffer[..bytes_read],
+                            &term,
+                            &mut parser,
+                            &mut shell_sequences,
+                            &runtime_state,
+                        );
+                        append_replay_bytes(&replay_buffer, &buffer[..bytes_read]);
+
+                        if let Some(writer) = log_writer.as_mut() {
+                            writer.write_chunk(&buffer[..bytes_read]);
+                        }
+
+                        if let Some(notifier) = output_notifier.as_ref() {
+                            notifier(buffer[..bytes_read].to_vec(), mode);
+                        }
+                        if let Ok(sink) = service_output_sink.lock() {
+                            if let Some(notifier) = sink.as_ref() {
+                                notifier(buffer[..bytes_read].to_vec(), mode);
+                            }
+                        }
+                        if let Some(notifier) = state_notifier.as_ref() {
+                            notifier();
+                        }
+                    }
+                    Err(error) => {
+                        if !child_exited.load(Ordering::Acquire) {
+                            // A read error is not evidence of child death. Never
+                            // mark the session failed or tear the tree down here;
+                            // the wait actor is the only exit authority.
+                            if debug_enabled {
+                                eprintln!(
+                                    "[terminal:{session_id}] PTY read error while child alive; retrying in {retry_backoff:?}: {error}"
+                                );
+                            }
+                            thread::sleep(retry_backoff);
+                            retry_backoff = (retry_backoff * 2).min(READER_RETRY_MAX_BACKOFF);
+                            continue;
+                        }
+                        // The child already exited, so the closed pipe is the
+                        // expected end of stream rather than a failure.
+                        if debug_enabled {
+                            eprintln!(
+                                "[terminal:{session_id}] PTY read ended after child exit: {error}"
+                            );
+                        }
+                        notify_service_lifecycle(
+                            &service_lifecycle_sink,
+                            TerminalLifecycleEvent::ReaderEof,
+                        );
+                        if let Some(notifier) = state_notifier.as_ref() {
+                            notifier();
+                        }
+                        break;
+                    }
                 }
-                Ok(bytes_read) => {
-                    let mode = apply_terminal_output_chunk(
-                        &session_id,
-                        &buffer[..bytes_read],
-                        &term,
-                        &mut parser,
-                        &mut shell_sequences,
-                        &runtime_state,
+            }
+
+            if let Some(writer) = log_writer.as_mut() {
+                writer.flush_remaining();
+            }
+        })
+        .map_err(|error| format!("Failed to spawn terminal reader actor: {error}"))
+}
+
+fn notify_service_lifecycle(
+    sink: &Arc<Mutex<Option<TerminalLifecycleSink>>>,
+    event: TerminalLifecycleEvent,
+) {
+    if let Ok(guard) = sink.lock() {
+        if let Some(notifier) = guard.as_ref() {
+            notifier(event);
+        }
+    }
+}
+
+/// `Child::wait` failed. That is a failure to *observe* the child, not proof
+/// that it exited, so re-observe liveness through `try_wait` until the child
+/// is seen to exit. Only when both observation paths fail is the child treated
+/// as unobservable and reported as an error to the caller.
+fn observe_exit_after_wait_failure(
+    session_id: &str,
+    child: &mut (dyn Child + Send + Sync),
+    error: std::io::Error,
+    debug_enabled: bool,
+) -> Result<portable_pty::ExitStatus, String> {
+    if debug_enabled {
+        eprintln!("[terminal:{session_id}] wait failed; polling child liveness instead: {error}");
+    }
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) => thread::sleep(WAIT_FALLBACK_POLL_INTERVAL),
+            Err(poll_error) => {
+                return Err(format!(
+                    "{error}; child liveness poll also failed: {poll_error}"
+                ));
+            }
+        }
+    }
+}
+
+fn spawn_wait_thread(
+    session_id: String,
+    mut child: Box<dyn Child + Send + Sync>,
+    #[cfg_attr(windows, allow(unused_variables))] pid: Option<u32>,
+    #[cfg(any(windows, target_os = "linux"))] teardown: Arc<
+        Mutex<Option<Arc<ManagedTerminalTeardown>>>,
+    >,
+    #[cfg(not(any(windows, target_os = "linux")))] process_job: Arc<
+        Mutex<Option<platform_service::ManagedProcessJob>>,
+    >,
+    runtime_state: Arc<RwLock<RuntimeState>>,
+    debug_enabled: bool,
+    state_notifier: Option<SessionStateNotifier>,
+    service_lifecycle_sink: Arc<Mutex<Option<TerminalLifecycleSink>>>,
+    start_gate: Arc<TerminalActorStartGate>,
+    child_exited: Arc<AtomicBool>,
+) -> Result<thread::JoinHandle<()>, String> {
+    #[cfg(all(test, any(windows, target_os = "linux")))]
+    if FAIL_NEXT_WAIT_ACTOR_SPAWN.swap(false, Ordering::SeqCst) {
+        return Err("injected wait actor spawn failure".to_string());
+    }
+    thread::Builder::new()
+        .name(format!("terminal-wait-{session_id}"))
+        .spawn(move || {
+            start_gate.wait();
+            let outcome = match child.wait() {
+                Ok(status) => Ok(status),
+                Err(error) => observe_exit_after_wait_failure(
+                    &session_id,
+                    child.as_mut(),
+                    error,
+                    debug_enabled,
+                ),
+            };
+            // Publish child death before any teardown so the reader actor can
+            // distinguish a closed pipe from a transient read failure.
+            child_exited.store(true, Ordering::Release);
+            match outcome {
+                Ok(status) => {
+                    if debug_enabled {
+                        eprintln!("[terminal:{session_id}] child exit -> {status}");
+                    }
+                    #[cfg(any(windows, target_os = "linux"))]
+                    request_managed_terminal_teardown(&teardown);
+                    #[cfg(not(any(windows, target_os = "linux")))]
+                    drop_managed_process_job(&process_job);
+                    #[cfg(not(any(windows, target_os = "linux")))]
+                    thread::sleep(Duration::from_millis(50));
+                    #[cfg(not(any(windows, target_os = "linux")))]
+                    let surviving_descendants = pid
+                        .map(platform_service::collect_descendant_process_identities)
+                        .unwrap_or_default();
+                    let summary = if let Some(signal) = status.signal() {
+                        format!("Shell terminated by {signal}")
+                    } else {
+                        format!("Shell exited with code {}", status.exit_code())
+                    };
+                    if let Ok(mut runtime) = runtime_state.write() {
+                        if let Some(session) = runtime.sessions.get_mut(&session_id) {
+                            let closed_by_user = session
+                                .exit
+                                .as_ref()
+                                .map(|exit| exit.closed_by_user)
+                                .unwrap_or(false);
+                            session.note_exit(
+                                SessionExitState {
+                                    code: Some(status.exit_code()),
+                                    signal: status.signal().map(str::to_string),
+                                    closed_by_user,
+                                    summary: summary.clone(),
+                                },
+                                SessionStatus::Exited,
+                            );
+                        }
+                    }
+                    notify_service_lifecycle(
+                        &service_lifecycle_sink,
+                        TerminalLifecycleEvent::ChildExited {
+                            summary,
+                            code: Some(status.exit_code()),
+                        },
                     );
-                    append_replay_bytes(&replay_buffer, &buffer[..bytes_read]);
-
-                    if let Some(writer) = log_writer.as_mut() {
-                        writer.write_chunk(&buffer[..bytes_read]);
-                    }
-
-                    if let Some(notifier) = output_notifier.as_ref() {
-                        notifier(buffer[..bytes_read].to_vec(), mode);
-                    }
                     if let Some(notifier) = state_notifier.as_ref() {
                         notifier();
+                    }
+                    #[cfg(not(any(windows, target_os = "linux")))]
+                    if let Some(pid) = pid {
+                        let _ =
+                            pid_file::release_session_root(&session_id, pid, surviving_descendants);
                     }
                 }
                 Err(error) => {
                     if debug_enabled {
-                        eprintln!("[terminal:{session_id}] PTY read error: {error}");
+                        eprintln!("[terminal:{session_id}] wait error: {error}");
                     }
+                    #[cfg(any(windows, target_os = "linux"))]
+                    request_managed_terminal_teardown(&teardown);
+                    #[cfg(not(any(windows, target_os = "linux")))]
+                    drop_managed_process_job(&process_job);
+                    #[cfg(not(any(windows, target_os = "linux")))]
+                    thread::sleep(Duration::from_millis(50));
+                    #[cfg(not(any(windows, target_os = "linux")))]
+                    let surviving_descendants = pid
+                        .map(platform_service::collect_descendant_process_identities)
+                        .unwrap_or_default();
+                    let summary = format!("Failed while waiting for shell exit: {error}");
                     if let Ok(mut runtime) = runtime_state.write() {
                         if let Some(session) = runtime.sessions.get_mut(&session_id) {
                             session.note_exit(
@@ -1611,104 +3173,31 @@ fn spawn_reader_thread(
                                     code: None,
                                     signal: None,
                                     closed_by_user: false,
-                                    summary: format!("PTY read failed: {error}"),
+                                    summary: summary.clone(),
                                 },
                                 SessionStatus::Failed,
                             );
                         }
                     }
+                    notify_service_lifecycle(
+                        &service_lifecycle_sink,
+                        TerminalLifecycleEvent::ChildExited {
+                            summary,
+                            code: None,
+                        },
+                    );
                     if let Some(notifier) = state_notifier.as_ref() {
                         notifier();
                     }
-                    break;
+                    #[cfg(not(any(windows, target_os = "linux")))]
+                    if let Some(pid) = pid {
+                        let _ =
+                            pid_file::release_session_root(&session_id, pid, surviving_descendants);
+                    }
                 }
             }
-        }
-
-        if let Some(writer) = log_writer.as_mut() {
-            writer.flush_remaining();
-        }
-    });
-}
-
-fn spawn_wait_thread(
-    session_id: String,
-    mut child: Box<dyn Child + Send + Sync>,
-    pid: Option<u32>,
-    process_job: Arc<Mutex<Option<platform_service::ManagedProcessJob>>>,
-    runtime_state: Arc<RwLock<RuntimeState>>,
-    debug_enabled: bool,
-    state_notifier: Option<SessionStateNotifier>,
-) {
-    thread::spawn(move || match child.wait() {
-        Ok(status) => {
-            if debug_enabled {
-                eprintln!("[terminal:{session_id}] child exit -> {status}");
-            }
-            drop_managed_process_job(&process_job);
-            thread::sleep(Duration::from_millis(50));
-            let surviving_descendants = pid
-                .map(platform_service::collect_descendant_process_identities)
-                .unwrap_or_default();
-            if let Ok(mut runtime) = runtime_state.write() {
-                if let Some(session) = runtime.sessions.get_mut(&session_id) {
-                    let closed_by_user = session
-                        .exit
-                        .as_ref()
-                        .map(|exit| exit.closed_by_user)
-                        .unwrap_or(false);
-                    session.note_exit(
-                        SessionExitState {
-                            code: Some(status.exit_code()),
-                            signal: status.signal().map(str::to_string),
-                            closed_by_user,
-                            summary: if let Some(signal) = status.signal() {
-                                format!("Shell terminated by {signal}")
-                            } else {
-                                format!("Shell exited with code {}", status.exit_code())
-                            },
-                        },
-                        SessionStatus::Exited,
-                    );
-                }
-            }
-            if let Some(notifier) = state_notifier.as_ref() {
-                notifier();
-            }
-            if let Some(pid) = pid {
-                let _ = pid_file::release_session_root(&session_id, pid, surviving_descendants);
-            }
-        }
-        Err(error) => {
-            if debug_enabled {
-                eprintln!("[terminal:{session_id}] wait error: {error}");
-            }
-            drop_managed_process_job(&process_job);
-            thread::sleep(Duration::from_millis(50));
-            let surviving_descendants = pid
-                .map(platform_service::collect_descendant_process_identities)
-                .unwrap_or_default();
-            if let Ok(mut runtime) = runtime_state.write() {
-                if let Some(session) = runtime.sessions.get_mut(&session_id) {
-                    session.note_exit(
-                        SessionExitState {
-                            code: None,
-                            signal: None,
-                            closed_by_user: false,
-                            summary: format!("Failed while waiting for shell exit: {error}"),
-                        },
-                        SessionStatus::Failed,
-                    );
-                }
-            }
-            if let Some(notifier) = state_notifier.as_ref() {
-                notifier();
-            }
-            if let Some(pid) = pid {
-                let _ = pid_file::release_session_root(&session_id, pid, surviving_descendants);
-            }
-        }
-    });
+        })
+        .map_err(|error| format!("Failed to spawn terminal wait actor: {error}"))
 }
 
 fn spawn_with_command(
@@ -1726,55 +3215,125 @@ fn spawn_with_command(
     track_pid: bool,
     state_notifier: Option<SessionStateNotifier>,
     output_notifier: Option<SessionOutputNotifier>,
+    authority: TerminalLaunchAuthority,
 ) -> Result<TerminalSession, String> {
     let pty_system = native_pty_system();
     let pair = pty_system
         .openpty(pty_size(dimensions))
         .map_err(|error| error.to_string())?;
     let scrolling_history = scrolling_history.max(100);
+    #[cfg(not(any(windows, target_os = "linux")))]
+    let service_attachment_fence = (authority.resource_id, authority.runtime_generation);
 
-    let mut command = CommandBuilder::new(program.clone());
-    if let Some(valid_cwd) = existing_directory(&cwd) {
-        command.cwd(valid_cwd);
-    }
-    if !args.is_empty() {
-        command.args(args.clone());
-    }
-    apply_terminal_env_defaults(&mut command, env);
-
-    let child = pair
-        .slave
-        .spawn_command(command)
-        .map_err(|error| format!("Failed to spawn command: {error}"))?;
+    #[cfg(any(windows, target_os = "linux"))]
+    let writer = Arc::new(Mutex::new(
+        Box::new(std::io::sink()) as Box<dyn Write + Send>
+    ));
+    let input_admission = Arc::new(AtomicBool::new(false));
+    #[cfg(any(windows, target_os = "linux"))]
+    let master = Arc::new(Mutex::new(None));
+    let actors = Arc::new(Mutex::new(TerminalActorHandles::default()));
+    #[cfg(any(windows, target_os = "linux"))]
+    let io = ManagedTerminalIo::new(
+        Arc::clone(&writer),
+        Arc::clone(&master),
+        Arc::clone(&actors),
+        Arc::clone(&input_admission),
+    );
+    #[cfg(any(windows, target_os = "linux"))]
+    let (child, teardown) = spawn_suspended_managed_terminal(
+        &*pair.slave,
+        session_id,
+        &cwd,
+        &program,
+        &args,
+        env,
+        authority,
+        Arc::clone(&io),
+        session_id.starts_with("provider-"),
+    )?;
+    #[cfg(not(any(windows, target_os = "linux")))]
+    let child = {
+        let mut command = CommandBuilder::new(program.clone());
+        if let Some(valid_cwd) = existing_directory(&cwd) {
+            command.cwd(valid_cwd);
+        }
+        if !args.is_empty() {
+            command.args(args.clone());
+        }
+        apply_terminal_env_defaults(&mut command, env);
+        pair.slave
+            .spawn_command(command)
+            .map_err(|error| format!("Failed to spawn command: {error}"))?
+    };
 
     let pid = child.process_id();
+    #[cfg(not(any(windows, target_os = "linux")))]
     let mut cleanup_killer = child.clone_killer();
+    #[cfg(not(any(windows, target_os = "linux")))]
     let process_job = attach_managed_process_job(pid);
-    let writer = match pair.master.take_writer() {
+    let acquired_writer = match pair.master.take_writer() {
         Ok(writer) => writer,
         Err(error) => {
-            cleanup_failed_spawn(&mut cleanup_killer);
+            cleanup_failed_spawn(
+                #[cfg(not(any(windows, target_os = "linux")))]
+                &mut cleanup_killer,
+                #[cfg(any(windows, target_os = "linux"))]
+                &teardown,
+            );
             return Err(format!("Failed to acquire PTY writer: {error}"));
         }
     };
+    #[cfg(any(windows, target_os = "linux"))]
+    {
+        let mut writer_slot = match writer.lock() {
+            Ok(writer_slot) => writer_slot,
+            Err(_) => {
+                cleanup_failed_spawn(&teardown);
+                return Err("terminal PTY writer poisoned".to_string());
+            }
+        };
+        *writer_slot = acquired_writer;
+    }
     let reader = match pair.master.try_clone_reader() {
         Ok(reader) => reader,
         Err(error) => {
-            cleanup_failed_spawn(&mut cleanup_killer);
+            cleanup_failed_spawn(
+                #[cfg(not(any(windows, target_os = "linux")))]
+                &mut cleanup_killer,
+                #[cfg(any(windows, target_os = "linux"))]
+                &teardown,
+            );
             return Err(format!("Failed to clone PTY reader: {error}"));
         }
     };
     let log_writer = open_log_writer(log_file_path);
 
-    let writer = Arc::new(Mutex::new(writer));
-    let master = Arc::new(Mutex::new(pair.master));
+    #[cfg(not(any(windows, target_os = "linux")))]
+    let writer = Arc::new(Mutex::new(acquired_writer));
+    #[cfg(any(windows, target_os = "linux"))]
+    {
+        let mut master_slot = match master.lock() {
+            Ok(master_slot) => master_slot,
+            Err(_) => {
+                cleanup_failed_spawn(&teardown);
+                return Err("terminal PTY master poisoned".to_string());
+            }
+        };
+        *master_slot = Some(pair.master);
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    let master = Arc::new(Mutex::new(Some(pair.master)));
+    #[cfg(not(any(windows, target_os = "linux")))]
     let killer = Arc::new(Mutex::new(child.clone_killer()));
+    #[cfg(not(any(windows, target_os = "linux")))]
     let process_job = Arc::new(Mutex::new(process_job));
     let dimensions_state = Arc::new(Mutex::new(dimensions));
     let replay_buffer = Arc::new(Mutex::new(Vec::new()));
     let event_proxy = SessionEventProxy {
         session_id: session_id.to_string(),
         writer: writer.clone(),
+        input_admission: Arc::clone(&input_admission),
         runtime_state: runtime_state.clone(),
         dimensions: dimensions_state.clone(),
         debug_enabled,
@@ -1800,12 +3359,35 @@ fn spawn_with_command(
 
     if track_pid {
         if let Err(error) = track_managed_process(&runtime_state, session_id, pid, &program) {
-            cleanup_failed_spawn(&mut cleanup_killer);
+            cleanup_failed_spawn(
+                #[cfg(not(any(windows, target_os = "linux")))]
+                &mut cleanup_killer,
+                #[cfg(any(windows, target_os = "linux"))]
+                &teardown,
+            );
             return Err(error);
         }
     }
 
-    spawn_reader_thread(
+    #[cfg(any(windows, target_os = "linux"))]
+    let teardown_handle = Arc::new(Mutex::new(Some(teardown.clone())));
+    let mut actor_slots = match actors.lock() {
+        Ok(actor_slots) => actor_slots,
+        Err(_) => {
+            cleanup_failed_spawn(
+                #[cfg(not(any(windows, target_os = "linux")))]
+                &mut cleanup_killer,
+                #[cfg(any(windows, target_os = "linux"))]
+                &teardown,
+            );
+            return Err("terminal actor handles poisoned".to_string());
+        }
+    };
+    let start_gate = Arc::new(TerminalActorStartGate::default());
+    let child_exited = Arc::new(AtomicBool::new(false));
+    let service_output_sink = Arc::new(Mutex::new(None));
+    let service_lifecycle_sink = Arc::new(Mutex::new(None));
+    let reader_actor = match spawn_reader_thread(
         session_id.to_string(),
         reader,
         term.clone(),
@@ -1814,18 +3396,75 @@ fn spawn_with_command(
         debug_enabled,
         state_notifier.clone(),
         output_notifier.clone(),
+        Arc::clone(&service_output_sink),
+        Arc::clone(&service_lifecycle_sink),
         replay_buffer.clone(),
-    );
+        Arc::clone(&start_gate),
+        Arc::clone(&child_exited),
+    ) {
+        Ok(actor) => actor,
+        Err(error) => {
+            drop(actor_slots);
+            cleanup_failed_spawn(
+                #[cfg(not(any(windows, target_os = "linux")))]
+                &mut cleanup_killer,
+                #[cfg(any(windows, target_os = "linux"))]
+                &teardown,
+            );
+            return Err(error);
+        }
+    };
+    actor_slots.reader = Some(reader_actor);
 
-    spawn_wait_thread(
+    let wait_actor = match spawn_wait_thread(
         session_id.to_string(),
         child,
         pid,
+        #[cfg(any(windows, target_os = "linux"))]
+        teardown_handle,
+        #[cfg(not(any(windows, target_os = "linux")))]
         process_job.clone(),
         runtime_state.clone(),
         debug_enabled,
         state_notifier,
-    );
+        Arc::clone(&service_lifecycle_sink),
+        Arc::clone(&start_gate),
+        Arc::clone(&child_exited),
+    ) {
+        Ok(actor) => actor,
+        Err(error) => {
+            drop(actor_slots);
+            // No wait actor exists to publish child exit; publish it here so
+            // the reader treats the cleanup-closed PTY as final.
+            child_exited.store(true, Ordering::Release);
+            start_gate.release();
+            cleanup_failed_spawn(
+                #[cfg(not(any(windows, target_os = "linux")))]
+                &mut cleanup_killer,
+                #[cfg(any(windows, target_os = "linux"))]
+                &teardown,
+            );
+            #[cfg(not(any(windows, target_os = "linux")))]
+            if let Err(join_error) =
+                detach_pty_and_join_actor_slots(&input_admission, &writer, &master, &actors)
+            {
+                eprintln!(
+                    "terminal session `{session_id}` setup cleanup could not join actors: {join_error}"
+                );
+            }
+            return Err(error);
+        }
+    };
+    actor_slots.waiter = Some(wait_actor);
+    drop(actor_slots);
+    start_gate.release();
+    #[cfg(any(windows, target_os = "linux"))]
+    if let Err(error) = open_managed_terminal_input(&io) {
+        cleanup_failed_spawn(&teardown);
+        return Err(error);
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    input_admission.store(true, Ordering::Release);
 
     event_proxy.debug_log(format!("spawned {}", program));
 
@@ -1833,8 +3472,20 @@ fn spawn_with_command(
         session_id: session_id.to_string(),
         term,
         writer,
+        input_admission,
         master,
+        actors,
+        #[cfg(not(any(windows, target_os = "linux")))]
         killer,
+        #[cfg(any(windows, target_os = "linux"))]
+        teardown: Arc::new(Mutex::new(Some(teardown))),
+        #[cfg(any(windows, target_os = "linux"))]
+        lifecycle: Mutex::new(()),
+        #[cfg(any(windows, target_os = "linux"))]
+        retired: AtomicBool::new(false),
+        #[cfg(all(test, any(windows, target_os = "linux")))]
+        managed_resource_publication_barrier: Mutex::new(None),
+        #[cfg(not(any(windows, target_os = "linux")))]
         process_job,
         runtime_state,
         dimensions: dimensions_state,
@@ -1843,9 +3494,14 @@ fn spawn_with_command(
         scrolling_history,
         replay_buffer,
         output_notifier,
+        service_output_sink,
+        service_lifecycle_sink,
+        #[cfg(not(any(windows, target_os = "linux")))]
+        service_attachment_pin: Mutex::new(Some(service_attachment_fence)),
     })
 }
 
+#[cfg(not(any(windows, target_os = "linux")))]
 fn drop_managed_process_job(process_job: &Arc<Mutex<Option<platform_service::ManagedProcessJob>>>) {
     if let Ok(mut process_job) = process_job.lock() {
         process_job.take();
@@ -1853,26 +3509,339 @@ fn drop_managed_process_job(process_job: &Arc<Mutex<Option<platform_service::Man
 }
 
 impl TerminalSession {
-    /// Returns active PIDs from the session's managed Job Object, if any.
-    ///
-    /// Does not expose the raw Job handle. Query failures degrade to `None`
-    /// after emitting a concise diagnostic.
-    pub fn managed_process_ids(&self) -> Option<Vec<u32>> {
-        let job_slot = self.process_job.lock().ok()?;
-        let job = job_slot.as_ref()?;
-        match job.active_process_ids() {
-            Ok(process_ids) => Some(process_ids),
-            Err(error) => {
-                eprintln!(
-                    "[terminal:{}] managed job query failed: {error}",
-                    self.session_id
+    #[cfg(not(any(windows, target_os = "linux")))]
+    fn validate_service_restart_fence(
+        &self,
+        authority: &TerminalLaunchAuthority,
+    ) -> Result<(), String> {
+        let pin = self
+            .service_attachment_pin
+            .lock()
+            .map_err(|_| "terminal attachment pin poisoned".to_string())?;
+        if let Some((resource_id, generation)) = *pin {
+            if resource_id == authority.resource_id && authority.runtime_generation <= generation {
+                return Err(
+                    "terminal restart authority is not newer than the attached generation"
+                        .to_string(),
                 );
-                None
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(not(any(windows, target_os = "linux")))]
+    fn publish_service_attachment_fence(
+        &self,
+        authority: &TerminalLaunchAuthority,
+    ) -> Result<(), String> {
+        let mut pin = self
+            .service_attachment_pin
+            .lock()
+            .map_err(|_| "terminal attachment pin poisoned".to_string())?;
+        *pin = Some((authority.resource_id, authority.runtime_generation));
+        Ok(())
+    }
+
+    /// Returns only the current exact teardown fence. This performs no Job
+    /// enumeration and grants no raw process or termination capability.
+    #[cfg(any(windows, target_os = "linux"))]
+    pub(crate) fn managed_process_fence(&self) -> Result<Option<ManagedProcessFence>, String> {
+        let _lifecycle = lock_terminal_lifecycle(&self.lifecycle)?;
+        let teardown = lock_terminal_teardown_slot(&self.teardown)?.clone();
+        Ok(teardown.map(|teardown| teardown.managed_process_fence()))
+    }
+
+    /// Snapshots the exact managed root fence and current Job membership from
+    /// the teardown-owned registry. This deliberately exposes neither the Job
+    /// handle nor any raw termination operation.
+    #[cfg(all(test, any(windows, target_os = "linux")))]
+    pub(crate) fn managed_process_snapshot(&self) -> Option<(ManagedProcessFence, Vec<u32>)> {
+        let teardown = lock_terminal_teardown_slot(&self.teardown).ok()?.clone()?;
+        teardown.managed_process_snapshot().ok()
+    }
+
+    /// Returns the exact generation/identity fence and exact current Job
+    /// observations under one caller-supplied absolute deadline. This is a
+    /// read-only accounting seam; the Job handle and close authority remain
+    /// sealed inside teardown.
+    #[cfg(any(windows, target_os = "linux"))]
+    pub(crate) fn managed_process_observations_until(
+        &self,
+        absolute_deadline: std::time::Instant,
+        max_members: usize,
+    ) -> Result<Option<ManagedProcessObservationQuery>, String> {
+        if std::time::Instant::now() >= absolute_deadline {
+            return Err("terminal managed-process observation exceeded deadline".to_string());
+        }
+        let teardown =
+            lock_terminal_teardown_slot_until(&self.teardown, absolute_deadline)?.clone();
+        if std::time::Instant::now() >= absolute_deadline {
+            return Err("terminal managed-process observation exceeded deadline".to_string());
+        }
+        let Some(teardown) = teardown else {
+            return Ok(None);
+        };
+        let fence = teardown.managed_process_fence();
+        let members = teardown
+            .managed_process_observations_until(absolute_deadline, max_members)
+            .and_then(|(observed_fence, members)| {
+                if observed_fence == fence {
+                    Ok(members)
+                } else {
+                    Err("terminal managed-process observation generation changed".to_string())
+                }
+            });
+        Ok(Some(ManagedProcessObservationQuery {
+            capture: ManagedProcessObservationCapture { teardown, fence },
+            members,
+        }))
+    }
+
+    /// Publishes one accounting snapshot only if the exact teardown Arc,
+    /// registry fence, runtime generation, and root PID captured by the Job
+    /// query are still current. Lock order intentionally matches restart and
+    /// asynchronous teardown: lifecycle, publication guard, teardown state,
+    /// then runtime projection. Release takes only the publication write guard
+    /// and teardown state, so it cannot invalidate authority during commit.
+    #[cfg(any(windows, target_os = "linux"))]
+    pub(crate) fn publish_managed_resource_sample_if_current(
+        &self,
+        capture: &ManagedProcessObservationCapture,
+        snapshot: ResourceSnapshot,
+        awaiting_external_editor: bool,
+        absolute_deadline: std::time::Instant,
+    ) -> Result<ManagedResourceSamplePublication, String> {
+        let _lifecycle = lock_terminal_lifecycle_until(&self.lifecycle, absolute_deadline)?;
+        let current_teardown =
+            lock_terminal_teardown_slot_until(&self.teardown, absolute_deadline)?.clone();
+        let exact_teardown_is_current = current_teardown.as_ref().is_some_and(|current| {
+            Arc::ptr_eq(current, &capture.teardown)
+                && current.matches_fence(&capture.fence)
+                && capture.teardown.matches_fence(&capture.fence)
+        });
+        let _publication_guard = exact_teardown_is_current
+            .then(|| {
+                capture
+                    .teardown
+                    .lock_resource_publication_until(absolute_deadline)
+            })
+            .transpose()?;
+        let exact_registry_is_current = exact_teardown_is_current
+            && capture
+                .teardown
+                .exact_registry_entry_is_current_until(absolute_deadline)?;
+        #[cfg(all(test, any(windows, target_os = "linux")))]
+        if exact_registry_is_current {
+            self.pause_managed_resource_publication_after_validation_for_test()?;
+        }
+
+        let mut runtime =
+            lock_terminal_runtime_write_until(&self.runtime_state, absolute_deadline)?;
+        let Some(session) = runtime.sessions.get_mut(&self.session_id) else {
+            return Ok(ManagedResourceSamplePublication::StaleGeneration {
+                dirty_changed: false,
+            });
+        };
+        if std::time::Instant::now() >= absolute_deadline {
+            return Err("terminal resource publication exceeded deadline".to_string());
+        }
+        let dirty_before = session.dirty_generation;
+        let exact_runtime_is_current =
+            session.status.is_live() && session.pid == Some(capture.fence.root().id().pid());
+        if !exact_teardown_is_current || !exact_registry_is_current || !exact_runtime_is_current {
+            // Never disturb a replacement generation. If the row still holds
+            // the rejected G1 action fence, remove that local authority and
+            // explicitly type the retained values as stale/unknown.
+            if session.resources.managed_process_fence.as_ref() == Some(&capture.fence) {
+                session.resources.managed_process_fence = None;
+                session.resources.metrics_unavailable = true;
+                session.resources.metrics_status =
+                    crate::domain::snapshot::ProcessMetricStatus::Unknown;
+                session.resources.metrics_stale = true;
+                session.resources.metrics_error = Some("sampling_generation_stale".to_string());
+                session.resources.process_count_value_state =
+                    last_known_resource_value_state(session.resources.process_count_value_state);
+                session.resources.cpu_value_state =
+                    last_known_resource_value_state(session.resources.cpu_value_state);
+                session.resources.memory_value_state =
+                    last_known_resource_value_state(session.resources.memory_value_state);
+                session.resources.metric_values =
+                    last_known_resource_value_state(session.resources.metric_values);
+                session.mark_dirty();
+            }
+            return Ok(ManagedResourceSamplePublication::StaleGeneration {
+                dirty_changed: session.dirty_generation != dirty_before,
+            });
+        }
+
+        if std::time::Instant::now() >= absolute_deadline {
+            return Err("terminal resource publication exceeded deadline".to_string());
+        }
+        let cleared_unreaped = session.reap_incomplete && snapshot.process_ids.is_empty();
+        session.note_resource_sample(snapshot);
+        session.note_external_editor_wait(awaiting_external_editor);
+        Ok(ManagedResourceSamplePublication::Published {
+            dirty_changed: session.dirty_generation != dirty_before,
+            cleared_unreaped,
+        })
+    }
+
+    #[cfg(all(test, any(windows, target_os = "linux")))]
+    fn install_managed_resource_publication_barrier_for_test(
+        &self,
+        validated: std::sync::mpsc::SyncSender<()>,
+        resume: std::sync::mpsc::Receiver<()>,
+    ) {
+        *self
+            .managed_resource_publication_barrier
+            .lock()
+            .expect("managed resource publication test barrier") =
+            Some(ManagedResourcePublicationTestBarrier { validated, resume });
+    }
+
+    #[cfg(all(test, any(windows, target_os = "linux")))]
+    fn pause_managed_resource_publication_after_validation_for_test(&self) -> Result<(), String> {
+        let barrier = self
+            .managed_resource_publication_barrier
+            .lock()
+            .map_err(|_| "managed resource publication test barrier poisoned".to_string())?
+            .take();
+        let Some(barrier) = barrier else {
+            return Ok(());
+        };
+        barrier
+            .validated
+            .send(())
+            .map_err(|_| "managed resource publication test signal was dropped".to_string())?;
+        barrier
+            .resume
+            .recv_timeout(Duration::from_secs(5))
+            .map_err(|_| "managed resource publication test release timed out".to_string())
+    }
+}
+
+#[cfg(any(windows, target_os = "linux"))]
+fn last_known_resource_value_state(
+    state: crate::state::ResourceMetricValueState,
+) -> crate::state::ResourceMetricValueState {
+    match state {
+        crate::state::ResourceMetricValueState::Observed
+        | crate::state::ResourceMetricValueState::Partial
+        | crate::state::ResourceMetricValueState::LastKnown => {
+            crate::state::ResourceMetricValueState::LastKnown
+        }
+        crate::state::ResourceMetricValueState::Unavailable => {
+            crate::state::ResourceMetricValueState::Unavailable
+        }
+    }
+}
+
+#[cfg(any(windows, target_os = "linux"))]
+fn request_managed_terminal_teardown(teardown: &Arc<Mutex<Option<Arc<ManagedTerminalTeardown>>>>) {
+    // Reader/wait actors must never block each other or host shutdown on this
+    // projection slot. A missed request is harmless: the retained session
+    // owner still performs the same exact close on reconciliation/drop.
+    let context = teardown.try_lock().ok().and_then(|slot| slot.clone());
+    if let Some(context) = context {
+        let _ = context.request_close();
+    }
+}
+
+#[cfg(any(windows, target_os = "linux"))]
+fn lock_terminal_lifecycle(lifecycle: &Mutex<()>) -> Result<MutexGuard<'_, ()>, String> {
+    let deadline = std::time::Instant::now()
+        .checked_add(Duration::from_millis(100))
+        .ok_or_else(|| "terminal lifecycle deadline overflow".to_string())?;
+    lock_terminal_lifecycle_until(lifecycle, deadline)
+}
+
+#[cfg(any(windows, target_os = "linux"))]
+fn lock_terminal_lifecycle_until(
+    lifecycle: &Mutex<()>,
+    deadline: std::time::Instant,
+) -> Result<MutexGuard<'_, ()>, String> {
+    loop {
+        if std::time::Instant::now() >= deadline {
+            return Err("terminal lifecycle remained contended".to_string());
+        }
+        match lifecycle.try_lock() {
+            Ok(guard) => return Ok(guard),
+            Err(std::sync::TryLockError::WouldBlock) => thread::yield_now(),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err("terminal lifecycle poisoned".to_string())
             }
         }
     }
 }
 
+#[cfg(any(windows, target_os = "linux"))]
+fn lock_terminal_runtime_write_until<'a>(
+    runtime_state: &'a Arc<RwLock<RuntimeState>>,
+    deadline: std::time::Instant,
+) -> Result<RwLockWriteGuard<'a, RuntimeState>, String> {
+    loop {
+        if std::time::Instant::now() >= deadline {
+            return Err("terminal runtime projection remained contended".to_string());
+        }
+        match runtime_state.try_write() {
+            Ok(runtime) => {
+                if std::time::Instant::now() >= deadline {
+                    return Err("terminal runtime projection remained contended".to_string());
+                }
+                return Ok(runtime);
+            }
+            Err(std::sync::TryLockError::WouldBlock) => thread::yield_now(),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err("terminal runtime projection poisoned".to_string())
+            }
+        }
+    }
+}
+
+#[cfg(any(windows, target_os = "linux"))]
+fn lock_terminal_teardown_slot<'a>(
+    teardown: &'a Arc<Mutex<Option<Arc<ManagedTerminalTeardown>>>>,
+) -> Result<MutexGuard<'a, Option<Arc<ManagedTerminalTeardown>>>, String> {
+    let deadline = std::time::Instant::now()
+        .checked_add(Duration::from_millis(100))
+        .ok_or_else(|| "terminal teardown slot deadline overflow".to_string())?;
+    lock_terminal_teardown_slot_until(teardown, deadline)
+}
+
+#[cfg(any(windows, target_os = "linux"))]
+fn lock_terminal_teardown_slot_until<'a>(
+    teardown: &'a Arc<Mutex<Option<Arc<ManagedTerminalTeardown>>>>,
+    deadline: std::time::Instant,
+) -> Result<MutexGuard<'a, Option<Arc<ManagedTerminalTeardown>>>, String> {
+    loop {
+        if std::time::Instant::now() >= deadline {
+            return Err("terminal teardown slot remained contended".to_string());
+        }
+        match teardown.try_lock() {
+            Ok(slot) => {
+                if std::time::Instant::now() >= deadline {
+                    return Err("terminal teardown slot remained contended".to_string());
+                }
+                return Ok(slot);
+            }
+            Err(std::sync::TryLockError::WouldBlock) => thread::yield_now(),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err("terminal teardown slot poisoned".to_string())
+            }
+        }
+    }
+}
+
+#[cfg(any(windows, target_os = "linux"))]
+fn open_managed_terminal_input(io: &ManagedTerminalIo) -> Result<(), String> {
+    #[cfg(test)]
+    if FAIL_NEXT_INPUT_ADMISSION_OPEN.swap(false, Ordering::SeqCst) {
+        return Err("injected terminal input-admission open failure".to_string());
+    }
+    io.open_input_after_start()
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
 fn attach_managed_process_job(pid: Option<u32>) -> Option<platform_service::ManagedProcessJob> {
     pid.and_then(
         |pid| match platform_service::attach_process_to_managed_job(pid) {
@@ -1967,10 +3936,17 @@ impl LogWriter {
 fn renderable_cell_snapshot(cell: &Cell, colors: &Colors) -> TerminalCellSnapshot {
     let mut foreground = resolve_terminal_color(cell.fg, colors);
     let mut background = resolve_terminal_color(cell.bg, colors);
+    // After INVERSE, visual fg comes from the original bg and visual bg from the
+    // original fg — mirror that swap when tagging named default colors.
     let default_background = if cell.flags.contains(Flags::INVERSE) {
         matches!(cell.fg, AnsiColor::Named(NamedColor::Background))
     } else {
         matches!(cell.bg, AnsiColor::Named(NamedColor::Background))
+    };
+    let default_foreground = if cell.flags.contains(Flags::INVERSE) {
+        matches!(cell.bg, AnsiColor::Named(NamedColor::Foreground))
+    } else {
+        matches!(cell.fg, AnsiColor::Named(NamedColor::Foreground))
     };
 
     if cell.flags.contains(Flags::INVERSE) {
@@ -1994,6 +3970,7 @@ fn renderable_cell_snapshot(cell: &Cell, colors: &Colors) -> TerminalCellSnapsho
         hidden: cell.flags.contains(Flags::HIDDEN),
         has_hyperlink: cell.hyperlink().is_some(),
         default_background,
+        default_foreground,
     }
 }
 
@@ -2301,7 +4278,30 @@ fn parse_shell_sequence(payload: &str) -> Option<ShellSequence> {
     if let Some(rest) = payload.strip_prefix("7;") {
         return parse_ghostty_cwd(rest);
     }
+    if let Some(rest) = payload.strip_prefix("9;9;") {
+        return parse_conemu_cwd(rest);
+    }
     None
+}
+
+/// `ESC ] 9 ; 9 ; <path> ST` -- the ConEmu/Windows Terminal cwd report.
+///
+/// Unlike OSC 7 the payload is a bare native path, not a URL, so nothing is
+/// percent-decoded here: a Windows path is not percent-encoded and decoding
+/// one would corrupt any directory with a literal `%` in its name.
+///
+/// The quotes are optional because both spellings are in the wild -- ConEmu's
+/// own documentation quotes the path, [`PWSH_PROMPT_HOOK`] does not -- and a
+/// reader that accepted only one would silently report nothing for the other.
+fn parse_conemu_cwd(payload: &str) -> Option<ShellSequence> {
+    let path = payload
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'))
+        .unwrap_or(payload);
+    if path.is_empty() {
+        return None;
+    }
+    Some(ShellSequence::ReportedCwd(PathBuf::from(path)))
 }
 
 fn parse_ghostty_prompt_mark(payload: &str) -> Option<ShellSequence> {
@@ -2463,10 +4463,1380 @@ mod tests {
     use super::*;
     use std::io;
 
+    /// A replica with `rows` rows and `total` lines of numbered output, so the
+    /// margin assertions have real scrollback rather than a synthesized grid.
+    fn replica_with_scrollback(rows: u16, total: usize) -> TerminalReplica {
+        let mut runtime = SessionRuntimeState::new(
+            "margin-test".to_string(),
+            std::path::PathBuf::from("."),
+            SessionDimensions {
+                // A realistic width: the margin's cost is per CHARACTER, so a
+                // 20-column fixture would understate it tenfold.
+                cols: 200,
+                rows,
+                ..SessionDimensions::default()
+            },
+            TerminalBackend::default(),
+        );
+        runtime.status = crate::state::SessionStatus::Running;
+        let replica = TerminalReplica::from_bootstrap("margin-test", runtime, &[]);
+        let mut bytes = Vec::new();
+        for line in 0..total {
+            bytes.extend_from_slice(
+                format!(
+                    "line-{line}
+"
+                )
+                .as_bytes(),
+            );
+        }
+        replica.apply_output_bytes(&bytes);
+        replica
+    }
+
+    fn trimmed(rows: &[String]) -> Vec<String> {
+        rows.iter().map(|row| row.trim_end().to_string()).collect()
+    }
+
+    /// The host has to serve a WINDOW, not just the viewport, or the client
+    /// has nothing to scroll through locally. The rows above the viewport must
+    /// be the real ones immediately above it, in order.
+    #[test]
+    fn a_screen_carries_the_scrollback_rows_immediately_above_the_viewport() {
+        let replica = replica_with_scrollback(6, 60);
+        let screen = replica.snapshot();
+        assert!(
+            screen.history_size > 0,
+            "the fixture must produce scrollback"
+        );
+        assert!(
+            !screen.margin_above.is_empty(),
+            "a scrolled-back terminal must offer rows above the viewport"
+        );
+
+        // The viewport's own first row, and the margin's last row, have to be
+        // adjacent lines of the same output.
+        let viewport_first = screen.lines[0]
+            .iter()
+            .map(|cell| cell.character)
+            .collect::<String>();
+        let viewport_first = viewport_first.trim_end().to_string();
+        let above = trimmed(&screen.margin_above);
+        let last_above = above.last().expect("a row above the viewport");
+        let index = |row: &str| {
+            row.strip_prefix("line-")
+                .and_then(|rest| rest.parse::<usize>().ok())
+        };
+        assert_eq!(
+            index(last_above).map(|line| line + 1),
+            index(&viewport_first),
+            "the margin's last row must be the line directly above the viewport"
+        );
+        // Ordered oldest first, with no gaps.
+        for pair in above.windows(2) {
+            assert_eq!(
+                index(&pair[0]).map(|line| line + 1),
+                index(&pair[1]),
+                "margin rows must be contiguous and oldest first"
+            );
+        }
+    }
+
+    /// At the live prompt there is nothing below, and reporting rows there
+    /// would be inventing them.
+    #[test]
+    fn a_screen_at_the_live_prompt_carries_no_rows_below_the_viewport() {
+        let replica = replica_with_scrollback(6, 60);
+        let screen = replica.snapshot();
+        assert_eq!(screen.display_offset, 0);
+        assert!(screen.margin_below.is_empty());
+    }
+
+    /// A terminal with no history has no margin either way -- an empty vector
+    /// means "there is nothing there", never "we did not look".
+    #[test]
+    fn a_terminal_with_no_scrollback_carries_no_margin() {
+        let replica = replica_with_scrollback(24, 3);
+        let screen = replica.snapshot();
+        assert_eq!(screen.history_size, 0);
+        assert!(screen.margin_above.is_empty());
+        assert!(screen.margin_below.is_empty());
+    }
+
+    /// The margin is bounded: a very tall terminal must not triple an already
+    /// large reply without limit.
+    #[test]
+    fn the_margin_is_bounded_by_the_declared_row_budget() {
+        let replica = replica_with_scrollback(6, 400);
+        let screen = replica.snapshot();
+        assert!(screen.margin_above.len() <= TERMINAL_MARGIN_ROWS);
+        assert!(screen.margin_above.len() <= screen.rows.max(1));
+        assert!(screen.margin_below.len() <= TERMINAL_MARGIN_ROWS);
+    }
+
+    /// Measurement, not an assertion: what the retained-window margin adds to
+    /// `worker=`, the host's cost to produce one screen (measured median 52 ms
+    /// on the real launch this lane started from).
+    ///
+    /// The A/B is two replicas with the SAME 48-row viewport, one with deep
+    /// scrollback (so the margin collects 48 rows) and one with none (so it
+    /// collects nothing). The viewport iteration is identical in both, which
+    /// is what makes the difference attributable to the margin rather than to
+    /// the grid being bigger.
+    ///
+    /// Ignored by default -- a wall-clock number on a shared machine is not a
+    /// gate. Run it with `cargo test -- --ignored margin_cost`.
+    #[test]
+    #[ignore = "measurement, not a gate: prints the margin's snapshot cost"]
+    fn margin_cost_measurement() {
+        let iterations = 200;
+        let time = |replica: &TerminalReplica| {
+            for _ in 0..20 {
+                std::hint::black_box(replica.snapshot());
+            }
+            let started = std::time::Instant::now();
+            for _ in 0..iterations {
+                std::hint::black_box(replica.snapshot());
+            }
+            started.elapsed().as_secs_f64() * 1000.0 / f64::from(iterations)
+        };
+
+        let with_scrollback = replica_with_scrollback(48, 4_000);
+        // 20 lines into a 48-row terminal never scrolls, so there is no
+        // history and therefore no margin, on an identically sized viewport.
+        let without_scrollback = replica_with_scrollback(48, 20);
+
+        let with_margin = time(&with_scrollback);
+        let without_margin = time(&without_scrollback);
+
+        let margin = with_scrollback.snapshot();
+        let none = without_scrollback.snapshot();
+        assert!(!margin.margin_above.is_empty());
+        assert!(none.margin_above.is_empty() && none.margin_below.is_empty());
+        println!(
+            "host snapshot: {with_margin:.3} ms with a {}-row margin, \
+             {without_margin:.3} ms with none, delta {:.3} ms (viewport {}x{})",
+            margin.margin_above.len() + margin.margin_below.len(),
+            with_margin - without_margin,
+            margin.rows,
+            margin.cols
+        );
+    }
+
+    /// ADDITIVE WIRE: an older host sends a screen with no margin keys at all,
+    /// and a newer client must decode it with empty margins rather than fail.
+    /// The inverse -- a newer host's extra keys reaching an older client -- is
+    /// the same property, and it is why `TerminalScreenSnapshot` must never
+    /// gain `deny_unknown_fields`.
+    #[test]
+    fn a_screen_without_margin_keys_still_decodes() {
+        #[derive(serde::Serialize)]
+        struct LegacyScreen {
+            cells: Vec<TerminalIndexedCellSnapshot>,
+            lines: Vec<Vec<TerminalCellSnapshot>>,
+            cursor: Option<TerminalCursorSnapshot>,
+            display_offset: usize,
+            history_size: usize,
+            total_lines: usize,
+            rows: usize,
+            cols: usize,
+            mode: TerminalModeSnapshot,
+        }
+
+        let legacy = LegacyScreen {
+            cells: Vec::new(),
+            lines: Vec::new(),
+            cursor: None,
+            display_offset: 3,
+            history_size: 40,
+            total_lines: 64,
+            rows: 24,
+            cols: 80,
+            mode: TerminalModeSnapshot::default(),
+        };
+        let encoded = serde_json::to_vec(&legacy).expect("encode legacy screen");
+        let decoded: TerminalScreenSnapshot =
+            serde_json::from_slice(&encoded).expect("an older host's screen must still decode");
+        assert_eq!(decoded.display_offset, 3);
+        assert!(decoded.margin_above.is_empty());
+        assert!(decoded.margin_below.is_empty());
+
+        // And an unknown key from a newer peer must not be fatal either.
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&encoded).expect("re-decode as value");
+        value["some_future_field"] = serde_json::json!(7);
+        let decoded: TerminalScreenSnapshot =
+            serde_json::from_value(value).expect("a newer host's screen must still decode");
+        assert_eq!(decoded.rows, 24);
+    }
+
+    /// The durable shell recipe has to name one exact executable, so the
+    /// resolver must actually find one on this machine — a resolver that
+    /// silently returned the unresolved candidate would produce a recipe that
+    /// only fails at spawn, where it reads as "the shell died" instead of
+    /// "no shell is installed".
+    #[test]
+    fn plain_shell_resolution_names_an_existing_executable_and_skips_windows_powershell() {
+        let cwd = std::env::current_dir().expect("cwd");
+        let launch = resolve_plain_shell_launch(Some(&DefaultTerminal::Pwsh), None, false, &cwd)
+            .expect("a shell must resolve on a developer machine");
+        assert!(
+            launch.program.is_absolute(),
+            "resolved shell must be absolute: {}",
+            launch.program.display()
+        );
+        assert!(
+            launch.program.exists(),
+            "resolved shell must exist: {}",
+            launch.program.display()
+        );
+        let file_name = launch
+            .program
+            .file_name()
+            .map(|name| name.to_string_lossy().to_ascii_lowercase())
+            .unwrap_or_default();
+        assert_ne!(
+            file_name, "powershell.exe",
+            "Windows PowerShell dies ~3s into a managed launch; it is never a plain-shell candidate"
+        );
+    }
+
+    /// The exclusion is the whole point of having a separate plain-shell
+    /// candidate list, so it is asserted against the list itself rather than
+    /// inferred from whichever shell happens to be installed here.
+    #[cfg(windows)]
+    #[test]
+    fn plain_shell_candidates_drop_windows_powershell_and_keep_pwsh_then_cmd() {
+        let (candidates, excluded) =
+            plain_shell_candidates(Some(&DefaultTerminal::Pwsh), None, false);
+        let programs: Vec<String> = candidates
+            .into_iter()
+            .map(|candidate| candidate.program)
+            .collect();
+        assert_eq!(programs, vec!["pwsh".to_string(), "cmd.exe".to_string()]);
+        assert_eq!(excluded, vec!["powershell.exe".to_string()]);
+        // The same exclusion holds when the setting names Windows PowerShell
+        // outright: there is no way to ask for the shell that dies at 3s.
+        for preferred in [
+            DefaultTerminal::Powershell,
+            DefaultTerminal::Cmd,
+            DefaultTerminal::Bash,
+        ] {
+            let (candidates, excluded) = plain_shell_candidates(Some(&preferred), None, false);
+            let programs: Vec<String> = candidates
+                .into_iter()
+                .map(|candidate| candidate.program)
+                .collect();
+            assert!(
+                !programs
+                    .iter()
+                    .any(|program| program.eq_ignore_ascii_case("powershell.exe")
+                        || program.eq_ignore_ascii_case("powershell")),
+                "{preferred:?} -> {programs:?}"
+            );
+            assert!(
+                programs.iter().any(|program| program == "cmd.exe"),
+                "{preferred:?} must retain a last-resort shell: {programs:?}"
+            );
+            // What was dropped is reported, not merely absent: the refusal
+            // message has to be able to say "powershell excluded" rather than
+            // let the operator read "powershell is not installed".
+            assert_eq!(
+                excluded,
+                vec!["powershell.exe".to_string()],
+                "{preferred:?} must name what it refused to consider"
+            );
+        }
+    }
+
+    /// The hook's argument text is pinned, because nothing downstream can
+    /// check it.
+    ///
+    /// It is one opaque string handed to `CreateProcess`; a typo inside it
+    /// produces a shell that starts perfectly and simply never reports a
+    /// directory, which reads as "PowerShell does not support this" rather
+    /// than as a bug. Writing the expected text out again here is the only
+    /// thing that makes an edit to it visible.
+    #[test]
+    fn the_pwsh_prompt_hook_argument_is_pinned() {
+        let expected_hook = "$__dmPrompt = $function:prompt; function global:prompt { $__dmOut = & $__dmPrompt; $__dmLoc = $ExecutionContext.SessionState.Path.CurrentLocation; if ($__dmLoc.Provider.Name -eq 'FileSystem') { [Environment]::CurrentDirectory = $__dmLoc.ProviderPath; $__dmOut = ([char]27 + ']9;9;' + $__dmLoc.ProviderPath + [char]27 + [char]92) + $__dmOut }; $__dmOut }";
+        assert_eq!(PWSH_PROMPT_HOOK, expected_hook);
+        assert_eq!(
+            pwsh_shell_args(true),
+            vec![
+                "-NoLogo".to_string(),
+                "-NoExit".to_string(),
+                "-Command".to_string(),
+                expected_hook.to_string(),
+            ],
+            "-Command consumes everything after it, so it must come last"
+        );
+        // Shell integration off is the escape hatch, and must be exactly the
+        // arguments a pwsh candidate carried before the hook existed.
+        assert_eq!(pwsh_shell_args(false), vec!["-NoLogo".to_string()]);
+
+        let backslash = char::from_u32(92).expect("backslash");
+        assert!(
+            !PWSH_PROMPT_HOOK.contains(backslash),
+            "the hook must stay backslash-free so no quoting layer can eat an escape"
+        );
+        assert!(
+            !PWSH_PROMPT_HOOK.contains('"'),
+            "a double quote would have to survive Windows command-line quoting intact"
+        );
+    }
+
+    /// The bytes a real `pwsh` emitted under this hook become a cwd sample.
+    ///
+    /// Recorded from a live PowerShell 7.6.5 run of [`PWSH_PROMPT_HOOK`]
+    /// followed by `Set-Location C:` + separator + `Windows`, so the parser is
+    /// tested against what the shell actually writes rather than against what
+    /// this file believes it writes. The trailing prompt text is included
+    /// because the report never arrives alone.
+    #[test]
+    fn a_real_pwsh_prompt_hook_report_becomes_a_cwd_sample() {
+        let emitted: Vec<u8> = vec![
+            27, 93, 57, 59, 57, 59, 67, 58, 92, 87, 105, 110, 100, 111, 119, 115, 27, 92, 80, 83,
+            32, 67, 58, 92, 87, 105, 110, 100, 111, 119, 115, 62, 32,
+        ];
+        let mut parser = ShellSequenceParser::default();
+        let events = parser.push_chunk(&emitted);
+        let separator = char::from_u32(92).expect("backslash");
+        let expected = PathBuf::from(format!("C:{separator}Windows"));
+        match events.as_slice() {
+            [ShellSequence::ReportedCwd(cwd)] => assert_eq!(*cwd, expected),
+            other => panic!("the hook's report must parse as exactly one cwd: {other:?}"),
+        }
+
+        // ConEmu's own documentation quotes the path. Both spellings are in
+        // the wild, so a reader that took only one would report nothing for
+        // the other and look like a shell with no integration.
+        let mut quoted = vec![27u8, 93];
+        quoted.extend_from_slice(b"9;9;");
+        quoted.push(b'"');
+        quoted.extend_from_slice(format!("C:{separator}Windows").as_bytes());
+        quoted.push(b'"');
+        quoted.extend_from_slice(&[27, 92]);
+        let mut parser = ShellSequenceParser::default();
+        match parser.push_chunk(&quoted).as_slice() {
+            [ShellSequence::ReportedCwd(cwd)] => assert_eq!(*cwd, expected),
+            other => panic!("the quoted spelling must parse too: {other:?}"),
+        }
+
+        // A path is not a URL: percent-decoding one would corrupt any
+        // directory with a literal `%` in its name.
+        let mut percent = vec![27u8, 93];
+        percent.extend_from_slice(b"9;9;");
+        percent.extend_from_slice(format!("C:{separator}a%20b").as_bytes());
+        percent.extend_from_slice(&[27, 92]);
+        let mut parser = ShellSequenceParser::default();
+        match parser.push_chunk(&percent).as_slice() {
+            [ShellSequence::ReportedCwd(cwd)] => {
+                assert_eq!(*cwd, PathBuf::from(format!("C:{separator}a%20b")));
+            }
+            other => panic!("a native path must not be percent-decoded: {other:?}"),
+        }
+    }
+
+    /// A real `pwsh` running the real hook produces a real cwd sample.
+    ///
+    /// This is the end-to-end proof for the PowerShell rung, and it is here
+    /// rather than in `tests/task_shell_terminals.rs` because the managed
+    /// launcher cannot start MSIX `pwsh` on every machine (measured
+    /// 2026-09-02: not on this one, by either spelling on PATH, hook or no
+    /// hook) while `pwsh` itself runs fine. Running it as a plain child
+    /// process takes the launcher out of the question and leaves exactly the
+    /// two things the hook is responsible for under test: the bytes PowerShell
+    /// emits, and what this file's parser makes of them.
+    ///
+    /// Both rungs of the ladder are asserted from the one run:
+    /// `[Environment]::CurrentDirectory` is what the PEB rung reads, and the
+    /// OSC report is what the parser rung reads. The unhooked control proves
+    /// the first is the hook's doing -- PowerShell leaves its Win32 directory
+    /// at the launch directory on `Set-Location`, which is the whole reason
+    /// the hook exists.
+    ///
+    /// Skipped with a printed reason only when `pwsh` is not resolvable.
+    #[cfg(windows)]
+    #[test]
+    fn a_live_pwsh_prompt_hook_reports_the_directory_it_moved_to() {
+        let Some(program) = crate::diagnostics::resolve::resolve_all("pwsh")
+            .into_iter()
+            .next()
+        else {
+            println!(
+                "SKIPPED a_live_pwsh_prompt_hook_reports_the_directory_it_moved_to: \
+                 pwsh is not resolvable on PATH"
+            );
+            return;
+        };
+        let separator = char::from_u32(92).expect("backslash");
+        let target = format!("C:{separator}Windows");
+
+        // The hook exactly as a plain shell receives it, then one move and one
+        // prompt render -- which is what an interactive session does after
+        // every command.
+        let run = |hook: &str| -> (String, String) {
+            let script = format!(
+                "{hook}; Set-Location '{target}'; \
+                 [Console]::Out.Write((prompt)); \
+                 [Console]::Error.Write([Environment]::CurrentDirectory)"
+            );
+            let output = std::process::Command::new(&program)
+                .args(["-NoLogo", "-NoProfile", "-Command", script.as_str()])
+                .output()
+                .expect("pwsh must run");
+            assert!(
+                output.status.success(),
+                "pwsh exited {:?}: {}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            (
+                String::from_utf8_lossy(&output.stdout).into_owned(),
+                String::from_utf8_lossy(&output.stderr).into_owned(),
+            )
+        };
+
+        let (hooked_stdout, hooked_win32_cwd) = run(PWSH_PROMPT_HOOK);
+        assert_eq!(
+            PathBuf::from(hooked_win32_cwd.trim()),
+            PathBuf::from(&target),
+            "the hook must move the Win32 current directory, which is the PEB rung"
+        );
+
+        let mut parser = ShellSequenceParser::default();
+        let reported = parser
+            .push_chunk(hooked_stdout.as_bytes())
+            .into_iter()
+            .find_map(|sequence| match sequence {
+                ShellSequence::ReportedCwd(cwd) => Some(cwd),
+                _ => None,
+            })
+            .unwrap_or_else(|| {
+                panic!("the hook's prompt reported no cwd; pwsh wrote {hooked_stdout:?}")
+            });
+        assert_eq!(
+            reported,
+            PathBuf::from(&target),
+            "the parser rung must read the directory the shell moved to"
+        );
+
+        // Control: the same shell with no hook. `Set-Location` moves the
+        // PowerShell location and nothing else, so neither rung would ever
+        // move without the hook and neither assertion above can pass by
+        // accident.
+        let (plain_stdout, plain_win32_cwd) = run("$null = $null");
+        assert_ne!(
+            PathBuf::from(plain_win32_cwd.trim()),
+            PathBuf::from(&target),
+            "an unhooked pwsh must not update its Win32 directory, or the hook is unnecessary \
+             and this test proves nothing"
+        );
+        let mut parser = ShellSequenceParser::default();
+        assert!(
+            parser
+                .push_chunk(plain_stdout.as_bytes())
+                .into_iter()
+                .all(|sequence| !matches!(sequence, ShellSequence::ReportedCwd(_))),
+            "an unhooked pwsh must report no cwd at all; it wrote {plain_stdout:?}"
+        );
+    }
+
+    /// The hook is a plain-shell concern only.
+    ///
+    /// `shell_candidates` is shared with the provider terminal launch path,
+    /// which owns its own shell contract and does not report cwd through this
+    /// ladder, so the substitution happens in `plain_shell_candidates` and
+    /// must be observable as a difference between the two.
+    #[cfg(windows)]
+    #[test]
+    fn only_a_plain_shell_pwsh_carries_the_prompt_hook() {
+        let (plain, _excluded) = plain_shell_candidates(Some(&DefaultTerminal::Pwsh), None, true);
+        let plain_pwsh = plain
+            .iter()
+            .find(|candidate| candidate.program == "pwsh")
+            .expect("pwsh is a plain-shell candidate");
+        assert_eq!(plain_pwsh.args, pwsh_shell_args(true));
+
+        let provider = shell_candidates(Some(&DefaultTerminal::Pwsh), None, true);
+        let provider_pwsh = provider
+            .iter()
+            .find(|candidate| candidate.program == "pwsh")
+            .expect("pwsh is a provider candidate too");
+        assert_eq!(
+            provider_pwsh.args,
+            vec!["-NoLogo".to_string()],
+            "a provider terminal's pwsh must be launched exactly as before"
+        );
+
+        // cmd.exe reports through the PEB rung and takes no hook, so the
+        // substitution must not have leaked onto every candidate.
+        let cmd = plain
+            .iter()
+            .find(|candidate| candidate.program == "cmd.exe")
+            .expect("cmd.exe is the last-resort plain shell");
+        assert!(
+            cmd.args.is_empty(),
+            "cmd.exe takes no shell-integration arguments: {:?}",
+            cmd.args
+        );
+    }
+
+    /// The refusal a client reads must distinguish "not installed" from
+    /// "deliberately not considered".
+    #[test]
+    fn no_shell_found_names_the_excluded_program() {
+        assert_eq!(
+            no_shell_found_message(
+                &["pwsh".to_string(), "cmd.exe".to_string()],
+                &["powershell.exe".to_string()],
+            ),
+            "no shell found; tried: pwsh, cmd.exe (powershell.exe excluded)"
+        );
+        // With nothing excluded the message must not grow an empty note.
+        assert_eq!(
+            no_shell_found_message(&["sh".to_string()], &[]),
+            "no shell found; tried: sh"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn managed_observation_slot_uses_the_callers_expired_deadline() {
+        let teardown = Arc::new(Mutex::new(None));
+        let error = match lock_terminal_teardown_slot_until(&teardown, std::time::Instant::now()) {
+            Ok(_) => panic!("expired accounting deadline must fail before locking"),
+            Err(error) => error,
+        };
+        assert!(error.contains("remained contended"), "{error}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires a systemd user session and cgroup v2 delegation"]
+    fn linux_cgroup_production_terminal_input_restart_and_cleanup() {
+        let launches_before = crate::process::launcher::managed_launch_count_for_test();
+        let runtime = Arc::new(RwLock::new(RuntimeState::default()));
+        let journal = tempfile::tempdir().expect("terminal teardown journal");
+        let resource_id = ResourceId::new();
+        let completion_store =
+            TeardownCompletionStore::durable(journal.path().join("teardown.sqlite3"))
+                .expect("durable terminal teardown store");
+        let authority = TerminalLaunchAuthority::new(
+            ProcessOwner::Host,
+            resource_id,
+            1,
+            OperationId::new(),
+            1,
+            Vec::new(),
+            completion_store.clone(),
+        )
+        .expect("terminal launch authority");
+        let session = spawn_with_command(
+            "suspended-managed-terminal-test",
+            std::env::current_dir().expect("test cwd"),
+            SessionDimensions::default(),
+            "/bin/bash".to_string(),
+            vec!["--noprofile".to_string(), "--norc".to_string()],
+            HashMap::new(),
+            100,
+            None,
+            runtime,
+            false,
+            TerminalBackend::PortablePtyFeedingAlacritty,
+            false,
+            None,
+            None,
+            authority,
+        )
+        .expect("spawn production terminal");
+
+        assert_eq!(
+            crate::process::launcher::managed_launch_count_for_test(),
+            launches_before + 1,
+            "the production terminal path must register its suspended root before resume"
+        );
+        let (fence, active_process_ids) = session
+            .managed_process_snapshot()
+            .expect("exact managed process snapshot");
+        assert!(
+            active_process_ids.contains(&fence.root().id().pid()),
+            "the root named by the exact PID/creation/executable/generation fence must be in the authoritative Job"
+        );
+        let observation_deadline = std::time::Instant::now()
+            .checked_add(Duration::from_secs(1))
+            .expect("observation deadline");
+        let observation = session
+            .managed_process_observations_until(observation_deadline, 32)
+            .expect("bounded observation query")
+            .expect("managed observation authority");
+        let (observation_capture, observations) = observation.into_parts();
+        let observations = observations.expect("managed Job observations");
+        assert_eq!(observation_capture.fence(), &fence);
+        assert!(observations.iter().any(|observation| matches!(
+            observation,
+            crate::process::job::JobMemberObservation::Accessible { identity }
+                if identity == fence.root()
+        )));
+        session
+            .write_bytes(b"printf 'managed-%s\\n' terminal-ok\n")
+            .expect("write through native PTY admission");
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            let lines =
+                crate::providers::input::terminal_text_lines_from_screen(&session.snapshot());
+            if lines
+                .iter()
+                .any(|line| line.trim() == "managed-terminal-ok")
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "PTY output did not reach terminal replica: {lines:?}"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        let restart_authority = TerminalLaunchAuthority::new(
+            ProcessOwner::Host,
+            resource_id,
+            2,
+            OperationId::new(),
+            2,
+            Vec::new(),
+            completion_store,
+        )
+        .expect("terminal restart authority");
+        session
+            .restart_command(
+                std::env::current_dir().expect("restart test cwd"),
+                SessionDimensions::default(),
+                "/bin/bash".to_string(),
+                vec!["--noprofile".to_string(), "--norc".to_string()],
+                HashMap::new(),
+                None,
+                false,
+                restart_authority,
+            )
+            .expect("restart through suspended managed launch");
+        assert_eq!(
+            crate::process::launcher::managed_launch_count_for_test(),
+            launches_before + 2,
+            "restart must use the same suspended-in-Job production path"
+        );
+        let (restart_fence, restart_process_ids) = session
+            .managed_process_snapshot()
+            .expect("restarted exact managed process snapshot");
+        assert_eq!(restart_fence.resource().runtime_generation, 2);
+        assert!(restart_process_ids.contains(&restart_fence.root().id().pid()));
+        session.close(false).expect("close managed terminal");
+        assert_eq!(
+            session.live_actor_count_for_test(),
+            0,
+            "terminal close must join its reader and wait actors before returning"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn production_terminal_spawn_uses_suspended_managed_launch() {
+        let launches_before = crate::process::launcher::managed_launch_count_for_test();
+        let runtime = Arc::new(RwLock::new(RuntimeState::default()));
+        let journal = tempfile::tempdir().expect("terminal teardown journal");
+        let resource_id = ResourceId::new();
+        let completion_store =
+            TeardownCompletionStore::durable(journal.path().join("teardown.sqlite3"))
+                .expect("durable terminal teardown store");
+        let authority = TerminalLaunchAuthority::new(
+            ProcessOwner::Host,
+            resource_id,
+            1,
+            OperationId::new(),
+            1,
+            Vec::new(),
+            completion_store.clone(),
+        )
+        .expect("terminal launch authority");
+        let session = spawn_with_command(
+            "suspended-managed-terminal-test",
+            std::env::current_dir().expect("test cwd"),
+            SessionDimensions::default(),
+            "cmd.exe".to_string(),
+            vec![
+                "/d".to_string(),
+                "/s".to_string(),
+                "/c".to_string(),
+                "ping -n 30 127.0.0.1 >nul".to_string(),
+            ],
+            HashMap::new(),
+            100,
+            None,
+            runtime,
+            false,
+            TerminalBackend::PortablePtyFeedingAlacritty,
+            false,
+            None,
+            None,
+            authority,
+        )
+        .expect("spawn production terminal");
+
+        assert_eq!(
+            crate::process::launcher::managed_launch_count_for_test(),
+            launches_before + 1,
+            "the production terminal path must register its suspended root before resume"
+        );
+        let (fence, active_process_ids) = session
+            .managed_process_snapshot()
+            .expect("exact managed process snapshot");
+        assert!(
+            active_process_ids.contains(&fence.root().id().pid()),
+            "the root named by the exact PID/creation/executable/generation fence must be in the authoritative Job"
+        );
+        let observation_deadline = std::time::Instant::now()
+            .checked_add(Duration::from_secs(1))
+            .expect("observation deadline");
+        let observation = session
+            .managed_process_observations_until(observation_deadline, 32)
+            .expect("bounded observation query")
+            .expect("managed observation authority");
+        let (observation_capture, observations) = observation.into_parts();
+        let observations = observations.expect("managed Job observations");
+        assert_eq!(observation_capture.fence(), &fence);
+        assert!(observations.iter().any(|observation| matches!(
+            observation,
+            crate::process::job::JobMemberObservation::Accessible { identity }
+                if identity == fence.root()
+        )));
+        let restart_authority = TerminalLaunchAuthority::new(
+            ProcessOwner::Host,
+            resource_id,
+            2,
+            OperationId::new(),
+            2,
+            Vec::new(),
+            completion_store,
+        )
+        .expect("terminal restart authority");
+        session
+            .restart_command(
+                std::env::current_dir().expect("restart test cwd"),
+                SessionDimensions::default(),
+                "cmd.exe".to_string(),
+                vec![
+                    "/d".to_string(),
+                    "/s".to_string(),
+                    "/c".to_string(),
+                    "ping -n 30 127.0.0.1 >nul".to_string(),
+                ],
+                HashMap::new(),
+                None,
+                false,
+                restart_authority,
+            )
+            .expect("restart through suspended managed launch");
+        assert_eq!(
+            crate::process::launcher::managed_launch_count_for_test(),
+            launches_before + 2,
+            "restart must use the same suspended-in-Job production path"
+        );
+        let (restart_fence, restart_process_ids) = session
+            .managed_process_snapshot()
+            .expect("restarted exact managed process snapshot");
+        assert_eq!(restart_fence.resource().runtime_generation, 2);
+        assert!(restart_process_ids.contains(&restart_fence.root().id().pid()));
+        session.close(false).expect("close managed terminal");
+        assert_eq!(
+            session.live_actor_count_for_test(),
+            0,
+            "terminal close must join its reader and wait actors before returning"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn stale_sampling_capture_cannot_publish_or_close_restarted_generation() {
+        let runtime = Arc::new(RwLock::new(RuntimeState::default()));
+        let journal = tempfile::tempdir().expect("terminal sampling-generation journal");
+        let resource_id = ResourceId::new();
+        let completion_store =
+            TeardownCompletionStore::durable(journal.path().join("teardown.sqlite3"))
+                .expect("durable terminal teardown store");
+        let authority = TerminalLaunchAuthority::new(
+            ProcessOwner::Host,
+            resource_id,
+            1,
+            OperationId::new(),
+            1,
+            Vec::new(),
+            completion_store.clone(),
+        )
+        .expect("terminal launch authority");
+        let session = Arc::new(
+            spawn_with_command(
+                "sampling-generation-barrier-test",
+                std::env::current_dir().expect("test cwd"),
+                SessionDimensions::default(),
+                "cmd.exe".to_string(),
+                vec![
+                    "/d".to_string(),
+                    "/s".to_string(),
+                    "/c".to_string(),
+                    "ping -n 30 127.0.0.1 >nul".to_string(),
+                ],
+                HashMap::new(),
+                100,
+                None,
+                Arc::clone(&runtime),
+                false,
+                TerminalBackend::PortablePtyFeedingAlacritty,
+                false,
+                None,
+                None,
+                authority,
+            )
+            .expect("spawn first managed generation"),
+        );
+
+        let (captured_tx, captured_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+        let sampling_session = Arc::clone(&session);
+        let sampler = thread::spawn(move || {
+            let query = sampling_session
+                .managed_process_observations_until(
+                    std::time::Instant::now() + Duration::from_secs(2),
+                    32,
+                )
+                .expect("first-generation Job query")
+                .expect("first-generation managed authority");
+            let (capture, members) = query.into_parts();
+            members.expect("first-generation Job members");
+            let old_fence = capture.fence().clone();
+            captured_tx
+                .send(old_fence.clone())
+                .expect("publish after-query barrier");
+            release_rx.recv().expect("release stale sampler");
+
+            let stale_snapshot = crate::state::ResourceSnapshot {
+                process_count: 1,
+                process_count_value_state: crate::state::ResourceMetricValueState::Observed,
+                process_ids: vec![old_fence.root().id().pid()],
+                managed_process_fence: Some(old_fence),
+                metrics_status: crate::domain::snapshot::ProcessMetricStatus::Complete,
+                metric_values: crate::state::ResourceMetricValueState::Observed,
+                cpu_value_state: crate::state::ResourceMetricValueState::Observed,
+                memory_value_state: crate::state::ResourceMetricValueState::Observed,
+                ..crate::state::ResourceSnapshot::default()
+            };
+            sampling_session.publish_managed_resource_sample_if_current(
+                &capture,
+                stale_snapshot,
+                false,
+                std::time::Instant::now() + Duration::from_secs(2),
+            )
+        });
+
+        let old_fence = captured_rx.recv().expect("first generation captured");
+        let restart_authority = TerminalLaunchAuthority::new(
+            ProcessOwner::Host,
+            resource_id,
+            2,
+            OperationId::new(),
+            2,
+            Vec::new(),
+            completion_store,
+        )
+        .expect("terminal restart authority");
+        session
+            .restart_command(
+                std::env::current_dir().expect("restart test cwd"),
+                SessionDimensions::default(),
+                "cmd.exe".to_string(),
+                vec![
+                    "/d".to_string(),
+                    "/s".to_string(),
+                    "/c".to_string(),
+                    "ping -n 30 127.0.0.1 >nul".to_string(),
+                ],
+                HashMap::new(),
+                None,
+                false,
+                restart_authority,
+            )
+            .expect("install second managed generation");
+        let restart_fence = session
+            .managed_process_snapshot()
+            .expect("second-generation managed snapshot")
+            .0;
+        assert_eq!(restart_fence.resource().runtime_generation, 2);
+        runtime
+            .write()
+            .expect("runtime state")
+            .sessions
+            .get_mut("sampling-generation-barrier-test")
+            .expect("second-generation runtime")
+            .note_resource_sample(crate::state::ResourceSnapshot {
+                process_count: 1,
+                process_count_value_state: crate::state::ResourceMetricValueState::Observed,
+                process_ids: vec![restart_fence.root().id().pid()],
+                managed_process_fence: Some(restart_fence.clone()),
+                metrics_status: crate::domain::snapshot::ProcessMetricStatus::Complete,
+                metric_values: crate::state::ResourceMetricValueState::Observed,
+                cpu_value_state: crate::state::ResourceMetricValueState::Observed,
+                memory_value_state: crate::state::ResourceMetricValueState::Observed,
+                ..crate::state::ResourceSnapshot::default()
+            });
+
+        release_tx
+            .send(())
+            .expect("release first-generation sample");
+        assert_eq!(
+            sampler.join().expect("join stale sampler"),
+            Ok(ManagedResourceSamplePublication::StaleGeneration {
+                dirty_changed: false
+            })
+        );
+
+        let current = runtime
+            .read()
+            .expect("runtime state")
+            .sessions
+            .get("sampling-generation-barrier-test")
+            .cloned()
+            .expect("current runtime generation");
+        assert_eq!(current.pid, Some(restart_fence.root().id().pid()));
+        assert_eq!(current.resources.process_count, 1);
+        assert_eq!(
+            current.resources.process_count_value_state,
+            crate::state::ResourceMetricValueState::Observed
+        );
+        assert!(!current
+            .resources
+            .process_ids
+            .contains(&old_fence.root().id().pid()));
+        assert_eq!(
+            current.resources.managed_process_fence.as_ref(),
+            Some(&restart_fence)
+        );
+
+        let stale_action_error = session
+            .close_managed_process_exact(&old_fence, true)
+            .expect_err("an old monitor action must not close the replacement generation");
+        assert!(
+            stale_action_error.contains("generation changed"),
+            "unexpected stale action error: {stale_action_error}"
+        );
+        assert!(
+            platform_service::is_pid_running(restart_fence.root().id().pid()),
+            "the replacement generation must remain alive"
+        );
+        session.close(false).expect("close replacement generation");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn asynchronous_registry_release_cannot_cross_a_validated_sample_commit() {
+        let runtime = Arc::new(RwLock::new(RuntimeState::default()));
+        let journal = tempfile::tempdir().expect("terminal release/publication journal");
+        let authority = TerminalLaunchAuthority::new(
+            ProcessOwner::Host,
+            ResourceId::new(),
+            1,
+            OperationId::new(),
+            1,
+            Vec::new(),
+            TeardownCompletionStore::durable(journal.path().join("teardown.sqlite3"))
+                .expect("durable terminal teardown store"),
+        )
+        .expect("terminal launch authority");
+        let session = Arc::new(
+            spawn_with_command(
+                "sampling-release-barrier-test",
+                std::env::current_dir().expect("test cwd"),
+                SessionDimensions::default(),
+                "cmd.exe".to_string(),
+                vec![
+                    "/d".to_string(),
+                    "/s".to_string(),
+                    "/c".to_string(),
+                    "ping -n 30 127.0.0.1 >nul".to_string(),
+                ],
+                HashMap::new(),
+                100,
+                None,
+                Arc::clone(&runtime),
+                false,
+                TerminalBackend::PortablePtyFeedingAlacritty,
+                false,
+                None,
+                None,
+                authority,
+            )
+            .expect("spawn managed generation"),
+        );
+        let teardown = lock_terminal_teardown_slot(&session.teardown)
+            .expect("teardown slot")
+            .clone()
+            .expect("managed teardown");
+
+        let (release_attempted_tx, release_attempted_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_resume_tx, release_resume_rx) = std::sync::mpsc::sync_channel(0);
+        let (released_tx, released_rx) = std::sync::mpsc::sync_channel(1);
+        teardown.install_release_barrier_for_test(
+            release_attempted_tx,
+            release_resume_rx,
+            released_tx,
+        );
+
+        let query = session
+            .managed_process_observations_until(
+                std::time::Instant::now() + Duration::from_secs(2),
+                32,
+            )
+            .expect("exact Job query")
+            .expect("managed observation authority");
+        let (capture, members) = query.into_parts();
+        members.expect("exact Job members");
+        let fence = capture.fence().clone();
+        let (validated_tx, validated_rx) = std::sync::mpsc::sync_channel(1);
+        let (publication_resume_tx, publication_resume_rx) = std::sync::mpsc::sync_channel(0);
+        session.install_managed_resource_publication_barrier_for_test(
+            validated_tx,
+            publication_resume_rx,
+        );
+
+        let sampling_session = Arc::clone(&session);
+        let sample_fence = fence.clone();
+        let sampler = thread::spawn(move || {
+            sampling_session.publish_managed_resource_sample_if_current(
+                &capture,
+                ResourceSnapshot {
+                    process_count: 1,
+                    process_count_value_state: crate::state::ResourceMetricValueState::Observed,
+                    process_ids: vec![sample_fence.root().id().pid()],
+                    managed_process_fence: Some(sample_fence),
+                    metrics_status: crate::domain::snapshot::ProcessMetricStatus::Complete,
+                    metric_values: crate::state::ResourceMetricValueState::Observed,
+                    cpu_value_state: crate::state::ResourceMetricValueState::Observed,
+                    memory_value_state: crate::state::ResourceMetricValueState::Observed,
+                    ..ResourceSnapshot::default()
+                },
+                false,
+                std::time::Instant::now() + Duration::from_secs(10),
+            )
+        });
+
+        validated_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("sample reached post-validation barrier");
+        teardown
+            .request_close()
+            .expect("request asynchronous coordinator close");
+        release_attempted_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("coordinator reached exact registry release");
+        release_resume_tx
+            .send(())
+            .expect("allow exact registry release attempt");
+
+        let released_while_publication_paused =
+            released_rx.recv_timeout(Duration::from_millis(200)).is_ok();
+        let registry_current_while_publication_paused = teardown
+            .exact_registry_entry_is_current_until(
+                std::time::Instant::now() + Duration::from_secs(1),
+            )
+            .unwrap_or(false);
+        publication_resume_tx
+            .send(())
+            .expect("release sample publication");
+        let publication = sampler.join().expect("join sample publication");
+        if !released_while_publication_paused {
+            released_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("registry releases after sample commit");
+        }
+        session.close(false).expect("settle managed teardown");
+
+        assert!(
+            !released_while_publication_paused,
+            "registry release crossed the validated-but-uncommitted sample"
+        );
+        assert!(
+            registry_current_while_publication_paused,
+            "validated sample lost exact registry authority before commit"
+        );
+        assert!(
+            matches!(
+                &publication,
+                Ok(ManagedResourceSamplePublication::Published { .. })
+                    | Ok(ManagedResourceSamplePublication::StaleGeneration { .. })
+            ),
+            "validated sample did not resolve safely: {publication:?}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn exact_close_retires_generation_before_a_stale_arc_can_restart_it() {
+        let runtime = Arc::new(RwLock::new(RuntimeState::default()));
+        let journal = tempfile::tempdir().expect("terminal retirement journal");
+        let resource_id = ResourceId::new();
+        let completion_store =
+            TeardownCompletionStore::durable(journal.path().join("teardown.sqlite3"))
+                .expect("durable terminal teardown store");
+        let authority = TerminalLaunchAuthority::new(
+            ProcessOwner::Host,
+            resource_id,
+            1,
+            OperationId::new(),
+            1,
+            Vec::new(),
+            completion_store.clone(),
+        )
+        .expect("terminal launch authority");
+        let session = spawn_with_command(
+            "exact-close-retirement-test",
+            std::env::current_dir().expect("test cwd"),
+            SessionDimensions::default(),
+            "cmd.exe".to_string(),
+            vec![
+                "/d".to_string(),
+                "/s".to_string(),
+                "/c".to_string(),
+                "ping -n 30 127.0.0.1 >nul".to_string(),
+            ],
+            HashMap::new(),
+            100,
+            None,
+            runtime,
+            false,
+            TerminalBackend::PortablePtyFeedingAlacritty,
+            false,
+            None,
+            None,
+            authority,
+        )
+        .expect("spawn managed terminal");
+        let fence = session
+            .managed_process_snapshot()
+            .expect("exact managed process snapshot")
+            .0;
+
+        session
+            .close_managed_process_exact(&fence, true)
+            .expect("exact generation close");
+        session
+            .close_managed_process_exact(&fence, true)
+            .expect("an exact completed-generation retry must be idempotent");
+
+        let restart_authority = TerminalLaunchAuthority::new(
+            ProcessOwner::Host,
+            resource_id,
+            2,
+            OperationId::new(),
+            2,
+            Vec::new(),
+            completion_store,
+        )
+        .expect("terminal restart authority");
+        let error = session
+            .restart_command(
+                std::env::current_dir().expect("restart test cwd"),
+                SessionDimensions::default(),
+                "cmd.exe".to_string(),
+                vec!["/d".to_string(), "/c".to_string(), "exit 0".to_string()],
+                HashMap::new(),
+                None,
+                false,
+                restart_authority,
+            )
+            .expect_err("a stale Arc must not restart a retired terminal generation");
+        assert!(error.contains("retired"), "unexpected error: {error}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn production_terminal_drop_closes_job_and_joins_real_pty_actors() {
+        let runtime = Arc::new(RwLock::new(RuntimeState::default()));
+        let journal = tempfile::tempdir().expect("terminal drop teardown journal");
+        let authority = TerminalLaunchAuthority::new(
+            ProcessOwner::Host,
+            ResourceId::new(),
+            1,
+            OperationId::new(),
+            1,
+            Vec::new(),
+            TeardownCompletionStore::durable(journal.path().join("teardown.sqlite3"))
+                .expect("durable terminal teardown store"),
+        )
+        .expect("terminal launch authority");
+        let session = spawn_with_command(
+            "suspended-managed-terminal-drop-test",
+            std::env::current_dir().expect("test cwd"),
+            SessionDimensions::default(),
+            "cmd.exe".to_string(),
+            vec![
+                "/d".to_string(),
+                "/s".to_string(),
+                "/c".to_string(),
+                "ping -n 30 127.0.0.1 >nul".to_string(),
+            ],
+            HashMap::new(),
+            100,
+            None,
+            runtime,
+            false,
+            TerminalBackend::PortablePtyFeedingAlacritty,
+            false,
+            None,
+            None,
+            authority,
+        )
+        .expect("spawn production terminal for drop");
+        let pid = session
+            .managed_process_snapshot()
+            .expect("drop-test managed process snapshot")
+            .0
+            .root()
+            .id()
+            .pid();
+
+        drop(session);
+
+        assert!(
+            !platform_service::is_pid_running(pid),
+            "TerminalSession::drop must synchronously close its Job-owned root"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn wait_actor_setup_failure_joins_existing_reader_and_closes_managed_root() {
+        let runtime = Arc::new(RwLock::new(RuntimeState::default()));
+        let temp = tempfile::tempdir().expect("terminal actor failure temp dir");
+        let _pid_file_guard = pid_file::use_test_pid_file(temp.path().join("running-pids.json"));
+        let authority = TerminalLaunchAuthority::new(
+            ProcessOwner::Host,
+            ResourceId::new(),
+            1,
+            OperationId::new(),
+            1,
+            Vec::new(),
+            TeardownCompletionStore::durable(temp.path().join("teardown.sqlite3"))
+                .expect("durable terminal teardown store"),
+        )
+        .expect("terminal launch authority");
+        FAIL_NEXT_WAIT_ACTOR_SPAWN.store(true, Ordering::SeqCst);
+
+        let error = match spawn_with_command(
+            "managed-terminal-wait-actor-failure",
+            std::env::current_dir().expect("test cwd"),
+            SessionDimensions::default(),
+            "cmd.exe".to_string(),
+            vec![
+                "/d".to_string(),
+                "/s".to_string(),
+                "/c".to_string(),
+                "ping -n 30 127.0.0.1 >nul".to_string(),
+            ],
+            HashMap::new(),
+            100,
+            None,
+            runtime,
+            false,
+            TerminalBackend::PortablePtyFeedingAlacritty,
+            true,
+            None,
+            None,
+            authority,
+        ) {
+            Ok(session) => {
+                drop(session);
+                panic!("injected wait actor spawn must fail");
+            }
+            Err(error) => error,
+        };
+
+        assert!(
+            error.contains("injected wait actor spawn failure"),
+            "{error}"
+        );
+        assert!(
+            pid_file::active_tracked_processes_for_session(
+                "managed-terminal-wait-actor-failure"
+            )
+            .is_empty(),
+            "setup failure must not return until its Job root is zero and its ledger settlement is released"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn input_admission_setup_failure_joins_both_actors_and_closes_managed_root() {
+        let runtime = Arc::new(RwLock::new(RuntimeState::default()));
+        let temp = tempfile::tempdir().expect("terminal input failure temp dir");
+        let _pid_file_guard = pid_file::use_test_pid_file(temp.path().join("running-pids.json"));
+        let authority = TerminalLaunchAuthority::new(
+            ProcessOwner::Host,
+            ResourceId::new(),
+            1,
+            OperationId::new(),
+            1,
+            Vec::new(),
+            TeardownCompletionStore::durable(temp.path().join("teardown.sqlite3"))
+                .expect("durable terminal teardown store"),
+        )
+        .expect("terminal launch authority");
+        FAIL_NEXT_INPUT_ADMISSION_OPEN.store(true, Ordering::SeqCst);
+
+        let error = match spawn_with_command(
+            "managed-terminal-input-admission-failure",
+            std::env::current_dir().expect("test cwd"),
+            SessionDimensions::default(),
+            "cmd.exe".to_string(),
+            vec![
+                "/d".to_string(),
+                "/s".to_string(),
+                "/c".to_string(),
+                "ping -n 30 127.0.0.1 >nul".to_string(),
+            ],
+            HashMap::new(),
+            100,
+            None,
+            runtime,
+            false,
+            TerminalBackend::PortablePtyFeedingAlacritty,
+            true,
+            None,
+            None,
+            authority,
+        ) {
+            Ok(session) => {
+                drop(session);
+                panic!("injected input-admission open must fail");
+            }
+            Err(error) => error,
+        };
+
+        assert!(
+            error.contains("injected terminal input-admission open failure"),
+            "{error}"
+        );
+        assert!(
+            pid_file::active_tracked_processes_for_session(
+                "managed-terminal-input-admission-failure"
+            )
+            .is_empty(),
+            "setup failure must join reader/wait actors, prove Job zero, and release its ledger observation"
+        );
+    }
+
     fn test_event_proxy(dimensions: SessionDimensions) -> SessionEventProxy {
         SessionEventProxy {
             session_id: "test".to_string(),
             writer: Arc::new(Mutex::new(Box::new(io::sink()) as Box<dyn Write + Send>)),
+            input_admission: Arc::new(AtomicBool::new(true)),
             runtime_state: Arc::new(RwLock::new(RuntimeState::default())),
             dimensions: Arc::new(Mutex::new(dimensions)),
             debug_enabled: false,
@@ -2580,6 +5950,26 @@ mod tests {
     }
 
     #[test]
+    fn paste_source_limit_rejects_escape_only_input_before_sanitizing() {
+        let source = "\u{1b}".repeat(MAX_TERMINAL_INPUT_BYTES + 1);
+
+        let error = prepare_paste_payload("", &source, true)
+            .expect_err("source bytes must be bounded before bracketed-paste sanitization");
+
+        assert!(error.contains("PTY input exceeds"), "{error}");
+    }
+
+    #[test]
+    fn paste_source_limit_includes_user_prefix_before_building_payload() {
+        let source = "x".repeat(MAX_TERMINAL_INPUT_BYTES);
+
+        let error = prepare_paste_payload("p", &source, false)
+            .expect_err("prefix and user input must share the source byte bound");
+
+        assert!(error.contains("PTY input exceeds"), "{error}");
+    }
+
+    #[test]
     fn plain_paste_normalizes_newlines_to_carriage_returns() {
         let normalized = normalize_plain_paste_text("one\r\ntwo\nthree");
 
@@ -2626,13 +6016,38 @@ mod tests {
     fn composite_user_payload_is_one_write_and_one_flush() {
         let state = Arc::new(Mutex::new(CountingWriteState::default()));
         let writer = counting_writer(state.clone());
+        let admission = AtomicBool::new(true);
 
-        write_composite_pty_payload(&writer, b"annotation preamble\n", b"user prompt").unwrap();
+        write_composite_pty_payload(
+            &writer,
+            &admission,
+            b"annotation preamble\n",
+            b"user prompt",
+        )
+        .unwrap();
 
         let state = state.lock().unwrap();
         assert_eq!(state.bytes, b"annotation preamble\nuser prompt");
         assert_eq!(state.writes, 1);
         assert_eq!(state.flushes, 1);
+    }
+
+    #[test]
+    fn provider_payload_writes_without_waiting_for_conpty_flush() {
+        let state = Arc::new(Mutex::new(CountingWriteState {
+            fail_flush: true,
+            ..CountingWriteState::default()
+        }));
+        let writer = counting_writer(state.clone());
+        let admission = AtomicBool::new(true);
+
+        write_composite_pty_payload_inner(&writer, &admission, b"", b"provider prompt", false)
+            .expect("provider write must not call the blocking flush path");
+
+        let state = state.lock().unwrap();
+        assert_eq!(state.bytes, b"provider prompt");
+        assert_eq!(state.writes, 1);
+        assert_eq!(state.flushes, 0);
     }
 
     #[test]
@@ -2651,17 +6066,91 @@ mod tests {
             fail_write: true,
             ..CountingWriteState::default()
         }));
-        let error = write_composite_pty_payload(&counting_writer(write_state), b"prefix", b"input")
-            .unwrap_err();
+        let admission = AtomicBool::new(true);
+        let error = write_composite_pty_payload(
+            &counting_writer(write_state),
+            &admission,
+            b"prefix",
+            b"input",
+        )
+        .unwrap_err();
         assert!(error.contains("write"));
 
         let flush_state = Arc::new(Mutex::new(CountingWriteState {
             fail_flush: true,
             ..CountingWriteState::default()
         }));
-        let error = write_composite_pty_payload(&counting_writer(flush_state), b"prefix", b"input")
-            .unwrap_err();
+        let error = write_composite_pty_payload(
+            &counting_writer(flush_state),
+            &admission,
+            b"prefix",
+            b"input",
+        )
+        .unwrap_err();
         assert!(error.contains("flush"));
+    }
+
+    #[test]
+    fn terminal_input_is_rejected_after_teardown_admission_closes() {
+        let state = Arc::new(Mutex::new(CountingWriteState::default()));
+        let writer = counting_writer(state.clone());
+        let admission = AtomicBool::new(false);
+
+        let error = write_composite_pty_payload(&writer, &admission, b"prefix", b"input")
+            .expect_err("closed input admission must reject every later writer");
+
+        assert!(error.contains("closed"));
+        assert!(state.lock().unwrap().bytes.is_empty());
+    }
+
+    #[test]
+    fn terminal_input_drain_revokes_admission_before_process_termination() {
+        let state = Arc::new(Mutex::new(CountingWriteState::default()));
+        let writer = counting_writer(state.clone());
+        let admission = AtomicBool::new(true);
+        let deadline = std::time::Instant::now()
+            .checked_add(Duration::from_secs(1))
+            .expect("input-drain test deadline");
+
+        drain_terminal_input_until(&admission, &writer, deadline)
+            .expect("input drain must settle while the writer is idle");
+
+        assert!(!admission.load(Ordering::Acquire));
+        let error = write_composite_pty_payload(&writer, &admission, b"", b"late input")
+            .expect_err("no writer may pass admission after the drain returns");
+        assert!(error.contains("closed"));
+        assert!(state.lock().unwrap().bytes.is_empty());
+    }
+
+    #[cfg(not(any(windows, target_os = "linux")))]
+    #[test]
+    fn actor_shutdown_fails_boundedly_when_writer_lock_is_unjoinable() {
+        let writer = Arc::new(Mutex::new(Box::new(io::sink()) as Box<dyn Write + Send>));
+        let master = Arc::new(Mutex::new(None));
+        let actors = Arc::new(Mutex::new(TerminalActorHandles::default()));
+        let input_admission = AtomicBool::new(true);
+        let writer_guard = writer.lock().expect("writer lock");
+        let started = std::time::Instant::now();
+
+        let result = detach_pty_and_join_actor_slots_until(
+            &input_admission,
+            &writer,
+            &master,
+            &actors,
+            started + Duration::from_millis(100),
+        );
+
+        drop(writer_guard);
+        assert!(
+            result
+                .expect_err("a contended writer must fail closed")
+                .contains("writer"),
+            "shutdown must identify the unjoinable writer lock"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "unjoinable actor shutdown must be bounded"
+        );
     }
 
     #[test]
@@ -2670,5 +6159,248 @@ mod tests {
 
         assert_eq!(truncate_utf8_boundary(text, 2), "a");
         assert_eq!(truncate_utf8_boundary(text, 5), "a😀");
+    }
+
+    #[test]
+    fn default_foreground_marker_for_named_default_cells() {
+        let colors = Colors::default();
+        let snap = renderable_cell_snapshot(&Cell::default(), &colors);
+        assert!(
+            snap.default_foreground,
+            "named Foreground must mark default_foreground"
+        );
+        assert!(
+            snap.default_background,
+            "named Background must mark default_background"
+        );
+    }
+
+    #[test]
+    fn default_foreground_marker_clears_on_inverse_of_default_cell() {
+        let colors = Colors::default();
+        let mut cell = Cell::default();
+        cell.flags.insert(Flags::INVERSE);
+        let snap = renderable_cell_snapshot(&cell, &colors);
+        // Visual fg comes from original Background; visual bg from original Foreground.
+        assert!(
+            !snap.default_foreground,
+            "inverse default cell visual fg is Background, not Foreground"
+        );
+        assert!(
+            !snap.default_background,
+            "inverse default cell visual bg is Foreground, not Background"
+        );
+        assert_eq!(
+            snap.foreground,
+            named_color_fallback(NamedColor::Background)
+        );
+        assert_eq!(snap.foreground, crate::theme::TERMINAL_BG);
+        assert_eq!(
+            snap.background,
+            named_color_fallback(NamedColor::Foreground)
+        );
+    }
+
+    #[test]
+    fn default_foreground_marker_stays_false_for_indexed_ansi() {
+        let colors = Colors::default();
+        let mut cell = Cell::default();
+        cell.fg = AnsiColor::Indexed(1);
+        let snap = renderable_cell_snapshot(&cell, &colors);
+        assert!(!snap.default_foreground);
+        assert!(snap.default_background);
+    }
+
+    #[test]
+    fn blank_cell_fixture_marks_default_foreground() {
+        let blank = TerminalCellSnapshot::blank(0x111111, 0x222222);
+        assert!(blank.default_foreground);
+        assert!(blank.default_background);
+        assert_eq!(blank.foreground, 0x111111);
+        assert_eq!(blank.background, 0x222222);
+    }
+
+    struct ScriptedPtyReader {
+        steps: std::collections::VecDeque<ScriptedReadStep>,
+        release: Arc<(Mutex<bool>, Condvar)>,
+    }
+
+    enum ScriptedReadStep {
+        Data(&'static [u8]),
+        Eof,
+        Error(io::ErrorKind),
+        BlockUntilReleased,
+    }
+
+    impl Read for ScriptedPtyReader {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            match self.steps.pop_front() {
+                Some(ScriptedReadStep::Data(bytes)) => {
+                    buffer[..bytes.len()].copy_from_slice(bytes);
+                    Ok(bytes.len())
+                }
+                Some(ScriptedReadStep::Eof) | None => Ok(0),
+                Some(ScriptedReadStep::Error(kind)) => {
+                    Err(io::Error::new(kind, "scripted pty read failure"))
+                }
+                Some(ScriptedReadStep::BlockUntilReleased) => {
+                    let (lock, changed) = &*self.release;
+                    let mut released = lock.lock().expect("release lock");
+                    while !*released {
+                        released = changed.wait(released).expect("release wait");
+                    }
+                    Ok(0)
+                }
+            }
+        }
+    }
+
+    struct ReaderActorHarness {
+        received: Arc<Mutex<Vec<u8>>>,
+        lifecycle: Arc<Mutex<Vec<TerminalLifecycleEvent>>>,
+        start_gate: Arc<TerminalActorStartGate>,
+        child_exited: Arc<AtomicBool>,
+        handle: thread::JoinHandle<()>,
+    }
+
+    fn spawn_reader_actor_harness(
+        reader: ScriptedPtyReader,
+        child_exited: bool,
+    ) -> ReaderActorHarness {
+        let runtime_state = Arc::new(RwLock::new(RuntimeState::default()));
+        let dimensions = SessionDimensions {
+            cols: 80,
+            rows: 24,
+            cell_width: 8,
+            cell_height: 16,
+        };
+        let event_proxy = SessionEventProxy {
+            session_id: "reader-test".to_string(),
+            writer: Arc::new(Mutex::new(
+                Box::new(std::io::sink()) as Box<dyn Write + Send>
+            )),
+            input_admission: Arc::new(AtomicBool::new(false)),
+            runtime_state: runtime_state.clone(),
+            dimensions: Arc::new(Mutex::new(dimensions)),
+            debug_enabled: false,
+            state_notifier: None,
+        };
+        let term = Arc::new(Mutex::new(Term::new(
+            configured_term(100),
+            &TerminalSize::new(80, 24),
+            event_proxy,
+        )));
+        let received = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let lifecycle = Arc::new(Mutex::new(Vec::<TerminalLifecycleEvent>::new()));
+        let output_sink: TerminalOutputSink = {
+            let received = Arc::clone(&received);
+            Arc::new(move |bytes, _| received.lock().expect("received").extend_from_slice(&bytes))
+        };
+        let lifecycle_sink: TerminalLifecycleSink = {
+            let lifecycle = Arc::clone(&lifecycle);
+            Arc::new(move |event| lifecycle.lock().expect("lifecycle").push(event))
+        };
+        let start_gate = Arc::new(TerminalActorStartGate::default());
+        let child_exited = Arc::new(AtomicBool::new(child_exited));
+        let handle = spawn_reader_thread(
+            "reader-test".to_string(),
+            Box::new(reader),
+            term,
+            None,
+            runtime_state,
+            false,
+            None,
+            None,
+            Arc::new(Mutex::new(Some(output_sink))),
+            Arc::new(Mutex::new(Some(lifecycle_sink))),
+            Arc::new(Mutex::new(Vec::new())),
+            Arc::clone(&start_gate),
+            Arc::clone(&child_exited),
+        )
+        .expect("reader actor");
+        ReaderActorHarness {
+            received,
+            lifecycle,
+            start_gate,
+            child_exited,
+            handle,
+        }
+    }
+
+    #[test]
+    fn reader_survives_transient_eof_and_errors_while_child_is_alive() {
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let reader = ScriptedPtyReader {
+            steps: std::collections::VecDeque::from(vec![
+                ScriptedReadStep::Error(io::ErrorKind::BrokenPipe),
+                ScriptedReadStep::Eof,
+                ScriptedReadStep::Error(io::ErrorKind::Interrupted),
+                ScriptedReadStep::Eof,
+                ScriptedReadStep::Data(b"still alive"),
+                ScriptedReadStep::BlockUntilReleased,
+            ]),
+            release: Arc::clone(&release),
+        };
+        let harness = spawn_reader_actor_harness(reader, false);
+        harness.start_gate.release();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while harness.received.lock().expect("received").is_empty() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "reader never delivered output after transient EOF/errors"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            harness.received.lock().expect("received").as_slice(),
+            b"still alive"
+        );
+        assert!(
+            harness.lifecycle.lock().expect("lifecycle").is_empty(),
+            "no lifecycle exit may be published while the child lives: {:?}",
+            harness.lifecycle.lock().expect("lifecycle")
+        );
+        assert!(
+            !harness.handle.is_finished(),
+            "reader must keep running while the child lives"
+        );
+
+        // Child exit is the only authority that ends the reader.
+        harness.child_exited.store(true, Ordering::Release);
+        {
+            let (lock, changed) = &*release;
+            *lock.lock().expect("release lock") = true;
+            changed.notify_all();
+        }
+        harness
+            .handle
+            .join()
+            .expect("reader actor joins after child exit");
+        assert_eq!(
+            harness.lifecycle.lock().expect("lifecycle").as_slice(),
+            &[TerminalLifecycleEvent::ReaderEof]
+        );
+    }
+
+    #[test]
+    fn read_error_after_child_exit_is_end_of_stream_not_failure() {
+        let reader = ScriptedPtyReader {
+            steps: std::collections::VecDeque::from(vec![ScriptedReadStep::Error(
+                io::ErrorKind::BrokenPipe,
+            )]),
+            release: Arc::new((Mutex::new(false), Condvar::new())),
+        };
+        let harness = spawn_reader_actor_harness(reader, true);
+        harness.start_gate.release();
+        harness
+            .handle
+            .join()
+            .expect("reader actor joins once the child is known to be gone");
+        assert_eq!(
+            harness.lifecycle.lock().expect("lifecycle").as_slice(),
+            &[TerminalLifecycleEvent::ReaderEof]
+        );
+        assert!(harness.received.lock().expect("received").is_empty());
     }
 }

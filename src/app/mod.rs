@@ -19,17 +19,19 @@ use crate::browser::{
     BrowserRisk, BrowserSettingsAction, BrowserWebViewHost, BrowserWorkflowReviewEditor,
     BrowserWorkspaceKey, BrowserWorkspaceSnapshot,
 };
+use crate::git::command::{GitHostBinding, GitRepository};
 use crate::git::git_service;
 use crate::models::{
     AppConfig, DependencyStatus, MacTerminalProfile, PortStatus, Project, ProjectFolder,
     RunCommand, SSHConnection, SessionState, SessionTab, TabType,
 };
 use crate::notifications;
+use crate::persistence::{ConfigWriteAvailability, WorkspaceSnapshot};
 use crate::remote::presentation::{SemanticEventKind, StableSessionKey};
 use crate::remote::{
-    self, ClientAuth, LocalPortForwardManager, PendingRemoteRequest, RemoteAction,
-    RemoteActionPayload, RemoteActionResult, RemoteClientHandle, RemoteClientPool, RemoteGitRepo,
-    RemoteHostService, RemoteLatencyStats, RemoteMachineState, RemotePortForwardState,
+    self, ClientAuth, LocalPortForwardManager, RemoteAction, RemoteActionPayload,
+    RemoteActionResult, RemoteClientHandle, RemoteClientPool, RemoteGitRepo, RemoteHostService,
+    RemoteHostWeakHandle, RemoteLatencyStats, RemoteMachineState, RemotePortForwardState,
     RemoteSessionBootstrap, RemoteTerminalExport, RemoteTerminalInput,
 };
 use crate::services::{
@@ -42,6 +44,9 @@ use crate::state::{
     AppState, RuntimeState, SessionDimensions, SessionKind, SessionRuntimeState, SessionStatus,
 };
 use crate::terminal::{self, view};
+use crate::ui::task_cockpit::{
+    QuotaObservation, QuotaObservationIdentity, TopBarModel, TopBarProjectionInput,
+};
 use crate::updater::UpdaterService;
 use crate::workspace::{
     self, apply_browser_enabled_preference, CommandDraft, DiagnosticsDraft, EditorAction,
@@ -187,7 +192,6 @@ pub fn run() {
 
 #[derive(Debug, Clone)]
 enum ActionableNotice {
-    PortInUse { command_id: String, message: String },
     ForceQuit { message: String },
 }
 
@@ -262,9 +266,39 @@ fn execute_app_termination(termination: PendingAppTermination, cx: &App) {
     }
 }
 
+fn is_config_mutation_remote_action(action: &RemoteAction) -> bool {
+    matches!(
+        action,
+        RemoteAction::SaveProject { .. }
+            | RemoteAction::DeleteProject { .. }
+            | RemoteAction::SaveFolder { .. }
+            | RemoteAction::DeleteFolder { .. }
+            | RemoteAction::SaveCommand { .. }
+            | RemoteAction::DeleteCommand { .. }
+            | RemoteAction::SaveSsh { .. }
+            | RemoteAction::DeleteSsh { .. }
+            | RemoteAction::SaveSettings { .. }
+            | RemoteAction::GitPollForToken { .. }
+            | RemoteAction::GitLogout
+    )
+}
+
+fn unavailable_sidebar_config() -> AppConfig {
+    let mut config = AppConfig::default();
+    config.projects.push(Project {
+        id: "__config_unavailable__".to_string(),
+        name: "Configuration unavailable".to_string(),
+        root_path: String::new(),
+        notes: Some("Repair the canonical ConfigStore before editing projects.".to_string()),
+        ..Project::default()
+    });
+    config
+}
+
 struct NativeShell {
     state: AppState,
     session_manager: SessionManager,
+    config_write_availability: ConfigWriteAvailability,
     process_manager: ProcessManager,
     browser_gateway: Option<BrowserGatewayHandle>,
     browser_host: BrowserWebViewHost,
@@ -300,6 +334,8 @@ struct NativeShell {
     last_remote_app_revision: u64,
     last_remote_runtime_revision: u64,
     last_remote_port_hash: u64,
+    last_remote_authority_hash: u64,
+    last_remote_port_snapshot_sequence: u64,
     remote_live_session_generations: HashMap<String, u64>,
     terminal_focus: FocusHandle,
     editor_focus: FocusHandle,
@@ -317,6 +353,12 @@ struct NativeShell {
     last_terminal_mouse_report: Option<(TerminalGridPosition, Option<MouseButton>)>,
     terminal_mouse_press_owner: Option<TerminalMousePressOwner>,
     terminal_scrollbar_drag: Option<TerminalScrollbarDrag>,
+    /// True while the pointer is inside the terminal's scrollbar gutter.
+    ///
+    /// The gutter is painted on a `canvas`, which cannot answer a
+    /// `group_hover`, so the hover that widens the thumb from 4 px to 10 px is
+    /// tracked here from the same global mouse-move listener the drag uses.
+    terminal_scrollbar_hovered: bool,
     pending_terminal_display_offset: Option<usize>,
     terminal_search: TerminalSearchState,
     editor_panel: Option<EditorPanel>,
@@ -338,11 +380,14 @@ struct NativeShell {
     splash_fetch_in_flight: bool,
     native_dialog_blockers: Arc<AtomicUsize>,
     remote_connect_request_id: u64,
+    /// Monotonic host-owned epoch for legacy quota replay observations.
+    ai_quota_generation: u64,
     ai_quota_states: HashMap<String, AiQuotaState>,
     remote_status_notice: Option<RemoteStatusNotice>,
     pending_shutdown_op_id: Option<u64>,
     pending_window_close: bool,
     pending_install_update: Option<String>,
+    pending_update_handoff_token: Option<uuid::Uuid>,
     pending_app_termination: Option<PendingAppTermination>,
     window_subscriptions: Vec<Subscription>,
 }
@@ -511,7 +556,7 @@ struct TerminalScrollbarGeometry {
 
 #[derive(Debug, Clone, Copy)]
 struct TerminalScrollbarDrag {
-    grab_offset_px: f32,
+    grab: crate::ui::scrollbar::ScrollbarGrab,
     thumb_top_ratio: f32,
     last_display_offset: usize,
 }
@@ -522,21 +567,12 @@ struct TerminalMousePressOwner {
     button: MouseButton,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PortKillFeedback {
-    Killed,
-    None,
-    Error,
-}
-
 #[derive(Debug, Clone)]
 struct ActivePortState {
     command_id: String,
     port: u16,
     status: Option<PortStatus>,
     last_checked_at: Option<Instant>,
-    kill_feedback: Option<PortKillFeedback>,
-    kill_feedback_until: Option<Instant>,
     refresh_in_flight: bool,
 }
 
@@ -552,10 +588,55 @@ struct AiQuotaState {
 
 #[derive(Debug, Clone, Default)]
 struct ServerPortSnapshotState {
+    inventory: ports_service::PortInventory,
     tracked_ports: Vec<u16>,
     statuses: HashMap<u16, PortStatus>,
+    authorities: HashMap<u16, crate::process::ports::PortStatus>,
+    probe_failures: HashMap<u16, String>,
+    source_observed_at: Option<Instant>,
+    source_freshness_deadline: Option<Instant>,
+    source_publication_sequence: u64,
     last_checked_at: Option<Instant>,
     refresh_in_flight: bool,
+    refresh_generation: u64,
+    task_action_epoch: u64,
+    server_lifecycle_generation: u64,
+    active_refresh: Option<PortRefreshFence>,
+    /// Stable sentinel for a port with no host-verified managed resource.
+    /// This is never a managed authority; it only keeps typed projections
+    /// from minting a new wire identity on every refresh.
+    no_managed_resource: Option<crate::domain::operation::ResourceFence>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct PortRefreshProjection {
+    statuses: HashMap<u16, PortStatus>,
+    authorities: HashMap<u16, crate::process::ports::PortStatus>,
+    probe_failures: HashMap<u16, String>,
+    source_observed_at: Option<Instant>,
+    source_freshness_deadline: Option<Instant>,
+    source_publication_sequence: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PortRefreshFence {
+    generation: u64,
+    ports: Vec<u16>,
+    task_action_epoch: u64,
+    runtime_generation: u64,
+    resource_generation: u64,
+    managed_snapshot_generation: u64,
+    server_lifecycle_generation: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PortUiAuthority {
+    Managed,
+    ManagedUnready,
+    ProvenExternal,
+    Starting,
+    Free,
+    Unknown,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1058,6 +1139,114 @@ fn resolve_remote_state_startup(
     }
 }
 
+fn remote_terminal_input_callback(
+    input_manager: ProcessManager,
+    input_host: RemoteHostWeakHandle,
+) -> impl Fn(RemoteTerminalInput, u64) -> Result<(), String> + Send + Sync + 'static {
+    move |input, enqueued_at_epoch_ms| {
+        // A queued callback may outlive the root shell. Upgrade only for this
+        // bounded input operation so its payload cannot retain the stopped
+        // host runtime, and fail closed if teardown has already started.
+        let Some(input_host) = input_host.upgrade() else {
+            return Err("Remote host stopped before terminal input could be applied.".to_string());
+        };
+        let result = match input {
+            RemoteTerminalInput::Text { session_id, text } => {
+                input_manager.write_user_text_to_session(&session_id, &text)
+            }
+            RemoteTerminalInput::Bytes { session_id, bytes } => {
+                input_manager.write_user_bytes_to_session(&session_id, &bytes)
+            }
+            RemoteTerminalInput::Control { session_id, bytes } => {
+                input_manager.write_bytes_to_session(&session_id, &bytes)
+            }
+            RemoteTerminalInput::Paste { session_id, text } => {
+                input_manager.paste_user_text_to_session(&session_id, &text)
+            }
+            RemoteTerminalInput::Image {
+                session_id,
+                attachment,
+                authority,
+            } => crate::remote::web::image_paste::handle_web_image_paste(
+                &input_manager,
+                &session_id,
+                &attachment,
+                || {
+                    authority.as_ref().is_none_or(|authority| {
+                        input_host.web_mutation_authority_is_current(authority)
+                    })
+                },
+            ),
+            RemoteTerminalInput::ComposerBatch {
+                session_id,
+                text,
+                attachments,
+                authority,
+            } => crate::remote::web::image_paste::handle_web_composer_batch(
+                &input_manager,
+                &session_id,
+                &attachments,
+                &text,
+                || input_host.web_mutation_authority_is_current(&authority),
+            ),
+        };
+        if result.is_ok() {
+            input_host.record_input_write_latency(enqueued_at_epoch_ms);
+        }
+        result
+    }
+}
+
+fn remote_session_event_callback(
+    event_host: RemoteHostWeakHandle,
+) -> impl Fn(RemoteSessionEvent) + Send + Sync + 'static {
+    move |event| {
+        // ProcessManager owns this callback independently of the shell. A
+        // stopped host is therefore an ordinary no-op, not an owning cycle.
+        let Some(event_host) = event_host.upgrade() else {
+            return;
+        };
+        match event {
+            RemoteSessionEvent::Output {
+                session_id,
+                bytes,
+                mode,
+                screen,
+            } => event_host.push_session_output_with_mode(&session_id, bytes, mode, screen),
+            RemoteSessionEvent::Runtime {
+                session_id,
+                runtime,
+            } => event_host.push_session_runtime(&session_id, runtime),
+            RemoteSessionEvent::Removed { session_id } => {
+                event_host.push_session_removed(&session_id)
+            }
+            RemoteSessionEvent::Semantic { draft } => event_host.push_semantic_draft(draft),
+            RemoteSessionEvent::ClaudeSemantic { identity, draft } => {
+                event_host.push_claude_semantic_draft(identity, draft)
+            }
+            RemoteSessionEvent::ClaudeAdapterRegistered { identity } => {
+                event_host.push_claude_adapter_registered(identity)
+            }
+            RemoteSessionEvent::ClaudeAdapterRemoved { identity } => {
+                event_host.push_claude_adapter_removed(&identity)
+            }
+            RemoteSessionEvent::CodexSemantic { identity, draft } => {
+                event_host.push_codex_semantic_draft(identity, draft)
+            }
+            RemoteSessionEvent::CodexAdapterRegistered { identity } => {
+                event_host.push_codex_adapter_registered(identity)
+            }
+            RemoteSessionEvent::CodexAdapterRemoved { identity } => {
+                event_host.push_codex_adapter_removed(&identity)
+            }
+            RemoteSessionEvent::AdapterHealth {
+                stable_session_key,
+                health,
+            } => event_host.push_semantic_adapter_health(stable_session_key, health),
+        }
+    }
+}
+
 impl NativeShell {
     fn new(cx: &mut Context<Self>) -> Self {
         let session_manager = SessionManager::new();
@@ -1088,14 +1277,44 @@ impl NativeShell {
             diagnostic: remote_config_diagnostic,
         } = resolve_remote_state_startup(remote::load_remote_machine_state());
         let native_dialog_blockers = Arc::new(AtomicUsize::new(0));
-        let (mut state, mut startup_notice) = match session_manager.load_workspace() {
-            Ok(snapshot) => (AppState::from_workspace(snapshot), None),
-            Err(error) => (
-                AppState::default(),
-                Some(format!(
-                    "Fell back to an empty workspace because legacy state could not be loaded: {error}"
-                )),
+        let (mut state, mut startup_notice, config_write_availability) = match session_manager
+            .load_workspace()
+        {
+            Ok(snapshot) => (
+                AppState::from_workspace(snapshot),
+                None,
+                ConfigWriteAvailability::Ready,
             ),
+            Err(error) => {
+                // Keep validated current/backup rows visible when the
+                // canonical store is temporarily unreadable.  If no
+                // validated recovery copy exists, show an explicit unavailable
+                // sidebar row rather than silently constructing a blank editor
+                // model. Session state is intentionally not touched on this
+                // fail-closed path.
+                let (config, diagnostic) = match session_manager.load_config_recovery() {
+                    Ok(config) => (
+                        config,
+                        format!(
+                            "ConfigStore failed to load the workspace: {error}. A validated recovery copy is shown read-only until the canonical store is repaired."
+                        ),
+                    ),
+                    Err(recovery_error) => (
+                        unavailable_sidebar_config(),
+                        format!(
+                            "ConfigStore is unavailable and no validated recovery copy could be loaded: {recovery_error}. The left sidebar is read-only until the store is repaired."
+                        ),
+                    ),
+                };
+                (
+                    AppState::from_workspace(WorkspaceSnapshot {
+                        config,
+                        session: SessionState::default(),
+                    }),
+                    Some(diagnostic.clone()),
+                    ConfigWriteAvailability::Unavailable { diagnostic },
+                )
+            }
         };
         if let Some(diagnostic) = browser_config_diagnostic {
             startup_notice = Some(match startup_notice {
@@ -1109,7 +1328,28 @@ impl NativeShell {
                 None => diagnostic,
             });
         }
-        pid_file::cleanup_orphaned_processes();
+        match pid_file::reconcile_orphaned_process_ledger() {
+            Ok(pid_file::OrphanedProcessReconciliation::Clear) => {}
+            Ok(pid_file::OrphanedProcessReconciliation::ExactAuthorityUnavailable {
+                retained_sessions,
+                retained_processes,
+            }) => {
+                let diagnostic = format!(
+                    "Found {retained_processes} verified process(es) from {retained_sessions} prior session(s). They remain observable, but were not terminated because the prior instance's exact managed-process authority is unavailable."
+                );
+                startup_notice = Some(match startup_notice {
+                    Some(existing) => format!("{existing}\n{diagnostic}"),
+                    None => diagnostic,
+                });
+            }
+            Err(error) => {
+                let diagnostic = format!("Could not reconcile the prior process ledger: {error}");
+                startup_notice = Some(match startup_notice {
+                    Some(existing) => format!("{existing}\n{diagnostic}"),
+                    None => diagnostic,
+                });
+            }
+        }
 
         let process_manager = ProcessManager::new();
         process_manager.set_settings(state.config.settings.clone());
@@ -1125,6 +1365,7 @@ impl NativeShell {
                         browser_app_config_dir,
                     ) {
                         Ok(gateway) => {
+                            browser_host.attach_gateway_registrar(gateway.registrar());
                             process_manager
                                 .set_browser_gateway_registrar(Some(gateway.registrar()));
                             Some(gateway)
@@ -1148,6 +1389,8 @@ impl NativeShell {
         };
         let updater = UpdaterService::new();
         let remote_host_service = RemoteHostService::new(remote_machine_state.host.clone());
+        let _ = crate::connect::ConnectProductionStartup::reject_legacy_remote_web_as_connect();
+        remote_host_service.prepare_connect_production_or_surface();
         let bootstrap_manager = process_manager.clone();
         remote_host_service.set_session_bootstrap_provider(Some(Arc::new(move |session_id| {
             let session_view = bootstrap_manager.session_view(session_id)?;
@@ -1161,55 +1404,11 @@ impl NativeShell {
                 replay_bytes,
             })
         })));
-        let input_manager = process_manager.clone();
-        let input_host_service = remote_host_service.clone();
         remote_host_service.set_terminal_input_handler(Some(Arc::new(
-            move |input, enqueued_at_epoch_ms| {
-                let result = match input {
-                    RemoteTerminalInput::Text { session_id, text } => {
-                        input_manager.write_user_text_to_session(&session_id, &text)
-                    }
-                    RemoteTerminalInput::Bytes { session_id, bytes } => {
-                        input_manager.write_user_bytes_to_session(&session_id, &bytes)
-                    }
-                    RemoteTerminalInput::Control { session_id, bytes } => {
-                        input_manager.write_bytes_to_session(&session_id, &bytes)
-                    }
-                    RemoteTerminalInput::Paste { session_id, text } => {
-                        input_manager.paste_user_text_to_session(&session_id, &text)
-                    }
-                    RemoteTerminalInput::Image {
-                        session_id,
-                        attachment,
-                        authority,
-                    } => crate::remote::web::image_paste::handle_web_image_paste(
-                        &input_manager,
-                        &session_id,
-                        &attachment,
-                        || {
-                            authority.as_ref().is_none_or(|authority| {
-                                input_host_service.web_mutation_authority_is_current(authority)
-                            })
-                        },
-                    ),
-                    RemoteTerminalInput::ComposerBatch {
-                        session_id,
-                        text,
-                        attachments,
-                        authority,
-                    } => crate::remote::web::image_paste::handle_web_composer_batch(
-                        &input_manager,
-                        &session_id,
-                        &attachments,
-                        &text,
-                        || input_host_service.web_mutation_authority_is_current(&authority),
-                    ),
-                };
-                if result.is_ok() {
-                    input_host_service.record_input_write_latency(enqueued_at_epoch_ms);
-                }
-                result
-            },
+            remote_terminal_input_callback(
+                process_manager.clone(),
+                remote_host_service.downgrade(),
+            ),
         )));
         let resize_manager = process_manager.clone();
         remote_host_service.set_terminal_resize_handler(Some(Arc::new(
@@ -1217,53 +1416,9 @@ impl NativeShell {
                 let _ = resize_manager.resize_session(&session_id, dimensions);
             },
         )));
-        let event_host_service = remote_host_service.clone();
-        process_manager.set_remote_session_handler(Some(Arc::new(move |event| match event {
-            RemoteSessionEvent::Output {
-                session_id,
-                bytes,
-                mode,
-                screen,
-            } => {
-                event_host_service.push_session_output_with_mode(&session_id, bytes, mode, screen);
-            }
-            RemoteSessionEvent::Runtime {
-                session_id,
-                runtime,
-            } => {
-                event_host_service.push_session_runtime(&session_id, runtime);
-            }
-            RemoteSessionEvent::Removed { session_id } => {
-                event_host_service.push_session_removed(&session_id);
-            }
-            RemoteSessionEvent::Semantic { draft } => {
-                event_host_service.push_semantic_draft(draft);
-            }
-            RemoteSessionEvent::ClaudeSemantic { identity, draft } => {
-                event_host_service.push_claude_semantic_draft(identity, draft);
-            }
-            RemoteSessionEvent::ClaudeAdapterRegistered { identity } => {
-                event_host_service.push_claude_adapter_registered(identity);
-            }
-            RemoteSessionEvent::ClaudeAdapterRemoved { identity } => {
-                event_host_service.push_claude_adapter_removed(&identity);
-            }
-            RemoteSessionEvent::CodexSemantic { identity, draft } => {
-                event_host_service.push_codex_semantic_draft(identity, draft);
-            }
-            RemoteSessionEvent::CodexAdapterRegistered { identity } => {
-                event_host_service.push_codex_adapter_registered(identity);
-            }
-            RemoteSessionEvent::CodexAdapterRemoved { identity } => {
-                event_host_service.push_codex_adapter_removed(&identity);
-            }
-            RemoteSessionEvent::AdapterHealth {
-                stable_session_key,
-                health,
-            } => {
-                event_host_service.push_semantic_adapter_health(stable_session_key, health);
-            }
-        })));
+        process_manager.set_remote_session_handler(Some(Arc::new(remote_session_event_callback(
+            remote_host_service.downgrade(),
+        ))));
         let focus_manager = process_manager.clone();
         remote_host_service.set_focused_session_handler(Some(Arc::new(move |session_id| {
             focus_manager.set_active_session(session_id);
@@ -1300,14 +1455,16 @@ impl NativeShell {
         }
         Self::spawn_remote_refresh_task(native_dialog_blockers.clone(), cx);
         Self::spawn_ai_quota_refresh_task(
-            remote_host_service.clone(),
+            remote_host_service.downgrade(),
             native_dialog_blockers.clone(),
             cx,
         );
 
+        let port_inventory = process_manager.port_inventory();
         let shell = Self {
             state,
             session_manager,
+            config_write_availability,
             process_manager,
             browser_gateway,
             browser_host,
@@ -1343,13 +1500,18 @@ impl NativeShell {
             last_remote_app_revision: 0,
             last_remote_runtime_revision: 0,
             last_remote_port_hash: 0,
+            last_remote_authority_hash: 0,
+            last_remote_port_snapshot_sequence: 0,
             remote_live_session_generations: HashMap::new(),
             terminal_focus: cx.focus_handle(),
             editor_focus: cx.focus_handle(),
             did_focus_terminal: false,
             focused_terminal_session_id: None,
             active_port_state: None,
-            server_port_snapshot: ServerPortSnapshotState::default(),
+            server_port_snapshot: ServerPortSnapshotState {
+                inventory: port_inventory,
+                ..ServerPortSnapshotState::default()
+            },
             ssh_password_prompt_state: None,
             editor_needs_focus: false,
             synced_session_id,
@@ -1361,6 +1523,7 @@ impl NativeShell {
             last_terminal_mouse_report: None,
             terminal_mouse_press_owner: None,
             terminal_scrollbar_drag: None,
+            terminal_scrollbar_hovered: false,
             pending_terminal_display_offset: None,
             terminal_search: TerminalSearchState::default(),
             editor_panel: None,
@@ -1381,10 +1544,12 @@ impl NativeShell {
             splash_fetch_in_flight: false,
             native_dialog_blockers,
             remote_connect_request_id: 0,
+            ai_quota_generation: 1,
             remote_status_notice: None,
             pending_shutdown_op_id: None,
             pending_window_close: false,
             pending_install_update: None,
+            pending_update_handoff_token: None,
             pending_app_termination: None,
             window_subscriptions: Vec::new(),
         };
@@ -1416,15 +1581,20 @@ impl NativeShell {
     fn apply_diagnostics_settings_delta(
         &mut self,
         delta: &crate::diagnostics::DiagnosticsSettingsDelta,
-    ) {
+        cx: &mut Context<Self>,
+    ) -> bool {
         if delta.is_empty() {
-            return;
+            return true;
+        }
+        if !self.ensure_config_mutation_available(cx) {
+            return false;
         }
         let mut settings = self.state.settings().clone();
         delta.apply_to(&mut settings);
         self.state.update_settings(settings.clone());
         self.process_manager.set_settings(settings);
         self.save_config_state();
+        true
     }
 
     fn next_diagnostics_generation(&mut self) -> u64 {
@@ -1735,7 +1905,9 @@ impl NativeShell {
                                 );
                                 match follow_up {
                                     DiagnosticsRepairFollowUp::ApplyDeltaAndSnapshot => {
-                                        shell.apply_diagnostics_settings_delta(&delta);
+                                        if !shell.apply_diagnostics_settings_delta(&delta, cx) {
+                                            return;
+                                        }
                                         if let Some(Ok(snapshot)) = scan_result {
                                             shell.finish_diagnostics_scan(generation, snapshot, cx);
                                         }
@@ -1745,7 +1917,9 @@ impl NativeShell {
                                         }
                                     }
                                     DiagnosticsRepairFollowUp::ApplyDeltaAndRescan => {
-                                        shell.apply_diagnostics_settings_delta(&delta);
+                                        if !shell.apply_diagnostics_settings_delta(&delta, cx) {
+                                            return;
+                                        }
                                         shell.surface_diagnostics_restart_notice(&batch);
                                         if let Some(EditorPanel::Diagnostics(draft)) =
                                             shell.editor_panel.as_mut()
@@ -1767,7 +1941,9 @@ impl NativeShell {
                                     DiagnosticsRepairFollowUp::ApplyDeltaAndScanError(
                                         scan_error,
                                     ) => {
-                                        shell.apply_diagnostics_settings_delta(&delta);
+                                        if !shell.apply_diagnostics_settings_delta(&delta, cx) {
+                                            return;
+                                        }
                                         shell.surface_diagnostics_restart_notice(&batch);
                                         if let Some(error) = diagnostics_repair_soft_error(
                                             batch_failure,
@@ -1873,6 +2049,7 @@ impl NativeShell {
         let should_run =
             self.state.settings().browser_enabled && self.browser_host.status().available;
         if !should_run {
+            self.browser_host.detach_gateway_registrar();
             self.process_manager.set_browser_gateway_registrar(None);
             self.browser_gateway = None;
             return None;
@@ -1881,6 +2058,7 @@ impl NativeShell {
             return None;
         }
         let Some(browser_app_config_dir) = self.browser_app_config_dir.as_ref() else {
+            self.browser_host.detach_gateway_registrar();
             self.process_manager.set_browser_gateway_registrar(None);
             self.browser_gateway = None;
             return Some(
@@ -1893,12 +2071,15 @@ impl NativeShell {
             browser_app_config_dir,
         ) {
             Ok(gateway) => {
+                self.browser_host
+                    .attach_gateway_registrar(gateway.registrar());
                 self.process_manager
                     .set_browser_gateway_registrar(Some(gateway.registrar()));
                 self.browser_gateway = Some(gateway);
                 None
             }
             Err(error) => {
+                self.browser_host.detach_gateway_registrar();
                 self.process_manager.set_browser_gateway_registrar(None);
                 Some(format!(
                     "Browser tools are unavailable; AI terminals will continue normally: {error}"
@@ -4793,7 +4974,7 @@ impl NativeShell {
     }
 
     fn spawn_ai_quota_refresh_task(
-        remote_host_service: RemoteHostService,
+        remote_host_service: RemoteHostWeakHandle,
         native_dialog_blockers: Arc<AtomicUsize>,
         cx: &mut Context<Self>,
     ) {
@@ -4809,6 +4990,9 @@ impl NativeShell {
                         while native_dialog_blockers.load(Ordering::Acquire) > 0 {
                             background_executor.timer(Duration::from_millis(50)).await;
                         }
+                        let Some(remote_host_service) = remote_host_service.upgrade() else {
+                            break;
+                        };
                         if this
                             .update(&mut async_cx, |shell, cx: &mut Context<'_, Self>| {
                                 if shell.refresh_ai_quota_states(&remote_host_service) {
@@ -4883,9 +5067,17 @@ impl NativeShell {
 
         for (tab_id, tab_type, provider_session_id) in active_ai_tabs {
             let provider_name = Self::ai_provider_name(&tab_type).expect("only ai tabs");
+            let provider_key = provider_name.to_string();
+            let session_changed = self
+                .ai_quota_states
+                .get(&provider_key)
+                .is_some_and(|state| state.provider_session_id != provider_session_id);
+            if session_changed {
+                self.ai_quota_generation = self.ai_quota_generation.saturating_add(1).max(1);
+            }
             let entry = self
                 .ai_quota_states
-                .entry(provider_name.to_string())
+                .entry(provider_key)
                 .or_insert_with(|| AiQuotaState {
                     tab_id: tab_id.clone(),
                     tab_type: tab_type.clone(),
@@ -4957,40 +5149,36 @@ impl NativeShell {
         changed
     }
 
-    fn ai_quota_statuses(&self) -> Vec<chrome::QuotaStatus> {
+    fn ai_top_bar_model(&self) -> TopBarModel {
         let now_epoch_ms = Self::app_now_epoch_ms();
-        let mut latest_by_provider = HashMap::<&'static str, (String, u64)>::new();
-
-        for state in self.ai_quota_states.values() {
-            if Self::is_ai_quota_stale(state, now_epoch_ms) {
-                continue;
-            }
-            let Some(usage) = &state.latest_usage else {
-                continue;
-            };
-            let provider = Self::ai_provider_name(&state.tab_type).expect("only ai tabs");
-            let replace = latest_by_provider
-                .get(provider)
-                .is_none_or(|(_, seen_at)| state.latest_usage_seen_at_epoch_ms > *seen_at);
-            if replace {
-                latest_by_provider.insert(
-                    provider,
-                    (usage.clone(), state.latest_usage_seen_at_epoch_ms),
-                );
-            }
-        }
-
-        ["Claude", "Codex"]
-            .into_iter()
-            .filter_map(|provider| {
-                latest_by_provider
-                    .get(provider)
-                    .map(|(detail, _)| chrome::QuotaStatus {
-                        provider,
-                        detail: detail.clone(),
-                    })
+        let now_ms = i64::try_from(now_epoch_ms).unwrap_or(i64::MAX);
+        let quotas = self
+            .ai_quota_states
+            .values()
+            .filter_map(|state| {
+                let provider = Self::ai_provider_name(&state.tab_type)?;
+                Some(QuotaObservation {
+                    identity: QuotaObservationIdentity {
+                        provider: provider.to_string(),
+                        provider_session_id: state.provider_session_id.clone(),
+                        observation_id: state.cursor,
+                    },
+                    detail: state.latest_usage.clone(),
+                    observed_at_ms: i64::try_from(state.latest_usage_seen_at_epoch_ms).ok(),
+                    generation: Some(self.ai_quota_generation),
+                })
             })
-            .collect()
+            .collect();
+
+        TopBarModel::from_input(&TopBarProjectionInput {
+            now_ms,
+            generation: self.ai_quota_generation,
+            host: None,
+            connect: None,
+            update: None,
+            quotas,
+            resources: None,
+        })
     }
 
     fn ai_provider_name(tab_type: &TabType) -> Option<&'static str> {
@@ -5027,9 +5215,10 @@ impl NativeShell {
 
     fn is_ai_quota_stale(entry: &AiQuotaState, now_epoch_ms: u64) -> bool {
         entry.latest_usage.is_some()
-            && entry.latest_usage_seen_at_epoch_ms != 0
-            && now_epoch_ms.saturating_sub(entry.latest_usage_seen_at_epoch_ms)
-                > AI_QUOTA_VISIBILITY_TTL.as_millis() as u64
+            && (entry.latest_usage_seen_at_epoch_ms == 0
+                || now_epoch_ms < entry.latest_usage_seen_at_epoch_ms
+                || now_epoch_ms.saturating_sub(entry.latest_usage_seen_at_epoch_ms)
+                    >= AI_QUOTA_VISIBILITY_TTL.as_millis() as u64)
     }
 
     fn pause_for_native_dialog(&self) -> NativeDialogPauseGuard {
@@ -5058,8 +5247,18 @@ impl NativeShell {
         if self.remote_mode.is_some() {
             return;
         }
+        if let Some(diagnostic) = self.config_write_availability.diagnostic() {
+            self.editor_notice = Some(format!(
+                "Configuration is read-only until ConfigStore recovery succeeds: {diagnostic}"
+            ));
+            return;
+        }
         if let Err(error) = self.session_manager.save_config(&self.state.config) {
-            self.editor_notice = Some(format!("Failed to save config: {error}"));
+            let diagnostic = error.to_string();
+            self.config_write_availability = ConfigWriteAvailability::Unavailable {
+                diagnostic: diagnostic.clone(),
+            };
+            self.editor_notice = Some(format!("Failed to save config: {diagnostic}"));
         } else {
             self.process_manager
                 .set_settings(self.state.config.settings.clone());
@@ -5271,7 +5470,21 @@ impl NativeShell {
         false
     }
 
+    fn ensure_config_mutation_available(&mut self, cx: &mut Context<Self>) -> bool {
+        if let Some(diagnostic) = self.config_write_availability.diagnostic() {
+            self.editor_notice = Some(format!(
+                "Configuration is read-only until ConfigStore recovery succeeds: {diagnostic}"
+            ));
+            cx.notify();
+            return false;
+        }
+        true
+    }
+
     fn ensure_mutation_control(&mut self, cx: &mut Context<Self>) -> bool {
+        if !self.ensure_config_mutation_available(cx) {
+            return false;
+        }
         if self.remote_mode.is_some() {
             return self.ensure_remote_control(cx);
         }
@@ -5282,6 +5495,35 @@ impl NativeShell {
         self.editor_notice =
             Some("Took control back from the connected remote client.".to_string());
         self.sync_settings_remote_draft();
+        cx.notify();
+        true
+    }
+
+    fn reject_unavailable_config_remote_action(
+        &mut self,
+        action: &RemoteAction,
+        response: &mut Option<std::sync::mpsc::Sender<RemoteActionResult>>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.config_write_availability.diagnostic().is_none()
+            || !is_config_mutation_remote_action(action)
+        {
+            return false;
+        }
+        let diagnostic = self
+            .config_write_availability
+            .diagnostic()
+            .unwrap_or("ConfigStore is unavailable");
+        let result = RemoteActionResult::error(format!(
+            "configuration mutation is unavailable until ConfigStore recovery succeeds: {diagnostic}"
+        ));
+        if let Some(sender) = response.take() {
+            let _ = sender.send(result);
+        }
+        self.editor_notice = Some(
+            "Configuration mutations are disabled while the canonical ConfigStore is unavailable."
+                .to_string(),
+        );
         cx.notify();
         true
     }
@@ -5548,28 +5790,83 @@ impl NativeShell {
         let app_revision = self.state.revision();
         let runtime_revision = self.process_manager.runtime_revision();
         let port_hash = local_stable_hash(&self.server_port_snapshot.statuses);
+        let authority_hash = local_port_authority_hash(&self.server_port_snapshot.authorities);
+        let port_snapshot_sequence = self.server_port_snapshot.source_publication_sequence;
         let forced_sync = self.last_remote_snapshot_sync_at.is_none();
         let app_changed = forced_sync || app_revision != self.last_remote_app_revision;
         let runtime_changed = forced_sync || runtime_revision != self.last_remote_runtime_revision;
         let port_changed = forced_sync || port_hash != self.last_remote_port_hash;
+        let authority_changed = forced_sync || authority_hash != self.last_remote_authority_hash;
+        let source_changed =
+            forced_sync || port_snapshot_sequence != self.last_remote_port_snapshot_sequence;
+        let port_authority_changed = port_changed || authority_changed || source_changed;
         if !forced_sync
             && !app_changed
             && !runtime_changed
             && !port_changed
+            && !authority_changed
+            && !source_changed
             && !has_pending_requests
         {
             self.last_remote_snapshot_sync_at = Some(now);
             return;
         }
 
+        let reference_epoch_ms = now_epoch_ms();
+        let source_observed_at_epoch_ms = self
+            .server_port_snapshot
+            .source_observed_at
+            .map(|observed_at| instant_to_epoch_ms(observed_at, now, reference_epoch_ms))
+            .unwrap_or(reference_epoch_ms);
+        let source_freshness_deadline_epoch_ms = self
+            .server_port_snapshot
+            .source_freshness_deadline
+            .map(|deadline| instant_to_epoch_ms(deadline, now, reference_epoch_ms))
+            .unwrap_or(reference_epoch_ms);
+        let source_publication_sequence = self.server_port_snapshot.source_publication_sequence;
         self.remote_host_service.update_snapshot_parts(
             app_changed.then(|| remote_shared_app_state(&self.state)),
             runtime_changed.then(|| runtime_state.clone()),
-            port_changed.then(|| self.server_port_snapshot.statuses.clone()),
+            port_authority_changed.then(|| self.server_port_snapshot.statuses.clone()),
+            port_authority_changed.then(|| {
+                self.server_port_snapshot
+                    .authorities
+                    .iter()
+                    .map(|(port, authority)| {
+                        let remote_authority =
+                            remote::RemotePortAuthority::from_rich_with_source_metadata(
+                                authority,
+                                source_observed_at_epoch_ms,
+                                source_freshness_deadline_epoch_ms,
+                            )
+                            .with_snapshot_metadata(
+                                source_publication_sequence,
+                                0,
+                                0,
+                            );
+                        let remote_authority = if matches!(
+                            remote_authority.kind(),
+                            remote::RemotePortAuthorityKind::Managed
+                                | remote::RemotePortAuthorityKind::ManagedUnready
+                        ) {
+                            unique_server_session_id(runtime_state, *port)
+                                .map(|session_id| {
+                                    remote_authority.clone().with_session_id(session_id)
+                                })
+                                .unwrap_or(remote_authority)
+                        } else {
+                            remote_authority
+                        };
+                        (*port, remote_authority)
+                    })
+                    .collect()
+            }),
         );
         self.last_remote_app_revision = app_revision;
         self.last_remote_runtime_revision = runtime_revision;
         self.last_remote_port_hash = port_hash;
+        self.last_remote_authority_hash = authority_hash;
+        self.last_remote_port_snapshot_sequence = port_snapshot_sequence;
         self.last_remote_snapshot_sync_at = Some(now);
     }
 
@@ -6327,11 +6624,18 @@ impl NativeShell {
         self.process_manager.session_view(session_id)
     }
 
-    fn current_port_statuses(&self) -> HashMap<u16, PortStatus> {
+    fn current_port_authorities(&self) -> HashMap<u16, crate::process::ports::PortStatus> {
         self.remote_mode
             .as_ref()
-            .map(|remote_mode| remote_mode.snapshot.port_statuses.clone())
-            .unwrap_or_else(|| self.server_port_snapshot.statuses.clone())
+            .map(|_| HashMap::new())
+            .unwrap_or_else(|| self.server_port_snapshot.authorities.clone())
+    }
+
+    fn current_port_probe_failures(&self) -> HashMap<u16, String> {
+        self.remote_mode
+            .as_ref()
+            .map(|_| HashMap::new())
+            .unwrap_or_else(|| self.server_port_snapshot.probe_failures.clone())
     }
 
     fn sync_remote_port_forwards(&mut self) -> bool {
@@ -6431,6 +6735,7 @@ impl NativeShell {
         &mut self,
         action: &RemoteAction,
         response: Option<std::sync::mpsc::Sender<RemoteActionResult>>,
+        bound_repository: Option<Result<GitRepository, String>>,
         cx: &mut Context<Self>,
     ) -> bool {
         #[derive(Debug)]
@@ -6500,8 +6805,10 @@ impl NativeShell {
                                 ),
                                 None,
                             ),
-                            RemoteAction::GitStatus { repo_path } => (
-                                match git_service::status(&repo_path) {
+                            RemoteAction::GitStatus { .. } => (
+                                match require_bound_git_repository(&bound_repository)
+                                    .and_then(git_service::status)
+                                {
                                     Ok(status) => RemoteActionResult::ok(
                                         None,
                                         Some(RemoteActionPayload::GitStatus { status }),
@@ -6511,11 +6818,13 @@ impl NativeShell {
                                 None,
                             ),
                             RemoteAction::GitLog {
-                                repo_path,
                                 limit,
                                 skip,
+                                ..
                             } => (
-                                match git_service::log(&repo_path, limit, skip) {
+                                match require_bound_git_repository(&bound_repository)
+                                    .and_then(|repository| git_service::log(repository, limit, skip))
+                                {
                                     Ok(entries) => RemoteActionResult::ok(
                                         None,
                                         Some(RemoteActionPayload::GitLogEntries { entries }),
@@ -6525,11 +6834,14 @@ impl NativeShell {
                                 None,
                             ),
                             RemoteAction::GitDiffFile {
-                                repo_path,
                                 file_path,
                                 staged,
+                                ..
                             } => (
-                                match git_service::diff_file(&repo_path, &file_path, staged) {
+                                match require_bound_git_repository(&bound_repository)
+                                    .and_then(|repository| {
+                                        git_service::diff_file(repository, &file_path, staged)
+                                    }) {
                                     Ok(diff) => RemoteActionResult::ok(
                                         None,
                                         Some(RemoteActionPayload::GitDiff { diff }),
@@ -6538,8 +6850,10 @@ impl NativeShell {
                                 },
                                 None,
                             ),
-                            RemoteAction::GitDiffCommit { repo_path, hash } => (
-                                match git_service::diff_commit(&repo_path, &hash) {
+                            RemoteAction::GitDiffCommit { hash, .. } => (
+                                match require_bound_git_repository(&bound_repository)
+                                    .and_then(|repository| git_service::diff_commit(repository, &hash))
+                                {
                                     Ok(diff) => RemoteActionResult::ok(
                                         None,
                                         Some(RemoteActionPayload::GitDiff { diff }),
@@ -6548,8 +6862,10 @@ impl NativeShell {
                                 },
                                 None,
                             ),
-                            RemoteAction::GitBranches { repo_path } => (
-                                match git_service::branches(&repo_path) {
+                            RemoteAction::GitBranches { .. } => (
+                                match require_bound_git_repository(&bound_repository)
+                                    .and_then(git_service::branches)
+                                {
                                     Ok(branches) => RemoteActionResult::ok(
                                         None,
                                         Some(RemoteActionPayload::GitBranches { branches }),
@@ -6558,48 +6874,59 @@ impl NativeShell {
                                 },
                                 None,
                             ),
-                            RemoteAction::GitStage { repo_path, files } => {
+                            RemoteAction::GitStage { files, .. } => {
                                 let file_refs =
                                     files.iter().map(|file| file.as_str()).collect::<Vec<_>>();
                                 (
-                                    match git_service::stage(&repo_path, &file_refs) {
+                                    match require_bound_git_repository(&bound_repository)
+                                        .and_then(|repository| git_service::stage(repository, &file_refs))
+                                    {
                                         Ok(()) => RemoteActionResult::ok(None, None),
                                         Err(error) => RemoteActionResult::error(error),
                                     },
                                     None,
                                 )
                             }
-                            RemoteAction::GitUnstage { repo_path, files } => {
+                            RemoteAction::GitUnstage { files, .. } => {
                                 let file_refs =
                                     files.iter().map(|file| file.as_str()).collect::<Vec<_>>();
                                 (
-                                    match git_service::unstage(&repo_path, &file_refs) {
+                                    match require_bound_git_repository(&bound_repository)
+                                        .and_then(|repository| git_service::unstage(repository, &file_refs))
+                                    {
                                         Ok(()) => RemoteActionResult::ok(None, None),
                                         Err(error) => RemoteActionResult::error(error),
                                     },
                                     None,
                                 )
                             }
-                            RemoteAction::GitStageAll { repo_path } => (
-                                match git_service::stage_all(&repo_path) {
+                            RemoteAction::GitStageAll { .. } => (
+                                match require_bound_git_repository(&bound_repository)
+                                    .and_then(git_service::stage_all)
+                                {
                                     Ok(()) => RemoteActionResult::ok(None, None),
                                     Err(error) => RemoteActionResult::error(error),
                                 },
                                 None,
                             ),
-                            RemoteAction::GitUnstageAll { repo_path } => (
-                                match git_service::unstage_all(&repo_path) {
+                            RemoteAction::GitUnstageAll { .. } => (
+                                match require_bound_git_repository(&bound_repository)
+                                    .and_then(git_service::unstage_all)
+                                {
                                     Ok(()) => RemoteActionResult::ok(None, None),
                                     Err(error) => RemoteActionResult::error(error),
                                 },
                                 None,
                             ),
                             RemoteAction::GitCommit {
-                                repo_path,
                                 summary,
                                 body,
+                                ..
                             } => (
-                                match git_service::commit(&repo_path, &summary, body.as_deref()) {
+                                match require_bound_git_repository(&bound_repository)
+                                    .and_then(|repository| {
+                                        git_service::commit(repository, &summary, body.as_deref())
+                                    }) {
                                     Ok(hash) => RemoteActionResult::ok(
                                         None,
                                         Some(RemoteActionPayload::GitCommit { hash }),
@@ -6608,57 +6935,74 @@ impl NativeShell {
                                 },
                                 None,
                             ),
-                            RemoteAction::GitPush { repo_path } => (
-                                match git_service::push(&repo_path) {
+                            RemoteAction::GitPush { .. } => (
+                                match require_bound_git_repository(&bound_repository)
+                                    .and_then(git_service::push)
+                                {
                                     Ok(message) => RemoteActionResult::ok(Some(message), None),
                                     Err(error) => RemoteActionResult::error(error),
                                 },
                                 None,
                             ),
-                            RemoteAction::GitPushSetUpstream { repo_path, branch } => (
-                                match git_service::push_set_upstream(&repo_path, &branch) {
+                            RemoteAction::GitPushSetUpstream { branch, .. } => (
+                                match require_bound_git_repository(&bound_repository)
+                                    .and_then(|repository| {
+                                        git_service::push_set_upstream(repository, &branch)
+                                    }) {
                                     Ok(message) => RemoteActionResult::ok(Some(message), None),
                                     Err(error) => RemoteActionResult::error(error),
                                 },
                                 None,
                             ),
-                            RemoteAction::GitPull { repo_path } => (
-                                match git_service::pull(&repo_path) {
+                            RemoteAction::GitPull { .. } => (
+                                match require_bound_git_repository(&bound_repository)
+                                    .and_then(git_service::pull)
+                                {
                                     Ok(message) => RemoteActionResult::ok(Some(message), None),
                                     Err(error) => RemoteActionResult::error(error),
                                 },
                                 None,
                             ),
-                            RemoteAction::GitFetch { repo_path } => (
-                                match git_service::fetch(&repo_path) {
+                            RemoteAction::GitFetch { .. } => (
+                                match require_bound_git_repository(&bound_repository)
+                                    .and_then(git_service::fetch)
+                                {
                                     Ok(message) => RemoteActionResult::ok(Some(message), None),
                                     Err(error) => RemoteActionResult::error(error),
                                 },
                                 None,
                             ),
-                            RemoteAction::GitSync { repo_path } => (
-                                match git_service::sync(&repo_path) {
+                            RemoteAction::GitSync { .. } => (
+                                match require_bound_git_repository(&bound_repository)
+                                    .and_then(git_service::sync)
+                                {
                                     Ok(message) => RemoteActionResult::ok(Some(message), None),
                                     Err(error) => RemoteActionResult::error(error),
                                 },
                                 None,
                             ),
-                            RemoteAction::GitSwitchBranch { repo_path, name } => (
-                                match git_service::switch_branch(&repo_path, &name) {
+                            RemoteAction::GitSwitchBranch { name, .. } => (
+                                match require_bound_git_repository(&bound_repository)
+                                    .and_then(|repository| git_service::switch_branch(repository, &name))
+                                {
                                     Ok(()) => RemoteActionResult::ok(None, None),
                                     Err(error) => RemoteActionResult::error(error),
                                 },
                                 None,
                             ),
-                            RemoteAction::GitCreateBranch { repo_path, name } => (
-                                match git_service::create_branch(&repo_path, &name) {
+                            RemoteAction::GitCreateBranch { name, .. } => (
+                                match require_bound_git_repository(&bound_repository)
+                                    .and_then(|repository| git_service::create_branch(repository, &name))
+                                {
                                     Ok(()) => RemoteActionResult::ok(None, None),
                                     Err(error) => RemoteActionResult::error(error),
                                 },
                                 None,
                             ),
-                            RemoteAction::GitDeleteBranch { repo_path, name } => (
-                                match git_service::delete_branch(&repo_path, &name) {
+                            RemoteAction::GitDeleteBranch { name, .. } => (
+                                match require_bound_git_repository(&bound_repository)
+                                    .and_then(|repository| git_service::delete_branch(repository, &name))
+                                {
                                     Ok(()) => RemoteActionResult::ok(None, None),
                                     Err(error) => RemoteActionResult::error(error),
                                 },
@@ -6759,9 +7103,11 @@ impl NativeShell {
                                 RemoteActionResult::ok(None, None),
                                 Some(GitHostMutation::SetGithubToken(None)),
                             ),
-                            RemoteAction::GitGenerateCommitMessage { repo_path } => {
+                            RemoteAction::GitGenerateCommitMessage { .. } => {
                                 if let Some(token) = host_token.clone() {
-                                    match git_service::get_staged_diff(&repo_path) {
+                                    match require_bound_git_repository(&bound_repository)
+                                        .and_then(git_service::get_staged_diff)
+                                    {
                                         Ok(diff) if diff.trim().is_empty() => (
                                             RemoteActionResult::error(
                                                 "No staged changes to summarize",
@@ -6807,6 +7153,9 @@ impl NativeShell {
                     let _ = this.update(&mut cx, |this, cx| {
                         match mutation {
                             GitHostMutation::SetGithubToken(token) => {
+                                if !this.ensure_config_mutation_available(cx) {
+                                    return;
+                                }
                                 let mut settings = this.state.settings().clone();
                                 settings.github_token = token;
                                 this.state.update_settings(settings);
@@ -6880,24 +7229,13 @@ impl NativeShell {
                                 Some("Stopped all running server tabs.".to_string());
                         }
                     }
-                    ProcessOpKind::StartServer
-                    | ProcessOpKind::RestartServer
-                    | ProcessOpKind::KillPortAndRestart => {
+                    ProcessOpKind::StartServer | ProcessOpKind::RestartServer => {
                         if let Some(command_id) = completion.context.session_id.as_deref() {
                             if completion.context.focus {
                                 self.synced_session_id = Some(command_id.to_string());
                             }
                             self.terminal_notice = None;
                             self.terminal_actionable_notice = None;
-                            if completion.kind == ProcessOpKind::KillPortAndRestart {
-                                if let Some(port) = completion.context.port {
-                                    self.record_port_kill_feedback(
-                                        command_id,
-                                        port,
-                                        PortKillFeedback::Killed,
-                                    );
-                                }
-                            }
                         }
                     }
                     ProcessOpKind::StartSsh | ProcessOpKind::RestartSsh => {
@@ -6915,7 +7253,30 @@ impl NativeShell {
                             self.pending_window_close = false;
                             self.pending_shutdown_op_id = None;
                             self.terminal_actionable_notice = None;
-                            let termination = if self.pending_install_update.take().is_some() {
+                            let termination = if let Some(token_id) =
+                                self.pending_update_handoff_token.take()
+                            {
+                                match self.updater.launch_verified_installer(token_id) {
+                                    Ok(outcome) => {
+                                        let _ = self.pending_install_update.take();
+                                        self.editor_notice = Some(format!(
+                                            "Installer for {} launched; exiting old process.",
+                                            outcome.version
+                                        ));
+                                        PendingAppTermination::ExitAfterUpdate
+                                    }
+                                    Err(error) => {
+                                        let _ = self.updater.abort_update_handoff();
+                                        let _ = self.pending_install_update.take();
+                                        self.resume_browser_window_after_canceled_shutdown();
+                                        self.editor_notice = Some(format!(
+                                                "Installer launch failed after drain; host resumed for retry: {error}"
+                                            ));
+                                        // Stay interactive; do not force quit after abortable failure.
+                                        continue;
+                                    }
+                                }
+                            } else if self.pending_install_update.take().is_some() {
                                 PendingAppTermination::ExitAfterUpdate
                             } else {
                                 PendingAppTermination::Quit
@@ -6934,23 +7295,9 @@ impl NativeShell {
                 did_change = true;
             } else if let Err(error) = completion.result {
                 match completion.kind {
-                    ProcessOpKind::StartServer
-                    | ProcessOpKind::RestartServer
-                    | ProcessOpKind::KillPortAndRestart => {
+                    ProcessOpKind::StartServer | ProcessOpKind::RestartServer => {
                         self.terminal_notice =
                             Some(format!("Failed to run server action: {error}"));
-                        if completion.kind == ProcessOpKind::KillPortAndRestart {
-                            if let (Some(command_id), Some(port)) = (
-                                completion.context.session_id.as_deref(),
-                                completion.context.port,
-                            ) {
-                                self.record_port_kill_feedback(
-                                    command_id,
-                                    port,
-                                    PortKillFeedback::Error,
-                                );
-                            }
-                        }
                     }
                     ProcessOpKind::StopServer => {
                         self.terminal_notice = Some(format!(
@@ -7014,13 +7361,20 @@ impl NativeShell {
         let mut did_change = false;
 
         for request in requests {
-            let PendingRemoteRequest {
-                client_id: _client_id,
-                action,
-                response,
-            } = request;
+            let (_client_id, git_authority, action, mut response) = request.into_host_parts();
 
-            if self.spawn_remote_git_request_if_needed(&action, response.clone(), cx) {
+            if self.reject_unavailable_config_remote_action(&action, &mut response, cx) {
+                continue;
+            }
+
+            let bound_repository = git_action_repository(&action, git_authority.as_ref());
+
+            if self.spawn_remote_git_request_if_needed(
+                &action,
+                response.clone(),
+                bound_repository.clone(),
+                cx,
+            ) {
                 continue;
             }
 
@@ -7037,6 +7391,11 @@ impl NativeShell {
                     {
                         RemoteActionResult::error(error)
                     } else {
+                        let port = self
+                            .state
+                            .find_command(&command_id)
+                            .and_then(|lookup| lookup.command.port);
+                        self.invalidate_server_port_snapshot(port);
                         if focus {
                             self.interrupt_active_browser_replay_before_route_change(None);
                         }
@@ -7059,6 +7418,11 @@ impl NativeShell {
                     }
                 }
                 RemoteAction::StopServer { command_id } => {
+                    let port = self
+                        .state
+                        .find_command(&command_id)
+                        .and_then(|lookup| lookup.command.port);
+                    self.invalidate_server_port_snapshot(port);
                     match self.process_manager.enqueue_stop_server_and_wait(
                         &command_id,
                         Duration::ZERO,
@@ -7083,6 +7447,11 @@ impl NativeShell {
                     {
                         RemoteActionResult::error(error)
                     } else {
+                        let port = self
+                            .state
+                            .find_command(&command_id)
+                            .and_then(|lookup| lookup.command.port);
+                        self.invalidate_server_port_snapshot(port);
                         self.interrupt_active_browser_replay_before_route_change(None);
                         match self.process_manager.restart_server_with_remote_response(
                             &mut self.state,
@@ -7370,6 +7739,13 @@ impl NativeShell {
                     }
                 }
                 RemoteAction::CloseTab { tab_id } => {
+                    let closes_server = self
+                        .state
+                        .find_tab(&tab_id)
+                        .is_some_and(|tab| matches!(tab.tab_type, TabType::Server));
+                    if closes_server {
+                        self.invalidate_server_port_snapshot(None);
+                    }
                     let workspace_key =
                         browser_workspace_key_for_ai_tab(self.state.find_ai_tab(&tab_id));
                     if let Some(workspace_key) = workspace_key.as_ref() {
@@ -7387,6 +7763,7 @@ impl NativeShell {
                     }
                 }
                 RemoteAction::StopAllServers => {
+                    self.invalidate_server_port_snapshot(None);
                     let stopped = self.process_manager.stop_all_servers();
                     if stopped > 0 {
                         did_change = true;
@@ -7624,36 +8001,42 @@ impl NativeShell {
                         repos: collect_git_repositories(&self.state),
                     }),
                 ),
-                RemoteAction::GitStatus { repo_path } => match git_service::status(&repo_path) {
-                    Ok(status) => RemoteActionResult::ok(
-                        None,
-                        Some(RemoteActionPayload::GitStatus { status }),
-                    ),
-                    Err(error) => RemoteActionResult::error(error),
-                },
-                RemoteAction::GitLog {
-                    repo_path,
-                    limit,
-                    skip,
-                } => match git_service::log(&repo_path, limit, skip) {
-                    Ok(entries) => RemoteActionResult::ok(
-                        None,
-                        Some(RemoteActionPayload::GitLogEntries { entries }),
-                    ),
-                    Err(error) => RemoteActionResult::error(error),
-                },
+                RemoteAction::GitStatus { .. } => {
+                    match require_bound_git_repository(&bound_repository)
+                        .and_then(git_service::status)
+                    {
+                        Ok(status) => RemoteActionResult::ok(
+                            None,
+                            Some(RemoteActionPayload::GitStatus { status }),
+                        ),
+                        Err(error) => RemoteActionResult::error(error),
+                    }
+                }
+                RemoteAction::GitLog { limit, skip, .. } => {
+                    match require_bound_git_repository(&bound_repository)
+                        .and_then(|repository| git_service::log(repository, limit, skip))
+                    {
+                        Ok(entries) => RemoteActionResult::ok(
+                            None,
+                            Some(RemoteActionPayload::GitLogEntries { entries }),
+                        ),
+                        Err(error) => RemoteActionResult::error(error),
+                    }
+                }
                 RemoteAction::GitDiffFile {
-                    repo_path,
-                    file_path,
-                    staged,
-                } => match git_service::diff_file(&repo_path, &file_path, staged) {
+                    file_path, staged, ..
+                } => match require_bound_git_repository(&bound_repository)
+                    .and_then(|repository| git_service::diff_file(repository, &file_path, staged))
+                {
                     Ok(diff) => {
                         RemoteActionResult::ok(None, Some(RemoteActionPayload::GitDiff { diff }))
                     }
                     Err(error) => RemoteActionResult::error(error),
                 },
-                RemoteAction::GitDiffCommit { repo_path, hash } => {
-                    match git_service::diff_commit(&repo_path, &hash) {
+                RemoteAction::GitDiffCommit { hash, .. } => {
+                    match require_bound_git_repository(&bound_repository)
+                        .and_then(|repository| git_service::diff_commit(repository, &hash))
+                    {
                         Ok(diff) => RemoteActionResult::ok(
                             None,
                             Some(RemoteActionPayload::GitDiff { diff }),
@@ -7661,8 +8044,10 @@ impl NativeShell {
                         Err(error) => RemoteActionResult::error(error),
                     }
                 }
-                RemoteAction::GitBranches { repo_path } => {
-                    match git_service::branches(&repo_path) {
+                RemoteAction::GitBranches { .. } => {
+                    match require_bound_git_repository(&bound_repository)
+                        .and_then(git_service::branches)
+                    {
                         Ok(branches) => RemoteActionResult::ok(
                             None,
                             Some(RemoteActionPayload::GitBranches { branches }),
@@ -7670,77 +8055,111 @@ impl NativeShell {
                         Err(error) => RemoteActionResult::error(error),
                     }
                 }
-                RemoteAction::GitStage { repo_path, files } => {
+                RemoteAction::GitStage { files, .. } => {
                     let file_refs = files.iter().map(|file| file.as_str()).collect::<Vec<_>>();
-                    match git_service::stage(&repo_path, &file_refs) {
+                    match require_bound_git_repository(&bound_repository)
+                        .and_then(|repository| git_service::stage(repository, &file_refs))
+                    {
                         Ok(()) => RemoteActionResult::ok(None, None),
                         Err(error) => RemoteActionResult::error(error),
                     }
                 }
-                RemoteAction::GitUnstage { repo_path, files } => {
+                RemoteAction::GitUnstage { files, .. } => {
                     let file_refs = files.iter().map(|file| file.as_str()).collect::<Vec<_>>();
-                    match git_service::unstage(&repo_path, &file_refs) {
+                    match require_bound_git_repository(&bound_repository)
+                        .and_then(|repository| git_service::unstage(repository, &file_refs))
+                    {
                         Ok(()) => RemoteActionResult::ok(None, None),
                         Err(error) => RemoteActionResult::error(error),
                     }
                 }
-                RemoteAction::GitStageAll { repo_path } => match git_service::stage_all(&repo_path)
-                {
-                    Ok(()) => RemoteActionResult::ok(None, None),
-                    Err(error) => RemoteActionResult::error(error),
-                },
-                RemoteAction::GitUnstageAll { repo_path } => {
-                    match git_service::unstage_all(&repo_path) {
+                RemoteAction::GitStageAll { .. } => {
+                    match require_bound_git_repository(&bound_repository)
+                        .and_then(git_service::stage_all)
+                    {
                         Ok(()) => RemoteActionResult::ok(None, None),
                         Err(error) => RemoteActionResult::error(error),
                     }
                 }
-                RemoteAction::GitCommit {
-                    repo_path,
-                    summary,
-                    body,
-                } => match git_service::commit(&repo_path, &summary, body.as_deref()) {
-                    Ok(hash) => {
-                        RemoteActionResult::ok(None, Some(RemoteActionPayload::GitCommit { hash }))
+                RemoteAction::GitUnstageAll { .. } => {
+                    match require_bound_git_repository(&bound_repository)
+                        .and_then(git_service::unstage_all)
+                    {
+                        Ok(()) => RemoteActionResult::ok(None, None),
+                        Err(error) => RemoteActionResult::error(error),
                     }
-                    Err(error) => RemoteActionResult::error(error),
-                },
-                RemoteAction::GitPush { repo_path } => match git_service::push(&repo_path) {
-                    Ok(message) => RemoteActionResult::ok(Some(message), None),
-                    Err(error) => RemoteActionResult::error(error),
-                },
-                RemoteAction::GitPushSetUpstream { repo_path, branch } => {
-                    match git_service::push_set_upstream(&repo_path, &branch) {
+                }
+                RemoteAction::GitCommit { summary, body, .. } => {
+                    match require_bound_git_repository(&bound_repository).and_then(|repository| {
+                        git_service::commit(repository, &summary, body.as_deref())
+                    }) {
+                        Ok(hash) => RemoteActionResult::ok(
+                            None,
+                            Some(RemoteActionPayload::GitCommit { hash }),
+                        ),
+                        Err(error) => RemoteActionResult::error(error),
+                    }
+                }
+                RemoteAction::GitPush { .. } => {
+                    match require_bound_git_repository(&bound_repository)
+                        .and_then(git_service::push)
+                    {
                         Ok(message) => RemoteActionResult::ok(Some(message), None),
                         Err(error) => RemoteActionResult::error(error),
                     }
                 }
-                RemoteAction::GitPull { repo_path } => match git_service::pull(&repo_path) {
-                    Ok(message) => RemoteActionResult::ok(Some(message), None),
-                    Err(error) => RemoteActionResult::error(error),
-                },
-                RemoteAction::GitFetch { repo_path } => match git_service::fetch(&repo_path) {
-                    Ok(message) => RemoteActionResult::ok(Some(message), None),
-                    Err(error) => RemoteActionResult::error(error),
-                },
-                RemoteAction::GitSync { repo_path } => match git_service::sync(&repo_path) {
-                    Ok(message) => RemoteActionResult::ok(Some(message), None),
-                    Err(error) => RemoteActionResult::error(error),
-                },
-                RemoteAction::GitSwitchBranch { repo_path, name } => {
-                    match git_service::switch_branch(&repo_path, &name) {
+                RemoteAction::GitPushSetUpstream { branch, .. } => {
+                    match require_bound_git_repository(&bound_repository)
+                        .and_then(|repository| git_service::push_set_upstream(repository, &branch))
+                    {
+                        Ok(message) => RemoteActionResult::ok(Some(message), None),
+                        Err(error) => RemoteActionResult::error(error),
+                    }
+                }
+                RemoteAction::GitPull { .. } => {
+                    match require_bound_git_repository(&bound_repository)
+                        .and_then(git_service::pull)
+                    {
+                        Ok(message) => RemoteActionResult::ok(Some(message), None),
+                        Err(error) => RemoteActionResult::error(error),
+                    }
+                }
+                RemoteAction::GitFetch { .. } => {
+                    match require_bound_git_repository(&bound_repository)
+                        .and_then(git_service::fetch)
+                    {
+                        Ok(message) => RemoteActionResult::ok(Some(message), None),
+                        Err(error) => RemoteActionResult::error(error),
+                    }
+                }
+                RemoteAction::GitSync { .. } => {
+                    match require_bound_git_repository(&bound_repository)
+                        .and_then(git_service::sync)
+                    {
+                        Ok(message) => RemoteActionResult::ok(Some(message), None),
+                        Err(error) => RemoteActionResult::error(error),
+                    }
+                }
+                RemoteAction::GitSwitchBranch { name, .. } => {
+                    match require_bound_git_repository(&bound_repository)
+                        .and_then(|repository| git_service::switch_branch(repository, &name))
+                    {
                         Ok(()) => RemoteActionResult::ok(None, None),
                         Err(error) => RemoteActionResult::error(error),
                     }
                 }
-                RemoteAction::GitCreateBranch { repo_path, name } => {
-                    match git_service::create_branch(&repo_path, &name) {
+                RemoteAction::GitCreateBranch { name, .. } => {
+                    match require_bound_git_repository(&bound_repository)
+                        .and_then(|repository| git_service::create_branch(repository, &name))
+                    {
                         Ok(()) => RemoteActionResult::ok(None, None),
                         Err(error) => RemoteActionResult::error(error),
                     }
                 }
-                RemoteAction::GitDeleteBranch { repo_path, name } => {
-                    match git_service::delete_branch(&repo_path, &name) {
+                RemoteAction::GitDeleteBranch { name, .. } => {
+                    match require_bound_git_repository(&bound_repository)
+                        .and_then(|repository| git_service::delete_branch(repository, &name))
+                    {
                         Ok(()) => RemoteActionResult::ok(None, None),
                         Err(error) => RemoteActionResult::error(error),
                     }
@@ -7823,7 +8242,7 @@ impl NativeShell {
                     did_change = true;
                     RemoteActionResult::ok(None, None)
                 }
-                RemoteAction::GitGenerateCommitMessage { repo_path } => {
+                RemoteAction::GitGenerateCommitMessage { .. } => {
                     if let Some(token) = self
                         .state
                         .settings()
@@ -7831,7 +8250,9 @@ impl NativeShell {
                         .clone()
                         .filter(|token| !token.trim().is_empty())
                     {
-                        match git_service::get_staged_diff(&repo_path) {
+                        match require_bound_git_repository(&bound_repository)
+                            .and_then(git_service::get_staged_diff)
+                        {
                             Ok(diff) if diff.trim().is_empty() => {
                                 RemoteActionResult::error("No staged changes to summarize")
                             }
@@ -7943,7 +8364,8 @@ impl NativeShell {
         };
         let metrics = self.terminal_render_metrics(window);
         let available_width = if self.state.settings().show_terminal_scrollbar {
-            (layout.available_width - view::TERMINAL_SCROLLBAR_WIDTH_PX).max(metrics.cell_width)
+            (layout.available_width - view::terminal_scrollbar_spec().gutter_width)
+                .max(metrics.cell_width)
         } else {
             layout.available_width
         };
@@ -7967,6 +8389,7 @@ impl NativeShell {
         if !self.ensure_mutation_control(cx) {
             return;
         }
+        self.invalidate_server_port_snapshot(None);
         if self.remote_mode.is_some() {
             self.remote_send_action(RemoteAction::StopAllServers);
             self.terminal_notice = Some("Stopping remote server tab(s)...".to_string());
@@ -7995,6 +8418,9 @@ impl NativeShell {
 
         if !self.ensure_mutation_control(cx) {
             return;
+        }
+        if matches!(tab.tab_type, TabType::Server) {
+            self.invalidate_server_port_snapshot(None);
         }
         if let Some(workspace_key) = browser_workspace_key_for_ai_tab(Some(&tab)) {
             self.interrupt_browser_workspace_before_teardown(&workspace_key);
@@ -8068,10 +8494,7 @@ impl NativeShell {
 
     fn export_config_action(&mut self, cx: &mut Context<Self>) {
         let _dialog_pause = self.pause_for_native_dialog();
-        match self
-            .session_manager
-            .export_config_dialog(&self.state.config)
-        {
+        match self.session_manager.export_config_dialog() {
             Ok(Some(path)) => {
                 self.editor_notice = Some(format!("Exported config to {}", path.display()));
             }
@@ -8084,6 +8507,9 @@ impl NativeShell {
     }
 
     fn import_config_action(&mut self, mode: ConfigImportMode, cx: &mut Context<Self>) {
+        if !self.ensure_mutation_control(cx) {
+            return;
+        }
         let _dialog_pause = self.pause_for_native_dialog();
         match self
             .session_manager
@@ -8107,6 +8533,9 @@ impl NativeShell {
         source_path: &std::path::Path,
         cx: &mut Context<Self>,
     ) {
+        if !self.ensure_mutation_control(cx) {
+            return;
+        }
         let replace_disables_browser = matches!(mode, ConfigImportMode::Replace)
             && self.state.settings().browser_enabled
             && !config.settings.browser_enabled;
@@ -8224,20 +8653,29 @@ impl NativeShell {
     }
 
     fn install_update_action(&mut self, cx: &mut Context<Self>) {
-        match self.updater.install_update() {
-            Ok(version) => {
+        // Windows order: host admission/drain first, resource shutdown next,
+        // installer launch last (irreversible). Never assume code runs after packager exits.
+        match self
+            .updater
+            .prepare_update_install(crate::updater::InstallUpdateOptions::default())
+        {
+            Ok(token) => {
                 promote_pending_app_termination_for_update(&mut self.pending_app_termination);
                 let _ = self.begin_browser_window_teardown(cx);
                 self.save_session_state();
                 match self.process_manager.schedule_shutdown(APP_SHUTDOWN_TIMEOUT) {
                     Ok(op_id) => {
                         self.pending_shutdown_op_id = Some(op_id);
-                        self.pending_install_update = Some(version.clone());
+                        self.pending_install_update = Some(token.target_version.clone());
+                        self.pending_update_handoff_token = Some(token.token_id);
                         self.editor_notice = Some(format!(
-                            "Installer for {version} launched. Shutting down managed processes..."
+                            "Update {} admitted. Draining resources before installer launch...",
+                            token.target_version
                         ));
                     }
                     Err(error) => {
+                        let _ = self.updater.abort_update_handoff();
+                        self.pending_update_handoff_token = None;
                         self.resume_browser_window_after_canceled_shutdown();
                         self.editor_notice =
                             Some(format!("Failed to start shutdown before update: {error}"));
@@ -8562,6 +9000,20 @@ impl NativeShell {
         remote_client: Option<RemoteClientHandle>,
         cx: &mut Context<Self>,
     ) {
+        let (repos, local_repositories) = if remote_client.is_none() {
+            let mut local_repositories = Vec::new();
+            let repos = repos
+                .into_iter()
+                .filter_map(|(label, path)| {
+                    let repository = local_host_git_repository(&path).ok()?;
+                    local_repositories.push(repository);
+                    Some((label, path))
+                })
+                .collect::<Vec<_>>();
+            (repos, local_repositories)
+        } else {
+            (repos, Vec::new())
+        };
         if repos.is_empty() {
             self.editor_notice = Some("No Git repositories were found.".to_string());
             cx.notify();
@@ -8582,11 +9034,12 @@ impl NativeShell {
             |_window, cx| {
                 let repos = repos.clone();
                 let remote_client = remote_client.clone();
+                let local_repositories = local_repositories.clone();
                 cx.new(move |cx| {
                     if let Some(client) = remote_client.clone() {
                         crate::git::GitWindow::new_remote(repos, client, cx)
                     } else {
-                        crate::git::GitWindow::new(repos, cx)
+                        crate::git::GitWindow::new_local(repos, local_repositories, cx)
                     }
                 })
             },
@@ -8650,10 +9103,14 @@ impl NativeShell {
                     cx.notify();
                 }
             }
-            process_monitor::ProcessMonitorAction::KillProcess { session_id, pid } => {
+            process_monitor::ProcessMonitorAction::KillProcess {
+                session_id,
+                pid,
+                fence,
+            } => {
                 match self
                     .process_manager
-                    .enqueue_kill_process(&session_id, pid, None)
+                    .enqueue_kill_process(&session_id, pid, fence, None)
                 {
                     Ok(()) => {
                         self.terminal_notice =
@@ -8665,10 +9122,14 @@ impl NativeShell {
                 }
                 cx.notify();
             }
-            process_monitor::ProcessMonitorAction::KillProcessTree { session_id, pid } => {
+            process_monitor::ProcessMonitorAction::KillProcessTree {
+                session_id,
+                pid,
+                fence,
+            } => {
                 match self
                     .process_manager
-                    .enqueue_kill_process_tree(&session_id, pid, None)
+                    .enqueue_kill_process_tree(&session_id, pid, fence, None)
                 {
                     Ok(()) => {
                         self.terminal_notice =
@@ -8697,6 +9158,12 @@ impl NativeShell {
 
         let result = match session.session_kind {
             SessionKind::Server => {
+                self.invalidate_server_port_snapshot(
+                    session
+                        .server_launch
+                        .as_ref()
+                        .and_then(|launch| launch.port),
+                );
                 let command_id = session
                     .command_id
                     .clone()
@@ -10017,6 +10484,17 @@ impl NativeShell {
         let Some(panel) = self.editor_panel.clone() else {
             return;
         };
+
+        if matches!(
+            panel,
+            EditorPanel::Project(_)
+                | EditorPanel::Folder(_)
+                | EditorPanel::Command(_)
+                | EditorPanel::Ssh(_)
+        ) && !self.ensure_mutation_control(cx)
+        {
+            return;
+        }
 
         match panel {
             EditorPanel::Settings(_) => {}
@@ -11701,21 +12179,6 @@ impl NativeShell {
             self.terminal_actionable_notice
                 .as_ref()
                 .and_then(|notice| match notice {
-                    ActionableNotice::PortInUse {
-                        command_id,
-                        message,
-                        ..
-                    } => {
-                        if command_id.as_str() == active_spec.session_id.as_str() {
-                            Some(view::TerminalActionableNotice {
-                                message: message.clone(),
-                                action_label: "Kill process & start server",
-                                action_color: theme::DANGER_TEXT,
-                            })
-                        } else {
-                            None
-                        }
-                    }
                     ActionableNotice::ForceQuit { message } => {
                         Some(view::TerminalActionableNotice {
                             message: message.clone(),
@@ -11806,11 +12269,12 @@ impl NativeShell {
         session: Option<&crate::terminal::session::TerminalSessionView>,
     ) -> Option<view::TerminalScrollbarModel> {
         let session = session?;
-        scrollbar_model_for_screen(
+        view::scrollbar_model_for_screen(
             &session.screen,
             self.terminal_scrollbar_drag
                 .map(|drag| drag.thumb_top_ratio),
             self.state.settings().show_terminal_scrollbar,
+            self.terminal_scrollbar_hovered,
         )
     }
 
@@ -11828,21 +12292,33 @@ impl NativeShell {
         let visible_lines = session.screen.rows.max(1);
         let max_offset = session.screen.history_size.max(1);
 
-        let left = layout.left + layout.available_width - view::TERMINAL_SCROLLBAR_WIDTH_PX;
+        // The drag side and the paint side must agree exactly or the thumb
+        // jumps under the pointer, so both go through the one geometry in
+        // `crate::ui::scrollbar` rather than each doing the arithmetic.
+        let spec = view::terminal_scrollbar_spec();
+        let left = layout.left + layout.available_width - spec.gutter_width;
         let top = layout.top - 2.0;
-        let width = view::TERMINAL_SCROLLBAR_WIDTH_PX;
+        let width = spec.gutter_width;
         let height = layout.available_height + 4.0;
-        let track_top = top + view::TERMINAL_SCROLLBAR_TRACK_INSET_Y_PX;
-        let track_height = (height - view::TERMINAL_SCROLLBAR_TRACK_INSET_Y_PX * 2.0).max(12.0);
-        let thumb_height = (track_height
-            * (visible_lines as f32 / total_lines as f32).clamp(0.08, 1.0))
-        .max(view::TERMINAL_SCROLLBAR_MIN_THUMB_HEIGHT_PX)
-        .min(track_height);
-        let thumb_range = (track_height - thumb_height).max(0.0);
-        let thumb_top = track_top
-            + thumb_range
-                * scrollbar_thumb_top_ratio(session.screen.display_offset, max_offset)
-                    .clamp(0.0, 1.0);
+        // No local minimum: the one min-thumb rule is `min_thumb_length` inside
+        // `thumb_geometry`, so a second clamp here would be a second rule that
+        // the paint path does not share.
+        let visible_fraction = visible_lines as f32 / total_lines as f32;
+        let scroll_fraction =
+            view::scrollbar_thumb_top_ratio(session.screen.display_offset, max_offset)
+                .clamp(0.0, 1.0);
+        let track = crate::ui::scrollbar::track_geometry(spec, height);
+        let thumb = crate::ui::scrollbar::thumb_geometry(
+            spec,
+            height,
+            visible_fraction,
+            scroll_fraction,
+            true,
+        )?;
+        let track_top = top + track.top;
+        let track_height = track.height;
+        let thumb_height = thumb.height;
+        let thumb_top = top + thumb.top;
 
         Some(TerminalScrollbarGeometry {
             left,
@@ -11870,15 +12346,6 @@ impl NativeShell {
             && y <= geometry.top + geometry.height
     }
 
-    fn scrollbar_thumb_contains(
-        &self,
-        position: Point<Pixels>,
-        geometry: TerminalScrollbarGeometry,
-    ) -> bool {
-        let y: f32 = position.y.into();
-        y >= geometry.thumb_top && y <= geometry.thumb_top + geometry.thumb_height
-    }
-
     fn scroll_terminal_from_scrollbar(
         &mut self,
         position: Point<Pixels>,
@@ -11889,9 +12356,9 @@ impl NativeShell {
             return;
         };
 
-        let thumb_top_ratio = scrollbar_ratio_for_position(position, geometry, drag.grab_offset_px);
+        let thumb_top_ratio = scrollbar_ratio_for_position(position, geometry, drag.grab);
         let display_offset =
-            display_offset_for_scrollbar_ratio(thumb_top_ratio, geometry.max_offset);
+            view::display_offset_for_scrollbar_ratio(thumb_top_ratio, geometry.max_offset);
         let ratio_changed = (drag.thumb_top_ratio - thumb_top_ratio).abs() > 0.0001;
         let offset_changed = drag.last_display_offset != display_offset;
 
@@ -11955,9 +12422,34 @@ impl NativeShell {
     }
 
     fn sync_server_port_snapshot(&mut self, runtime: &RuntimeState, cx: &mut Context<Self>) {
+        let server_lifecycle_generation = self.process_manager.server_lifecycle_generation();
+        if self.server_port_snapshot.server_lifecycle_generation != server_lifecycle_generation {
+            self.invalidate_server_port_snapshot(None);
+            self.server_port_snapshot.server_lifecycle_generation = server_lifecycle_generation;
+        }
         let (tracked_ports, refresh_interval) = server_port_snapshot_plan(&self.state, runtime);
         if tracked_ports.is_empty() {
-            self.server_port_snapshot = ServerPortSnapshotState::default();
+            // Keep the ProcessManager-owned coordinator even while the
+            // current config has no tracked ports. Replacing the state with a
+            // fresh inventory here would split later starts onto a second
+            // reservation/scan owner after a command is added again.
+            self.server_port_snapshot.tracked_ports.clear();
+            self.server_port_snapshot.statuses.clear();
+            self.server_port_snapshot.authorities.clear();
+            self.server_port_snapshot.probe_failures.clear();
+            clear_server_port_source_metadata(&mut self.server_port_snapshot);
+            self.server_port_snapshot.last_checked_at = None;
+            self.server_port_snapshot.refresh_in_flight = false;
+            self.server_port_snapshot.refresh_generation = self
+                .server_port_snapshot
+                .refresh_generation
+                .saturating_add(1);
+            self.server_port_snapshot.task_action_epoch = self
+                .server_port_snapshot
+                .task_action_epoch
+                .saturating_add(1);
+            self.server_port_snapshot.active_refresh = None;
+            clear_active_port_state_for_untracked_ports(&mut self.active_port_state, &[]);
             return;
         }
 
@@ -11966,24 +12458,87 @@ impl NativeShell {
             self.server_port_snapshot
                 .statuses
                 .retain(|port, _| tracked_ports.binary_search(port).is_ok());
+            self.server_port_snapshot
+                .authorities
+                .retain(|port, _| tracked_ports.binary_search(port).is_ok());
+            self.server_port_snapshot
+                .probe_failures
+                .retain(|port, _| tracked_ports.binary_search(port).is_ok());
+            clear_server_port_source_metadata(&mut self.server_port_snapshot);
             self.server_port_snapshot.last_checked_at = None;
+            self.server_port_snapshot.refresh_generation = self
+                .server_port_snapshot
+                .refresh_generation
+                .saturating_add(1);
+            self.server_port_snapshot.task_action_epoch = self
+                .server_port_snapshot
+                .task_action_epoch
+                .saturating_add(1);
+            self.server_port_snapshot.refresh_in_flight = false;
+            self.server_port_snapshot.active_refresh = None;
+            clear_active_port_state_for_untracked_ports(
+                &mut self.active_port_state,
+                &tracked_ports,
+            );
         }
 
-        let missing_status = tracked_ports
-            .iter()
-            .any(|port| !self.server_port_snapshot.statuses.contains_key(port));
-        let should_refresh = missing_status
-            || self
-                .server_port_snapshot
-                .last_checked_at
-                .map(|checked_at| checked_at.elapsed() >= refresh_interval)
-                .unwrap_or(true);
+        let should_refresh = self
+            .server_port_snapshot
+            .last_checked_at
+            .map(|checked_at| checked_at.elapsed() >= refresh_interval)
+            .unwrap_or(true);
         if !should_refresh || self.server_port_snapshot.refresh_in_flight {
             return;
         }
 
+        stage_server_port_refresh(
+            &mut self.server_port_snapshot.statuses,
+            &mut self.server_port_snapshot.authorities,
+            &mut self.server_port_snapshot.probe_failures,
+            &tracked_ports,
+        );
+        clear_server_port_source_metadata(&mut self.server_port_snapshot);
         self.server_port_snapshot.refresh_in_flight = true;
         let ports = tracked_ports.clone();
+        let runtime_generation = self.process_manager.runtime_revision();
+        let resource_generation = local_stable_hash(&runtime.sessions);
+        let managed_snapshot_generation =
+            local_port_authority_hash(&self.server_port_snapshot.authorities);
+        let no_managed_resource = *self
+            .server_port_snapshot
+            .no_managed_resource
+            .get_or_insert_with(|| {
+                crate::domain::operation::ResourceFence::new(
+                    crate::domain::id::ResourceId::new(),
+                    0,
+                )
+            });
+        let refresh_fence = PortRefreshFence {
+            generation: self
+                .server_port_snapshot
+                .refresh_generation
+                .saturating_add(1),
+            ports: ports.clone(),
+            task_action_epoch: self.server_port_snapshot.task_action_epoch,
+            runtime_generation,
+            resource_generation,
+            managed_snapshot_generation,
+            server_lifecycle_generation,
+        };
+        self.server_port_snapshot.refresh_generation = refresh_fence.generation;
+        self.server_port_snapshot.active_refresh = Some(refresh_fence.clone());
+        let inventory = self.server_port_snapshot.inventory.clone();
+        let managed_candidate_ports = runtime
+            .sessions
+            .values()
+            .filter(|session| session.status.is_live())
+            .filter_map(|session| {
+                session
+                    .server_launch
+                    .as_ref()
+                    .and_then(|launch| launch.port)
+            })
+            .collect::<std::collections::HashSet<_>>();
         let background_executor = cx.background_executor().clone();
         let native_dialog_blockers = self.native_dialog_blockers.clone();
         cx.spawn(
@@ -11991,21 +12546,84 @@ impl NativeShell {
                 let mut async_cx = cx.clone();
                 let native_dialog_blockers = native_dialog_blockers.clone();
                 async move {
-                    let statuses = background_executor
-                        .spawn(async move { ports_service::snapshot_ports(&ports).ok() })
+                    let projection = background_executor
+                        .spawn(async move {
+                            let result = inventory.refresh(&ports);
+                            let cached_snapshot = inventory.cached_snapshot();
+                            project_port_refresh_result(
+                                result,
+                                cached_snapshot,
+                                &ports,
+                                no_managed_resource,
+                                &HashMap::new(),
+                                &managed_candidate_ports,
+                            )
+                        })
                         .await;
                     while native_dialog_blockers.load(Ordering::Acquire) > 0 {
                         background_executor.timer(Duration::from_millis(50)).await;
                     }
                     let _ = this.update(&mut async_cx, |this, cx: &mut Context<'_, Self>| {
+                        let expected_fence = refresh_fence.clone();
+                        if !port_refresh_is_current(
+                            this.server_port_snapshot.active_refresh.as_ref(),
+                            &expected_fence,
+                        ) {
+                            return;
+                        }
+                        if !port_refresh_projection_is_fresh_at(&projection, Instant::now()) {
+                            this.server_port_snapshot.refresh_in_flight = false;
+                            this.server_port_snapshot.active_refresh = None;
+                            this.server_port_snapshot.last_checked_at = None;
+                            clear_server_port_source_metadata(&mut this.server_port_snapshot);
+                            cx.notify();
+                            return;
+                        }
+                        let current_runtime = this.process_manager.runtime_state();
+                        let current_runtime_generation = this.process_manager.runtime_revision();
+                        let current_server_lifecycle_generation =
+                            this.process_manager.server_lifecycle_generation();
+                        let current_resource_generation =
+                            local_stable_hash(&current_runtime.sessions);
+                        let current_managed_snapshot_generation =
+                            local_port_authority_hash(&this.server_port_snapshot.authorities);
+                        if !port_refresh_is_current_for_state(
+                            this.server_port_snapshot.active_refresh.as_ref(),
+                            &expected_fence,
+                            &this.server_port_snapshot.tracked_ports,
+                            this.server_port_snapshot.task_action_epoch,
+                            current_runtime_generation,
+                            current_resource_generation,
+                            current_managed_snapshot_generation,
+                            current_server_lifecycle_generation,
+                        ) {
+                            // The callback is still for this exact refresh, but
+                            // the runtime/resource generations moved while the
+                            // probe was in flight. Release the fence so the
+                            // next sync schedules a fresh authoritative scan.
+                            this.server_port_snapshot.refresh_in_flight = false;
+                            this.server_port_snapshot.active_refresh = None;
+                            this.server_port_snapshot.last_checked_at = None;
+                            clear_server_port_source_metadata(&mut this.server_port_snapshot);
+                            cx.notify();
+                            return;
+                        }
+                        let source_observed_at = projection.source_observed_at;
                         this.server_port_snapshot.refresh_in_flight = false;
-                        this.server_port_snapshot.last_checked_at = Some(Instant::now());
-                        if let Some(statuses) = statuses {
-                            this.server_port_snapshot.statuses = statuses;
-                            let tracked_ports = this.server_port_snapshot.tracked_ports.clone();
-                            this.server_port_snapshot
-                                .statuses
-                                .retain(|port, _| tracked_ports.binary_search(port).is_ok());
+                        this.server_port_snapshot.active_refresh = None;
+                        this.server_port_snapshot.last_checked_at = source_observed_at;
+                        let tracked_ports = this.server_port_snapshot.tracked_ports.clone();
+                        if let Some(notice) = apply_server_port_refresh_with_metadata(
+                            &mut this.server_port_snapshot.statuses,
+                            &mut this.server_port_snapshot.authorities,
+                            &mut this.server_port_snapshot.probe_failures,
+                            &mut this.server_port_snapshot.source_observed_at,
+                            &mut this.server_port_snapshot.source_freshness_deadline,
+                            &mut this.server_port_snapshot.source_publication_sequence,
+                            &tracked_ports,
+                            Ok(projection),
+                        ) {
+                            this.terminal_notice = Some(notice);
                         }
                         cx.notify();
                     });
@@ -12032,20 +12650,11 @@ impl NativeShell {
                 port,
                 status: None,
                 last_checked_at: None,
-                kill_feedback: None,
-                kill_feedback_until: None,
                 refresh_in_flight: false,
             });
         }
 
         if let Some(state) = self.active_port_state.as_mut() {
-            if state
-                .kill_feedback_until
-                .is_some_and(|deadline| Instant::now() >= deadline)
-            {
-                state.kill_feedback = None;
-                state.kill_feedback_until = None;
-            }
             state.status = self.server_port_snapshot.statuses.get(&port).cloned();
             state.last_checked_at = self.server_port_snapshot.last_checked_at;
             state.refresh_in_flight = self.server_port_snapshot.refresh_in_flight
@@ -12057,67 +12666,12 @@ impl NativeShell {
         }
     }
 
-    fn refresh_port_state(&mut self, command_id: String, port: u16, cx: &mut Context<Self>) {
-        let state = self
-            .active_port_state
-            .get_or_insert_with(|| ActivePortState {
-                command_id: command_id.clone(),
-                port,
-                status: None,
-                last_checked_at: None,
-                kill_feedback: None,
-                kill_feedback_until: None,
-                refresh_in_flight: false,
-            });
-        state.command_id = command_id.clone();
-        state.port = port;
-        state.status = None;
-        state.last_checked_at = None;
-        state.refresh_in_flight = true;
-        self.server_port_snapshot.statuses.remove(&port);
-        self.server_port_snapshot.last_checked_at = None;
-        self.server_port_snapshot.refresh_in_flight = false;
-        self.sync_active_port_state(&command_id, Some(port));
-        cx.notify();
-    }
-
     fn invalidate_server_port_snapshot(&mut self, port: Option<u16>) {
-        if let Some(port) = port {
-            self.server_port_snapshot.statuses.remove(&port);
-            if let Some(state) = self.active_port_state.as_mut() {
-                if state.port == port {
-                    state.status = None;
-                    state.last_checked_at = None;
-                    state.refresh_in_flight = true;
-                }
-            }
-        }
-        self.server_port_snapshot.last_checked_at = None;
-        self.server_port_snapshot.refresh_in_flight = false;
-    }
-
-    fn record_port_kill_feedback(
-        &mut self,
-        command_id: &str,
-        port: u16,
-        feedback: PortKillFeedback,
-    ) {
-        let state = self
-            .active_port_state
-            .get_or_insert_with(|| ActivePortState {
-                command_id: command_id.to_string(),
-                port,
-                status: None,
-                last_checked_at: None,
-                kill_feedback: None,
-                kill_feedback_until: None,
-                refresh_in_flight: false,
-            });
-        state.command_id = command_id.to_string();
-        state.port = port;
-        state.kill_feedback = Some(feedback);
-        state.kill_feedback_until = Some(Instant::now() + std::time::Duration::from_secs(2));
-        state.last_checked_at = None;
+        invalidate_server_port_snapshot_state(
+            &mut self.server_port_snapshot,
+            &mut self.active_port_state,
+            port,
+        );
     }
 
     fn maybe_auto_submit_ssh_password(
@@ -12328,10 +12882,7 @@ impl NativeShell {
                 can_stop: false,
                 can_restart: false,
                 can_clear: false,
-                can_kill_port: false,
                 can_open_url: false,
-                kill_label: "kill",
-                kill_color: theme::WARNING_TEXT,
                 prompt_action_label,
                 prompt_action_color,
                 search_active: self.terminal_search.active,
@@ -12360,10 +12911,7 @@ impl NativeShell {
                 can_stop: false,
                 can_restart: false,
                 can_clear: active_session.is_some() && !remote,
-                can_kill_port: false,
                 can_open_url: false,
-                kill_label: "kill",
-                kill_color: theme::WARNING_TEXT,
                 prompt_action_label: None,
                 prompt_action_color: theme::PRIMARY,
                 search_active: self.terminal_search.active,
@@ -12395,92 +12943,107 @@ impl NativeShell {
             && port
                 .and_then(|value| self.remote_port_forward_state(value))
                 .is_some_and(|state| state.listener_active);
+        let remote_authority_allows_url = remote
+            && port.is_some_and(|value| {
+                self.remote_mode
+                    .as_ref()
+                    .and_then(|remote_mode| remote_mode.snapshot.port_authorities.get(&value))
+                    .zip(active_session.map(|session| &session.runtime))
+                    .is_some_and(|(authority, session)| {
+                        can_open_remote_server_url_now(
+                            Some(authority),
+                            Some(session),
+                            value,
+                            remote_url_available,
+                        )
+                    })
+            });
         let remote_forward_state = if remote {
             port.and_then(|value| self.remote_port_forward_state(value))
         } else {
             None
         };
-        let port_status = if remote {
+        let current_port_probe_failures = self.current_port_probe_failures();
+        let port_probe_failure =
+            port.and_then(|value| current_port_probe_failures.get(&value).cloned());
+        if remote {
             self.active_port_state = None;
-            port.and_then(|port| self.current_port_statuses().get(&port).cloned())
         } else {
             self.sync_active_port_state(&command_id, port);
-            self.active_port_state
-                .as_ref()
-                .filter(|state| state.command_id == command_id)
-                .and_then(|state| state.status.clone())
-        };
-
+        }
         let status = active_session
             .map(|session| session.runtime.status)
             .unwrap_or(crate::state::SessionStatus::Stopped);
-        let port_state = self
-            .active_port_state
-            .as_ref()
-            .filter(|state| state.command_id == command_id);
-        let has_port_conflict = port_status
-            .as_ref()
-            .map(|status| !is_managed_port_owner(active_session, status))
-            .unwrap_or(false);
+        let port_authority = if status == crate::state::SessionStatus::Starting {
+            Some(PortUiAuthority::Starting)
+        } else if remote {
+            port.and_then(|port| {
+                self.remote_mode
+                    .as_ref()
+                    .and_then(|remote_mode| remote_mode.snapshot.port_authorities.get(&port))
+            })
+            .and_then(|authority| {
+                remote_port_ui_authority(
+                    Some(authority),
+                    active_session.map(|session| &session.runtime),
+                )
+            })
+        } else {
+            port.and_then(|port| {
+                local_port_ui_authority(
+                    self.server_port_snapshot.authorities.get(&port),
+                    active_session.map(|session| &session.runtime),
+                    self.server_port_snapshot.source_freshness_deadline,
+                )
+            })
+        };
+
         let probe_disagrees_with_live_session = active_session
             .is_some_and(|session| session.runtime.status.is_live())
-            && port_status.as_ref().is_some_and(|status| !status.in_use);
+            && matches!(port_authority, Some(PortUiAuthority::Free));
         let port_label = port.map(|port| {
-            if let Some(status) = port_status.as_ref() {
-                let base = if probe_disagrees_with_live_session {
+            let base = match port_authority {
+                Some(PortUiAuthority::Managed) => format!("port {port} • live"),
+                Some(PortUiAuthority::ManagedUnready) => format!("port {port} • unready"),
+                Some(PortUiAuthority::ProvenExternal) => format!("port {port} • external"),
+                Some(PortUiAuthority::Starting) => format!("port {port} • starting"),
+                Some(PortUiAuthority::Free) if probe_disagrees_with_live_session => {
                     format!("port {port} • probing")
-                } else if status.in_use {
-                    if is_managed_port_owner(active_session, status) {
-                        format!("port {port} • live")
+                }
+                Some(PortUiAuthority::Free) => format!("port {port} • free"),
+                Some(PortUiAuthority::Unknown) => {
+                    if let Some(detail) = port_probe_failure.as_deref() {
+                        format!(
+                            "port {port} • status unknown (probe failed: {})",
+                            bounded_port_probe_detail(detail)
+                        )
                     } else {
-                        let owner = status
-                            .process_name
-                            .clone()
-                            .unwrap_or_else(|| "external process".to_string());
-                        match status.pid {
-                            Some(pid) => format!("port {port} • {owner} ({pid})"),
-                            None => format!("port {port} • {owner}"),
-                        }
+                        format!("port {port} • status unknown (ownership unverified)")
                     }
-                } else {
-                    format!("port {port} • free")
-                };
+                }
+                None => format!("port {port} • checking"),
+            };
 
-                if let Some(forward_state) = remote_forward_state.as_ref() {
-                    if forward_state.listener_active {
-                        format!("{base} • mirrored locally")
-                    } else if forward_state.local_port_busy {
-                        format!("{base} • local port busy")
-                    } else {
-                        base
-                    }
+            if let Some(forward_state) = remote_forward_state.as_ref() {
+                if forward_state.listener_active {
+                    format!("{base} • mirrored locally")
+                } else if forward_state.local_port_busy {
+                    format!("{base} • local port busy")
                 } else {
                     base
                 }
             } else {
-                format!("port {port} • checking")
+                base
             }
         });
-        let port_color = if has_port_conflict {
-            theme::WARNING_TEXT
-        } else if probe_disagrees_with_live_session {
-            theme::TEXT_MUTED
-        } else if port_status
-            .as_ref()
-            .map(|status| status.in_use)
-            .unwrap_or(false)
-        {
-            theme::SUCCESS_TEXT
-        } else {
-            theme::TEXT_DIM
+        let port_color = match port_authority {
+            Some(PortUiAuthority::Managed) => theme::SUCCESS_TEXT,
+            Some(PortUiAuthority::ManagedUnready) => theme::WARNING_TEXT,
+            Some(PortUiAuthority::ProvenExternal) => theme::PRIMARY,
+            Some(PortUiAuthority::Starting) => theme::WARNING_TEXT,
+            Some(PortUiAuthority::Unknown) => theme::TEXT_MUTED,
+            Some(PortUiAuthority::Free) | None => theme::TEXT_DIM,
         };
-        let (kill_label, kill_color) = match port_state.and_then(|state| state.kill_feedback) {
-            Some(PortKillFeedback::Killed) => ("freed", theme::SUCCESS_TEXT),
-            Some(PortKillFeedback::None) => ("none", theme::TEXT_MUTED),
-            Some(PortKillFeedback::Error) => ("error", theme::DANGER_TEXT),
-            None => ("kill", theme::WARNING_TEXT),
-        };
-
         Some(view::TerminalRuntimeControlsModel {
             port_label,
             port_color,
@@ -12488,14 +13051,23 @@ impl NativeShell {
             can_stop: allow_mutation && status.is_live(),
             can_restart: allow_mutation && status.is_live(),
             can_clear: active_session.is_some() && !remote,
-            can_kill_port: !remote && port.is_some() && has_port_conflict,
-            can_open_url: (remote && remote_url_available)
+            can_open_url: (remote
+                && remote_url_available
+                && remote_authority_allows_url
+                && matches!(
+                    port_authority,
+                    Some(PortUiAuthority::Managed | PortUiAuthority::ProvenExternal)
+                ))
                 || (!remote
-                    && port.is_some()
-                    && status == crate::state::SessionStatus::Running
-                    && !has_port_conflict),
-            kill_label,
-            kill_color,
+                    && can_open_local_server_url_now(
+                        status,
+                        active_session.is_some_and(|session| session.runtime.reap_incomplete),
+                        port.and_then(|value| self.server_port_snapshot.authorities.get(&value)),
+                        port_probe_failure.as_deref(),
+                        self.server_port_snapshot.last_checked_at,
+                        self.server_port_snapshot.source_freshness_deadline,
+                        self.server_port_snapshot.refresh_in_flight,
+                    )),
             prompt_action_label: None,
             prompt_action_color: theme::PRIMARY,
             search_active: self.terminal_search.active,
@@ -12688,6 +13260,9 @@ impl NativeShell {
     }
 
     fn toggle_terminal_mouse_override_action(&mut self, cx: &mut Context<Self>) {
+        if !self.ensure_mutation_control(cx) {
+            return;
+        }
         let mut settings = self.state.settings().clone();
         settings.terminal_mouse_override = !settings.terminal_mouse_override;
         self.state.update_settings(settings);
@@ -12696,6 +13271,9 @@ impl NativeShell {
     }
 
     fn toggle_terminal_read_only_action(&mut self, cx: &mut Context<Self>) {
+        if !self.ensure_mutation_control(cx) {
+            return;
+        }
         let mut settings = self.state.settings().clone();
         settings.terminal_read_only = !settings.terminal_read_only;
         self.state.update_settings(settings);
@@ -12839,7 +13417,12 @@ impl NativeShell {
         if !self.ensure_mutation_control(cx) {
             return;
         }
+        let port = self
+            .state
+            .find_command(command_id)
+            .and_then(|lookup| lookup.command.port);
         if self.remote_mode.is_some() {
+            self.invalidate_server_port_snapshot(port);
             let dimensions = self.terminal_dimensions(window);
             self.remote_send_action(RemoteAction::StartServer {
                 command_id: command_id.to_string(),
@@ -12856,140 +13439,29 @@ impl NativeShell {
         }
 
         let dimensions = self.terminal_dimensions(window);
-        let Some(port) = self
-            .state
-            .find_command(command_id)
-            .and_then(|lookup| lookup.command.port)
-        else {
-            if focus_started_server {
-                self.interrupt_active_browser_replay_before_route_change(None);
-            }
-            let result = if focus_started_server {
-                self.process_manager
-                    .start_server(&mut self.state, command_id, dimensions)
-            } else {
-                self.process_manager.start_server_in_background(
-                    &mut self.state,
-                    command_id,
-                    dimensions,
-                )
-            };
-            match result {
-                Ok(()) => {
-                    if focus_started_server {
-                        self.synced_session_id = Some(command_id.to_string());
-                    }
-                    self.terminal_notice = None;
-                    self.terminal_actionable_notice = None;
-                    self.save_session_state();
-                }
-                Err(error) => {
-                    self.terminal_notice = Some(format!("Failed to start server: {error}"));
-                }
-            }
-            cx.notify();
-            return;
-        };
-
-        self.invalidate_server_port_snapshot(Some(port));
-        if let Some(state) = self.active_port_state.as_mut() {
-            if state.command_id == command_id && state.port == port {
-                state.status = None;
-                state.last_checked_at = None;
-                state.refresh_in_flight = true;
-            }
+        if focus_started_server {
+            self.interrupt_active_browser_replay_before_route_change(None);
         }
-
-        let command_id = command_id.to_string();
-        let background_executor = cx.background_executor().clone();
-        let native_dialog_blockers = self.native_dialog_blockers.clone();
-        cx.spawn(
-            move |this: gpui::WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
-                let mut async_cx = cx.clone();
-                let native_dialog_blockers = native_dialog_blockers.clone();
-                async move {
-                    let status = background_executor
-                        .spawn(async move { ports_service::check_port_in_use(port).ok() })
-                        .await;
-                    while native_dialog_blockers.load(Ordering::Acquire) > 0 {
-                        background_executor.timer(Duration::from_millis(50)).await;
-                    }
-                    let _ = this.update(&mut async_cx, |this, cx: &mut Context<'_, Self>| {
-                        if let Err(error) = this
-                            .process_manager
-                            .validate_server_launch(&this.state, &command_id)
-                        {
-                            this.terminal_notice = Some(format!("Failed to start server: {error}"));
-                            cx.notify();
-                            return;
-                        }
-                        if let Some(state) = this.active_port_state.as_mut() {
-                            if state.command_id == command_id && state.port == port {
-                                state.status = status.clone();
-                                state.last_checked_at = Some(Instant::now());
-                                state.refresh_in_flight = false;
-                            }
-                        }
-
-                        if let Some(status) = status.filter(|status| status.in_use) {
-                            let owner = status
-                                .process_name
-                                .clone()
-                                .unwrap_or_else(|| "another process".to_string());
-                            let owner_label = status
-                                .pid
-                                .map(|pid| format!("{owner} ({pid})"))
-                                .unwrap_or(owner);
-                            let message =
-                                format!("Port {port} is already in use by {owner_label}.");
-                            this.terminal_notice = Some(message.clone());
-                            this.terminal_actionable_notice = Some(ActionableNotice::PortInUse {
-                                command_id: command_id.clone(),
-                                message,
-                            });
-                            cx.notify();
-                            return;
-                        }
-
-                        if focus_started_server {
-                            this.interrupt_active_browser_replay_before_route_change(None);
-                        }
-                        let result = if focus_started_server {
-                            this.process_manager.start_server(
-                                &mut this.state,
-                                &command_id,
-                                dimensions,
-                            )
-                        } else {
-                            this.process_manager.start_server_in_background(
-                                &mut this.state,
-                                &command_id,
-                                dimensions,
-                            )
-                        };
-
-                        match result {
-                            Ok(()) => {
-                                if focus_started_server {
-                                    this.synced_session_id = Some(command_id.clone());
-                                }
-                                this.terminal_notice = None;
-                                this.terminal_actionable_notice = None;
-                                this.save_session_state();
-                            }
-                            Err(error) => {
-                                this.terminal_notice =
-                                    Some(format!("Failed to start server: {error}"));
-                            }
-                        }
-                        cx.notify();
-                    });
+        self.invalidate_server_port_snapshot(port);
+        let result = if focus_started_server {
+            self.process_manager
+                .start_server(&mut self.state, command_id, dimensions)
+        } else {
+            self.process_manager
+                .start_server_in_background(&mut self.state, command_id, dimensions)
+        };
+        match result {
+            Ok(()) => {
+                if focus_started_server {
+                    self.synced_session_id = Some(command_id.to_string());
                 }
-            },
-        )
-        .detach();
-        if self.terminal_notice.is_none() {
-            self.terminal_notice = Some(format!("Checking port {port} before starting..."));
+                self.terminal_notice = Some(format!("Starting `{command_id}`..."));
+                self.terminal_actionable_notice = None;
+                self.save_session_state();
+            }
+            Err(error) => {
+                self.terminal_notice = Some(format!("Failed to start server: {error}"));
+            }
         }
         cx.notify();
     }
@@ -12998,7 +13470,12 @@ impl NativeShell {
         if !self.ensure_mutation_control(cx) {
             return;
         }
+        let port = self
+            .state
+            .find_command(command_id)
+            .and_then(|lookup| lookup.command.port);
         if self.remote_mode.is_some() {
+            self.invalidate_server_port_snapshot(port);
             self.remote_send_action(RemoteAction::StopServer {
                 command_id: command_id.to_string(),
             });
@@ -13007,10 +13484,6 @@ impl NativeShell {
             return;
         }
 
-        let port = self
-            .state
-            .find_command(command_id)
-            .and_then(|lookup| lookup.command.port);
         self.invalidate_server_port_snapshot(port);
         let command_id = command_id.to_string();
         if let Some(state) = self.active_port_state.as_mut() {
@@ -13052,7 +13525,12 @@ impl NativeShell {
         if !self.ensure_mutation_control(cx) {
             return;
         }
+        let port = self
+            .state
+            .find_command(command_id)
+            .and_then(|lookup| lookup.command.port);
         if self.remote_mode.is_some() {
+            self.invalidate_server_port_snapshot(port);
             let dimensions = self.terminal_dimensions(window);
             self.remote_send_action(RemoteAction::RestartServer {
                 command_id: command_id.to_string(),
@@ -13065,10 +13543,6 @@ impl NativeShell {
 
         self.interrupt_active_browser_replay_before_route_change(None);
         let dimensions = self.terminal_dimensions(window);
-        let port = self
-            .state
-            .find_command(command_id)
-            .and_then(|lookup| lookup.command.port);
         self.invalidate_server_port_snapshot(port);
         match self
             .process_manager
@@ -13106,6 +13580,26 @@ impl NativeShell {
         };
 
         if self.remote_mode.is_some() {
+            let remote_authority = self
+                .remote_mode
+                .as_ref()
+                .and_then(|remote_mode| remote_mode.snapshot.port_authorities.get(&port));
+            let remote_session = self.remote_mode.as_ref().and_then(|remote_mode| {
+                remote_mode.snapshot.runtime_state.sessions.get(command_id)
+            });
+            if !can_open_remote_server_url_now(
+                remote_authority,
+                remote_session,
+                port,
+                self.remote_port_forward_state(port)
+                    .is_some_and(|state| state.listener_active),
+            ) {
+                self.terminal_notice = Some(format!(
+                    "Could not open localhost:{port} because current host port authority is not fresh and verified."
+                ));
+                cx.notify();
+                return;
+            }
             match self.remote_port_forward_state(port) {
                 Some(state) if state.listener_active => {}
                 Some(state) => {
@@ -13127,6 +13621,29 @@ impl NativeShell {
                     return;
                 }
             }
+        } else {
+            let current_runtime = self.process_manager.runtime_state();
+            let current_session = current_runtime.sessions.get(command_id);
+            if !can_open_local_server_url_now(
+                current_session
+                    .map(|session| session.status)
+                    .unwrap_or(SessionStatus::Stopped),
+                current_session.is_some_and(|session| session.reap_incomplete),
+                self.server_port_snapshot.authorities.get(&port),
+                self.server_port_snapshot
+                    .probe_failures
+                    .get(&port)
+                    .map(String::as_str),
+                self.server_port_snapshot.last_checked_at,
+                self.server_port_snapshot.source_freshness_deadline,
+                self.server_port_snapshot.refresh_in_flight,
+            ) {
+                self.terminal_notice = Some(format!(
+                    "Could not open localhost:{port} because current port authority is not fresh and verified."
+                ));
+                cx.notify();
+                return;
+            }
         }
 
         let url = format!("http://localhost:{port}");
@@ -13134,79 +13651,6 @@ impl NativeShell {
             Ok(()) => self.terminal_notice = Some(format!("Opened {url}")),
             Err(error) => self.terminal_notice = Some(format!("Failed to open {url}: {error}")),
         }
-        cx.notify();
-    }
-
-    fn kill_server_port_action(
-        &mut self,
-        command_id: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if let Err(error) = self
-            .process_manager
-            .validate_server_launch(&self.state, command_id)
-        {
-            self.terminal_notice = Some(format!(
-                "Failed to restart server after freeing port: {error}"
-            ));
-            cx.notify();
-            return;
-        }
-        let Some(lookup) = self
-            .state
-            .find_command(command_id)
-            .map(|lookup| (lookup.project.id.clone(), lookup.command.clone()))
-        else {
-            self.terminal_notice = Some(format!("Unknown command `{command_id}`"));
-            cx.notify();
-            return;
-        };
-        let (project_id, command) = lookup;
-        let Some(port) = command.port else {
-            self.terminal_notice = Some("This command does not define a port.".to_string());
-            cx.notify();
-            return;
-        };
-
-        self.interrupt_active_browser_replay_before_route_change(None);
-        let _ = self.process_manager.write_virtual_text(
-            command_id,
-            &format!("\r\n\x1b[33m--- Resolving port {port} conflict... ---\x1b[0m\r\n"),
-        );
-
-        self.record_port_kill_feedback(command_id, port, PortKillFeedback::None);
-        self.refresh_port_state(command_id.to_string(), port, cx);
-        let dimensions = self.terminal_dimensions(window);
-        let banner = format!("--- Starting after freeing port {port}... ---");
-
-        match self.process_manager.schedule_kill_port_and_restart(
-            &mut self.state,
-            command_id,
-            port,
-            dimensions,
-            &banner,
-            None,
-        ) {
-            Ok(()) => {
-                self.synced_session_id = Some(command_id.to_string());
-                self.terminal_notice = Some(format!("Resolving port {port} conflict..."));
-                self.terminal_actionable_notice = None;
-                self.save_session_state();
-            }
-            Err(error) => {
-                self.record_port_kill_feedback(command_id, port, PortKillFeedback::Error);
-                self.terminal_notice = Some(format!(
-                    "Failed to restart server after freeing port: {error}"
-                ));
-                let _ = self.process_manager.write_virtual_text(
-                    command_id,
-                    &format!("\x1b[31mFailed to resolve port {port} conflict: {error}\x1b[0m\r\n"),
-                );
-            }
-        }
-        let _ = project_id;
-        let _ = command;
         cx.notify();
     }
 
@@ -13816,11 +14260,15 @@ impl NativeShell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.handle_terminal_scrollbar_mouse_move(event, window, cx) {
+        // The scrollbar handler takes the screen snapshot only when the pointer
+        // is in the gutter's column or a drag is running; when it does, this
+        // reuses that one clone rather than taking a second.
+        let mut active_session = None;
+        if self.handle_terminal_scrollbar_mouse_move(event, window, cx, &mut active_session) {
             return;
         }
 
-        let active_session = self.current_active_session_view();
+        let active_session = active_session.or_else(|| self.current_active_session_view());
         let session_mode = active_session.as_ref().map(|session| session.screen.mode);
         let terminal_input_blocked = self.terminal_input_block_reason().is_some();
         if session_mode.is_some_and(|mode| self.terminal_mouse_capture_active(mode))
@@ -13892,16 +14340,17 @@ impl NativeShell {
                 if self.scrollbar_hit_test(event.position, geometry) {
                     self.terminal_selection = None;
                     self.is_selecting_terminal = false;
-                    let grab_offset_px = if self.scrollbar_thumb_contains(event.position, geometry)
-                    {
-                        let y: f32 = event.position.y.into();
-                        (y - geometry.thumb_top).clamp(0.0, geometry.thumb_height)
-                    } else {
-                        geometry.thumb_height / 2.0
-                    };
+                    // Same rule as every other scrollbar in the app: inside the
+                    // thumb the pointer keeps its hold, outside it the thumb
+                    // centres on the pointer.
+                    let grab = crate::ui::scrollbar::grab_for_pointer(
+                        geometry.thumb_top,
+                        geometry.thumb_height,
+                        event.position.y.into(),
+                    );
                     self.terminal_scrollbar_drag = Some(TerminalScrollbarDrag {
-                        grab_offset_px,
-                        thumb_top_ratio: scrollbar_thumb_top_ratio(
+                        grab,
+                        thumb_top_ratio: view::scrollbar_thumb_top_ratio(
                             session.screen.display_offset,
                             geometry.max_offset,
                         ),
@@ -13917,25 +14366,61 @@ impl NativeShell {
         false
     }
 
+    /// This listener is registered globally for the frame, so it is also the
+    /// only place that can see the pointer entering and leaving the gutter.
+    ///
+    /// It therefore runs for every pixel the pointer travels ANYWHERE in the
+    /// window, and `current_active_session_view()` clones a whole screen
+    /// snapshot -- now including the retained margin, so three viewports of
+    /// rows. The cheap tests come first: an active drag, or a pointer inside
+    /// the gutter's column, both of which are layout and metrics only. The
+    /// snapshot is taken after that, and handed back through `session` so the
+    /// caller does not clone it a second time.
     fn handle_terminal_scrollbar_mouse_move(
         &mut self,
         event: &MouseMoveEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
+        session: &mut Option<crate::terminal::session::TerminalSessionView>,
     ) -> bool {
-        let Some(_) = self.terminal_scrollbar_drag else {
-            return false;
-        };
-        if !event.dragging() {
+        let dragging = self.terminal_scrollbar_drag.is_some() && event.dragging();
+        let pointer_x: f32 = event.position.x.into();
+        let in_gutter_column = self
+            .terminal_scrollbar_gutter_span(window)
+            .is_some_and(|(left, right)| pointer_x >= left && pointer_x <= right);
+        if !dragging && !in_gutter_column {
+            // Nowhere near the bar. Clearing a hover that is already false
+            // costs nothing and notifies nothing.
+            if self.terminal_scrollbar_hovered {
+                self.terminal_scrollbar_hovered = false;
+                cx.notify();
+            }
             return false;
         }
 
-        if let Some(session) = self.current_active_session_view() {
-            if let Some(geometry) = self.terminal_scrollbar_geometry(window, &session) {
-                self.scroll_terminal_from_scrollbar(event.position, geometry, cx);
-                window.prevent_default();
-                return true;
-            }
+        if session.is_none() {
+            *session = self.current_active_session_view();
+        }
+        let geometry = session
+            .as_ref()
+            .and_then(|session| self.terminal_scrollbar_geometry(window, session));
+        // Only notify when the hover actually changed -- a repaint per mouse
+        // move would cost more than the hover is worth.
+        let hovered =
+            geometry.is_some_and(|geometry| self.scrollbar_hit_test(event.position, geometry));
+        if hovered != self.terminal_scrollbar_hovered {
+            self.terminal_scrollbar_hovered = hovered;
+            cx.notify();
+        }
+
+        if !dragging {
+            return false;
+        }
+
+        if let Some(geometry) = geometry {
+            self.scroll_terminal_from_scrollbar(event.position, geometry, cx);
+            window.prevent_default();
+            return true;
         }
         self.terminal_scrollbar_drag = None;
         false
@@ -14487,7 +14972,7 @@ impl NativeShell {
         let cell_width = metrics.cell_width;
         let row_height = metrics.line_height;
         let scrollbar_width = if self.state.settings().show_terminal_scrollbar {
-            view::TERMINAL_SCROLLBAR_WIDTH_PX
+            view::terminal_scrollbar_spec().gutter_width
         } else {
             0.0
         };
@@ -14510,15 +14995,41 @@ impl NativeShell {
         })
     }
 
+    /// The terminal grid's horizontal span: left edge and usable width.
+    ///
+    /// Split out of [`Self::terminal_viewport_layout`] because it depends on
+    /// the window and the sidebar alone -- never on a session -- which is what
+    /// lets a mouse-move ask whether the pointer is in the scrollbar's column
+    /// before it pays for a screen snapshot.
+    fn terminal_viewport_columns(&self, window: &Window) -> Option<(f32, f32)> {
+        let viewport_width: f32 = window.viewport_size().width.into();
+        let left = self.sidebar_width() + 4.0; // px_1() left padding on grid inner
+        if viewport_width <= left {
+            return None;
+        }
+        let right_padding = 4.0; // px_1() right padding on grid inner
+        Some((left, (viewport_width - left - right_padding).max(320.0)))
+    }
+
+    /// The scrollbar gutter's x range, from layout and metrics only.
+    fn terminal_scrollbar_gutter_span(&self, window: &Window) -> Option<(f32, f32)> {
+        if !self.state.settings().show_terminal_scrollbar {
+            return None;
+        }
+        let (left, available_width) = self.terminal_viewport_columns(window)?;
+        let width = view::terminal_scrollbar_spec().gutter_width;
+        let gutter_left = left + available_width - width;
+        Some((gutter_left, gutter_left + width))
+    }
+
     fn terminal_viewport_layout(
         &self,
         window: &Window,
         include_exit_banner: bool,
     ) -> Option<TerminalViewportLayout> {
         let viewport = window.viewport_size();
-        let viewport_width: f32 = viewport.width.into();
         let viewport_height: f32 = viewport.height.into();
-        let left = self.sidebar_width() + 4.0; // px_1() left padding on grid inner
+        let (left, available_width) = self.terminal_viewport_columns(window)?;
         let mut top = TERMINAL_TOPBAR_HEIGHT_PX;
 
         let active_workspace_key = browser_workspace_key_for_ai_tab(self.state.active_tab());
@@ -14555,11 +15066,10 @@ impl NativeShell {
         }
         top += 2.0; // py(px(2.0)) top on grid inner
 
-        if viewport_width <= left || viewport_height <= top {
+        if viewport_height <= top {
             return None;
         }
 
-        let right_padding = 4.0; // px_1() right padding on grid inner
         let bottom_padding = chrome::STATUS_BAR_HEIGHT_PX
             + 2.0  // py(px(2.0)) bottom on grid inner
             + 2.0  // pb(px(2.0)) on body wrapper
@@ -14573,7 +15083,7 @@ impl NativeShell {
         Some(TerminalViewportLayout {
             left,
             top,
-            available_width: (viewport_width - left - right_padding).max(320.0),
+            available_width,
             available_height: (viewport_height - top - bottom_padding).max(160.0),
         })
     }
@@ -14721,6 +15231,13 @@ fn apply_window_bounds_state(state: &mut AppState, next: crate::models::WindowBo
 fn remote_shared_app_state(state: &AppState) -> AppState {
     let mut next = state.clone();
     next.window_bounds = None;
+    // Remote snapshots are a transfer surface, not a credential boundary.
+    // Keep the local state intact for SSH password auto-submit, while
+    // ensuring serialized app-state diagnostics never carry legacy secrets.
+    for connection in &mut next.config.ssh_connections {
+        connection.password = None;
+        connection.private_key = None;
+    }
     next
 }
 
@@ -14759,13 +15276,23 @@ impl Render for NativeShell {
         let runtime_snapshot =
             local_runtime_snapshot.unwrap_or_else(|| self.current_runtime_snapshot());
         self.sync_window_title(window, &runtime_snapshot);
-        let server_indicators = derive_server_indicator_states(
-            &self.state,
-            &runtime_snapshot,
-            &self.current_port_statuses(),
-        );
+        let server_indicators = if let Some(remote_mode) = self.remote_mode.as_ref() {
+            derive_server_indicator_states_from_remote_authority(
+                &self.state,
+                &runtime_snapshot,
+                &remote_mode.snapshot.port_authorities,
+            )
+        } else {
+            derive_server_indicator_states_with_authority(
+                &self.state,
+                &runtime_snapshot,
+                &self.current_port_authorities(),
+                &self.current_port_probe_failures(),
+                self.server_port_snapshot.source_freshness_deadline,
+            )
+        };
         let updater_snapshot = self.updater.snapshot();
-        let quota_statuses = self.ai_quota_statuses();
+        let top_bar = self.ai_top_bar_model();
         let remote_status_bar = self.remote_status_bar_state();
         self.sync_settings_remote_draft();
         let allow_editor_mutation = self.remote_mode.is_none() || self.remote_has_control();
@@ -14914,6 +15441,9 @@ impl Render for NativeShell {
         let make_move_project_up_handler =
             |project_id: String| -> Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)> {
                 Box::new(cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
+                    if !this.ensure_mutation_control(cx) {
+                        return;
+                    }
                     this.state.move_project(&project_id, -1);
                     this.save_config_state();
                     cx.notify();
@@ -14922,6 +15452,9 @@ impl Render for NativeShell {
         let make_move_project_down_handler =
             |project_id: String| -> Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)> {
                 Box::new(cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
+                    if !this.ensure_mutation_control(cx) {
+                        return;
+                    }
                     this.state.move_project(&project_id, 1);
                     this.save_config_state();
                     cx.notify();
@@ -15156,12 +15689,6 @@ impl Render for NativeShell {
             |command_id: String| -> Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)> {
                 Box::new(cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
                     this.open_server_url_action(&command_id, cx);
-                }))
-            };
-        let make_kill_port_handler =
-            |command_id: String| -> Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)> {
-                Box::new(cx.listener(move |this, _: &MouseDownEvent, window, cx| {
-                    this.kill_server_port_action(&command_id, window, cx);
                 }))
             };
         let make_force_quit_handler = || -> Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)> {
@@ -15484,14 +16011,8 @@ impl Render for NativeShell {
                 on_clear_output: controls
                     .filter(|controls| controls.can_clear)
                     .map(|_| make_clear_output_handler(command_id.clone())),
-                on_kill_port: controls
-                    .filter(|controls| controls.can_kill_port)
-                    .map(|_| make_kill_port_handler(command_id.clone())),
                 on_actionable_notice_action: self.terminal_actionable_notice.as_ref().map(
                     |notice| match notice {
-                        ActionableNotice::PortInUse {
-                            command_id: cmd_id, ..
-                        } => make_kill_port_handler(cmd_id.clone()),
                         ActionableNotice::ForceQuit { .. } => make_force_quit_handler(),
                     },
                 ),
@@ -15549,7 +16070,7 @@ impl Render for NativeShell {
                     )),
                     on_mouse_move: Arc::new(cx.listener(
                         |this, event: &MouseMoveEvent, window, cx| {
-                            this.handle_terminal_scrollbar_mouse_move(event, window, cx);
+                            this.handle_terminal_scrollbar_mouse_move(event, window, cx, &mut None);
                         },
                     )),
                     on_mouse_up: Arc::new(cx.listener(|this, event: &MouseUpEvent, window, cx| {
@@ -15569,7 +16090,8 @@ impl Render for NativeShell {
                 &runtime_snapshot,
                 &server_indicators,
                 sidebar::SidebarActions {
-                    mutations_allowed: self.remote_mode.is_none() || self.remote_has_control(),
+                    mutations_allowed: self.config_write_availability.diagnostic().is_none()
+                        && (self.remote_mode.is_none() || self.remote_has_control()),
                     on_open_settings: &make_open_settings_handler,
                     on_toggle_sidebar: &make_toggle_sidebar_handler,
                     on_stop_all_servers: &make_stop_all_servers_handler,
@@ -15849,7 +16371,7 @@ impl Render for NativeShell {
                         &runtime_snapshot,
                         &updater_snapshot,
                         Some(&remote_status_bar.model),
-                        &quota_statuses,
+                        &top_bar,
                         chrome::StatusBarActions {
                             on_open_process_monitor: &make_open_process_monitor_handler,
                             on_install_update: &make_install_update_handler,
@@ -16693,6 +17215,463 @@ fn server_port_snapshot_plan(
     (tracked_server_ports(state), refresh_interval)
 }
 
+#[cfg(test)]
+fn server_start_probe_allowed(refresh_in_flight: bool) -> bool {
+    !refresh_in_flight
+}
+
+fn stage_server_port_refresh(
+    statuses: &mut HashMap<u16, PortStatus>,
+    authorities: &mut HashMap<u16, crate::process::ports::PortStatus>,
+    probe_failures: &mut HashMap<u16, String>,
+    ports: &[u16],
+) {
+    for &port in ports {
+        statuses.remove(&port);
+        authorities.remove(&port);
+        probe_failures.remove(&port);
+    }
+}
+
+fn clear_active_port_state_for_untracked_ports(
+    active_port_state: &mut Option<ActivePortState>,
+    tracked_ports: &[u16],
+) {
+    if active_port_state
+        .as_ref()
+        .is_some_and(|state| tracked_ports.binary_search(&state.port).is_err())
+    {
+        *active_port_state = None;
+    }
+}
+
+fn invalidate_server_port_snapshot_state(
+    snapshot: &mut ServerPortSnapshotState,
+    active_port_state: &mut Option<ActivePortState>,
+    port: Option<u16>,
+) {
+    if let Some(port) = port {
+        snapshot.statuses.remove(&port);
+        snapshot.authorities.remove(&port);
+        snapshot.probe_failures.remove(&port);
+        if let Some(state) = active_port_state.as_mut() {
+            if state.port == port {
+                state.status = None;
+                state.last_checked_at = None;
+                state.refresh_in_flight = true;
+            }
+        }
+    } else {
+        snapshot.statuses.clear();
+        snapshot.authorities.clear();
+        snapshot.probe_failures.clear();
+        *active_port_state = None;
+    }
+    snapshot.last_checked_at = None;
+    clear_server_port_source_metadata(snapshot);
+    snapshot.refresh_generation = snapshot.refresh_generation.saturating_add(1);
+    snapshot.task_action_epoch = snapshot.task_action_epoch.saturating_add(1);
+    snapshot.refresh_in_flight = false;
+    snapshot.active_refresh = None;
+}
+
+fn clear_server_port_source_metadata(snapshot: &mut ServerPortSnapshotState) {
+    snapshot.source_observed_at = None;
+    snapshot.source_freshness_deadline = None;
+    snapshot.source_publication_sequence = 0;
+}
+
+fn port_refresh_is_current(active: Option<&PortRefreshFence>, expected: &PortRefreshFence) -> bool {
+    active == Some(expected)
+}
+
+fn port_refresh_is_current_for_state(
+    active: Option<&PortRefreshFence>,
+    expected: &PortRefreshFence,
+    tracked_ports: &[u16],
+    task_action_epoch: u64,
+    runtime_generation: u64,
+    resource_generation: u64,
+    managed_snapshot_generation: u64,
+    server_lifecycle_generation: u64,
+) -> bool {
+    port_refresh_is_current(active, expected)
+        && expected.ports == tracked_ports
+        && expected.task_action_epoch == task_action_epoch
+        && expected.runtime_generation == runtime_generation
+        && expected.resource_generation == resource_generation
+        && expected.managed_snapshot_generation == managed_snapshot_generation
+        && expected.server_lifecycle_generation == server_lifecycle_generation
+}
+
+fn port_refresh_projection_is_fresh_at(projection: &PortRefreshProjection, now: Instant) -> bool {
+    let (Some(observed_at), Some(deadline)) = (
+        projection.source_observed_at,
+        projection.source_freshness_deadline,
+    ) else {
+        return false;
+    };
+    projection.source_publication_sequence > 0
+        && observed_at <= now
+        && now <= deadline
+        && now
+            .checked_duration_since(observed_at)
+            .is_some_and(|age| age <= crate::process::ports::DEFAULT_FREE_PROOF_MAX_AGE)
+}
+
+const MAX_PORT_PROBE_DETAIL_CHARS: usize = 256;
+const MAX_PORT_PROBE_NOTICE_CHARS: usize = 1024;
+
+fn instant_to_epoch_ms(source: Instant, reference: Instant, reference_epoch_ms: u64) -> u64 {
+    if source <= reference {
+        reference_epoch_ms.saturating_sub(
+            u64::try_from(reference.duration_since(source).as_millis()).unwrap_or(u64::MAX),
+        )
+    } else {
+        reference_epoch_ms.saturating_add(
+            u64::try_from(source.duration_since(reference).as_millis()).unwrap_or(u64::MAX),
+        )
+    }
+}
+
+fn bounded_port_text(text: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+    let mut sanitized = String::with_capacity(text.len().min(max_chars));
+    let mut characters = text.chars();
+    while sanitized.chars().count() < max_chars.saturating_sub(1) {
+        let Some(character) = characters.next() else {
+            return sanitized;
+        };
+        sanitized.push(if character.is_control() {
+            ' '
+        } else {
+            character
+        });
+    }
+    if characters.next().is_some() {
+        sanitized.push('…');
+    }
+    sanitized
+}
+
+fn bounded_port_probe_detail(detail: &str) -> String {
+    bounded_port_text(detail, MAX_PORT_PROBE_DETAIL_CHARS)
+}
+
+fn project_legacy_port_snapshot(
+    snapshot: &crate::process::ports::PortInventorySnapshot,
+    ports: &[u16],
+) -> PortRefreshProjection {
+    let mut projection = PortRefreshProjection::default();
+    if !snapshot.is_exactly_for(ports) {
+        for &port in ports {
+            projection.probe_failures.insert(
+                port,
+                "listener inventory snapshot does not match the requested port set".to_string(),
+            );
+        }
+        return projection;
+    }
+    if !snapshot.is_fresh_at(
+        Instant::now(),
+        crate::process::ports::DEFAULT_FREE_PROOF_MAX_AGE,
+    ) {
+        for &port in ports {
+            projection
+                .probe_failures
+                .insert(port, "listener inventory snapshot is stale".to_string());
+        }
+        return projection;
+    }
+    for &port in ports {
+        if let Some(issue) = snapshot.issue(port) {
+            projection
+                .probe_failures
+                .insert(port, bounded_port_probe_detail(issue.detail()));
+            continue;
+        }
+        if !snapshot.is_valid() {
+            projection.probe_failures.insert(
+                port,
+                bounded_port_probe_detail(
+                    snapshot
+                        .validation_error()
+                        .unwrap_or("listener inventory snapshot was invalid"),
+                ),
+            );
+            continue;
+        }
+        match snapshot.observation(port) {
+            Some(crate::process::ports::PortObservation::Listeners(listeners)) => {
+                projection.statuses.insert(
+                    port,
+                    PortStatus {
+                        port,
+                        in_use: true,
+                        pid: (listeners.len() == 1).then(|| listeners[0].pid()),
+                        process_name: None,
+                    },
+                );
+            }
+            Some(crate::process::ports::PortObservation::Free) => {
+                projection.statuses.insert(
+                    port,
+                    PortStatus {
+                        port,
+                        in_use: false,
+                        pid: None,
+                        process_name: None,
+                    },
+                );
+            }
+            Some(crate::process::ports::PortObservation::ProbeError(detail)) => {
+                projection
+                    .probe_failures
+                    .insert(port, bounded_port_probe_detail(detail));
+            }
+            None => {
+                projection.probe_failures.insert(
+                    port,
+                    format!("port {port} was not included in listener inventory"),
+                );
+            }
+        }
+    }
+    projection
+}
+
+fn project_typed_port_snapshot(
+    snapshot: &crate::process::ports::PortInventorySnapshot,
+    ports: &[u16],
+    no_managed_resource: crate::domain::operation::ResourceFence,
+    managed: &HashMap<u16, crate::process::ports::ManagedResourceSnapshot>,
+    managed_candidate_ports: &std::collections::HashSet<u16>,
+) -> PortRefreshProjection {
+    let mut projection = project_legacy_port_snapshot(snapshot, ports);
+    let observed_at = snapshot.observed_at();
+    let deadline = snapshot.freshness_deadline();
+    projection.source_observed_at = Some(observed_at);
+    projection.source_freshness_deadline = Some(deadline);
+    projection.source_publication_sequence = snapshot.publication_sequence();
+
+    for &port in ports {
+        let resource = managed
+            .get(&port)
+            .map(crate::process::ports::ManagedResourceSnapshot::resource)
+            .unwrap_or(no_managed_resource);
+        let target = crate::process::ports::PortTarget::new(
+            port,
+            resource,
+            crate::process::ports::ManagedPortHealth::Ready,
+        );
+        let probe_error = matches!(
+            snapshot.observation(port),
+            Some(crate::process::ports::PortObservation::ProbeError(_))
+        ) || matches!(
+            snapshot.issue(port),
+            Some(crate::process::ports::PortObservationIssue::ProbeError(_))
+        );
+        let authority = if probe_error {
+            // A scan fault is authoritative for the affected port even when
+            // a live session is waiting for a managed fence. Do not let the
+            // candidate fallback turn typed ProbeError evidence into an
+            // apparently healthy/merely-unknown authority.
+            crate::process::ports::project_port_status_from_snapshot_with_membership_reconciliation_at(
+                &target,
+                snapshot,
+                None,
+                None,
+                observed_at,
+                deadline,
+            )
+        } else if managed_candidate_ports.contains(&port) && !managed.contains_key(&port) {
+            crate::process::ports::PortStatus {
+                port,
+                resource,
+                kind: crate::process::ports::PortStatusKind::Unknown,
+                listeners: snapshot
+                    .observation(port)
+                    .map(|observation| observation.listeners().to_vec().into())
+                    .unwrap_or_else(|| Arc::from([])),
+                error: Some(
+                    "managed process fence is unavailable for the current runtime generation"
+                        .to_string(),
+                ),
+            }
+        } else {
+            // A single registry read is not enough to settle ownership: the
+            // listener table and managed membership can cross between the
+            // two observations. Until the ProcessRegistry owner supplies a
+            // second equal membership snapshot, managed evidence remains
+            // Unknown. With no managed candidate, both sides are `None` and
+            // a fully identity-proven external listener may still be blue.
+            crate::process::ports::project_port_status_from_snapshot_with_membership_reconciliation_at(
+                &target,
+                snapshot,
+                managed.get(&port),
+                None,
+                observed_at,
+                deadline,
+            )
+        };
+        projection.authorities.insert(port, authority);
+    }
+    projection
+}
+
+fn project_port_refresh_result(
+    result: Result<Arc<crate::process::ports::PortInventorySnapshot>, String>,
+    cached_snapshot: Arc<crate::process::ports::PortInventorySnapshot>,
+    ports: &[u16],
+    no_managed_resource: crate::domain::operation::ResourceFence,
+    managed: &HashMap<u16, crate::process::ports::ManagedResourceSnapshot>,
+    managed_candidate_ports: &std::collections::HashSet<u16>,
+) -> PortRefreshProjection {
+    let snapshot = match result {
+        Ok(snapshot) => snapshot,
+        Err(_)
+            if cached_snapshot.publication_sequence() > 0
+                && cached_snapshot.is_exactly_for(ports)
+                && ports.iter().all(|port| {
+                    matches!(
+                        cached_snapshot.observation(*port),
+                        Some(crate::process::ports::PortObservation::ProbeError(_))
+                    )
+                }) =>
+        {
+            cached_snapshot
+        }
+        Err(error) => {
+            // A request-level failure must have been published by the
+            // PortInventory coordinator before it reaches this projection.
+            // Keep an unsequenced local diagnostic for fail-closed rendering,
+            // but do not mint source timestamps or publication identity here.
+            let snapshot = crate::process::ports::PortInventorySnapshot::probe_failure(
+                ports.iter().copied(),
+                error,
+            );
+            let mut projection = project_typed_port_snapshot(
+                &snapshot,
+                ports,
+                no_managed_resource,
+                managed,
+                managed_candidate_ports,
+            );
+            projection.source_observed_at = None;
+            projection.source_freshness_deadline = None;
+            projection.source_publication_sequence = 0;
+            return projection;
+        }
+    };
+    project_typed_port_snapshot(
+        &snapshot,
+        ports,
+        no_managed_resource,
+        managed,
+        managed_candidate_ports,
+    )
+}
+
+fn port_probe_failure_notice(probe_failures: &HashMap<u16, String>) -> Option<String> {
+    if probe_failures.is_empty() {
+        return None;
+    }
+
+    let mut ports = probe_failures.keys().copied().collect::<Vec<_>>();
+    ports.sort_unstable();
+    let details = ports
+        .iter()
+        .filter_map(|port| {
+            probe_failures.get(port).map(|detail| {
+                format!(
+                    "Port {port} status is unknown (probe failed: {})",
+                    bounded_port_probe_detail(detail)
+                )
+            })
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    Some(format!(
+        "{}. Ownership is unverified; no green or blue ownership state is shown.",
+        bounded_port_text(&details, MAX_PORT_PROBE_NOTICE_CHARS)
+    ))
+}
+
+fn apply_server_port_refresh(
+    current: &mut HashMap<u16, PortStatus>,
+    authorities: &mut HashMap<u16, crate::process::ports::PortStatus>,
+    probe_failures: &mut HashMap<u16, String>,
+    tracked_ports: &[u16],
+    result: Result<PortRefreshProjection, String>,
+) -> Option<String> {
+    let mut source_observed_at = None;
+    let mut source_freshness_deadline = None;
+    let mut source_publication_sequence = 0;
+    apply_server_port_refresh_with_metadata(
+        current,
+        authorities,
+        probe_failures,
+        &mut source_observed_at,
+        &mut source_freshness_deadline,
+        &mut source_publication_sequence,
+        tracked_ports,
+        result,
+    )
+}
+
+fn apply_server_port_refresh_with_metadata(
+    current: &mut HashMap<u16, PortStatus>,
+    authorities: &mut HashMap<u16, crate::process::ports::PortStatus>,
+    probe_failures: &mut HashMap<u16, String>,
+    source_observed_at: &mut Option<Instant>,
+    source_freshness_deadline: &mut Option<Instant>,
+    source_publication_sequence: &mut u64,
+    tracked_ports: &[u16],
+    result: Result<PortRefreshProjection, String>,
+) -> Option<String> {
+    match result {
+        Ok(mut next) => {
+            next.statuses
+                .retain(|port, _| tracked_ports.binary_search(port).is_ok());
+            next.authorities
+                .retain(|port, _| tracked_ports.binary_search(port).is_ok());
+            next.probe_failures
+                .retain(|port, _| tracked_ports.binary_search(port).is_ok());
+            *current = next.statuses;
+            *authorities = next.authorities;
+            *probe_failures = next.probe_failures;
+            *source_observed_at = next.source_observed_at;
+            *source_freshness_deadline = next.source_freshness_deadline;
+            *source_publication_sequence = next.source_publication_sequence;
+            port_probe_failure_notice(probe_failures)
+        }
+        Err(error) => {
+            current.clear();
+            authorities.clear();
+            probe_failures.clear();
+            *source_observed_at = None;
+            *source_freshness_deadline = None;
+            *source_publication_sequence = 0;
+            let detail = bounded_port_probe_detail(&error);
+            for &port in tracked_ports {
+                probe_failures.insert(port, detail.clone());
+            }
+            port_probe_failure_notice(probe_failures)
+        }
+    }
+}
+
+#[cfg(test)]
+fn port_start_error_notice(error: &crate::process::ports::PortStartError) -> String {
+    match error {
+        crate::process::ports::PortStartError::Occupied { .. }
+        | crate::process::ports::PortStartError::OccupiedAmbiguous { .. } => error.to_string(),
+        _ => format!("Failed to start server: {error}"),
+    }
+}
+
 fn live_server_ports(state: &AppState, runtime: &RuntimeState) -> Vec<u16> {
     let mut ports = Vec::new();
     for project in state.projects() {
@@ -16732,6 +17711,23 @@ fn tracked_server_ports(state: &AppState) -> Vec<u16> {
     ports
 }
 
+fn unique_server_session_id(runtime: &RuntimeState, port: u16) -> Option<String> {
+    let mut matching = runtime
+        .sessions
+        .values()
+        .filter(|session| session.status.is_live())
+        .filter(|session| {
+            session
+                .server_launch
+                .as_ref()
+                .and_then(|launch| launch.port)
+                == Some(port)
+        })
+        .map(|session| session.session_id.clone());
+    let session_id = matching.next()?;
+    matching.next().is_none().then_some(session_id)
+}
+
 fn remote_forwardable_ports(snapshot: &remote::RemoteWorkspaceSnapshot) -> Vec<u16> {
     let mut ports = Vec::new();
     for project in snapshot.app_state.projects() {
@@ -16743,10 +17739,15 @@ fn remote_forwardable_ports(snapshot: &remote::RemoteWorkspaceSnapshot) -> Vec<u
                 let Some(session) = snapshot.runtime_state.sessions.get(&command.id) else {
                     continue;
                 };
-                let Some(status) = snapshot.port_statuses.get(&port) else {
+                let Some(authority) = snapshot.port_authorities.get(&port) else {
                     continue;
                 };
-                if session.status.is_live() && status.in_use && runtime_owns_port(session, status) {
+                if session.status == SessionStatus::Running
+                    && !session.reap_incomplete
+                    && authority.kind() == remote::RemotePortAuthorityKind::Managed
+                    && authority.is_fresh_at(now_epoch_ms())
+                    && remote_managed_authority_matches_session(authority, session)
+                {
                     ports.push(port);
                 }
             }
@@ -16813,10 +17814,12 @@ fn remote_port_forward_rows(
         .collect()
 }
 
+#[cfg(test)]
 fn derive_server_indicator_states(
     state: &AppState,
     runtime: &RuntimeState,
     port_statuses: &HashMap<u16, PortStatus>,
+    probe_failures: &HashMap<u16, String>,
 ) -> HashMap<String, sidebar::ServerIndicatorState> {
     let mut indicators = HashMap::new();
     for project in state.projects() {
@@ -16825,7 +17828,7 @@ fn derive_server_indicator_states(
                 let session = runtime.sessions.get(&command.id);
                 indicators.insert(
                     command.id.clone(),
-                    derive_server_indicator(session, command.port, port_statuses),
+                    derive_server_indicator(session, command.port, port_statuses, probe_failures),
                 );
             }
         }
@@ -16833,22 +17836,169 @@ fn derive_server_indicator_states(
     indicators
 }
 
+fn derive_server_indicator_states_with_authority(
+    state: &AppState,
+    runtime: &RuntimeState,
+    authorities: &HashMap<u16, crate::process::ports::PortStatus>,
+    probe_failures: &HashMap<u16, String>,
+    source_freshness_deadline: Option<Instant>,
+) -> HashMap<String, sidebar::ServerIndicatorState> {
+    let mut indicators = HashMap::new();
+    for project in state.projects() {
+        for folder in &project.folders {
+            for command in &folder.commands {
+                let session = runtime.sessions.get(&command.id);
+                indicators.insert(
+                    command.id.clone(),
+                    derive_server_indicator_with_authority(
+                        session,
+                        command.port,
+                        command.port.and_then(|port| authorities.get(&port)),
+                        probe_failures,
+                        source_freshness_deadline,
+                    ),
+                );
+            }
+        }
+    }
+    indicators
+}
+
+fn derive_server_indicator_states_from_remote_authority(
+    state: &AppState,
+    runtime: &RuntimeState,
+    authorities: &HashMap<u16, remote::RemotePortAuthority>,
+) -> HashMap<String, sidebar::ServerIndicatorState> {
+    let mut indicators = HashMap::new();
+    for project in state.projects() {
+        for folder in &project.folders {
+            for command in &folder.commands {
+                let session = runtime.sessions.get(&command.id);
+                let authority = command.port.and_then(|port| authorities.get(&port));
+                indicators.insert(
+                    command.id.clone(),
+                    derive_server_indicator_with_remote_authority(session, authority),
+                );
+            }
+        }
+    }
+    indicators
+}
+
+fn derive_server_indicator_with_remote_authority(
+    session: Option<&SessionRuntimeState>,
+    authority: Option<&remote::RemotePortAuthority>,
+) -> sidebar::ServerIndicatorState {
+    if session.is_some_and(|session| session.reap_incomplete) {
+        return sidebar::ServerIndicatorState::Unknown;
+    }
+    if session.is_some_and(|session| session.status == SessionStatus::Starting) {
+        return sidebar::ServerIndicatorState::Unready;
+    }
+
+    if authority.is_some_and(|authority| !authority.is_fresh_at(now_epoch_ms())) {
+        return sidebar::ServerIndicatorState::Unknown;
+    }
+
+    let Some(session) = session else {
+        return match authority.map(remote::RemotePortAuthority::kind) {
+            Some(remote::RemotePortAuthorityKind::ProvenExternal)
+                if authority.is_some_and(remote_external_authority_is_proven) =>
+            {
+                sidebar::ServerIndicatorState::External
+            }
+            Some(remote::RemotePortAuthorityKind::ProvenExternal) => {
+                sidebar::ServerIndicatorState::Unknown
+            }
+            Some(remote::RemotePortAuthorityKind::Unknown)
+            | Some(remote::RemotePortAuthorityKind::ProbeError)
+            | Some(remote::RemotePortAuthorityKind::Managed)
+            | Some(remote::RemotePortAuthorityKind::ManagedUnready) => {
+                sidebar::ServerIndicatorState::Unknown
+            }
+            Some(remote::RemotePortAuthorityKind::Occupied) => {
+                sidebar::ServerIndicatorState::Unknown
+            }
+            Some(remote::RemotePortAuthorityKind::Free) | None => {
+                sidebar::ServerIndicatorState::Stopped
+            }
+        };
+    };
+
+    match session.status {
+        SessionStatus::Starting => sidebar::ServerIndicatorState::Unready,
+        SessionStatus::Stopping => sidebar::ServerIndicatorState::Stopping,
+        SessionStatus::Running => match authority.map(remote::RemotePortAuthority::kind) {
+            Some(remote::RemotePortAuthorityKind::Managed)
+                if authority.is_some_and(|authority| {
+                    remote_managed_authority_matches_session(authority, session)
+                }) =>
+            {
+                sidebar::ServerIndicatorState::Ready
+            }
+            Some(remote::RemotePortAuthorityKind::ManagedUnready)
+                if authority.is_some_and(|authority| {
+                    remote_managed_authority_matches_session(authority, session)
+                }) =>
+            {
+                sidebar::ServerIndicatorState::Unready
+            }
+            Some(remote::RemotePortAuthorityKind::Managed) => {
+                // A remote Managed label is only a transport hint until its
+                // generation, membership and listener identity match this
+                // live session. Keep the sidebar fail-closed at Unknown.
+                sidebar::ServerIndicatorState::Unknown
+            }
+            Some(remote::RemotePortAuthorityKind::ManagedUnready) => {
+                sidebar::ServerIndicatorState::Unknown
+            }
+            Some(remote::RemotePortAuthorityKind::ProvenExternal)
+                if authority.is_some_and(remote_external_authority_is_proven) =>
+            {
+                sidebar::ServerIndicatorState::External
+            }
+            Some(remote::RemotePortAuthorityKind::ProvenExternal) => {
+                sidebar::ServerIndicatorState::Unknown
+            }
+            Some(remote::RemotePortAuthorityKind::Unknown)
+            | Some(remote::RemotePortAuthorityKind::ProbeError)
+            | None => sidebar::ServerIndicatorState::Unknown,
+            Some(remote::RemotePortAuthorityKind::Free)
+            | Some(remote::RemotePortAuthorityKind::Occupied) => {
+                sidebar::ServerIndicatorState::Unready
+            }
+        },
+        SessionStatus::Stopped => sidebar::ServerIndicatorState::Stopped,
+        SessionStatus::Crashed => sidebar::ServerIndicatorState::Crashed,
+        SessionStatus::Exited => sidebar::ServerIndicatorState::Exited,
+        SessionStatus::Failed => sidebar::ServerIndicatorState::Failed,
+    }
+}
+
+#[cfg(test)]
 fn derive_server_indicator(
     session: Option<&SessionRuntimeState>,
     port: Option<u16>,
     port_statuses: &HashMap<u16, PortStatus>,
+    probe_failures: &HashMap<u16, String>,
 ) -> sidebar::ServerIndicatorState {
+    if session.is_some_and(|session| session.status == SessionStatus::Starting) {
+        // A probe can fail while a process is still establishing its
+        // listener. Keep the launch transition orange until a current
+        // authority snapshot replaces it; never flash red from stale probe
+        // state.
+        return sidebar::ServerIndicatorState::Unready;
+    }
+    if port.is_some_and(|port| probe_failures.contains_key(&port)) {
+        return sidebar::ServerIndicatorState::Failed;
+    }
+
     let port_status = port.and_then(|port| port_statuses.get(&port));
-    let external_listener = port_status.is_some_and(|status| {
-        status.in_use
-            && session
-                .map(|session| !runtime_owns_port(session, status))
-                .unwrap_or(true)
-    });
+    let occupied_listener = port_status.is_some_and(|status| status.in_use);
 
     let Some(session) = session else {
-        return if external_listener {
-            sidebar::ServerIndicatorState::External
+        return if occupied_listener {
+            occupied_indicator_state()
         } else {
             sidebar::ServerIndicatorState::Stopped
         };
@@ -16859,20 +18009,16 @@ fn derive_server_indicator(
         | SessionStatus::Crashed
         | SessionStatus::Exited
         | SessionStatus::Failed
-            if external_listener =>
+            if occupied_listener =>
         {
-            sidebar::ServerIndicatorState::External
+            occupied_indicator_state()
         }
         SessionStatus::Stopped => sidebar::ServerIndicatorState::Stopped,
         SessionStatus::Starting => sidebar::ServerIndicatorState::Unready,
         SessionStatus::Running => match port {
-            Some(port) => {
-                let status = port_statuses.get(&port);
-                if status.is_some_and(|status| status.in_use && runtime_owns_port(session, status))
-                {
-                    sidebar::ServerIndicatorState::Ready
-                } else if external_listener {
-                    sidebar::ServerIndicatorState::External
+            Some(_) => {
+                if occupied_listener {
+                    occupied_indicator_state()
                 } else {
                     sidebar::ServerIndicatorState::Unready
                 }
@@ -16886,25 +18032,338 @@ fn derive_server_indicator(
     }
 }
 
-fn is_managed_port_owner(
-    active_session: Option<&crate::terminal::session::TerminalSessionView>,
-    status: &PortStatus,
-) -> bool {
-    active_session
-        .map(|session| runtime_owns_port(&session.runtime, status))
-        .unwrap_or(false)
-}
-
-fn runtime_owns_port(session: &SessionRuntimeState, status: &PortStatus) -> bool {
-    let Some(pid) = status.pid else {
-        return false;
-    };
-
-    if session.pid == Some(pid) {
-        return true;
+fn derive_server_indicator_with_authority(
+    session: Option<&SessionRuntimeState>,
+    port: Option<u16>,
+    authority: Option<&crate::process::ports::PortStatus>,
+    probe_failures: &HashMap<u16, String>,
+    source_freshness_deadline: Option<Instant>,
+) -> sidebar::ServerIndicatorState {
+    if session.is_some_and(|session| session.reap_incomplete) {
+        return sidebar::ServerIndicatorState::Unknown;
+    }
+    if session.is_some_and(|session| session.status == SessionStatus::Starting) {
+        return sidebar::ServerIndicatorState::Unready;
+    }
+    if session.map_or(true, |session| session.status == SessionStatus::Running)
+        && authority.is_some_and(local_authority_requires_source_freshness)
+        && !local_source_is_fresh(source_freshness_deadline)
+    {
+        return sidebar::ServerIndicatorState::Unknown;
+    }
+    if authority
+        .is_some_and(|authority| authority.kind() == crate::process::ports::PortStatusKind::Unknown)
+    {
+        return sidebar::ServerIndicatorState::Unknown;
+    }
+    if port.is_some_and(|port| probe_failures.contains_key(&port)) {
+        return sidebar::ServerIndicatorState::Failed;
     }
 
-    session.resources.process_ids.contains(&pid)
+    let kind = authority.map(crate::process::ports::PortStatus::kind);
+    let Some(session) = session else {
+        return match kind {
+            Some(crate::process::ports::PortStatusKind::ProvenExternal)
+                if authority.is_some_and(local_external_authority_is_proven) =>
+            {
+                sidebar::ServerIndicatorState::External
+            }
+            Some(crate::process::ports::PortStatusKind::ProvenExternal) => {
+                sidebar::ServerIndicatorState::Unknown
+            }
+            Some(crate::process::ports::PortStatusKind::Unknown) => {
+                sidebar::ServerIndicatorState::Unknown
+            }
+            Some(crate::process::ports::PortStatusKind::ProbeError) => {
+                sidebar::ServerIndicatorState::Unknown
+            }
+            Some(crate::process::ports::PortStatusKind::ManagedHealthy)
+            | Some(crate::process::ports::PortStatusKind::ManagedUnready)
+            | Some(crate::process::ports::PortStatusKind::Starting)
+            | Some(crate::process::ports::PortStatusKind::Occupied) => {
+                sidebar::ServerIndicatorState::Unknown
+            }
+            _ => sidebar::ServerIndicatorState::Stopped,
+        };
+    };
+
+    match session.status {
+        SessionStatus::Starting => sidebar::ServerIndicatorState::Unready,
+        SessionStatus::Stopping => sidebar::ServerIndicatorState::Stopping,
+        SessionStatus::Running => match kind {
+            Some(crate::process::ports::PortStatusKind::ManagedHealthy)
+                if authority.is_some_and(local_managed_authority_is_proven) =>
+            {
+                sidebar::ServerIndicatorState::Ready
+            }
+            Some(crate::process::ports::PortStatusKind::ManagedHealthy) => {
+                sidebar::ServerIndicatorState::Unknown
+            }
+            Some(crate::process::ports::PortStatusKind::ManagedUnready)
+                if authority.is_some_and(local_managed_authority_is_proven) =>
+            {
+                sidebar::ServerIndicatorState::Unready
+            }
+            Some(crate::process::ports::PortStatusKind::ManagedUnready) => {
+                sidebar::ServerIndicatorState::Unknown
+            }
+            Some(crate::process::ports::PortStatusKind::ProvenExternal)
+                if authority.is_some_and(local_external_authority_is_proven) =>
+            {
+                sidebar::ServerIndicatorState::External
+            }
+            Some(crate::process::ports::PortStatusKind::ProvenExternal) => {
+                sidebar::ServerIndicatorState::Unknown
+            }
+            Some(crate::process::ports::PortStatusKind::Unknown)
+            | Some(crate::process::ports::PortStatusKind::ProbeError)
+            | None => sidebar::ServerIndicatorState::Unknown,
+            Some(crate::process::ports::PortStatusKind::Starting)
+            | Some(crate::process::ports::PortStatusKind::Occupied)
+            | Some(crate::process::ports::PortStatusKind::Stopped) => {
+                sidebar::ServerIndicatorState::Unready
+            }
+        },
+        SessionStatus::Stopped
+        | SessionStatus::Crashed
+        | SessionStatus::Exited
+        | SessionStatus::Failed => match kind {
+            Some(crate::process::ports::PortStatusKind::Unknown)
+            | Some(crate::process::ports::PortStatusKind::ProbeError) => {
+                sidebar::ServerIndicatorState::Unknown
+            }
+            _ => match session.status {
+                SessionStatus::Stopped => sidebar::ServerIndicatorState::Stopped,
+                SessionStatus::Crashed => sidebar::ServerIndicatorState::Crashed,
+                SessionStatus::Exited => sidebar::ServerIndicatorState::Exited,
+                SessionStatus::Failed => sidebar::ServerIndicatorState::Failed,
+                SessionStatus::Starting | SessionStatus::Running | SessionStatus::Stopping => {
+                    unreachable!("status arm is exhaustive")
+                }
+            },
+        },
+    }
+}
+
+fn local_port_ui_authority(
+    authority: Option<&crate::process::ports::PortStatus>,
+    session: Option<&SessionRuntimeState>,
+    source_freshness_deadline: Option<Instant>,
+) -> Option<PortUiAuthority> {
+    if session
+        .is_some_and(|session| session.reap_incomplete || session.status != SessionStatus::Running)
+    {
+        return Some(PortUiAuthority::Unknown);
+    }
+    if authority.is_some_and(local_authority_requires_source_freshness)
+        && !local_source_is_fresh(source_freshness_deadline)
+    {
+        return Some(PortUiAuthority::Unknown);
+    }
+    authority.map(|authority| match authority.kind() {
+        crate::process::ports::PortStatusKind::ManagedHealthy
+            if local_managed_authority_is_proven(authority) =>
+        {
+            PortUiAuthority::Managed
+        }
+        crate::process::ports::PortStatusKind::ManagedHealthy => PortUiAuthority::Unknown,
+        crate::process::ports::PortStatusKind::ManagedUnready
+            if local_managed_authority_is_proven(authority) =>
+        {
+            PortUiAuthority::ManagedUnready
+        }
+        crate::process::ports::PortStatusKind::ManagedUnready => PortUiAuthority::Unknown,
+        crate::process::ports::PortStatusKind::ProvenExternal
+            if local_external_authority_is_proven(authority) =>
+        {
+            PortUiAuthority::ProvenExternal
+        }
+        crate::process::ports::PortStatusKind::ProvenExternal => PortUiAuthority::Unknown,
+        crate::process::ports::PortStatusKind::Starting => PortUiAuthority::Starting,
+        crate::process::ports::PortStatusKind::Stopped => PortUiAuthority::Free,
+        crate::process::ports::PortStatusKind::Unknown
+        | crate::process::ports::PortStatusKind::ProbeError
+        | crate::process::ports::PortStatusKind::Occupied => PortUiAuthority::Unknown,
+    })
+}
+
+fn can_open_local_server_url_now(
+    status: SessionStatus,
+    reap_incomplete: bool,
+    authority: Option<&crate::process::ports::PortStatus>,
+    probe_failure: Option<&str>,
+    last_checked_at: Option<Instant>,
+    source_freshness_deadline: Option<Instant>,
+    refresh_in_flight: bool,
+) -> bool {
+    status == SessionStatus::Running
+        && !reap_incomplete
+        && !refresh_in_flight
+        && probe_failure.is_none()
+        && local_source_is_fresh(source_freshness_deadline)
+        && last_checked_at.is_some_and(|checked_at| {
+            Instant::now()
+                .checked_duration_since(checked_at)
+                .is_some_and(|age| age <= crate::process::ports::DEFAULT_FREE_PROOF_MAX_AGE)
+        })
+        && authority.is_some_and(|authority| {
+            (local_managed_authority_is_proven(authority)
+                && authority.kind() == crate::process::ports::PortStatusKind::ManagedHealthy)
+                || (authority.kind() == crate::process::ports::PortStatusKind::ProvenExternal
+                    && local_external_authority_is_proven(authority))
+        })
+}
+
+fn local_authority_requires_source_freshness(
+    authority: &crate::process::ports::PortStatus,
+) -> bool {
+    matches!(
+        authority.kind(),
+        crate::process::ports::PortStatusKind::ManagedHealthy
+            | crate::process::ports::PortStatusKind::ManagedUnready
+            | crate::process::ports::PortStatusKind::ProvenExternal
+    )
+}
+
+fn local_source_is_fresh(source_freshness_deadline: Option<Instant>) -> bool {
+    source_freshness_deadline.is_some_and(|deadline| Instant::now() <= deadline)
+}
+
+fn local_managed_authority_is_proven(authority: &crate::process::ports::PortStatus) -> bool {
+    matches!(
+        authority.kind(),
+        crate::process::ports::PortStatusKind::ManagedHealthy
+            | crate::process::ports::PortStatusKind::ManagedUnready
+    ) && authority.error().is_none()
+        && !authority.listeners().is_empty()
+        && authority
+            .listeners()
+            .iter()
+            .all(|listener| listener.has_executable_proof())
+}
+
+fn local_external_authority_is_proven(authority: &crate::process::ports::PortStatus) -> bool {
+    authority.kind() == crate::process::ports::PortStatusKind::ProvenExternal
+        && authority.error().is_none()
+        && !authority.listeners().is_empty()
+        && authority.listeners().iter().all(|listener| {
+            listener.pid() != 0
+                && listener.creation_time_100ns() != 0
+                && listener.has_executable_proof()
+        })
+}
+
+fn can_open_remote_server_url_now(
+    authority: Option<&remote::RemotePortAuthority>,
+    session: Option<&SessionRuntimeState>,
+    port: u16,
+    listener_active: bool,
+) -> bool {
+    let Some(authority) = authority else {
+        return false;
+    };
+    let Some(session) = session else {
+        return false;
+    };
+    authority.is_fresh_at(now_epoch_ms())
+        && authority.error.is_none()
+        && listener_active
+        && session.status == SessionStatus::Running
+        && !session.reap_incomplete
+        && session
+            .server_launch
+            .as_ref()
+            .and_then(|launch| launch.port)
+            == Some(port)
+        && match authority.kind() {
+            remote::RemotePortAuthorityKind::Managed => {
+                remote_managed_authority_matches_session(authority, session)
+            }
+            remote::RemotePortAuthorityKind::ProvenExternal => {
+                remote_external_authority_is_proven(authority)
+            }
+            _ => false,
+        }
+}
+
+fn remote_external_authority_is_proven(authority: &remote::RemotePortAuthority) -> bool {
+    authority.kind() == remote::RemotePortAuthorityKind::ProvenExternal
+        && authority.diagnostic.is_none()
+        && authority.error.is_none()
+        && !authority.listeners.is_empty()
+        && authority.listeners.iter().all(|listener| {
+            listener.pid != 0
+                && listener.creation_time_100ns != 0
+                && listener.executable_proven
+                && listener
+                    .executable_fingerprint
+                    .is_some_and(|fingerprint| fingerprint != 0)
+        })
+}
+
+fn remote_managed_authority_matches_session(
+    authority: &remote::RemotePortAuthority,
+    session: &SessionRuntimeState,
+) -> bool {
+    authority.is_host_verified()
+        && authority.session_id.as_deref() == Some(session.session_id.as_str())
+}
+
+fn remote_port_ui_authority(
+    authority: Option<&remote::RemotePortAuthority>,
+    session: Option<&SessionRuntimeState>,
+) -> Option<PortUiAuthority> {
+    let authority = authority?;
+    if session
+        .is_some_and(|session| session.reap_incomplete || session.status != SessionStatus::Running)
+    {
+        return Some(PortUiAuthority::Unknown);
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(u64::MAX as u128) as u64)
+        .unwrap_or_default();
+    if !authority.is_fresh_at(now) {
+        return Some(PortUiAuthority::Unknown);
+    }
+    Some(match authority.kind() {
+        remote::RemotePortAuthorityKind::Managed => {
+            if session
+                .is_some_and(|session| remote_managed_authority_matches_session(authority, session))
+            {
+                PortUiAuthority::Managed
+            } else {
+                PortUiAuthority::Unknown
+            }
+        }
+        remote::RemotePortAuthorityKind::ManagedUnready => {
+            if session
+                .is_some_and(|session| remote_managed_authority_matches_session(authority, session))
+            {
+                PortUiAuthority::ManagedUnready
+            } else {
+                PortUiAuthority::Unknown
+            }
+        }
+        remote::RemotePortAuthorityKind::ProvenExternal
+            if remote_external_authority_is_proven(authority) =>
+        {
+            PortUiAuthority::ProvenExternal
+        }
+        remote::RemotePortAuthorityKind::ProvenExternal => PortUiAuthority::Unknown,
+        remote::RemotePortAuthorityKind::Free => PortUiAuthority::Free,
+        remote::RemotePortAuthorityKind::Unknown
+        | remote::RemotePortAuthorityKind::ProbeError
+        | remote::RemotePortAuthorityKind::Occupied => PortUiAuthority::Unknown,
+    })
+}
+
+#[cfg(test)]
+fn occupied_indicator_state() -> sidebar::ServerIndicatorState {
+    // Legacy port rows contain only PID-level evidence. Until an exact
+    // generation/executable proof is available, occupied is unknown and must
+    // never be painted as the blue proven-external state.
+    sidebar::ServerIndicatorState::Unknown
 }
 
 fn normalize_optional_string(value: &str) -> Option<String> {
@@ -16917,6 +18376,40 @@ fn local_stable_hash<T: serde::Serialize>(value: &T) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     std::hash::Hash::hash(&bytes, &mut hasher);
     std::hash::Hasher::finish(&hasher)
+}
+
+fn local_port_authority_hash(authorities: &HashMap<u16, crate::process::ports::PortStatus>) -> u64 {
+    let mut rows = authorities
+        .iter()
+        .map(|(port, authority)| {
+            (
+                *port,
+                format!("{:?}", authority.kind()),
+                format!("{:?}", authority.resource),
+                authority
+                    .listeners()
+                    .iter()
+                    .map(|listener| {
+                        (
+                            listener.pid(),
+                            listener.creation_time_100ns(),
+                            listener.has_executable_proof(),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+                authority.error().map(str::to_string),
+            )
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by_key(|row| row.0);
+    local_stable_hash(&rows)
+}
+
+fn now_epoch_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 fn app_window_title() -> String {
@@ -17551,11 +19044,62 @@ fn collect_git_repositories(state: &AppState) -> Vec<RemoteGitRepo> {
     collect_git_repositories_from_projects(state.projects())
 }
 
+fn git_action_repository(
+    action: &RemoteAction,
+    authority: Option<&GitHostBinding>,
+) -> Option<Result<GitRepository, String>> {
+    let needs_repository = matches!(
+        action,
+        RemoteAction::GitStatus { .. }
+            | RemoteAction::GitLog { .. }
+            | RemoteAction::GitDiffFile { .. }
+            | RemoteAction::GitDiffCommit { .. }
+            | RemoteAction::GitBranches { .. }
+            | RemoteAction::GitStage { .. }
+            | RemoteAction::GitUnstage { .. }
+            | RemoteAction::GitStageAll { .. }
+            | RemoteAction::GitUnstageAll { .. }
+            | RemoteAction::GitCommit { .. }
+            | RemoteAction::GitPush { .. }
+            | RemoteAction::GitPushSetUpstream { .. }
+            | RemoteAction::GitPull { .. }
+            | RemoteAction::GitFetch { .. }
+            | RemoteAction::GitSync { .. }
+            | RemoteAction::GitSwitchBranch { .. }
+            | RemoteAction::GitCreateBranch { .. }
+            | RemoteAction::GitDeleteBranch { .. }
+            | RemoteAction::GitGenerateCommitMessage { .. }
+    );
+    if !needs_repository {
+        return None;
+    };
+    Some(match authority {
+        Some(binding) => git_service::open_repository(binding),
+        None => Err(
+            "Git action requires a live WorkspaceService-issued repository authority.".to_string(),
+        ),
+    })
+}
+
+fn require_bound_git_repository(
+    repository: &Option<Result<GitRepository, String>>,
+) -> Result<&GitRepository, String> {
+    match repository {
+        Some(Ok(repository)) => Ok(repository),
+        Some(Err(error)) => Err(error.clone()),
+        None => Err("Git action did not carry a host-issued repository binding.".to_string()),
+    }
+}
+
+fn local_host_git_repository(_display_hint: &str) -> Result<GitRepository, String> {
+    Err("Git local UI requires a live WorkspaceService-issued repository authority.".to_string())
+}
+
 fn collect_git_repositories_from_projects(projects: &[Project]) -> Vec<RemoteGitRepo> {
     let mut repos = Vec::new();
 
     for project in projects {
-        if git_service::is_repo(&project.root_path) {
+        if !project.root_path.trim().is_empty() {
             repos.push(RemoteGitRepo {
                 label: project.name.clone(),
                 path: project.root_path.clone(),
@@ -17563,7 +19107,7 @@ fn collect_git_repositories_from_projects(projects: &[Project]) -> Vec<RemoteGit
         }
 
         for folder in &project.folders {
-            if folder.folder_path.is_empty() || !git_service::is_repo(&folder.folder_path) {
+            if folder.folder_path.is_empty() {
                 continue;
             }
 
@@ -18000,62 +19544,23 @@ fn collapse_terminal_whitespace(value: &str) -> String {
     value.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-fn scrollbar_thumb_top_ratio(display_offset: usize, max_offset: usize) -> f32 {
-    if max_offset == 0 {
-        1.0
-    } else {
-        1.0 - (display_offset as f32 / max_offset as f32)
-    }
-}
-
-/// Pure scrollbar math shared by render and tests. With no scrollback
-/// (alt-screen apps, fresh sessions) this intentionally returns a
-/// full-height inert thumb instead of `None`, so the gutter stays visible
-/// whenever the setting is on — matching Windows Terminal.
-fn scrollbar_model_for_screen(
-    screen: &crate::terminal::session::TerminalScreenSnapshot,
-    drag_thumb_top_ratio: Option<f32>,
-    enabled: bool,
-) -> Option<view::TerminalScrollbarModel> {
-    if !enabled {
-        return None;
-    }
-
-    let total_lines = screen.total_lines.max(screen.rows.max(1));
-    let visible_lines = screen.rows.max(1);
-    let max_offset = screen.history_size.max(1);
-    let thumb_height_ratio = visible_lines as f32 / total_lines as f32;
-    let thumb_top_ratio = drag_thumb_top_ratio
-        .unwrap_or_else(|| scrollbar_thumb_top_ratio(screen.display_offset, max_offset));
-
-    Some(view::TerminalScrollbarModel {
-        thumb_top_ratio: thumb_top_ratio.clamp(0.0, 1.0),
-        thumb_height_ratio,
-    })
-}
-
+/// The drag arithmetic is `crate::ui::scrollbar`'s, in window coordinates.
+/// A track the thumb fills has no position to report, and for a terminal that
+/// means the live bottom -- the convention the rest of this module's ratios
+/// use, which is why the fallback is here rather than in the shared function.
 fn scrollbar_ratio_for_position(
     position: Point<Pixels>,
     geometry: TerminalScrollbarGeometry,
-    grab_offset_px: f32,
+    grab: crate::ui::scrollbar::ScrollbarGrab,
 ) -> f32 {
-    let thumb_range = (geometry.track_height - geometry.thumb_height).max(0.0);
-    let position_y: f32 = position.y.into();
-    let unclamped_thumb_top = position_y - geometry.track_top - grab_offset_px;
-
-    if thumb_range <= f32::EPSILON {
-        1.0
-    } else {
-        (unclamped_thumb_top / thumb_range).clamp(0.0, 1.0)
-    }
-}
-
-fn display_offset_for_scrollbar_ratio(thumb_top_ratio: f32, max_offset: usize) -> usize {
-    if max_offset == 0 {
-        0
-    } else {
-        ((1.0 - thumb_top_ratio.clamp(0.0, 1.0)) * max_offset as f32).round() as usize
-    }
+    crate::ui::scrollbar::scroll_fraction_for_grab(
+        geometry.track_top,
+        geometry.track_height,
+        geometry.thumb_height,
+        position.y.into(),
+        grab,
+    )
+    .unwrap_or(1.0)
 }
 
 fn terminal_view_needs_resize(
@@ -18416,6 +19921,98 @@ mod tests {
     use gpui::point;
     use std::collections::{BTreeSet, HashMap};
     use std::path::PathBuf;
+
+    #[test]
+    fn deferred_terminal_input_callback_does_not_retain_stopped_remote_host() {
+        let service = RemoteHostService::new(crate::remote::RemoteHostConfig::default());
+        let host = service.downgrade();
+        let callback = Arc::new(remote_terminal_input_callback(
+            ProcessManager::new(),
+            host.clone(),
+        ));
+        service.set_terminal_input_handler(Some(callback.clone()));
+
+        drop(service);
+
+        assert!(
+            host.upgrade().is_none(),
+            "terminal input callback retained the stopped host runtime"
+        );
+        let error = callback(
+            RemoteTerminalInput::Text {
+                session_id: "stopped-session".to_string(),
+                text: "must-not-run".to_string(),
+            },
+            0,
+        )
+        .expect_err("stopped host must fail terminal input closed");
+        assert!(error.contains("Remote host stopped"));
+    }
+
+    #[test]
+    fn process_manager_remote_session_callback_does_not_retain_stopped_host() {
+        let service = RemoteHostService::new(crate::remote::RemoteHostConfig::default());
+        let host = service.downgrade();
+        let manager = ProcessManager::new();
+        let callback = Arc::new(remote_session_event_callback(host.clone()));
+        manager.set_remote_session_handler(Some(callback.clone()));
+
+        drop(service);
+
+        assert!(
+            host.upgrade().is_none(),
+            "ProcessManager callback retained the stopped host runtime"
+        );
+        // A late ProcessManager event is an ordinary no-op after teardown.
+        callback(RemoteSessionEvent::Removed {
+            session_id: "stopped-session".to_string(),
+        });
+    }
+
+    #[test]
+    fn quota_refresh_task_capture_does_not_retain_stopped_remote_host() {
+        let service = RemoteHostService::new(crate::remote::RemoteHostConfig::default());
+        let deferred_tick = {
+            let quota_task_host = service.downgrade();
+            move || quota_task_host.upgrade()
+        };
+
+        drop(service);
+
+        assert!(
+            deferred_tick().is_none(),
+            "periodic quota task capture retained the stopped host runtime"
+        );
+    }
+
+    #[test]
+    fn legacy_ai_quota_visibility_is_strictly_younger_than_one_hour() {
+        let state = AiQuotaState {
+            tab_id: "tab".to_string(),
+            tab_type: TabType::Claude,
+            provider_session_id: "provider-session".to_string(),
+            cursor: 0,
+            latest_usage: Some("72% remaining".to_string()),
+            latest_usage_seen_at_epoch_ms: 1_000,
+        };
+
+        assert!(!NativeShell::is_ai_quota_stale(
+            &state,
+            1_000 + 60 * 60 * 1_000 - 1
+        ));
+        assert!(NativeShell::is_ai_quota_stale(
+            &state,
+            1_000 + 60 * 60 * 1_000
+        ));
+        assert!(NativeShell::is_ai_quota_stale(&state, 999));
+
+        let mut legacy_without_timestamp = state;
+        legacy_without_timestamp.latest_usage_seen_at_epoch_ms = 0;
+        assert!(NativeShell::is_ai_quota_stale(
+            &legacy_without_timestamp,
+            1_000
+        ));
+    }
 
     #[test]
     fn remote_state_load_failure_disables_remote_and_surfaces_diagnostic() {
@@ -19380,6 +20977,9 @@ mod tests {
             last_connection_note: None,
             last_connection_is_error: false,
             latency: RemoteLatencyStats::default(),
+            connect_startup_error: None,
+            connect_listener_bound: false,
+            connect_encryption_required: true,
         }
     }
 
@@ -19688,23 +21288,43 @@ mod tests {
 
     #[test]
     fn scrollbar_ratio_maps_live_bottom_to_bottom_thumb() {
-        assert_eq!(scrollbar_thumb_top_ratio(0, 120), 1.0);
-        assert_eq!(scrollbar_thumb_top_ratio(120, 120), 0.0);
-        assert_eq!(display_offset_for_scrollbar_ratio(1.0, 120), 0);
-        assert_eq!(display_offset_for_scrollbar_ratio(0.0, 120), 120);
-        assert_eq!(display_offset_for_scrollbar_ratio(0.5, 120), 60);
+        assert_eq!(view::scrollbar_thumb_top_ratio(0, 120), 1.0);
+        assert_eq!(view::scrollbar_thumb_top_ratio(120, 120), 0.0);
+        assert_eq!(view::display_offset_for_scrollbar_ratio(1.0, 120), 0);
+        assert_eq!(view::display_offset_for_scrollbar_ratio(0.0, 120), 120);
+        assert_eq!(view::display_offset_for_scrollbar_ratio(0.5, 120), 60);
     }
 
+    /// I3/I4: this used to assert a full-height inert thumb, on the reasoning
+    /// that Windows Terminal keeps its gutter occupied. The cockpit's own
+    /// derivation answered `None` for the same screen, so the two shells
+    /// disagreed about the commonest case there is. The brief rules that no
+    /// overflow shows no thumb -- the same predicate every other surface in the
+    /// app uses -- and there is now one derivation that says so.
     #[test]
-    fn scrollbar_model_shows_full_height_thumb_without_history() {
+    fn scrollbar_model_is_absent_without_scrollback() {
         let mut screen = screen_from_lines(&["one", "two"]);
         screen.total_lines = 2;
         screen.history_size = 0;
         screen.display_offset = 0;
 
-        let model = scrollbar_model_for_screen(&screen, None, true).expect("model");
+        assert!(view::scrollbar_model_for_screen(&screen, None, true, false).is_none());
+    }
 
-        assert_eq!(model.thumb_height_ratio, 1.0);
+    /// One row of scrollback is overflow, so the bar appears -- the boundary
+    /// the case above sits one row below.
+    #[test]
+    fn scrollbar_model_appears_with_a_single_row_of_scrollback() {
+        let mut screen = screen_from_lines(&["one", "two"]);
+        screen.total_lines = 3;
+        screen.history_size = 1;
+        screen.display_offset = 0;
+
+        let model = view::scrollbar_model_for_screen(&screen, None, true, false).expect("model");
+
+        assert_eq!(model.thumb_height_ratio, 2.0 / 3.0);
+        assert_eq!(model.thumb_top_ratio, 1.0);
+        assert!(!model.hovered);
     }
 
     #[test]
@@ -19713,7 +21333,7 @@ mod tests {
         screen.total_lines = 20;
         screen.history_size = 18;
 
-        assert!(scrollbar_model_for_screen(&screen, None, false).is_none());
+        assert!(view::scrollbar_model_for_screen(&screen, None, false, false).is_none());
     }
 
     #[test]
@@ -19723,7 +21343,7 @@ mod tests {
         screen.history_size = 6;
         screen.display_offset = 0;
 
-        let model = scrollbar_model_for_screen(&screen, None, true).expect("model");
+        let model = view::scrollbar_model_for_screen(&screen, None, true, false).expect("model");
 
         assert_eq!(model.thumb_height_ratio, 0.25);
         assert_eq!(model.thumb_top_ratio, 1.0);
@@ -19842,6 +21462,34 @@ mod tests {
     }
 
     #[test]
+    fn remote_shared_app_state_redacts_legacy_ssh_material() {
+        let mut state = AppState::default();
+        state.config.ssh_connections.push(SSHConnection {
+            id: "ssh-redaction-test".to_string(),
+            label: "redaction test".to_string(),
+            host: "redaction.example.test".to_string(),
+            port: 22,
+            username: "builder".to_string(),
+            password: Some("PASSWORD_SENTINEL".to_string()),
+            private_key: Some("PRIVATE_KEY_SENTINEL".to_string()),
+        });
+
+        let shared = remote_shared_app_state(&state);
+        let serialized = serde_json::to_string(&shared).expect("serialize remote snapshot");
+
+        assert!(!serialized.contains("PASSWORD_SENTINEL"));
+        assert!(!serialized.contains("PRIVATE_KEY_SENTINEL"));
+        assert_eq!(
+            state.config.ssh_connections[0].password.as_deref(),
+            Some("PASSWORD_SENTINEL")
+        );
+        assert_eq!(
+            state.config.ssh_connections[0].private_key.as_deref(),
+            Some("PRIVATE_KEY_SENTINEL")
+        );
+    }
+
+    #[test]
     fn remote_reconnect_backoff_caps_at_max_interval() {
         assert_eq!(remote_reconnect_backoff(0), REMOTE_RECONNECT_BASE_INTERVAL);
         assert_eq!(
@@ -19886,8 +21534,84 @@ mod tests {
             max_offset: 120,
         };
 
-        let ratio = scrollbar_ratio_for_position(point(px(5.0), px(44.0)), geometry, 10.0);
+        let ratio = scrollbar_ratio_for_position(
+            point(px(5.0), px(44.0)),
+            geometry,
+            crate::ui::scrollbar::ScrollbarGrab::Held(10.0),
+        );
         assert!((ratio - 0.4).abs() < 0.001);
+
+        // A track click has no hold, so the thumb centres on the pointer. On a
+        // 20 px thumb that is indistinguishable from `Held(10.0)` -- half the
+        // thumb IS the held offset -- so the two are compared on a 30 px thumb,
+        // where centring uses 15 and the hold uses 10 and they must disagree.
+        let taller = TerminalScrollbarGeometry {
+            thumb_height: 30.0,
+            ..geometry
+        };
+        let travel = taller.track_height - taller.thumb_height;
+        assert_eq!(travel, 50.0);
+
+        let centred = scrollbar_ratio_for_position(
+            point(px(5.0), px(45.0)),
+            taller,
+            crate::ui::scrollbar::ScrollbarGrab::Centre,
+        );
+        // (45 - 15 - 10) / 50
+        assert!((centred - 0.4).abs() < 0.001, "centred was {centred}");
+
+        let held = scrollbar_ratio_for_position(
+            point(px(5.0), px(45.0)),
+            taller,
+            crate::ui::scrollbar::ScrollbarGrab::Held(10.0),
+        );
+        // (45 - 10 - 10) / 50
+        assert!((held - 0.5).abs() < 0.001, "held was {held}");
+        assert_ne!(
+            centred, held,
+            "Centre and Held must be different rules, not one arithmetic dressed twice"
+        );
+    }
+
+    /// I1 at the terminal: a thumb grabbed 3 px below its top and dragged 10 px
+    /// must move exactly 10 px, not jump so its centre lands on the pointer.
+    #[test]
+    fn dragging_the_terminal_thumb_keeps_the_grab_offset() {
+        let geometry = TerminalScrollbarGeometry {
+            left: 0.0,
+            top: 0.0,
+            width: 10.0,
+            height: 100.0,
+            track_top: 10.0,
+            track_height: 80.0,
+            thumb_top: 34.0,
+            thumb_height: 20.0,
+            max_offset: 120,
+        };
+        let travel = geometry.track_height - geometry.thumb_height;
+
+        let press_y = geometry.thumb_top + 3.0;
+        let grab = crate::ui::scrollbar::grab_for_pointer(
+            geometry.thumb_top,
+            geometry.thumb_height,
+            press_y,
+        );
+        assert_eq!(grab, crate::ui::scrollbar::ScrollbarGrab::Held(3.0));
+
+        let pressed = scrollbar_ratio_for_position(point(px(5.0), px(press_y)), geometry, grab);
+        let pressed_top = geometry.track_top + pressed * travel;
+        assert!(
+            (pressed_top - geometry.thumb_top).abs() < 0.001,
+            "pressing inside the thumb must not move it: {pressed_top}"
+        );
+
+        let dragged =
+            scrollbar_ratio_for_position(point(px(5.0), px(press_y + 10.0)), geometry, grab);
+        let dragged_top = geometry.track_top + dragged * travel;
+        assert!(
+            (dragged_top - geometry.thumb_top - 10.0).abs() < 0.001,
+            "a 10 px drag must move the thumb 10 px: {dragged_top}"
+        );
     }
 
     fn snapshot_cell(character: char) -> TerminalCellSnapshot {
@@ -19905,6 +21629,7 @@ mod tests {
             hidden: false,
             has_hyperlink: false,
             default_background: true,
+            default_foreground: false,
         }
     }
 
@@ -20271,7 +21996,509 @@ mod tests {
     }
 
     #[test]
-    fn derive_server_indicator_uses_managed_port_ownership() {
+    fn stale_port_refresh_callback_cannot_apply_to_a_new_generation_or_port_set() {
+        let old = PortRefreshFence {
+            generation: 7,
+            ports: vec![5174],
+            task_action_epoch: 2,
+            runtime_generation: 10,
+            resource_generation: 11,
+            managed_snapshot_generation: 12,
+            server_lifecycle_generation: 1,
+        };
+        let current = PortRefreshFence {
+            generation: 8,
+            ports: vec![5174, 3000],
+            task_action_epoch: 3,
+            runtime_generation: 13,
+            resource_generation: 14,
+            managed_snapshot_generation: 15,
+            server_lifecycle_generation: 2,
+        };
+
+        assert!(!port_refresh_is_current(Some(&current), &old));
+        assert!(!port_refresh_is_current(None, &old));
+        assert!(port_refresh_is_current(Some(&current), &current));
+    }
+
+    #[test]
+    fn stale_port_refresh_callback_cannot_cross_action_runtime_or_resource_generation() {
+        let current = PortRefreshFence {
+            generation: 8,
+            ports: vec![5174],
+            task_action_epoch: 4,
+            runtime_generation: 12,
+            resource_generation: 13,
+            managed_snapshot_generation: 14,
+            server_lifecycle_generation: 3,
+        };
+        for changed in [
+            PortRefreshFence {
+                task_action_epoch: 5,
+                ..current.clone()
+            },
+            PortRefreshFence {
+                runtime_generation: 15,
+                ..current.clone()
+            },
+            PortRefreshFence {
+                resource_generation: 16,
+                ..current.clone()
+            },
+            PortRefreshFence {
+                managed_snapshot_generation: 17,
+                ..current.clone()
+            },
+            PortRefreshFence {
+                server_lifecycle_generation: 4,
+                ..current.clone()
+            },
+        ] {
+            assert!(!port_refresh_is_current(Some(&current), &changed));
+        }
+    }
+
+    #[test]
+    fn stale_port_refresh_callback_rejects_changed_current_generation() {
+        let current = PortRefreshFence {
+            generation: 8,
+            ports: vec![5174],
+            task_action_epoch: 4,
+            runtime_generation: 12,
+            resource_generation: 13,
+            managed_snapshot_generation: 14,
+            server_lifecycle_generation: 3,
+        };
+
+        assert!(port_refresh_is_current_for_state(
+            Some(&current),
+            &current,
+            &[5174],
+            4,
+            12,
+            13,
+            14,
+            3,
+        ));
+        assert!(!port_refresh_is_current_for_state(
+            Some(&current),
+            &current,
+            &[5174],
+            4,
+            15,
+            13,
+            14,
+            3,
+        ));
+        assert!(!port_refresh_is_current_for_state(
+            Some(&current),
+            &current,
+            &[5174],
+            4,
+            12,
+            13,
+            14,
+            4,
+        ));
+    }
+
+    #[test]
+    fn local_url_action_requires_fresh_authority_and_current_refresh() {
+        let resource =
+            crate::domain::operation::ResourceFence::new(crate::domain::id::ResourceId::new(), 7);
+        let listener = crate::process::ports::ListenerIdentity::with_executable(
+            42,
+            123,
+            std::env::current_exe().expect("test executable"),
+        )
+        .expect("managed listener identity");
+        let healthy = crate::process::ports::PortStatus {
+            port: 5174,
+            resource,
+            kind: crate::process::ports::PortStatusKind::ManagedHealthy,
+            listeners: Arc::from([listener]),
+            error: None,
+        };
+        let unready = crate::process::ports::PortStatus {
+            kind: crate::process::ports::PortStatusKind::ManagedUnready,
+            ..healthy.clone()
+        };
+
+        assert!(can_open_local_server_url_now(
+            SessionStatus::Running,
+            false,
+            Some(&healthy),
+            None,
+            Some(Instant::now()),
+            Some(Instant::now() + Duration::from_secs(5)),
+            false,
+        ));
+        assert!(!can_open_local_server_url_now(
+            SessionStatus::Running,
+            false,
+            Some(&unready),
+            None,
+            Some(Instant::now()),
+            Some(Instant::now() + Duration::from_secs(5)),
+            false,
+        ));
+        assert!(!can_open_local_server_url_now(
+            SessionStatus::Running,
+            false,
+            Some(&healthy),
+            None,
+            Some(Instant::now()),
+            Some(Instant::now() + Duration::from_secs(5)),
+            true,
+        ));
+        assert!(!can_open_local_server_url_now(
+            SessionStatus::Running,
+            false,
+            None,
+            None,
+            Some(Instant::now()),
+            Some(Instant::now() + Duration::from_secs(5)),
+            false,
+        ));
+        assert!(!can_open_local_server_url_now(
+            SessionStatus::Running,
+            false,
+            Some(&healthy),
+            Some("stale listener inventory"),
+            Some(Instant::now()),
+            Some(Instant::now() + Duration::from_secs(5)),
+            false,
+        ));
+        assert!(!can_open_local_server_url_now(
+            SessionStatus::Running,
+            true,
+            Some(&healthy),
+            None,
+            Some(Instant::now()),
+            Some(Instant::now() + Duration::from_secs(5)),
+            false,
+        ));
+    }
+
+    #[test]
+    fn local_url_action_rejects_evidence_past_source_deadline() {
+        let resource =
+            crate::domain::operation::ResourceFence::new(crate::domain::id::ResourceId::new(), 7);
+        let listener = crate::process::ports::ListenerIdentity::with_executable(
+            42,
+            123,
+            std::env::current_exe().expect("test executable"),
+        )
+        .expect("managed listener identity");
+        let healthy = crate::process::ports::PortStatus {
+            port: 5174,
+            resource,
+            kind: crate::process::ports::PortStatusKind::ManagedHealthy,
+            listeners: Arc::from([listener]),
+            error: None,
+        };
+
+        assert!(!can_open_local_server_url_now(
+            SessionStatus::Running,
+            false,
+            Some(&healthy),
+            None,
+            Some(Instant::now() - Duration::from_secs(3)),
+            Some(Instant::now() - Duration::from_secs(1)),
+            false,
+        ));
+    }
+
+    #[test]
+    fn local_indicator_and_terminal_authority_reject_expired_source_deadline() {
+        let resource =
+            crate::domain::operation::ResourceFence::new(crate::domain::id::ResourceId::new(), 7);
+        let listener = crate::process::ports::ListenerIdentity::with_executable(
+            42,
+            123,
+            std::env::current_exe().expect("test executable"),
+        )
+        .expect("managed listener identity");
+        let healthy = crate::process::ports::PortStatus {
+            port: 5174,
+            resource,
+            kind: crate::process::ports::PortStatusKind::ManagedHealthy,
+            listeners: Arc::from([listener]),
+            error: None,
+        };
+        let mut session = SessionRuntimeState::new(
+            "expired-server",
+            PathBuf::new(),
+            SessionDimensions::default(),
+            TerminalBackend::PortablePtyFeedingAlacritty,
+        );
+        session.status = SessionStatus::Running;
+        let expired = Some(Instant::now() - Duration::from_millis(1));
+
+        assert_eq!(
+            derive_server_indicator_with_authority(
+                Some(&session),
+                Some(5174),
+                Some(&healthy),
+                &HashMap::new(),
+                expired,
+            ),
+            sidebar::ServerIndicatorState::Unknown,
+        );
+        assert_eq!(
+            local_port_ui_authority(Some(&healthy), Some(&session), expired),
+            Some(PortUiAuthority::Unknown),
+        );
+    }
+
+    #[test]
+    fn managed_unready_is_attention_not_ready_and_not_managed_green() {
+        let resource =
+            crate::domain::operation::ResourceFence::new(crate::domain::id::ResourceId::new(), 7);
+        let status = crate::process::ports::PortStatus {
+            port: 5174,
+            resource,
+            kind: crate::process::ports::PortStatusKind::ManagedUnready,
+            listeners: Arc::from([crate::process::ports::ListenerIdentity::with_executable(
+                42,
+                123,
+                std::env::current_exe().expect("test executable"),
+            )
+            .expect("managed listener identity")]),
+            error: None,
+        };
+        let session = SessionRuntimeState::new(
+            "unready-server",
+            PathBuf::new(),
+            SessionDimensions::default(),
+            TerminalBackend::PortablePtyFeedingAlacritty,
+        );
+
+        assert_eq!(
+            derive_server_indicator_with_authority(
+                Some(&session),
+                Some(5174),
+                Some(&status),
+                &HashMap::new(),
+                Some(Instant::now() + Duration::from_secs(5)),
+            ),
+            sidebar::ServerIndicatorState::Unready,
+        );
+        assert_eq!(
+            local_port_ui_authority(
+                Some(&status),
+                None,
+                Some(Instant::now() + Duration::from_secs(5)),
+            ),
+            Some(PortUiAuthority::ManagedUnready),
+        );
+    }
+
+    #[test]
+    fn failed_port_refresh_keeps_unknown_indicator_and_copy() {
+        let mut statuses = HashMap::from([(
+            5174,
+            PortStatus {
+                port: 5174,
+                in_use: true,
+                pid: Some(42),
+                process_name: Some("stale-listener".to_string()),
+            },
+        )]);
+
+        let mut probe_failures = HashMap::new();
+        let notice = apply_server_port_refresh(
+            &mut statuses,
+            &mut HashMap::new(),
+            &mut probe_failures,
+            &[5174],
+            Err("listener inventory unavailable".to_string()),
+        );
+
+        assert!(statuses.is_empty());
+        assert_eq!(
+            probe_failures.get(&5174).map(String::as_str),
+            Some("listener inventory unavailable")
+        );
+        assert!(notice
+            .as_deref()
+            .is_some_and(|message| message.contains("Port 5174 status is unknown")));
+        assert_eq!(
+            derive_server_indicator(None, Some(5174), &statuses, &probe_failures),
+            sidebar::ServerIndicatorState::Failed
+        );
+    }
+
+    #[test]
+    fn applying_port_projection_preserves_source_metadata_without_restamping() {
+        let observed_at = Instant::now() - Duration::from_millis(25);
+        let deadline = observed_at + Duration::from_secs(5);
+        let mut statuses = HashMap::new();
+        let mut authorities = HashMap::new();
+        let mut probe_failures = HashMap::new();
+        let mut applied_observed_at = None;
+        let mut applied_deadline = None;
+        let mut applied_sequence = 0;
+
+        apply_server_port_refresh_with_metadata(
+            &mut statuses,
+            &mut authorities,
+            &mut probe_failures,
+            &mut applied_observed_at,
+            &mut applied_deadline,
+            &mut applied_sequence,
+            &[5174],
+            Ok(PortRefreshProjection {
+                source_observed_at: Some(observed_at),
+                source_freshness_deadline: Some(deadline),
+                source_publication_sequence: 9,
+                ..PortRefreshProjection::default()
+            }),
+        );
+
+        assert_eq!(applied_observed_at, Some(observed_at));
+        assert_eq!(applied_deadline, Some(deadline));
+        assert_eq!(applied_sequence, 9);
+    }
+
+    #[test]
+    fn failed_port_refresh_does_not_override_starting_indicator() {
+        let mut session = SessionRuntimeState::new(
+            "server-cmd",
+            PathBuf::from("."),
+            SessionDimensions::default(),
+            crate::terminal::session::TerminalBackend::PortablePtyFeedingAlacritty,
+        );
+        session.status = SessionStatus::Starting;
+
+        let statuses = HashMap::new();
+        let failures = HashMap::from([(5174, "listener inventory unavailable".to_string())]);
+
+        assert_eq!(
+            derive_server_indicator(Some(&session), Some(5174), &statuses, &failures),
+            sidebar::ServerIndicatorState::Unready
+        );
+    }
+
+    #[test]
+    fn staging_port_refresh_invalidates_old_legacy_statuses_immediately() {
+        let mut statuses = HashMap::from([(
+            5174,
+            PortStatus {
+                port: 5174,
+                in_use: false,
+                pid: None,
+                process_name: None,
+            },
+        )]);
+        let mut authorities = HashMap::from([(
+            5174,
+            crate::process::ports::PortStatus {
+                port: 5174,
+                resource: crate::domain::operation::ResourceFence::new(
+                    crate::domain::id::ResourceId::new(),
+                    1,
+                ),
+                kind: crate::process::ports::PortStatusKind::ProvenExternal,
+                listeners: Arc::from([]),
+                error: None,
+            },
+        )]);
+        let mut failures = HashMap::from([(5174, "old failure".to_string())]);
+
+        stage_server_port_refresh(&mut statuses, &mut authorities, &mut failures, &[5174]);
+
+        assert!(statuses.is_empty());
+        assert!(authorities.is_empty());
+        assert!(failures.is_empty());
+    }
+
+    #[test]
+    fn invalidating_all_server_port_evidence_clears_cached_authority_and_active_state() {
+        let port = 5174;
+        let mut snapshot = ServerPortSnapshotState::default();
+        snapshot.statuses.insert(
+            port,
+            PortStatus {
+                port,
+                in_use: true,
+                pid: Some(42),
+                process_name: None,
+            },
+        );
+        snapshot.authorities.insert(
+            port,
+            crate::process::ports::PortStatus {
+                port,
+                resource: crate::domain::operation::ResourceFence::new(
+                    crate::domain::id::ResourceId::new(),
+                    1,
+                ),
+                kind: crate::process::ports::PortStatusKind::ProvenExternal,
+                listeners: Arc::from([]),
+                error: None,
+            },
+        );
+        snapshot
+            .probe_failures
+            .insert(port, "old failure".to_string());
+        snapshot.source_observed_at = Some(Instant::now());
+        snapshot.source_freshness_deadline = Some(Instant::now() + Duration::from_secs(5));
+        snapshot.source_publication_sequence = 7;
+        snapshot.last_checked_at = Some(Instant::now());
+        snapshot.refresh_in_flight = true;
+        let mut active = Some(ActivePortState {
+            command_id: "server-cmd".to_string(),
+            port,
+            status: snapshot.statuses.get(&port).cloned(),
+            last_checked_at: snapshot.last_checked_at,
+            refresh_in_flight: true,
+        });
+
+        invalidate_server_port_snapshot_state(&mut snapshot, &mut active, None);
+
+        assert!(snapshot.statuses.is_empty());
+        assert!(snapshot.authorities.is_empty());
+        assert!(snapshot.probe_failures.is_empty());
+        assert!(snapshot.source_observed_at.is_none());
+        assert!(snapshot.source_freshness_deadline.is_none());
+        assert_eq!(snapshot.source_publication_sequence, 0);
+        assert!(active.is_none());
+    }
+
+    #[test]
+    fn tracked_port_invalidation_clears_removed_active_port_state() {
+        let mut active = Some(ActivePortState {
+            command_id: "server-cmd".to_string(),
+            port: 5174,
+            status: None,
+            last_checked_at: None,
+            refresh_in_flight: false,
+        });
+
+        clear_active_port_state_for_untracked_ports(&mut active, &[5175]);
+
+        assert!(active.is_none());
+    }
+
+    #[test]
+    fn occupied_start_notice_preserves_exact_listener_identity() {
+        let error = crate::process::ports::PortStartError::Occupied {
+            port: 5174,
+            listener: crate::process::ports::ListenerIdentity::new(42, 9_876_543)
+                .expect("listener identity"),
+        };
+
+        let notice = port_start_error_notice(&error);
+
+        assert!(notice.contains("PID 42"));
+        assert!(notice.contains("creation 9876543"));
+        assert!(notice.contains("ownership is unverified"));
+        assert!(!notice.contains("external"));
+    }
+
+    #[test]
+    fn derive_server_indicator_does_not_claim_managed_port_from_legacy_pid() {
         let mut state = AppState::default();
         let mut project = sample_project();
         project.folders[0].commands[0].port = Some(5174);
@@ -20300,10 +22527,11 @@ mod tests {
                 process_name: None,
             },
         );
-        let indicators = derive_server_indicator_states(&state, &runtime, &port_statuses);
+        let indicators =
+            derive_server_indicator_states(&state, &runtime, &port_statuses, &HashMap::new());
         assert_eq!(
             indicators.get("server-cmd"),
-            Some(&sidebar::ServerIndicatorState::Ready)
+            Some(&occupied_indicator_state())
         );
 
         port_statuses.insert(
@@ -20315,10 +22543,11 @@ mod tests {
                 process_name: None,
             },
         );
-        let indicators = derive_server_indicator_states(&state, &runtime, &port_statuses);
+        let indicators =
+            derive_server_indicator_states(&state, &runtime, &port_statuses, &HashMap::new());
         assert_eq!(
             indicators.get("server-cmd"),
-            Some(&sidebar::ServerIndicatorState::External)
+            Some(&occupied_indicator_state())
         );
 
         port_statuses.insert(
@@ -20330,7 +22559,8 @@ mod tests {
                 process_name: None,
             },
         );
-        let indicators = derive_server_indicator_states(&state, &runtime, &port_statuses);
+        let indicators =
+            derive_server_indicator_states(&state, &runtime, &port_statuses, &HashMap::new());
         assert_eq!(
             indicators.get("server-cmd"),
             Some(&sidebar::ServerIndicatorState::Unready)
@@ -20338,7 +22568,573 @@ mod tests {
     }
 
     #[test]
-    fn derive_server_indicator_detects_external_listener_without_session() {
+    fn typed_proven_external_authority_reaches_blue_indicator() {
+        let status = crate::process::ports::PortStatus {
+            port: 5174,
+            resource: crate::domain::operation::ResourceFence::new(
+                crate::domain::id::ResourceId::new(),
+                1,
+            ),
+            kind: crate::process::ports::PortStatusKind::ProvenExternal,
+            listeners: Arc::from([crate::process::ports::ListenerIdentity::with_executable(
+                42,
+                9,
+                std::env::current_exe().expect("test executable"),
+            )
+            .expect("external listener identity")]),
+            error: None,
+        };
+
+        assert_eq!(
+            derive_server_indicator_with_authority(
+                None,
+                Some(5174),
+                Some(&status),
+                &HashMap::new(),
+                Some(Instant::now() + Duration::from_secs(5)),
+            ),
+            sidebar::ServerIndicatorState::External
+        );
+    }
+
+    #[test]
+    fn remote_external_probe_diagnostic_cannot_paint_native_blue() {
+        let status = crate::process::ports::PortStatus {
+            port: 5174,
+            resource: crate::domain::operation::ResourceFence::new(
+                crate::domain::id::ResourceId::new(),
+                1,
+            ),
+            kind: crate::process::ports::PortStatusKind::ProvenExternal,
+            listeners: Arc::from([crate::process::ports::ListenerIdentity::with_executable(
+                42,
+                9,
+                std::env::current_exe().expect("test executable"),
+            )
+            .expect("external listener identity")]),
+            error: None,
+        };
+        let now_epoch_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock after unix epoch")
+            .as_millis()
+            .min(u64::MAX as u128) as u64;
+        let mut authority = remote::RemotePortAuthority::from_rich(&status, now_epoch_ms);
+        authority.diagnostic = Some(remote::RemotePortDiagnostic::ProbeError);
+        authority.publication_sequence = 1;
+
+        assert!(!remote_external_authority_is_proven(&authority));
+        assert_eq!(
+            remote_port_ui_authority(Some(&authority), None),
+            Some(PortUiAuthority::Unknown)
+        );
+    }
+
+    #[test]
+    fn external_authority_cannot_override_inactive_or_reaping_session() {
+        let status = crate::process::ports::PortStatus {
+            port: 5174,
+            resource: crate::domain::operation::ResourceFence::new(
+                crate::domain::id::ResourceId::new(),
+                1,
+            ),
+            kind: crate::process::ports::PortStatusKind::ProvenExternal,
+            listeners: Arc::from([crate::process::ports::ListenerIdentity::with_executable(
+                42,
+                9,
+                std::env::current_exe().expect("test executable"),
+            )
+            .expect("external listener identity")]),
+            error: None,
+        };
+        let mut session = SessionRuntimeState::new(
+            "inactive-server",
+            PathBuf::new(),
+            SessionDimensions::default(),
+            TerminalBackend::PortablePtyFeedingAlacritty,
+        );
+
+        for (state, expected) in [
+            (
+                SessionStatus::Stopped,
+                sidebar::ServerIndicatorState::Stopped,
+            ),
+            (SessionStatus::Failed, sidebar::ServerIndicatorState::Failed),
+        ] {
+            session.status = state;
+            assert_eq!(
+                derive_server_indicator_with_authority(
+                    Some(&session),
+                    Some(5174),
+                    Some(&status),
+                    &HashMap::new(),
+                    Some(Instant::now() + Duration::from_secs(5)),
+                ),
+                expected,
+            );
+        }
+
+        session.status = SessionStatus::Running;
+        session.reap_incomplete = true;
+        assert_eq!(
+            derive_server_indicator_with_authority(
+                Some(&session),
+                Some(5174),
+                Some(&status),
+                &HashMap::new(),
+                Some(Instant::now() + Duration::from_secs(5)),
+            ),
+            sidebar::ServerIndicatorState::Unknown,
+        );
+    }
+
+    #[test]
+    fn typed_refresh_projection_stays_unknown_until_registry_handoff() {
+        let port = 5174;
+        let listener = crate::process::ports::ListenerIdentity::with_executable(
+            42,
+            9_876_543,
+            std::env::current_exe().expect("test executable"),
+        )
+        .expect("listener identity");
+        let snapshot =
+            crate::process::ports::PortInventorySnapshot::new(std::collections::BTreeMap::from([
+                (
+                    port,
+                    crate::process::ports::PortObservation::from_listeners(vec![listener]),
+                ),
+            ]))
+            .with_publication_sequence(1);
+        let projection = project_typed_port_snapshot(
+            &snapshot,
+            &[port],
+            crate::domain::operation::ResourceFence::new(crate::domain::id::ResourceId::new(), 0),
+            &HashMap::new(),
+            &std::collections::HashSet::new(),
+        );
+
+        assert_eq!(
+            projection
+                .authorities
+                .get(&port)
+                .map(crate::process::ports::PortStatus::kind),
+            Some(crate::process::ports::PortStatusKind::Unknown)
+        );
+        assert_eq!(
+            derive_server_indicator_with_authority(
+                None,
+                Some(port),
+                projection.authorities.get(&port),
+                &HashMap::new(),
+                Some(Instant::now() + Duration::from_secs(5)),
+            ),
+            sidebar::ServerIndicatorState::Unknown
+        );
+    }
+
+    #[test]
+    fn failed_refresh_uses_cached_typed_probe_snapshot_for_every_port() {
+        let ports = [43_201, 43_202];
+        let observed_at = Instant::now();
+        let deadline = observed_at + Duration::from_secs(5);
+        let snapshot = Arc::new(
+            crate::process::ports::PortInventorySnapshot::probe_failure_at(
+                ports,
+                "listener probe failed: [redacted path]",
+                observed_at,
+                deadline,
+            )
+            .with_publication_sequence(7),
+        );
+        let projection = project_port_refresh_result(
+            Err("listener inventory scan failed".to_string()),
+            snapshot.clone(),
+            &ports,
+            crate::domain::operation::ResourceFence::new(crate::domain::id::ResourceId::new(), 0),
+            &HashMap::new(),
+            &std::collections::HashSet::from(ports),
+        );
+
+        for port in ports {
+            assert_eq!(
+                projection
+                    .authorities
+                    .get(&port)
+                    .map(crate::process::ports::PortStatus::kind),
+                Some(crate::process::ports::PortStatusKind::ProbeError)
+            );
+        }
+        assert_eq!(projection.source_observed_at, Some(observed_at));
+        assert_eq!(projection.source_freshness_deadline, Some(deadline));
+        assert_eq!(projection.source_publication_sequence, 7);
+    }
+
+    #[test]
+    fn uncached_refresh_error_preserves_typed_source_metadata_through_remote_authority() {
+        let ports = [43_203, 43_204];
+        let inventory = ports_service::PortInventory::with_scanner_and_timeout(
+            |_ports: &[u16], _cancellation: &crate::process::ports::ScanCancellation| {
+                unreachable!("shutdown admission must not invoke the scanner")
+            },
+            Duration::from_millis(50),
+        );
+        inventory.shutdown();
+
+        let result = inventory.refresh(&ports).map_err(|error| error.to_string());
+        let cached_snapshot = inventory.cached_snapshot();
+        let observed_at = cached_snapshot.observed_at();
+        let deadline = cached_snapshot.freshness_deadline();
+        let sequence = cached_snapshot.publication_sequence();
+        let now = Instant::now();
+        let projection = project_port_refresh_result(
+            result,
+            cached_snapshot,
+            &ports,
+            crate::domain::operation::ResourceFence::new(crate::domain::id::ResourceId::new(), 0),
+            &HashMap::new(),
+            &std::collections::HashSet::from(ports),
+        );
+
+        assert!(sequence > 0);
+        assert_eq!(projection.source_observed_at, Some(observed_at));
+        assert_eq!(projection.source_freshness_deadline, Some(deadline));
+        assert_eq!(projection.source_publication_sequence, sequence);
+        for port in ports {
+            let authority = projection.authorities.get(&port).expect("port authority");
+            assert_eq!(
+                authority.kind(),
+                crate::process::ports::PortStatusKind::ProbeError
+            );
+            let remote = remote::RemotePortAuthority::from_rich_with_source_metadata(
+                authority,
+                instant_to_epoch_ms(observed_at, now, now_epoch_ms()),
+                instant_to_epoch_ms(deadline, now, now_epoch_ms()),
+            )
+            .with_snapshot_metadata(sequence, 0, 0);
+            assert_eq!(remote.kind(), remote::RemotePortAuthorityKind::ProbeError);
+            assert_eq!(
+                remote.diagnostic,
+                Some(remote::RemotePortDiagnostic::ProbeError)
+            );
+            assert!(remote.is_fresh_at(now_epoch_ms()));
+        }
+    }
+
+    #[test]
+    fn dialog_delayed_expired_port_projection_is_rejected_and_rescans() {
+        let observed_at = Instant::now() - Duration::from_secs(2);
+        let projection = PortRefreshProjection {
+            source_observed_at: Some(observed_at),
+            source_freshness_deadline: Some(Instant::now() - Duration::from_millis(1)),
+            ..PortRefreshProjection::default()
+        };
+
+        assert!(!port_refresh_projection_is_fresh_at(
+            &projection,
+            Instant::now()
+        ));
+    }
+
+    #[test]
+    fn unsequenced_port_refresh_projection_is_not_fresh() {
+        let now = Instant::now();
+        let projection = PortRefreshProjection {
+            source_observed_at: Some(now - Duration::from_millis(1)),
+            source_freshness_deadline: Some(now + Duration::from_secs(5)),
+            source_publication_sequence: 0,
+            ..PortRefreshProjection::default()
+        };
+
+        assert!(!port_refresh_projection_is_fresh_at(&projection, now));
+    }
+
+    #[test]
+    fn future_observed_port_refresh_projection_is_not_fresh() {
+        let now = Instant::now();
+        let projection = PortRefreshProjection {
+            source_observed_at: Some(now + Duration::from_millis(1)),
+            source_freshness_deadline: Some(now + Duration::from_secs(5)),
+            source_publication_sequence: 1,
+            ..PortRefreshProjection::default()
+        };
+
+        assert!(!port_refresh_projection_is_fresh_at(&projection, now));
+    }
+
+    #[test]
+    fn no_managed_projection_reuses_stable_sentinel_fence() {
+        let port = 5175;
+        let snapshot =
+            crate::process::ports::PortInventorySnapshot::new(std::collections::BTreeMap::from([
+                (port, crate::process::ports::PortObservation::Free),
+            ]))
+            .with_publication_sequence(1);
+        let sentinel =
+            crate::domain::operation::ResourceFence::new(crate::domain::id::ResourceId::new(), 0);
+        let first = project_typed_port_snapshot(
+            &snapshot,
+            &[port],
+            sentinel,
+            &HashMap::new(),
+            &std::collections::HashSet::new(),
+        );
+        let second = project_typed_port_snapshot(
+            &snapshot,
+            &[port],
+            sentinel,
+            &HashMap::new(),
+            &std::collections::HashSet::new(),
+        );
+
+        assert_eq!(
+            first.authorities.get(&port).map(|status| status.resource),
+            second.authorities.get(&port).map(|status| status.resource)
+        );
+        assert_eq!(
+            first
+                .authorities
+                .get(&port)
+                .map(|status| status.resource.runtime_generation),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn stale_typed_authority_overrides_probe_failure_without_red_indicator() {
+        let authority = crate::process::ports::PortStatus {
+            port: 5174,
+            resource: crate::domain::operation::ResourceFence::new(
+                crate::domain::id::ResourceId::new(),
+                1,
+            ),
+            kind: crate::process::ports::PortStatusKind::Unknown,
+            listeners: Arc::from([]),
+            error: Some("listener inventory snapshot is stale".to_string()),
+        };
+        let probe_failures =
+            HashMap::from([(5174, "listener inventory snapshot is stale".to_string())]);
+
+        assert_eq!(
+            derive_server_indicator_with_authority(
+                None,
+                Some(5174),
+                Some(&authority),
+                &probe_failures,
+                Some(Instant::now() + Duration::from_secs(5)),
+            ),
+            sidebar::ServerIndicatorState::Unknown
+        );
+    }
+
+    #[test]
+    fn stale_remote_external_authority_cannot_reach_blue_indicator() {
+        let now = now_epoch_ms();
+        let authority = remote::RemotePortAuthority {
+            port: 5174,
+            kind: remote::RemotePortAuthorityKind::ProvenExternal,
+            diagnostic: None,
+            resource: None,
+            listeners: Vec::new(),
+            session_id: None,
+            root: None,
+            membership_revision: 0,
+            observation_sequence: 0,
+            publication_sequence: 1,
+            observed_at_epoch_ms: now.saturating_sub(remote::REMOTE_PORT_AUTHORITY_MAX_AGE_MS + 1),
+            freshness_deadline_epoch_ms: now.saturating_sub(1),
+            managed_fence_fingerprint: None,
+            verified: None,
+            error: None,
+        };
+
+        assert_eq!(
+            derive_server_indicator_with_remote_authority(None, Some(&authority)),
+            sidebar::ServerIndicatorState::Unknown
+        );
+    }
+
+    #[test]
+    fn remote_external_authority_cannot_override_inactive_or_reaping_session() {
+        let now = now_epoch_ms();
+        let authority = remote::RemotePortAuthority {
+            port: 5174,
+            kind: remote::RemotePortAuthorityKind::ProvenExternal,
+            diagnostic: None,
+            resource: None,
+            listeners: vec![remote::RemoteListenerIdentity {
+                pid: 42,
+                creation_time_100ns: 9_876_543,
+                executable_proven: true,
+                executable_fingerprint: Some(1),
+            }],
+            session_id: None,
+            root: None,
+            membership_revision: 0,
+            observation_sequence: 0,
+            publication_sequence: 1,
+            observed_at_epoch_ms: now,
+            freshness_deadline_epoch_ms: now + remote::REMOTE_PORT_AUTHORITY_MAX_AGE_MS,
+            managed_fence_fingerprint: None,
+            verified: None,
+            error: None,
+        };
+        let mut session = SessionRuntimeState::new(
+            "remote-inactive-server",
+            PathBuf::new(),
+            SessionDimensions::default(),
+            TerminalBackend::PortablePtyFeedingAlacritty,
+        );
+
+        for (state, expected) in [
+            (
+                SessionStatus::Stopped,
+                sidebar::ServerIndicatorState::Stopped,
+            ),
+            (SessionStatus::Failed, sidebar::ServerIndicatorState::Failed),
+        ] {
+            session.status = state;
+            assert_eq!(
+                derive_server_indicator_with_remote_authority(Some(&session), Some(&authority)),
+                expected,
+            );
+        }
+
+        session.status = SessionStatus::Running;
+        session.reap_incomplete = true;
+        assert_eq!(
+            derive_server_indicator_with_remote_authority(Some(&session), Some(&authority)),
+            sidebar::ServerIndicatorState::Unknown,
+        );
+    }
+
+    #[test]
+    fn remote_managed_indicator_requires_the_exact_fence_and_membership() {
+        let mut session = SessionRuntimeState::new(
+            "remote-server",
+            PathBuf::new(),
+            SessionDimensions::default(),
+            TerminalBackend::PortablePtyFeedingAlacritty,
+        );
+        session.status = SessionStatus::Running;
+        session.pid = Some(4242);
+        let now = now_epoch_ms();
+        let mut authority = remote::RemotePortAuthority {
+            port: 5174,
+            kind: remote::RemotePortAuthorityKind::Managed,
+            diagnostic: None,
+            resource: Some(crate::domain::operation::ResourceFence::new(
+                crate::domain::id::ResourceId::new(),
+                7,
+            )),
+            listeners: vec![remote::RemoteListenerIdentity {
+                pid: 4242,
+                creation_time_100ns: 42_420_000,
+                executable_proven: true,
+                executable_fingerprint: None,
+            }],
+            session_id: None,
+            root: None,
+            membership_revision: 0,
+            observation_sequence: 0,
+            publication_sequence: 1,
+            observed_at_epoch_ms: now,
+            freshness_deadline_epoch_ms: now + remote::REMOTE_PORT_AUTHORITY_MAX_AGE_MS,
+            managed_fence_fingerprint: None,
+            verified: None,
+            error: None,
+        };
+
+        assert_eq!(
+            derive_server_indicator_with_remote_authority(Some(&session), Some(&authority)),
+            sidebar::ServerIndicatorState::Unknown
+        );
+
+        authority.membership_revision = 9;
+        authority.observation_sequence = 11;
+        assert_eq!(
+            derive_server_indicator_with_remote_authority(Some(&session), Some(&authority)),
+            sidebar::ServerIndicatorState::Unknown
+        );
+
+        authority.session_id = Some(session.session_id.clone());
+        authority.root = Some(remote::RemoteListenerIdentity {
+            pid: 4242,
+            creation_time_100ns: 42_420_000,
+            executable_proven: true,
+            executable_fingerprint: None,
+        });
+        authority.managed_fence_fingerprint = Some(42);
+        assert_eq!(
+            derive_server_indicator_with_remote_authority(Some(&session), Some(&authority)),
+            sidebar::ServerIndicatorState::Unknown,
+            "a complete wire-shaped DTO without a host proof must not render Ready"
+        );
+    }
+
+    #[test]
+    fn remote_terminal_authority_requires_wire_session_and_root_identity() {
+        let mut session = SessionRuntimeState::new(
+            "remote-terminal-authority",
+            PathBuf::new(),
+            SessionDimensions::default(),
+            TerminalBackend::PortablePtyFeedingAlacritty,
+        );
+        session.status = SessionStatus::Running;
+        session.pid = Some(4242);
+        let now = now_epoch_ms();
+        let mut authority = remote::RemotePortAuthority {
+            port: 5174,
+            kind: remote::RemotePortAuthorityKind::Managed,
+            diagnostic: None,
+            resource: Some(crate::domain::operation::ResourceFence::new(
+                crate::domain::id::ResourceId::new(),
+                7,
+            )),
+            listeners: vec![remote::RemoteListenerIdentity {
+                pid: 4242,
+                creation_time_100ns: 42_420_000,
+                executable_proven: true,
+                executable_fingerprint: None,
+            }],
+            session_id: None,
+            root: None,
+            membership_revision: 9,
+            observation_sequence: 11,
+            publication_sequence: 1,
+            observed_at_epoch_ms: now,
+            freshness_deadline_epoch_ms: now + remote::REMOTE_PORT_AUTHORITY_MAX_AGE_MS,
+            managed_fence_fingerprint: Some(42),
+            verified: None,
+            error: None,
+        };
+
+        assert_eq!(
+            remote_port_ui_authority(Some(&authority), Some(&session)),
+            Some(PortUiAuthority::Unknown)
+        );
+
+        authority.session_id = Some(session.session_id.clone());
+        authority.root = Some(remote::RemoteListenerIdentity {
+            pid: 4242,
+            creation_time_100ns: 42_420_000,
+            executable_proven: true,
+            executable_fingerprint: None,
+        });
+        assert_eq!(
+            remote_port_ui_authority(Some(&authority), Some(&session)),
+            Some(PortUiAuthority::Unknown),
+            "a complete wire-shaped DTO without a host proof must not render Managed"
+        );
+    }
+
+    #[test]
+    fn server_start_probe_waits_for_existing_snapshot_refresh() {
+        assert!(!server_start_probe_allowed(true));
+        assert!(server_start_probe_allowed(false));
+    }
+
+    #[test]
+    fn derive_server_indicator_detects_occupied_listener_without_session() {
         let statuses = HashMap::from([(
             5174,
             PortStatus {
@@ -20350,13 +23146,38 @@ mod tests {
         )]);
 
         assert_eq!(
-            derive_server_indicator(None, Some(5174), &statuses),
-            sidebar::ServerIndicatorState::External
+            derive_server_indicator(None, Some(5174), &statuses, &HashMap::new()),
+            occupied_indicator_state()
         );
     }
 
     #[test]
-    fn derive_server_indicator_preserves_active_transitions_over_external_listener() {
+    fn derive_server_indicator_keeps_ambiguous_listener_ownership_unverified() {
+        let statuses = HashMap::from([(
+            5174,
+            PortStatus {
+                port: 5174,
+                in_use: true,
+                pid: None,
+                process_name: None,
+            },
+        )]);
+        let mut session = SessionRuntimeState::new(
+            "server-cmd",
+            PathBuf::from("."),
+            SessionDimensions::default(),
+            crate::terminal::session::TerminalBackend::PortablePtyFeedingAlacritty,
+        );
+        session.status = SessionStatus::Running;
+
+        assert_eq!(
+            derive_server_indicator(Some(&session), Some(5174), &statuses, &HashMap::new()),
+            occupied_indicator_state()
+        );
+    }
+
+    #[test]
+    fn derive_server_indicator_preserves_active_transitions_over_occupied_listener() {
         let statuses = HashMap::from([(
             5174,
             PortStatus {
@@ -20375,19 +23196,19 @@ mod tests {
 
         session.status = SessionStatus::Starting;
         assert_eq!(
-            derive_server_indicator(Some(&session), Some(5174), &statuses),
+            derive_server_indicator(Some(&session), Some(5174), &statuses, &HashMap::new(),),
             sidebar::ServerIndicatorState::Unready
         );
 
         session.status = SessionStatus::Stopping;
         assert_eq!(
-            derive_server_indicator(Some(&session), Some(5174), &statuses),
+            derive_server_indicator(Some(&session), Some(5174), &statuses, &HashMap::new(),),
             sidebar::ServerIndicatorState::Stopping
         );
     }
 
     #[test]
-    fn derive_server_indicator_prefers_external_listener_for_inactive_sessions() {
+    fn derive_server_indicator_prefers_occupied_listener_for_inactive_sessions() {
         let statuses = HashMap::from([(
             5174,
             PortStatus {
@@ -20412,8 +23233,8 @@ mod tests {
         ] {
             session.status = status;
             assert_eq!(
-                derive_server_indicator(Some(&session), Some(5174), &statuses),
-                sidebar::ServerIndicatorState::External,
+                derive_server_indicator(Some(&session), Some(5174), &statuses, &HashMap::new(),),
+                occupied_indicator_state(),
                 "status {status:?}"
             );
         }
@@ -20430,7 +23251,7 @@ mod tests {
         session.status = SessionStatus::Running;
 
         assert_eq!(
-            derive_server_indicator(Some(&session), None, &HashMap::new()),
+            derive_server_indicator(Some(&session), None, &HashMap::new(), &HashMap::new()),
             sidebar::ServerIndicatorState::Ready
         );
     }

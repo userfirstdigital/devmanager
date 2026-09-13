@@ -57,3 +57,25 @@ fn loopback_browser_fixture_covers_task_5a_protocol_scenarios() {
     assert!(!all_static_content.contains("https://"));
     assert!(!all_static_content.contains("http://"));
 }
+
+#[test]
+fn native_surface_identity_helpers_do_not_synthesize_task_ids() {
+    use devmanager::browser::{require_completed_wry_task_identity, BrowserTaskSurfaceBindBlocker};
+    use devmanager::domain::id::{BrowserContextId, ResourceId, TaskId};
+    use devmanager::protocol::BrowserSurfaceIdentity;
+
+    assert_eq!(
+        require_completed_wry_task_identity(None),
+        Err(BrowserTaskSurfaceBindBlocker::TaskIdentityUnavailableAtBuildCompletion)
+    );
+    let identity = BrowserSurfaceIdentity {
+        task_id: TaskId::new(),
+        context_id: BrowserContextId::new(),
+        resource_id: ResourceId::new(),
+    };
+    let bound = require_completed_wry_task_identity(Some(identity)).expect("exact identity");
+    assert_eq!(bound.task_id, identity.task_id);
+    assert_eq!(bound.context_id, identity.context_id);
+    assert_eq!(bound.resource_id, identity.resource_id);
+    assert_ne!(bound.task_id, TaskId::new());
+}

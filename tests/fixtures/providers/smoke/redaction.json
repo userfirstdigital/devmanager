@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "kind": "phase4.provider_smoke.redaction",
+  "sensitive": {
+    "prompt": "Please rewrite the quarterly memo.",
+    "response": "Here is the rewritten memo.",
+    "credential": "sk-ant-api03-fixture-secret",
+    "absolute_user_path": "C:/Users/fixture-user/Documents/notes.txt",
+    "session_id": "sess_0123456789abcdef"
+  },
+  "safeResultKeys": [
+    "schemaVersion",
+    "mode",
+    "providers",
+    "checks",
+    "launchedProviders",
+    "residueCount",
+    "disposition"
+  ]
+}

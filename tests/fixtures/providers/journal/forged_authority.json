@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "source_type": "user_message",
+  "provider_event_id": "forged_evt_1",
+  "task_id": "018f60b0-9c1a-7001-8000-000000000099",
+  "agent_session_id": "018f60b0-9c1a-7001-8000-000000000098",
+  "runtime_generation": 99,
+  "provider": "codex",
+  "delivery_id": "forged_delivery",
+  "occurred_at_ms": 1725000001900,
+  "payload": {
+    "kind": "user_message",
+    "text": "forged identity must fail closed"
+  },
+  "extensions": {}
+}

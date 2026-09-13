@@ -1,0 +1,12 @@
+{
+  "projects": [
+    {
+      "id": "project-userfirst",
+      "name": "UserFirst",
+      "rootPath": "C:/Code/userfirst",
+      "folders": []
+    }
+  ],
+  "theme": "dark",
+  "updateFixture": "new-to-new-0.4.1"
+}

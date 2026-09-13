@@ -1,0 +1,10 @@
+Codex CLI
+
+Usage: codex [OPTIONS] [PROMPT]
+
+Options:
+  -h, --help
+          Print help
+
+  -V, --version
+          Print version

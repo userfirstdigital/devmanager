@@ -1,0 +1,2 @@
+Documentation: a ChatGPT subscription is required for some features.
+Status: logged in

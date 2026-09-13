@@ -11,8 +11,30 @@ import type {
   WsOutbound,
 } from "./types";
 import { EMPTY_WRITER_LEASE, WEB_PROTOCOL_VERSION } from "./types";
-import { buildWebSocketUrl } from "../lib/browserIdentity";
 import { CLIENT_WEB_BUILD_ID } from "../pwa/buildCompatibility";
+import {
+  MAX_PENDING_OUTBOUND_BYTES,
+  MAX_PENDING_OUTBOUND_ITEMS,
+  allowsRawTerminal,
+  classifyInboundFrame,
+  createConnectRequestId,
+  inboundTextByteLength,
+  isRawTerminalWriterFrame,
+  parseAdvertisedRelayUrl,
+  selectConnectRoute,
+  CONNECT_BROWSER_E2E_HOLD,
+  ConnectBrowserTransportError,
+  type ConnectBrowserTransport,
+  type ConnectConnectionState,
+  type ConnectPayloadRequest,
+  type ConnectRoute,
+  type ConnectRouteSelection,
+  type DecodedConnectEnvelope,
+} from "../connect/transport";
+import {
+  parseHostCapabilityGrant,
+  type CapabilityGrant,
+} from "../connect/permissions";
 
 export type WsStatus =
   | { kind: "idle" }
@@ -39,16 +61,43 @@ type WithoutExpectedLeaseGeneration<T> = T extends unknown
   : never;
 
 export type WriterLeaseFrame = WithoutExpectedLeaseGeneration<
-  Extract<WsInbound, { type: "input" | "pasteImage" | "resize" | "interruptSession" }>
+  Extract<
+    WsInbound,
+    { type: "input" | "pasteImage" | "resize" | "interruptSession" }
+  >
 >;
 
 export interface WsClientCallbacks {
   onStatus(status: WsStatus): void;
   onMessage(message: WsOutbound): void;
   onSessionOutput(frame: SessionOutputFrame): void;
+  /** Explicit authority emitted only after the current socket hello passes validation. */
+  onCapabilityGrant?(grant: CapabilityGrant | null): void;
   getResumeContext?(): ResumeContext;
   onHelloFailure?(failure: WsHelloFailure): void;
 }
+
+export type WsClientOptions = Pick<
+  ConnectRouteSelection,
+  "preferDirect" | "directAvailable" | "relayUrl"
+> & {
+  /** Explicit Connect tasks must opt in; the default remains legacy `/api/ws`. */
+  transport?: "legacy" | "connect";
+  /** Constructed by the Connect task after Rust/WASM key custody is ready. */
+  connectTransport?: ConnectBrowserTransport;
+  /**
+   * Translate an existing web action into the typed Connect command/query
+   * schema. There is intentionally no unsafe default: Connect never sends a
+   * legacy WebAction object as if it were a domain command.
+   */
+  connectRequest?(action: RemoteAction, requestId: string): ConnectPayloadRequest | null;
+  /** Map a typed Connect receipt/reply back to the legacy web projection. */
+  connectResponse?(envelope: DecodedConnectEnvelope, action: RemoteAction): RemoteActionResult | null;
+  /** Optional typed resume projection. The default uses the protocol Resync lane. */
+  connectResume?(context: ResumeContext): ConnectPayloadRequest | null;
+  /** Map live typed Connect envelopes into the existing web projection. */
+  connectMessage?(envelope: DecodedConnectEnvelope): WsOutbound | null;
+};
 
 export type WsHelloFailure =
   | { kind: "missingHello" }
@@ -61,6 +110,10 @@ export type WsHelloFailure =
       kind: "buildMismatch";
       expectedBuildId: string;
       receivedBuildId: string;
+    }
+  | {
+      kind: "connectTransportHeld";
+      code: typeof CONNECT_BROWSER_E2E_HOLD;
     };
 
 interface PendingRequest {
@@ -109,8 +162,6 @@ const COMPOSER_RETRY_MIN_MS = 250;
 const COMPOSER_RETRY_MAX_MS = 1_000;
 const COMPOSER_ACK_TIMEOUT_MS = 5_000;
 const FOREGROUND_WAKE_COALESCE_MS = 1_000;
-const MAX_PENDING_OUTBOUND_ITEMS = 256;
-const MAX_PENDING_OUTBOUND_BYTES = 8 * 1_024 * 1_024;
 const OUTBOUND_CAPACITY_MESSAGE =
   "Too much outbound work is waiting to be sent.";
 const CLIENT_INSTANCE_ID_KEY = "devmanager.clientInstanceId";
@@ -160,12 +211,14 @@ function currentRoute(): string {
   const locationLike = globalThis.location as
     | (Location & { pathname?: string; search?: string; hash?: string })
     | undefined;
-  const pathname = locationLike?.pathname || "/sessions";
+  const pathname = locationLike?.pathname || "/tasks";
   return `${pathname}${locationLike?.search ?? ""}${locationLike?.hash ?? ""}`;
 }
 
 function currentVisibility(): boolean {
-  return typeof document === "undefined" || document.visibilityState !== "hidden";
+  return (
+    typeof document === "undefined" || document.visibilityState !== "hidden"
+  );
 }
 
 function defaultResumeContext(): ResumeContext {
@@ -237,14 +290,18 @@ export class WsClient {
   private stopped = false;
   private starting = false;
   private reconnectDelayMs = 1000;
-  private reconnectTimer: ReturnType<typeof globalThis.setTimeout> | null = null;
-  private heartbeatTimer: ReturnType<typeof globalThis.setInterval> | null = null;
+  private reconnectTimer: ReturnType<typeof globalThis.setTimeout> | null =
+    null;
+  private heartbeatTimer: ReturnType<typeof globalThis.setInterval> | null =
+    null;
   private helloTimer: ReturnType<typeof globalThis.setTimeout> | null = null;
-  private composerRetryTimer: ReturnType<typeof globalThis.setTimeout> | null = null;
+  private composerRetryTimer: ReturnType<typeof globalThis.setTimeout> | null =
+    null;
   private composerRetryDelayMs = COMPOSER_RETRY_MIN_MS;
   private lastWriterLeaseRequestAt = Number.NEGATIVE_INFINITY;
   private lastForegroundWakeAt = Number.NEGATIVE_INFINITY;
   private lastFrameAt = 0;
+  private hiddenAt: number | null = null;
   private nextRequestId = 1;
   private connectionEpoch = 0;
   private visible = currentVisibility();
@@ -256,16 +313,40 @@ export class WsClient {
   private pendingOutboundItems = 0;
   private pendingOutboundBytes = 0;
   private handshakeReady = false;
+  private route: ConnectRoute | null = null;
+  private hostAdvertisedRelayUrl: string | null = null;
+  private hostCapabilityGrant: CapabilityGrant | null = null;
+  private connectUnsubscribe: (() => void) | null = null;
+  private connectEnvelopeUnsubscribe: (() => void) | null = null;
+  private connectResyncInProgress = false;
 
-  constructor(private readonly cb: WsClientCallbacks) {}
+  constructor(
+    private readonly cb: WsClientCallbacks,
+    private readonly options: WsClientOptions = {},
+  ) {}
+
+  currentRoute(): ConnectRoute | null {
+    return this.route;
+  }
+
+  /** The last explicitly authenticated host grant; absent metadata is null. */
+  currentCapabilityGrant(): CapabilityGrant | null {
+    return this.hostCapabilityGrant;
+  }
 
   async start(): Promise<void> {
+    if (this.options.transport === "connect") {
+      await this.startConnectTransport();
+      return;
+    }
     if (this.stopped || this.starting) return;
     if (this.ws?.readyState === WebSocket.OPEN) return;
     if (this.ws?.readyState === WebSocket.CONNECTING) return;
 
     const epoch = ++this.connectionEpoch;
     this.starting = true;
+    this.hostAdvertisedRelayUrl = null;
+    this.hostCapabilityGrant = null;
     this.cb.onStatus({ kind: "connecting" });
 
     try {
@@ -289,9 +370,19 @@ export class WsClient {
     }
 
     if (!this.isCurrentEpoch(epoch)) return;
+    this.route = selectConnectRoute({
+      preferDirect: this.options.preferDirect,
+      directAvailable: this.options.directAvailable,
+      relayUrl: this.options.relayUrl ?? this.hostAdvertisedRelayUrl,
+      location,
+    });
+    if (this.route.kind === "noRoute") {
+      this.cb.onStatus({ kind: "closed", reason: this.route.reason });
+      return;
+    }
     let socket: WebSocket;
     try {
-      socket = new WebSocket(buildWebSocketUrl(location));
+      socket = new WebSocket(this.route.url);
     } catch (error) {
       this.scheduleReconnect(`construct failed: ${error}`);
       return;
@@ -312,6 +403,16 @@ export class WsClient {
     socket.onmessage = (event) => {
       if (!this.isCurrentSocket(socket, epoch)) return;
       if (typeof event.data === "string") {
+        const inboundClass = classifyInboundFrame({
+          channel: "text",
+          byteLength: inboundTextByteLength(event.data),
+        });
+        if (inboundClass !== "ok") {
+          if (!this.handshakeReady) {
+            this.failHello(socket, epoch, { kind: "missingHello" });
+          }
+          return;
+        }
         let parsedValue: unknown;
         try {
           parsedValue = JSON.parse(event.data) as unknown;
@@ -357,6 +458,18 @@ export class WsClient {
             });
             return;
           }
+          this.hostAdvertisedRelayUrl =
+            "relayUrl" in parsed
+              ? parseAdvertisedRelayUrl(parsed.relayUrl)
+              : null;
+          if ("capabilityGrant" in parsed) {
+            this.hostCapabilityGrant = parseHostCapabilityGrant(
+              parsed.capabilityGrant,
+            );
+          } else {
+            this.hostCapabilityGrant = null;
+          }
+          this.cb.onCapabilityGrant?.(this.hostCapabilityGrant);
           this.completeHello(socket, epoch);
           this.cb.onMessage(parsed);
           return;
@@ -382,6 +495,14 @@ export class WsClient {
           this.failHello(socket, epoch, { kind: "missingHello" });
           return;
         }
+        if (this.route && !allowsRawTerminal(this.route)) return;
+        const view = new DataView(event.data);
+        const inboundClass = classifyInboundFrame({
+          channel: "binary",
+          byteLength: event.data.byteLength,
+          frameType: view.byteLength > 0 ? view.getUint8(0) : undefined,
+        });
+        if (inboundClass !== "ok") return;
         this.lastFrameAt = Date.now();
         const frame = decodeSessionOutputFrame(event.data);
         if (frame) this.cb.onSessionOutput(frame);
@@ -399,6 +520,8 @@ export class WsClient {
       this.ws = null;
       this.lastForegroundWakeAt = Number.NEGATIVE_INFINITY;
       this.writerLease = { ...EMPTY_WRITER_LEASE };
+      this.hostAdvertisedRelayUrl = null;
+      this.hostCapabilityGrant = null;
       this.cb.onStatus({ kind: "closed", reason });
       if (!this.stopped) this.scheduleReconnect(reason);
       this.scheduleComposerRetry(true);
@@ -410,6 +533,11 @@ export class WsClient {
   }
 
   send(message: WsInbound): boolean {
+    if (this.options.transport === "connect") {
+      // Connect has no plaintext compatibility lane. Resume is represented by
+      // the typed protocol resync; raw WebAction/PTY frames are not sent here.
+      return message.type === "resume" ? this.resume() : false;
+    }
     if (
       !this.handshakeReady ||
       !this.ws ||
@@ -428,6 +556,20 @@ export class WsClient {
   resume(): boolean {
     const context = this.cb.getResumeContext?.() ?? defaultResumeContext();
     this.visible = context.visible;
+    if (this.options.transport === "connect") {
+      const transport = this.options.connectTransport;
+      if (!transport) return false;
+      const descriptor = this.options.connectResume?.(context);
+      if (descriptor) {
+        return transport.sendPayload(descriptor.payloadKind, descriptor.payload, {
+          requestId: descriptor.requestId ?? undefined,
+          operationId: descriptor.operationId,
+          privacyClass: descriptor.privacyClass,
+          payloadVersion: descriptor.payloadVersion,
+        });
+      }
+      return transport.requestResync("replay_unavailable");
+    }
     return this.send({
       type: "resume",
       ...context,
@@ -437,6 +579,9 @@ export class WsClient {
 
   request(action: RemoteAction): Promise<RemoteActionResult> {
     if (this.stopped) return Promise.reject(new Error("websocket stopped"));
+    if (this.options.transport === "connect") {
+      return this.requestConnect(action);
+    }
     const accountedBytes = outboundWorkBytes(action);
     if (!this.reservePendingWork(accountedBytes)) {
       return Promise.reject(new Error(OUTBOUND_CAPACITY_MESSAGE));
@@ -465,6 +610,19 @@ export class WsClient {
    */
   sendWithWriterLease(message: WriterLeaseFrame): boolean {
     if (this.stopped) return false;
+    if (this.options.transport === "connect") {
+      // Raw PTY compatibility frames belong to the host web bridge. A
+      // Connect client must use a typed, capability-authorized terminal
+      // payload adapter instead of queueing plaintext input here.
+      return false;
+    }
+    if (
+      isRawTerminalWriterFrame(message) &&
+      this.route &&
+      !allowsRawTerminal(this.route)
+    ) {
+      return false;
+    }
     if (
       this.ws?.readyState === WebSocket.OPEN &&
       this.writerLease.youAreOwner &&
@@ -507,12 +665,21 @@ export class WsClient {
   }
 
   submitComposer(submission: ComposerSubmission): Promise<ComposerAccepted> {
+    if (this.options.transport === "connect") {
+      return Promise.reject(
+        new ConnectBrowserTransportError(
+          "Composer submission requires a typed Connect provider-input adapter",
+        ),
+      );
+    }
     const fingerprint = composerFingerprint(submission);
     const existing = this.pendingComposers.get(submission.mutationId);
     if (existing) {
       if (existing.fingerprint === fingerprint) return existing.promise;
       return Promise.reject(
-        new Error("This mutation ID is already pending with different content."),
+        new Error(
+          "This mutation ID is already pending with different content.",
+        ),
       );
     }
     if (this.stopped) return Promise.reject(new Error("websocket stopped"));
@@ -552,6 +719,7 @@ export class WsClient {
    */
   ensureWriterLease(): void {
     if (this.stopped || !this.visible || this.writerLease.youAreOwner) return;
+    if (this.options.transport === "connect") return;
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
       this.wake();
       return;
@@ -559,7 +727,10 @@ export class WsClient {
     this.requestWriterLease();
   }
 
-  cancelComposer(mutationId: string, reason = "composer mutation superseded"): void {
+  cancelComposer(
+    mutationId: string,
+    reason = "composer mutation superseded",
+  ): void {
     const pending = this.pendingComposers.get(mutationId);
     if (!pending) return;
     this.pendingComposers.delete(mutationId);
@@ -591,6 +762,16 @@ export class WsClient {
       } catch {}
     }
     this.writerLease = { ...EMPTY_WRITER_LEASE };
+    this.hostAdvertisedRelayUrl = null;
+    this.hostCapabilityGrant = null;
+    this.connectUnsubscribe?.();
+    this.connectUnsubscribe = null;
+    this.connectEnvelopeUnsubscribe?.();
+    this.connectEnvelopeUnsubscribe = null;
+    this.connectResyncInProgress = false;
+    if (this.options.transport === "connect") {
+      this.options.connectTransport?.stop();
+    }
   }
 
   /**
@@ -599,6 +780,30 @@ export class WsClient {
    */
   wake(): void {
     if (this.stopped) return;
+    if (this.options.transport === "connect") {
+      const transport = this.options.connectTransport;
+      if (!transport) {
+        this.cb.onHelloFailure?.({
+          kind: "connectTransportHeld",
+          code: CONNECT_BROWSER_E2E_HOLD,
+        });
+        return;
+      }
+      // Capture elapsed hidden duration before clearing timestamps.
+      const hiddenDurationMs =
+        this.hiddenAt !== null ? Date.now() - this.hiddenAt : 0;
+      const action = transport.wake({ hiddenDurationMs });
+      if (this.visible) {
+        this.hiddenAt = null;
+        transport.setBackgrounded(false);
+      }
+      if (action === "held") return;
+      if (action === "resume") {
+        this.resume();
+      }
+      // reconnect/start: observeConnectState resumes once on authenticated ready
+      return;
+    }
     if (this.reconnectTimer !== null) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
@@ -637,23 +842,32 @@ export class WsClient {
     const now = Date.now();
     if (now - this.lastForegroundWakeAt <= FOREGROUND_WAKE_COALESCE_MS) return;
     this.wake();
-    this.lastForegroundWakeAt = this.visible
-      ? now
-      : Number.NEGATIVE_INFINITY;
+    this.lastForegroundWakeAt = this.visible ? now : Number.NEGATIVE_INFINITY;
   }
 
   setVisibility(visible: boolean): void {
     this.visible = visible;
     if (visible) {
+      // Preserve hiddenAt through foreground/wake so the 10s phone-return path
+      // observes the real elapsed duration; clear only after wake consumes it.
       this.foreground();
       return;
     }
+    this.hiddenAt ??= Date.now();
+    this.options.connectTransport?.setBackgrounded(true);
     this.lastForegroundWakeAt = Number.NEGATIVE_INFINITY;
     this.send({
       type: "setVisibility",
       clientInstanceId: this.clientInstanceId,
       visible: false,
     });
+  }
+
+  /** Reversible Connect suspension for pagehide/bfcache; no-op for legacy. */
+  suspendConnection(): void {
+    if (this.options.transport === "connect") {
+      this.options.connectTransport?.suspend();
+    }
   }
 
   resetRuntime(reason = "host runtime changed"): void {
@@ -668,7 +882,11 @@ export class WsClient {
     sessionId: string,
     stableSessionKey: string | null = null,
   ): void {
-    for (let index = this.pendingWriterFrames.length - 1; index >= 0; index -= 1) {
+    for (
+      let index = this.pendingWriterFrames.length - 1;
+      index >= 0;
+      index -= 1
+    ) {
       const pending = this.pendingWriterFrames[index];
       const matches =
         pending.message.type === "interruptSession"
@@ -688,6 +906,139 @@ export class WsClient {
 
   private isCurrentEpoch(epoch: number): boolean {
     return !this.stopped && this.connectionEpoch === epoch;
+  }
+
+  private async startConnectTransport(): Promise<void> {
+    if (this.stopped) return;
+    const transport = this.options.connectTransport;
+    if (!transport) {
+      const failure: WsHelloFailure = {
+        kind: "connectTransportHeld",
+        code: CONNECT_BROWSER_E2E_HOLD,
+      };
+      this.cb.onHelloFailure?.(failure);
+      this.cb.onStatus({
+        kind: "closed",
+        reason: `${CONNECT_BROWSER_E2E_HOLD}: Rust/WASM Connect transport is unavailable`,
+      });
+      return;
+    }
+    this.connectUnsubscribe?.();
+    this.connectUnsubscribe = transport.subscribe((state) => {
+      this.observeConnectState(state);
+    });
+    this.connectEnvelopeUnsubscribe?.();
+    this.connectEnvelopeUnsubscribe = transport.subscribeEnvelope((envelope) => {
+      this.observeConnectEnvelope(envelope);
+    });
+    this.cb.onStatus({ kind: "connecting" });
+    await transport.start();
+  }
+
+  private requestConnect(action: RemoteAction): Promise<RemoteActionResult> {
+    const transport = this.options.connectTransport;
+    if (!transport) {
+      return Promise.reject(
+        new ConnectBrowserTransportError(
+          "Connect request unavailable until the Rust/WASM transport is ready",
+        ),
+      );
+    }
+    const requestId = createConnectRequestId();
+    const descriptor = this.options.connectRequest?.(action, requestId);
+    if (!descriptor) {
+      return Promise.reject(
+        new ConnectBrowserTransportError(
+          "This WebAction has no typed Connect command adapter; no plaintext or legacy request was sent",
+        ),
+      );
+    }
+    return transport
+      .request(descriptor.payloadKind, descriptor.payload, {
+        requestId,
+        operationId: descriptor.operationId,
+        privacyClass: descriptor.privacyClass,
+        payloadVersion: descriptor.payloadVersion,
+      })
+      .then((envelope) => {
+        const mapped = this.options.connectResponse?.(envelope, action);
+        if (mapped) return mapped;
+        if (envelope.payloadKind === 16) {
+          const payload = envelope.payload as { message?: unknown };
+          return {
+            ok: false,
+            message:
+              typeof payload?.message === "string"
+                ? payload.message
+                : "Connect request was rejected",
+            payload: null,
+          };
+        }
+        throw new ConnectBrowserTransportError(
+          "Connect response has no web projection adapter",
+        );
+      });
+  }
+
+  private observeConnectEnvelope(envelope: DecodedConnectEnvelope): void {
+    this.lastFrameAt = Date.now();
+    const mapped = this.options.connectMessage?.(envelope);
+    if (mapped) {
+      this.cb.onMessage(mapped);
+      return;
+    }
+    if (envelope.payloadKind === 16) {
+      const payload = envelope.payload as { message?: unknown };
+      this.cb.onMessage({
+        type: "error",
+        message:
+          typeof payload?.message === "string"
+            ? payload.message
+            : "Connect request was rejected",
+      });
+    }
+  }
+
+  private observeConnectState(state: ConnectConnectionState): void {
+    switch (state.kind) {
+      case "ready":
+        this.cb.onStatus({ kind: "open" });
+        // The Connect Noise channel is ready only after the typed Hello
+        // response. Resume the projection on that authenticated boundary;
+        // requestResync is guarded in the transport so reconnect bursts do
+        // not create duplicate replay requests.
+        if (this.connectResyncInProgress) {
+          this.connectResyncInProgress = false;
+        } else {
+          this.resume();
+        }
+        return;
+      case "held":
+        this.cb.onHelloFailure?.({
+          kind: "connectTransportHeld",
+          code: state.code,
+        });
+        this.cb.onStatus({
+          kind: "closed",
+          reason: `${state.code}: ${state.reason}`,
+        });
+        return;
+      case "closed":
+        this.cb.onStatus({ kind: "closed", reason: state.reason });
+        return;
+      case "idle":
+        return;
+      case "loading":
+      case "connecting":
+      case "handshaking":
+      case "reconnecting":
+        this.cb.onStatus({ kind: "connecting" });
+        return;
+      case "resyncing":
+        this.connectResyncInProgress = true;
+        this.cb.onStatus({ kind: "connecting" });
+        return;
+    }
   }
 
   private isCurrentSocket(socket: WebSocket, epoch: number): boolean {
@@ -880,6 +1231,18 @@ export class WsClient {
     ) {
       const pending = this.pendingWriterFrames[0];
       if (
+        this.route &&
+        !allowsRawTerminal(this.route) &&
+        isRawTerminalWriterFrame(pending.message)
+      ) {
+        // A raw frame may have been staged before route selection completed.
+        // Never let that frame cross a relay boundary; it has not reached the
+        // host yet, so dropping it is safer than replaying it elsewhere.
+        this.pendingWriterFrames.shift();
+        this.releasePendingWork(pending.accountedBytes);
+        continue;
+      }
+      if (
         !this.send({
           ...pending.message,
           expectedLeaseGeneration: this.writerLease.generation,
@@ -911,10 +1274,7 @@ export class WsClient {
     const delay = this.composerRetryDelayMs;
     this.composerRetryTimer = globalThis.setTimeout(() => {
       this.composerRetryTimer = null;
-      this.composerRetryDelayMs = Math.min(
-        delay * 2,
-        COMPOSER_RETRY_MAX_MS,
-      );
+      this.composerRetryDelayMs = Math.min(delay * 2, COMPOSER_RETRY_MAX_MS);
       this.driveComposerRetries();
     }, delay);
   }

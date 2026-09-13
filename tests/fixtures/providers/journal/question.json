@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "source_type": "question",
+  "provider_event_id": "claude_evt_question_1",
+  "occurred_at_ms": 1725000001800,
+  "payload": {
+    "kind": "question",
+    "question_id": "q_claude_1",
+    "prompt": "Which approach?",
+    "options": ["A", "B"]
+  },
+  "extensions": {}
+}

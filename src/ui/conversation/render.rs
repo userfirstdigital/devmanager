@@ -1,0 +1,1893 @@
+//! Target UX painting for derived conversation rows.
+//!
+//! Every element body here was promoted from the throwaway look prototype
+//! committed at `5336cc2`, which answered whether GPUI could land the Target
+//! UX treatments before production code changed. This module paints the *closed*
+//! `ConversationRow` vocabulary, so there is no fallback arm and no way for
+//! an unmapped provider event to reach the screen -- it never becomes a row
+//! in the first place (see `rows.rs`).
+
+use gpui::{
+    div, font, px, relative, rems, AnimationExt, AnyElement, App, ClipboardItem, ElementId, Font,
+    FontFeatures, InteractiveElement, IntoElement, ParentElement, StatefulInteractiveElement,
+    Styled, Window,
+};
+use gpui_component::{
+    text::{TextView, TextViewStyle},
+    ActiveTheme,
+};
+use std::sync::{Arc, OnceLock};
+use time::{format_description, format_description::BorrowedFormatItem, OffsetDateTime, UtcOffset};
+
+use crate::ui::conversation::rows::{
+    activity_toggle_label, ActivityEntry, ActivityKind, ActivityState, ConversationRow,
+    ConversationRowKey,
+};
+use crate::ui::panel::permission::{
+    card_background, card_border, card_label, CARD_BORDER_WIDTH, CARD_CHROME_HEIGHT,
+    CARD_FONT_SIZE, CARD_FOOTER_HEIGHT, CARD_LINE_HEIGHT, CARD_PADDING_X, CARD_PADDING_Y,
+    CARD_RADIUS, CHOICE_BORDER_ALPHA, CHOICE_GAP, CHOICE_MARGIN_BOTTOM, CHOICE_NOTE_FONT_SIZE,
+    CHOICE_NUMBER_WIDTH, CHOICE_PADDING_X, CHOICE_PADDING_Y, CHOICE_RADIUS, CHOICE_ROW_HEIGHT,
+    FOOTER_FONT_SIZE, FOOTER_GAP, FOOTER_MARGIN_TOP, PROMPT_MARGIN_BOTTOM,
+};
+use crate::ui::renderers::{MarkdownDocument, MessageRole};
+use crate::ui::tokens::{mix_color, Color, ThemeMode, ThemeTokens};
+
+/// Production assistant markdown backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssistantMarkdownBackend {
+    /// gpui-component `TextView::markdown` (GFM).
+    NativeGfm,
+    /// Legacy home-grown heading/paragraph/code painter (must not remain selected).
+    LegacyHomeGrownBlocks,
+}
+
+/// Paint plan for one message body. Stable identity is derived from
+/// the conversation row key so streaming updates and virtualization recycle the
+/// same `TextView` keyed state instead of minting a fresh entity each repaint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MessageMarkdownPlan {
+    pub backend: AssistantMarkdownBackend,
+    pub selectable: bool,
+    pub source: String,
+    pub text_view_key: String,
+}
+
+/// Representative T3-shaped markdown used by focused render-seam tests.
+pub fn representative_t3_gfm_markdown() -> &'static str {
+    "\
+# Release notes
+
+Paragraph with **strong**, *emphasis*, and `inline code`.
+
+> Calm blockquote for secondary guidance.
+
+- Unordered item
+  - Nested unordered item
+1. Ordered item
+2. Second ordered item
+- [ ] Task item still open
+- [x] Task item done
+
+| Column | Value |
+| --- | --- |
+| Link | [docs](https://example.com/docs) |
+
+```rust
+fn paint() {}
+```
+"
+}
+
+pub fn message_text_view_key(row_key: &ConversationRowKey, user: bool) -> String {
+    let role = if user { "user" } else { "assistant" };
+    format!("conversation-{role}-gfm-{row_key:?}")
+}
+
+pub fn plan_message_markdown_render(
+    row_key: &ConversationRowKey,
+    source: &str,
+    selectable: bool,
+    user: bool,
+) -> MessageMarkdownPlan {
+    MessageMarkdownPlan {
+        backend: AssistantMarkdownBackend::NativeGfm,
+        selectable,
+        source: source.to_string(),
+        text_view_key: message_text_view_key(row_key, user),
+    }
+}
+
+/// Backend actually used by [`assistant_message_element`]. Tests require this
+/// to match [`AssistantMarkdownBackend::NativeGfm`] once the TextView path is live.
+pub fn assistant_message_paint_backend() -> AssistantMarkdownBackend {
+    AssistantMarkdownBackend::NativeGfm
+}
+
+// ---------------------------------------------------------------------------
+// The stream's visual language (redesign rules 1-12).
+//
+// Every size below is the redesign's own type/spacing scale rather than the
+// density tokens, because the density scale tops out at 11/12 px captions and
+// 13/14 px body and carries no half-pixel step. The rules ask for 10.5 / 11 /
+// 11.5 / 12 / 13, so the stream names its steps here, once, and every painter
+// in this module reads them.
+// ---------------------------------------------------------------------------
+
+/// Rule 2: the role label above a message block -- 10.5 px, uppercase,
+/// `text.muted`. It replaces the old right-aligned user bubble and the
+/// assistant's coloured dot: the stream has no avatars and no role tints.
+const ROLE_LABEL_FONT_SIZE: f32 = 10.5;
+/// Rule 2/5, as fix wave 3 tightened it: the role label sits DIRECTLY above
+/// the body it heads -- 2 px, off the 4/8 grid on purpose.
+///
+/// At 4 px, plus a 14.7 px label line box and a 17.25 px body line box, the
+/// label floated clear of its paragraph and read as a caption belonging to
+/// nothing: measured 23.5 logical px baseline to baseline in
+/// `fix-wave-2-panel-grid.png`, against 50 px between two whole blocks -- a
+/// ratio of 1:2 where the eye needs at least 1:4 to group a label with the
+/// text under it.
+const ROLE_LABEL_GAP: f32 = 2.0;
+/// The 4 px grid step the cards and folds inside the stream space themselves
+/// on: a card's top margin, a fold's padding, the gap between a glyph and its
+/// label. It is [`ROLE_LABEL_GAP`]'s old value, split out because the two are
+/// different jobs and only one of them is "a label above its body".
+const CARD_GAP: f32 = 4.0;
+/// Rule 6: 10 px of air between two message blocks.
+///
+/// This is the whole cadence of the stream, and the block's own bottom padding
+/// is now the only thing paying for it -- the meta row used to sit in the flow
+/// under every block at `4 + caption line + 8`, so two blocks stood ~40 px
+/// apart whether or not anything was visible in that space.
+const BLOCK_GAP: f32 = 10.0;
+/// The person's own message sits right, bounded so a long paste still wraps
+/// into a readable column rather than running the full width.
+const USER_MESSAGE_MAX_WIDTH: f32 = 0.82;
+const USER_MESSAGE_PADDING_X: f32 = 10.0;
+const USER_MESSAGE_PADDING_Y: f32 = 6.0;
+const USER_MESSAGE_RADIUS: f32 = 8.0;
+/// Rule 2: message body -- 11.5 px `text.primary`.
+const BODY_FONT_SIZE: f32 = 11.5;
+/// 11.5 px at the mockup stream's 1.5 leading (`.stream { font: 11.5px/1.5 }`).
+const BODY_LINE_HEIGHT: f32 = 17.25;
+/// Rule 2: nothing in the stream is larger than 13, so the four heading levels
+/// walk 13 -> 11.5 instead of the old 22 -> 14 chat scale.
+const HEADING_SIZES: [f32; 4] = [13.0, 12.5, 12.0, 11.5];
+/// Block cadence, in rems of GPUI's 16 px root. 10 px of air between blocks is
+/// the spacing grid's step at this type size.
+const PARAGRAPH_GAP_REMS: f32 = 0.625;
+/// Rule 2: captions -- timestamps, code-block affordances, group labels.
+const CAPTION_FONT_SIZE: f32 = 10.5;
+/// Rule 2: secondary rows -- one-line tool/step rows and their details.
+const SECONDARY_FONT_SIZE: f32 = 11.0;
+/// Rule 3: code is monospace 11.5 on `surfaces.sunken` inside a 1 px
+/// `borders.subtle` rule at radius 4 (`.stream`/`.cmdl` in the mockups).
+const CODE_FONT_SIZE: f32 = 11.5;
+/// Rule 3: radius 4 for chips/kbd/inputs, and for code.
+const CODE_RADIUS: f32 = 4.0;
+/// Rule 3: every rule in this module is one pixel.
+const HAIRLINE_WIDTH: f32 = 1.0;
+/// Rule 3: radius 6 for cards.
+const CARD_RADIUS_6: f32 = 6.0;
+/// Rule 2: monospace only in terminals and code. The mockup's stream face.
+const CODE_FONT_FAMILY: &str = "Cascadia Mono";
+/// A 10.5 px label at the mockup's 1.4 leading. Scroll bookkeeping only.
+const ROLE_LABEL_LINE_HEIGHT: f32 = 14.7;
+
+/// The scroll estimate for one single-line stream row -- a tool row, a plan
+/// step, the collapsed-group toggle. Named so the painter's padding and the
+/// estimate cannot drift.
+fn stream_row_height(caption_line_height: f32) -> f32 {
+    2.0 * ROW_PADDING_Y + caption_line_height
+}
+/// Rule 10: 14 px icons, 12 in captions. A tool row is a caption row.
+const ROW_GLYPH_SIZE: f32 = 12.0;
+/// Rule 4: a 24 px hit box around a 12/14 px glyph.
+const ROW_GLYPH_SLOT: f32 = 16.0;
+/// Rule 6: the spacing grid's control gap.
+const CONTROL_GAP: f32 = 8.0;
+/// Rule 6: rows sit on a 4 px vertical rhythm; the stream's rows are one line
+/// tall, so 3 px above and below keeps them on the 4/8 grid at 11 px.
+const ROW_PADDING_Y: f32 = 3.0;
+/// Target: the working indicator uses three 4 px dots.
+const WORKING_DOT: f32 = 4.0;
+const ASSISTANT_TURN_LABEL: &str = "Answer";
+/// The user's own turn is labelled the same way the assistant's is, because
+/// the bubble that used to distinguish it is gone.
+const USER_TURN_LABEL: &str = "You";
+/// Rule 2: a group header. The plan card's own label.
+const PLAN_CARD_LABEL: &str = "Tasks";
+/// The time and copy control stay on screen rather than appearing under the
+/// pointer. Hidden, they fought the message they sat on: the pointer that
+/// revealed them was the pointer trying to select text. Quiet at rest, full
+/// strength when the block is hovered or the control takes focus.
+const META_REST_OPACITY: f32 = 0.45;
+const META_REVEALED_OPACITY: f32 = 1.0;
+
+/// The markdown metrics the stream hands `TextView`. One struct so the painted
+/// body and [`markdown_body_height`]'s scroll estimate cannot drift.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ConversationMarkdownMetrics {
+    body_size: f32,
+    body_line_height: f32,
+    paragraph_gap_rems: f32,
+    heading_sizes: [f32; 4],
+}
+
+fn conversation_markdown_metrics(
+    _density: crate::ui::tokens::Density,
+) -> ConversationMarkdownMetrics {
+    ConversationMarkdownMetrics {
+        body_size: BODY_FONT_SIZE,
+        body_line_height: BODY_LINE_HEIGHT,
+        paragraph_gap_rems: PARAGRAPH_GAP_REMS,
+        heading_sizes: HEADING_SIZES,
+    }
+}
+
+/// Rule 2: a group label is uppercase. GPUI 0.2.2 exposes no text-transform,
+/// so the label is uppercased in the model and the painter reads this.
+fn role_label(text: &str) -> String {
+    text.to_uppercase()
+}
+
+/// The label element every message block wears. One builder so the user turn
+/// and the assistant turn cannot end up with two different labels.
+/// Returns the div rather than an erased element so a caller can align it: the
+/// user's label follows its message to the right.
+fn role_label_element(text: &str, tokens: ThemeTokens) -> gpui::Div {
+    div()
+        .w_full()
+        .text_size(px(ROLE_LABEL_FONT_SIZE))
+        // The line box the scroll estimate has always assumed. Without it the
+        // label inherits the surrounding leading, which measured about 4 px
+        // taller than [`ROLE_LABEL_LINE_HEIGHT`] in the fix wave 3 render and
+        // spent the difference on the gap W2 had just tightened.
+        .line_height(px(ROLE_LABEL_LINE_HEIGHT))
+        .text_color(tokens.text.muted.to_gpui())
+        .child(role_label(text))
+}
+
+fn tabular_numeral_font() -> Font {
+    // GPUI 0.2.2 can refine font features only through `Styled::font`, so
+    // start from its system-UI font helper and change just the feature set.
+    let mut font = font(".SystemUIFont");
+    font.features = FontFeatures(Arc::new(vec![("tnum".to_string(), 1)]));
+    font
+}
+
+fn message_meta_opacity(revealed: bool) -> f32 {
+    if revealed {
+        META_REVEALED_OPACITY
+    } else {
+        META_REST_OPACITY
+    }
+}
+
+pub fn conversation_row_element(
+    row: &ConversationRow,
+    tokens: ThemeTokens,
+    window: &mut Window,
+    cx: &mut App,
+) -> AnyElement {
+    match row {
+        ConversationRow::Message {
+            role: MessageRole::User,
+            text,
+            markdown,
+            occurred_at_ms,
+            ..
+        } => message_row_element(
+            row,
+            text.clone(),
+            markdown,
+            *occurred_at_ms,
+            true,
+            false,
+            tokens,
+            window,
+            cx,
+        ),
+        ConversationRow::Message {
+            role: MessageRole::Reasoning,
+            text,
+            ..
+        } => reasoning_element(text.clone(), tokens),
+        ConversationRow::Message {
+            text,
+            markdown,
+            occurred_at_ms,
+            streaming,
+            ..
+        } => message_row_element(
+            row,
+            text.clone(),
+            markdown,
+            *occurred_at_ms,
+            false,
+            *streaming,
+            tokens,
+            window,
+            cx,
+        ),
+        ConversationRow::Error { text, .. } => error_element(text.clone(), tokens),
+        ConversationRow::Activity { entries, state, .. } => {
+            activity_element(entries, *state, tokens)
+        }
+        ConversationRow::ActivityToggle {
+            hidden,
+            expanded,
+            only_tools,
+            ..
+        } => toggle_element(
+            activity_toggle_label(*hidden, *expanded, *only_tools),
+            tokens,
+        ),
+        ConversationRow::Question {
+            prompt,
+            choices,
+            settled_choice,
+            ..
+        } => question_element(
+            prompt,
+            choices,
+            *settled_choice,
+            recommended_choice(choices),
+            tokens,
+        ),
+        ConversationRow::TurnFold {
+            label, expanded, ..
+        } => turn_fold_element(label, *expanded, tokens),
+        ConversationRow::Working { elapsed_ms, step } => {
+            working_element(*elapsed_ms, step.as_deref(), tokens)
+        }
+    }
+}
+
+/// Estimated paint height for one row, in the same closed vocabulary as
+/// [`conversation_row_element`] and living beside it so the two cannot
+/// drift. This is scroll/virtualization bookkeeping, not a layout oracle --
+/// GPUI computes the real on-screen height independently when `surface()`
+/// actually paints `conversation_row_element`'s output. A row that never
+/// exists (a suppressed `Generic` item, for instance) never reaches this
+/// function at all, because `derive_conversation_rows` never emitted it --
+/// which is the whole point: no row means no height means no reserved
+/// scroll space, unlike the old item-keyed estimate it replaces.
+pub fn conversation_row_height(row: &ConversationRow, tokens: ThemeTokens) -> u32 {
+    let line_height = tokens.density.typography.body_line_height.max(1.0);
+    let caption_line_height = tokens.density.typography.caption_line_height.max(1.0);
+    let text_lines = |text: &str| text.lines().count().max(1) as f32;
+    let height = match row {
+        ConversationRow::Message {
+            role: MessageRole::Reasoning,
+            text,
+            ..
+        } => 2.0 * (ROW_PADDING_Y + 1.0) + text_lines(text) * caption_line_height,
+        // Both turns paint the same block now, so they estimate the same way:
+        // the role label and its gap, the body, then the air before the next
+        // block. The meta row is NOT counted -- it is absolutely positioned
+        // over the label line and takes no space in the flow, so counting it
+        // would reserve scroll room for a box that never displaces anything.
+        ConversationRow::Message { text, .. } => {
+            ROLE_LABEL_LINE_HEIGHT + ROLE_LABEL_GAP + markdown_body_height(text, tokens) + BLOCK_GAP
+        }
+        ConversationRow::Error { text, .. } => {
+            ROLE_LABEL_LINE_HEIGHT + ROLE_LABEL_GAP + text_lines(text) * BODY_LINE_HEIGHT
+        }
+        ConversationRow::Activity { entries, .. } => {
+            activity_row_height(entries, caption_line_height)
+        }
+        ConversationRow::ActivityToggle { .. } => stream_row_height(caption_line_height),
+        // The question card: the amber label, the prompt, one row per choice,
+        // and the footer. Every number is the mockup's, read from the shared
+        // card constants so the estimate and the painter cannot drift.
+        ConversationRow::Question {
+            prompt, choices, ..
+        } => {
+            CARD_CHROME_HEIGHT
+                + text_lines(prompt) * line_height
+                + choices.len() as f32 * CHOICE_ROW_HEIGHT
+                + CARD_FOOTER_HEIGHT
+        }
+        ConversationRow::TurnFold { .. } => 24.0,
+        ConversationRow::Working { .. } => 20.0,
+    };
+    height.max(16.0).min(u32::MAX as f32) as u32
+}
+
+/// Match the native GFM block cadence closely enough for scroll anchoring and
+/// follow-to-bottom bookkeeping. The previous fixed `line_count * line_height`
+/// estimate flattened paragraph gaps and code/table padding, then truncated the
+/// entire message at 480px. That made a long, correctly painted answer appear
+/// to start above the viewport or jump while streaming.
+fn markdown_body_height(text: &str, tokens: ThemeTokens) -> f32 {
+    let metrics = conversation_markdown_metrics(tokens.density.density);
+    let body_line = metrics.body_line_height;
+    let code_line = (tokens.density.typography.caption_line_height + 2.0).max(1.0);
+    let paragraph_gap = metrics.body_size * metrics.paragraph_gap_rems;
+    let mut height = 0.0;
+    let mut in_fence = false;
+    let mut fence_lines = 0usize;
+
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            if in_fence {
+                height += 24.0 + fence_lines.max(1) as f32 * code_line + paragraph_gap;
+                fence_lines = 0;
+            }
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence {
+            fence_lines = fence_lines.saturating_add(1);
+            continue;
+        }
+        if trimmed.is_empty() {
+            height += paragraph_gap;
+        } else if trimmed.starts_with('#') {
+            height += body_line + 5.0;
+        } else if trimmed.starts_with('|') {
+            height += body_line + 8.0;
+        } else {
+            height += body_line;
+        }
+    }
+    if in_fence {
+        height += 24.0 + fence_lines.max(1) as f32 * code_line;
+    }
+    height.max(body_line)
+}
+
+/// Keep timeline virtualization aware of the surfaced Tasks card. The card
+/// groups plan steps behind one header and one set of padding, while ordinary
+/// tool activity stays on the compact 24px cadence used by
+/// `work_entry_element`.
+fn activity_row_height(entries: &[ActivityEntry], caption_line_height: f32) -> f32 {
+    let work_count = entries
+        .iter()
+        .filter(|entry| entry.kind == ActivityKind::Tool)
+        .count();
+    let plan_count = entries
+        .iter()
+        .filter(|entry| entry.kind == ActivityKind::PlanStep)
+        .count();
+    let row = stream_row_height(caption_line_height);
+    let work_height = work_count as f32 * row;
+    if plan_count == 0 {
+        return work_height.max(row);
+    }
+
+    // The card's own chrome: the 4 px it sits below the rows above it, its
+    // 8 px of padding top and bottom, and the gap between its label and the
+    // first step. Then the label line, then one row per step.
+    let plan_card_height = CARD_GAP
+        + 2.0 * CONTROL_GAP
+        + ROLE_LABEL_GAP
+        + caption_line_height
+        + plan_count as f32 * row;
+    work_height + plan_card_height
+}
+
+/// Turn fold. Rule 3's 1 px `borders.subtle` rule between regions, under a
+/// 10.5 px muted group label and its chevron (rules 2 and 10).
+fn turn_fold_element(label: &str, expanded: bool, tokens: ThemeTokens) -> AnyElement {
+    let chevron = if expanded {
+        crate::icons::CHEVRON_DOWN
+    } else {
+        crate::icons::CHEVRON_RIGHT
+    };
+    div()
+        .w_full()
+        .pt(px(CARD_GAP))
+        .pb(px(CONTROL_GAP))
+        .border_b(px(HAIRLINE_WIDTH))
+        .border_color(tokens.borders.subtle.to_gpui())
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(CARD_GAP))
+                .text_size(px(ROLE_LABEL_FONT_SIZE))
+                .text_color(tokens.text.muted.to_gpui())
+                .child(row_glyph(chevron, tokens.text.muted))
+                .child(role_label(label)),
+        )
+        .into_any_element()
+}
+
+/// User turn. The same full-width, label-headed block the assistant gets:
+/// rule 1 leaves the stream grey, so a role tint or a bubble is the wrong way
+/// to say who spoke. The 10.5 uppercase label says it instead.
+fn user_message_element(
+    row_key: &ConversationRowKey,
+    text: &str,
+    markdown: &MarkdownDocument,
+    tokens: ThemeTokens,
+    window: &mut Window,
+    cx: &mut App,
+) -> AnyElement {
+    message_block_element(
+        USER_TURN_LABEL,
+        row_key,
+        text,
+        markdown,
+        true,
+        tokens,
+        window,
+        cx,
+    )
+}
+
+/// One message block: a 10.5 uppercase muted role label over 11.5 px
+/// `text.primary` body, full width, no surface of its own. Both turns paint
+/// through it so they cannot drift apart.
+fn message_block_element(
+    label: &str,
+    row_key: &ConversationRowKey,
+    text: &str,
+    markdown: &MarkdownDocument,
+    user: bool,
+    tokens: ThemeTokens,
+    window: &mut Window,
+    cx: &mut App,
+) -> AnyElement {
+    let metrics = conversation_markdown_metrics(tokens.density.density);
+    // The picture is painted by the timeline row, which owns the click that
+    // opens it; here the path only has to stop being read out as text.
+    let (text, _) = crate::ui::conversation::rows::split_pasted_images(text);
+    let text = text.as_str();
+    let view = native_markdown_view(row_key, text, markdown, user, tokens, window, cx);
+    let body = div()
+        .min_w(px(0.0))
+        .text_size(px(metrics.body_size))
+        .line_height(px(metrics.body_line_height))
+        .text_color(tokens.text.primary.to_gpui())
+        .child(view);
+    // What the person said sits on the right, the way every chat puts your own
+    // words; the agent's answer keeps the full column, because answers are long
+    // and a reply squeezed into half the width is harder to read. A quiet
+    // surface -- not a coloured bubble -- is what separates the two sides.
+    if user {
+        return div()
+            .w_full()
+            .min_w(px(0.0))
+            .flex()
+            .flex_col()
+            .items_end()
+            .gap(px(ROLE_LABEL_GAP))
+            // The label belongs over its own message, not at the far side of
+            // the column from it.
+            .child(role_label_element(label, tokens).text_right())
+            .child(
+                body.max_w(relative(USER_MESSAGE_MAX_WIDTH))
+                    .px(px(USER_MESSAGE_PADDING_X))
+                    .py(px(USER_MESSAGE_PADDING_Y))
+                    .rounded(px(USER_MESSAGE_RADIUS))
+                    // `surfaces.raised` is four values off the canvas and reads
+                    // as nothing at this size; the chip needs to be seen to do
+                    // its job of separating your words from the answer.
+                    .bg(mix_color(tokens.surfaces.canvas, tokens.text.primary, 0.08).to_gpui()),
+            )
+            .into_any_element();
+    }
+    div()
+        .w_full()
+        .min_w(px(0.0))
+        .flex()
+        .flex_col()
+        .gap(px(ROLE_LABEL_GAP))
+        .child(role_label_element(label, tokens))
+        .child(body.w_full())
+        .into_any_element()
+}
+
+/// Message chrome remains in layout and the tab order, but is visually
+/// absent until the exact row is hovered or the meta row receives keyboard
+/// focus. This is the same group-hover technique Zed uses for dense row
+/// actions; GPUI scopes the named group to the matching ancestor.
+fn message_row_element(
+    row: &ConversationRow,
+    text: String,
+    markdown: &MarkdownDocument,
+    occurred_at_ms: Option<u64>,
+    user: bool,
+    streaming: bool,
+    tokens: ThemeTokens,
+    window: &mut Window,
+    cx: &mut App,
+) -> AnyElement {
+    let row_key = crate::ui::conversation::rows::conversation_row_key(row);
+    let group = format!("conversation-message-{row_key:?}");
+    let body = if user {
+        user_message_element(&row_key, &text, markdown, tokens, window, cx)
+    } else {
+        assistant_message_element(&row_key, &text, markdown, tokens, window, cx)
+    };
+
+    div()
+        .w_full()
+        .group(group.clone())
+        .relative()
+        .flex()
+        .flex_col()
+        .min_w(px(0.0))
+        // The one thing between two blocks (W2). Everything else that used to
+        // sit under a block has left the flow.
+        .pb(px(BLOCK_GAP))
+        .child(body)
+        // The meta row is CHROME, not content: invisible until the block is
+        // hovered or its own control takes focus. In the flow it cost every
+        // block roughly 27 px of dead air -- a gap, a caption line and 8 px of
+        // padding -- which is most of the ~40 px that stood between two blocks
+        // in `fix-wave-2-panel-grid.png`. It is positioned over the block's own
+        // label line instead: the label is two short words at the left and the
+        // meta is right-aligned, so the two never meet, and no message body is
+        // ever covered by an affordance that appears under the pointer.
+        .child({
+            // Opposite the message it belongs to: your words sit right, so the
+            // time and copy control sit left, and the answer's sit right. They
+            // never land on top of the text any more.
+            let meta = div().absolute().top_0();
+            let meta = if user { meta.left_0() } else { meta.right_0() };
+            meta.child(message_meta_element(
+                group,
+                text,
+                occurred_at_ms,
+                user,
+                streaming,
+                tokens,
+            ))
+        })
+        .into_any_element()
+}
+
+/// Cache the parsed timestamp recipe just as Zed does for dense Git-history
+/// rows. Message hover must not reparse a format description while a streamed
+/// conversation is repainting.
+fn message_timestamp_format() -> &'static [BorrowedFormatItem<'static>] {
+    static FORMAT: OnceLock<Vec<BorrowedFormatItem<'static>>> = OnceLock::new();
+    FORMAT.get_or_init(|| {
+        format_description::parse("[hour repr:12 padding:none]:[minute] [period case:lower]")
+            .expect("valid conversation timestamp format")
+    })
+}
+
+fn format_message_timestamp_at_offset(epoch_ms: u64, offset: UtcOffset) -> Option<String> {
+    let timestamp =
+        OffsetDateTime::from_unix_timestamp_nanos((epoch_ms as i128) * 1_000_000).ok()?;
+    timestamp
+        .to_offset(offset)
+        .format(message_timestamp_format())
+        .ok()
+}
+
+fn format_message_timestamp(epoch_ms: Option<u64>) -> Option<String> {
+    let offset = UtcOffset::current_local_offset().unwrap_or(UtcOffset::UTC);
+    format_message_timestamp_at_offset(epoch_ms?, offset)
+}
+
+fn message_meta_element(
+    group: String,
+    text: String,
+    occurred_at_ms: Option<u64>,
+    user: bool,
+    streaming: bool,
+    tokens: ThemeTokens,
+) -> AnyElement {
+    let copy_id = (ElementId::from("copy-conversation-message"), group.clone());
+    // Content-sized, not `w_full`: the row is positioned at its block's right
+    // edge rather than stretched across it, so there is nothing left for
+    // `justify_end` to push against.
+    let mut meta = div()
+        .flex()
+        .items_center()
+        .gap(px(8.0))
+        .pr(px(4.0))
+        .opacity(message_meta_opacity(false))
+        .group_hover(group, |style| style.opacity(message_meta_opacity(true)))
+        .tab_index(0)
+        .focus(|style| style.opacity(message_meta_opacity(true)))
+        .font(tabular_numeral_font())
+        .text_size(px(CAPTION_FONT_SIZE))
+        .text_color(tokens.text.muted.to_gpui());
+
+    if let Some(timestamp) = format_message_timestamp(occurred_at_ms) {
+        meta = meta.child(timestamp);
+    }
+
+    if !streaming {
+        meta = meta.child(
+            div()
+                .id(copy_id)
+                .cursor_pointer()
+                .hover(|style| style.text_color(tokens.text.primary.to_gpui()))
+                .on_click(move |_event, _window, cx| {
+                    cx.stop_propagation();
+                    cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
+                })
+                .child("Copy"),
+        );
+    }
+
+    // Reverting agent work is intentionally advertised only for user turns,
+    // matching the Target UX. The mutation remains host-owned; this painter
+    // cannot mint a rewind request or bypass ComposerFence authority.
+    if user {
+        meta = meta.child(
+            div()
+                .text_color(tokens.text.muted.to_gpui())
+                .child("Revert"),
+        );
+    }
+
+    meta.into_any_element()
+}
+
+/// Assistant turn. The same block as the user's: a 10.5 uppercase muted scan
+/// anchor over 11.5 px body. The old coloured dot was the stream's only
+/// non-status use of the accent, which rule 1 does not allow.
+fn assistant_message_element(
+    row_key: &ConversationRowKey,
+    text: &str,
+    markdown: &MarkdownDocument,
+    tokens: ThemeTokens,
+    window: &mut Window,
+    cx: &mut App,
+) -> AnyElement {
+    debug_assert_eq!(
+        assistant_message_paint_backend(),
+        AssistantMarkdownBackend::NativeGfm
+    );
+    message_block_element(
+        ASSISTANT_TURN_LABEL,
+        row_key,
+        text,
+        markdown,
+        false,
+        tokens,
+        window,
+        cx,
+    )
+}
+
+fn native_markdown_view(
+    row_key: &ConversationRowKey,
+    text: &str,
+    markdown: &MarkdownDocument,
+    user: bool,
+    tokens: ThemeTokens,
+    window: &mut Window,
+    cx: &mut App,
+) -> TextView {
+    let plan = plan_message_markdown_render(row_key, text, markdown.selectable, user);
+    let code_action_scope = plan.text_view_key.clone();
+    let metrics = conversation_markdown_metrics(tokens.density.density);
+    let mut text_style = TextViewStyle::default();
+    text_style.highlight_theme = cx.theme().highlight_theme.clone();
+    text_style.is_dark = !matches!(tokens.mode, ThemeMode::Light);
+    TextView::markdown(
+        ElementId::Name(plan.text_view_key.clone().into()),
+        plan.source,
+        window,
+        cx,
+    )
+    .selectable(plan.selectable)
+    .style(
+        text_style
+            .paragraph_gap(rems(metrics.paragraph_gap_rems))
+            .heading_font_size(move |level, _base| match level {
+                1 => px(metrics.heading_sizes[0]),
+                2 => px(metrics.heading_sizes[1]),
+                3 => px(metrics.heading_sizes[2]),
+                _ => px(metrics.heading_sizes[3]),
+            })
+            // Rule 3: code sits in a sunken well behind a 1 px `borders.subtle`
+            // rule at radius 4, in the mockup's 11.5 px mono face.
+            .code_block(
+                gpui::StyleRefinement::default()
+                    .font(font(CODE_FONT_FAMILY))
+                    .text_size(px(CODE_FONT_SIZE))
+                    .line_height(px(BODY_LINE_HEIGHT))
+                    .bg(tokens.surfaces.sunken.to_gpui())
+                    .border(px(HAIRLINE_WIDTH))
+                    .border_color(tokens.borders.subtle.to_gpui())
+                    .rounded(px(CODE_RADIUS)),
+            ),
+    )
+    .code_block_actions(move |block, _window, _cx| {
+        let muted = tokens.text.muted.to_gpui();
+        let primary = tokens.text.primary.to_gpui();
+        let copy_text = block.code().to_string();
+        let lang = block
+            .lang()
+            .map(|name| name.to_string())
+            .unwrap_or_else(|| "Code".into());
+        let code_id = ElementId::Name(
+            format!(
+                "copy-conversation-gfm-code-{}",
+                stable_code_block_hash(&format!("{code_action_scope}:{copy_text}"))
+            )
+            .into(),
+        );
+        // Rule 2/10: the language and the copy affordance are captions on the
+        // code well, not controls -- 10.5 px, `text.muted`, `text.primary` on
+        // hover (rule 4's icon-button behaviour, applied to a text affordance).
+        div()
+            .flex()
+            .items_center()
+            .gap(px(CONTROL_GAP))
+            .px(px(8.0))
+            .py(px(ROW_PADDING_Y))
+            .text_size(px(CAPTION_FONT_SIZE))
+            .text_color(muted)
+            .child(lang)
+            .child(
+                div()
+                    .id(code_id)
+                    .cursor_pointer()
+                    .hover(move |style| style.text_color(primary))
+                    .on_click(move |_event, _window, cx| {
+                        cx.stop_propagation();
+                        cx.write_to_clipboard(ClipboardItem::new_string(copy_text.clone()));
+                    })
+                    .child("Copy"),
+            )
+    })
+}
+
+fn stable_code_block_hash(text: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Reasoning turn. Quiet and visually subordinate to the assistant's answer:
+/// a sunken well at radius 4 (rule 3) carrying 11 px `text.muted` (rule 2).
+fn reasoning_element(text: String, tokens: ThemeTokens) -> AnyElement {
+    div()
+        .w_full()
+        .px(px(CONTROL_GAP))
+        .py(px(ROW_PADDING_Y + 1.0))
+        .rounded(px(CODE_RADIUS))
+        .bg(tokens.surfaces.sunken.to_gpui())
+        .text_size(px(SECONDARY_FONT_SIZE))
+        .text_color(tokens.text.muted.to_gpui())
+        .child(text)
+        .into_any_element()
+}
+
+/// Error turn. Rules 1 and 4: red is information, so the label carries it and
+/// nothing is filled or ruled. The body stays `text.primary` at body size, so
+/// the message is legible rather than shouted.
+fn error_element(text: String, tokens: ThemeTokens) -> AnyElement {
+    div()
+        .w_full()
+        .flex()
+        .flex_col()
+        .gap(px(ROLE_LABEL_GAP))
+        .text_size(px(BODY_FONT_SIZE))
+        .line_height(px(BODY_LINE_HEIGHT))
+        .child(
+            div()
+                .text_size(px(ROLE_LABEL_FONT_SIZE))
+                .text_color(tokens.status.destructive.to_gpui())
+                .child(role_label("Error")),
+        )
+        .child(div().text_color(tokens.text.primary.to_gpui()).child(text))
+        .into_any_element()
+}
+
+/// The glyph and the label colour one work row wears.
+///
+/// Rule 1 keeps the stream grey: only a *failure* earns
+/// `status.destructive`. The old amber on `Active` spent the "needs you" hue
+/// on a tool that is merely busy, which is exactly the confusion the rule
+/// exists to prevent -- an active row is `text.primary` instead, and every
+/// settled row is muted.
+fn entry_tone(state: ActivityState, tokens: ThemeTokens) -> (gpui::Rgba, &'static str) {
+    match state {
+        ActivityState::Success => (tokens.text.muted.to_gpui(), crate::icons::CHECK),
+        ActivityState::Active => (tokens.text.primary.to_gpui(), crate::icons::PLAY),
+        ActivityState::Pending => (tokens.text.muted.to_gpui(), crate::icons::SQUARE),
+        ActivityState::Failure => (tokens.status.destructive.to_gpui(), crate::icons::X),
+    }
+}
+
+/// One work / tool entry: a single 11 px muted line behind a 12 px grey lucide
+/// glyph (rules 2 and 10). The detail rides on the same line and truncates, so
+/// a long command cannot turn one tool call into a paragraph.
+fn work_entry_element(entry: &ActivityEntry, tokens: ThemeTokens) -> AnyElement {
+    let (heading_color, icon) = entry_tone(entry.state, tokens);
+    if entry.subagent_id.is_some() && entry.detail.contains('\n') {
+        return div()
+            .w_full()
+            .min_w(px(0.0))
+            .flex()
+            .flex_col()
+            .gap(px(CONTROL_GAP))
+            .py(px(ROW_PADDING_Y))
+            .text_size(px(SECONDARY_FONT_SIZE))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(CONTROL_GAP))
+                    .child(row_glyph(icon, tokens.text.muted))
+                    .text_color(heading_color)
+                    .child(entry.label.clone()),
+            )
+            .child(
+                div()
+                    .w_full()
+                    .whitespace_normal()
+                    .text_color(tokens.text.secondary.to_gpui())
+                    .child(entry.detail.clone()),
+            )
+            .into_any_element();
+    }
+
+    div()
+        .w_full()
+        .min_w(px(0.0))
+        .flex()
+        .items_center()
+        .gap(px(CONTROL_GAP))
+        .py(px(ROW_PADDING_Y))
+        .text_size(px(SECONDARY_FONT_SIZE))
+        .whitespace_nowrap()
+        .overflow_hidden()
+        .child(row_glyph(icon, tokens.text.muted))
+        .child(
+            div()
+                .flex_none()
+                .text_color(heading_color)
+                .child(entry.label.clone()),
+        )
+        .children((!entry.detail.trim().is_empty()).then(|| {
+            div()
+                .min_w(px(0.0))
+                .overflow_hidden()
+                .text_ellipsis()
+                .text_color(tokens.text.muted.to_gpui())
+                .child(entry.detail.clone())
+                .into_any_element()
+        }))
+        .into_any_element()
+}
+
+/// Rule 10: a 12 px lucide glyph tinted with a token, centred in a fixed slot
+/// so every row's text starts on the same x whatever glyph it wears.
+fn row_glyph(path: &'static str, color: Color) -> AnyElement {
+    div()
+        .flex_none()
+        .size(px(ROW_GLYPH_SLOT))
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(crate::icons::app_icon(path, ROW_GLYPH_SIZE, color.to_u32()))
+        .into_any_element()
+}
+
+/// Activity group. Each visible entry paints as its own quiet work row.
+fn activity_element(
+    entries: &[ActivityEntry],
+    _state: ActivityState,
+    tokens: ThemeTokens,
+) -> AnyElement {
+    let mut column = div().w_full().flex().flex_col().gap(px(2.0));
+    let work_entries = entries
+        .iter()
+        .filter(|entry| entry.kind == ActivityKind::Tool);
+    let plan_entries = entries
+        .iter()
+        .filter(|entry| entry.kind == ActivityKind::PlanStep)
+        .collect::<Vec<_>>();
+    for entry in work_entries {
+        column = column.child(work_entry_element(entry, tokens));
+    }
+    if !plan_entries.is_empty() {
+        column = column.child(plan_card_element(&plan_entries, tokens));
+    }
+    column.into_any_element()
+}
+
+fn plan_progress(entries: &[&ActivityEntry]) -> (usize, usize) {
+    (
+        entries
+            .iter()
+            .filter(|entry| entry.state == ActivityState::Success)
+            .count(),
+        entries.len(),
+    )
+}
+
+fn plan_card_element(entries: &[&ActivityEntry], tokens: ThemeTokens) -> AnyElement {
+    let (completed, total) = plan_progress(entries);
+    let mut steps = div().w_full().flex().flex_col();
+    for entry in entries {
+        // Rule 1: a plan step is not a status, so only failure is coloured.
+        // The state reads from the glyph, which is what rule 10 is for.
+        let (icon, color) = match entry.state {
+            ActivityState::Success => (crate::icons::CHECK, tokens.text.muted),
+            ActivityState::Active => (crate::icons::PLAY, tokens.text.primary),
+            ActivityState::Pending => (crate::icons::SQUARE, tokens.text.muted),
+            ActivityState::Failure => (crate::icons::X, tokens.status.destructive),
+        };
+        steps = steps.child(
+            div()
+                .w_full()
+                .min_w(px(0.0))
+                .flex()
+                .items_center()
+                .gap(px(CONTROL_GAP))
+                .py(px(ROW_PADDING_Y))
+                .text_size(px(SECONDARY_FONT_SIZE))
+                .whitespace_nowrap()
+                .overflow_hidden()
+                .child(row_glyph(icon, color))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .text_color(if matches!(entry.state, ActivityState::Failure) {
+                            tokens.status.destructive.to_gpui()
+                        } else {
+                            tokens.text.muted.to_gpui()
+                        })
+                        .child(entry.detail.clone()),
+                ),
+        );
+    }
+
+    // Rule 3: a card is `surfaces.raised` at radius 6 on the canvas; rule 1
+    // forbids the drop shadow it used to carry, and rule 5 gives it the full
+    // width of the stream instead of a floating inset.
+    div()
+        .w_full()
+        .min_w(px(0.0))
+        .mt(px(CARD_GAP))
+        .px(px(10.0))
+        .py(px(CONTROL_GAP))
+        .rounded(px(CARD_RADIUS_6))
+        .bg(tokens.surfaces.raised.to_gpui())
+        .flex()
+        .flex_col()
+        .gap(px(ROLE_LABEL_GAP))
+        .child(
+            div()
+                .w_full()
+                .flex()
+                .items_center()
+                .gap(px(CONTROL_GAP))
+                .text_size(px(ROLE_LABEL_FONT_SIZE))
+                .text_color(tokens.text.muted.to_gpui())
+                .child(role_label(PLAN_CARD_LABEL))
+                .child(
+                    div()
+                        .font(tabular_numeral_font())
+                        .child(format!("{completed}/{total}")),
+                ),
+        )
+        .child(steps)
+        .into_any_element()
+}
+
+/// Collapsed work group. Copy is count- and kind-aware, computed by
+/// `activity_toggle_label` in the pure derivation layer. Painted as one more
+/// 11 px tool row (rule 2) behind the chevron that expands it (rule 10).
+fn toggle_element(label: String, tokens: ThemeTokens) -> AnyElement {
+    div()
+        .w_full()
+        .min_w(px(0.0))
+        .flex()
+        .items_center()
+        .gap(px(CONTROL_GAP))
+        .py(px(ROW_PADDING_Y))
+        .font(tabular_numeral_font())
+        .text_size(px(SECONDARY_FONT_SIZE))
+        .whitespace_nowrap()
+        .overflow_hidden()
+        .child(row_glyph(crate::icons::CHEVRON_RIGHT, tokens.text.muted))
+        .child(
+            div()
+                .min_w(px(0.0))
+                .overflow_hidden()
+                .text_ellipsis()
+                .text_color(tokens.text.muted.to_gpui())
+                .child(label),
+        )
+        .into_any_element()
+}
+
+/// A composer-style pill, reused for the question row's choices.
+/// The label above a question card.
+const QUESTION_LABEL: &str = "QUESTION";
+/// The footer's left half: the card takes numbers, but the compose box below
+/// it still takes prose, and the card is where that has to be said.
+const QUESTION_FOOTER: &str = "Type to answer in your own words";
+/// The word a provider uses to mark its preferred choice.
+const RECOMMENDED_MARKER: &str = "recommended";
+/// The note the marker becomes, on the right of the recommended row.
+const RECOMMENDED_NOTE: &str = "recommended";
+
+/// Which choice the provider marked as recommended, if any: the first whose
+/// text says so, case-insensitively. One rule in one place, so the row that
+/// gets the full-strength amber rule and the row whose marker is lifted into
+/// the trailing note can never be two different rows.
+pub fn recommended_choice(choices: &[String]) -> Option<usize> {
+    choices
+        .iter()
+        .position(|choice| recommendation_marker(choice).is_some())
+}
+
+/// Where this choice's recommendation marker starts, when the marker is
+/// actually a recommendation. "(not recommended)" and "never recommended" say
+/// the opposite, so a match whose preceding word negates it is not one -- and
+/// the negated row must keep its warning in the label as well as losing the
+/// full-strength rule, which is why both callers ask this one function.
+fn recommendation_marker(choice: &str) -> Option<usize> {
+    let lowered = choice.to_ascii_lowercase();
+    let start = lowered.find(RECOMMENDED_MARKER)?;
+    let not_a_word = |character: char| !character.is_ascii_alphanumeric();
+    let preceding_word = lowered[..start]
+        .trim_end_matches(not_a_word)
+        .rsplit(not_a_word)
+        .next()
+        .unwrap_or_default();
+    if matches!(preceding_word, "not" | "never") {
+        return None;
+    }
+    Some(start)
+}
+
+/// The rule one choice row draws. The recommended row is the only one at full
+/// strength; every other row -- including a row whose text says "(not
+/// recommended)" -- keeps the same hue at [`CHOICE_BORDER_ALPHA`]. A function
+/// rather than an inline branch so the card and its test read the same rule.
+fn choice_border(is_recommended: bool, tokens: ThemeTokens) -> Color {
+    if is_recommended {
+        tokens.status.attention
+    } else {
+        tokens.status.attention.with_alpha(CHOICE_BORDER_ALPHA)
+    }
+}
+
+/// The choice text with its recommendation marker lifted out, so the label
+/// reads as the answer alone and the marker becomes the muted note on the
+/// right -- which is how the mockup shows it. A parenthesised marker takes its
+/// brackets with it.
+fn choice_label(choice: &str) -> String {
+    let Some(start) = recommendation_marker(choice) else {
+        return choice.trim().to_string();
+    };
+    // `to_ascii_lowercase` is length-preserving, so these byte offsets are the
+    // original string's own char boundaries.
+    let mut begin = start;
+    let mut end = start + RECOMMENDED_MARKER.len();
+    if choice[..begin].ends_with('(') {
+        begin -= 1;
+    }
+    if choice[end..].starts_with(')') {
+        end += 1;
+    }
+    let head = choice[..begin].trim();
+    let tail = choice[end..].trim();
+    if head.is_empty() {
+        return tail.to_string();
+    }
+    if tail.is_empty() {
+        return head.to_string();
+    }
+    format!("{head} {tail}")
+}
+
+/// The question card. One of the few surfaces allowed to be prominent, and the
+/// only one in the stream that is allowed to be amber.
+///
+/// Geometry is the approved mockup's `.qc` rules, held in
+/// [`crate::ui::panel::permission`] so the card here and the permission dock
+/// under the panel are the same card.
+fn question_element(
+    prompt: &str,
+    choices: &[String],
+    settled_choice: Option<usize>,
+    recommended: Option<usize>,
+    tokens: ThemeTokens,
+) -> AnyElement {
+    let mut card = div()
+        .w_full()
+        .flex()
+        .flex_col()
+        .px(px(CARD_PADDING_X))
+        .py(px(CARD_PADDING_Y))
+        .rounded(px(CARD_RADIUS))
+        .border(px(CARD_BORDER_WIDTH))
+        .border_color(card_border(tokens))
+        .bg(card_background(tokens))
+        .text_size(px(CARD_FONT_SIZE))
+        .line_height(px(CARD_LINE_HEIGHT))
+        .text_color(tokens.text.primary.to_gpui())
+        .child(card_label(QUESTION_LABEL, tokens))
+        .child(
+            div()
+                .w_full()
+                .mb(px(PROMPT_MARGIN_BOTTOM))
+                .child(prompt.to_string()),
+        );
+
+    for (index, choice) in choices.iter().enumerate() {
+        let settled = settled_choice == Some(index);
+        let is_recommended = recommended == Some(index);
+        let border = choice_border(is_recommended, tokens);
+        // Once a question is settled it is history: the answer stays filled and
+        // legible, and the choices nobody took go quiet, so the card reads as
+        // answered rather than as still asking.
+        let (foreground, number_color) = match (settled, settled_choice.is_some()) {
+            (true, _) => (
+                tokens.status.attention_foreground,
+                tokens.status.attention_foreground,
+            ),
+            (false, true) => (tokens.text.disabled, tokens.text.disabled),
+            (false, false) => (tokens.text.primary, tokens.text.muted),
+        };
+        let mut row = div()
+            .w_full()
+            .flex()
+            .items_center()
+            .gap(px(CHOICE_GAP))
+            .mb(px(CHOICE_MARGIN_BOTTOM))
+            .px(px(CHOICE_PADDING_X))
+            .py(px(CHOICE_PADDING_Y))
+            .rounded(px(CHOICE_RADIUS))
+            .border(px(CARD_BORDER_WIDTH))
+            .border_color(border.to_gpui())
+            .text_color(foreground.to_gpui())
+            .child(
+                div()
+                    .flex_none()
+                    .w(px(CHOICE_NUMBER_WIDTH))
+                    .text_color(number_color.to_gpui())
+                    .child(format!("{}", index + 1)),
+            )
+            .child(div().child(choice_label(choice)));
+        if settled {
+            row = row.bg(tokens.status.attention_surface.to_gpui());
+        }
+        if is_recommended {
+            row = row.child(div().flex_1()).child(
+                div()
+                    .flex_none()
+                    .text_size(px(CHOICE_NOTE_FONT_SIZE))
+                    .text_color(if settled {
+                        tokens.status.attention_foreground.to_gpui()
+                    } else {
+                        tokens.text.muted.to_gpui()
+                    })
+                    .child(RECOMMENDED_NOTE),
+            );
+        }
+        card = card.child(row);
+    }
+
+    let key_hint = if choices.is_empty() {
+        "⏎ send".to_string()
+    } else {
+        format!("1-{} pick · ⏎ send", choices.len())
+    };
+    card.child(
+        div()
+            .w_full()
+            .flex()
+            .items_center()
+            .gap(px(FOOTER_GAP))
+            .mt(px(FOOTER_MARGIN_TOP))
+            .text_size(px(FOOTER_FONT_SIZE))
+            .text_color(tokens.text.muted.to_gpui())
+            .child(QUESTION_FOOTER)
+            .child(div().flex_1())
+            .child(key_hint),
+    )
+    .into_any_element()
+}
+
+/// Working indicator. Three dots plus an elapsed label.
+fn working_element(elapsed_ms: Option<u64>, step: Option<&str>, tokens: ThemeTokens) -> AnyElement {
+    // The three dots pulse in sequence, as T3 Code's status pulse does. This is
+    // the one thing on screen that says the wait is alive rather than stuck, so
+    // it moves; everything else about the row stays quiet.
+    let dot = |index: usize| {
+        div()
+            .flex_none()
+            .size(px(WORKING_DOT))
+            .rounded_full()
+            .bg(mix_color(tokens.surfaces.canvas, tokens.text.muted, 0.30).to_gpui())
+            .with_animation(
+                ("native-conversation-working-dot", index),
+                gpui::Animation::new(std::time::Duration::from_millis(900))
+                    .repeat()
+                    .with_easing(move |delta| {
+                        let shifted = (delta + index as f32 / 3.0) % 1.0;
+                        let triangle = if shifted <= 0.5 {
+                            shifted * 2.0
+                        } else {
+                            (1.0 - shifted) * 2.0
+                        };
+                        0.35 + triangle * 0.65
+                    }),
+                |dot, opacity| dot.opacity(opacity),
+            )
+            .into_any_element()
+    };
+    let elapsed_label = match elapsed_ms {
+        None => "Working".to_string(),
+        Some(ms) => crate::ui::conversation::rows::format_working_elapsed(ms as i64),
+    };
+    // Rule 1/2: the streaming indicator is one more quiet 11 px row. It is the
+    // only animated thing in the stream, so it earns no colour on top.
+    div()
+        .w_full()
+        .min_w(px(0.0))
+        .py(px(ROW_PADDING_Y))
+        .flex()
+        .items_center()
+        .gap(px(CONTROL_GAP))
+        .text_size(px(SECONDARY_FONT_SIZE))
+        .font(tabular_numeral_font())
+        .text_color(tokens.text.muted.to_gpui())
+        .whitespace_nowrap()
+        .overflow_hidden()
+        .child(
+            div()
+                .flex_none()
+                .w(px(ROW_GLYPH_SLOT))
+                .flex()
+                .items_center()
+                .justify_center()
+                .gap(px(3.0))
+                .child(dot(0))
+                .child(dot(1))
+                .child(dot(2)),
+        )
+        .child(div().flex_none().child(elapsed_label))
+        .children(step.map(|step| {
+            div()
+                .min_w(px(0.0))
+                .overflow_hidden()
+                .text_ellipsis()
+                .child(step.to_string())
+                .into_any_element()
+        }))
+        .into_any_element()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ui::task_cockpit::timeline::CONVERSATION_CONTENT_MAX_WIDTH;
+
+    fn sample_assistant_document() -> MarkdownDocument {
+        MarkdownDocument {
+            source: String::new(),
+            selectable: true,
+            copyable: true,
+            html_executed: false,
+            prose_wraps: true,
+            blocks: Vec::new(),
+            pending_links: vec![],
+        }
+    }
+
+    #[test]
+    fn message_render_plan_preserves_exact_gfm_and_stable_role_identity() {
+        let doc = sample_assistant_document();
+        let row_key = ConversationRowKey::Message("stable-event".into());
+        let source = representative_t3_gfm_markdown();
+        let plan = plan_message_markdown_render(&row_key, source, doc.selectable, false);
+        let grown = format!("{source}\ntrailing streamed chunk");
+        let plan_grown = plan_message_markdown_render(&row_key, &grown, doc.selectable, false);
+        let user_plan = plan_message_markdown_render(&row_key, source, doc.selectable, true);
+
+        assert_eq!(plan.backend, AssistantMarkdownBackend::NativeGfm);
+        assert!(plan.selectable);
+        assert_eq!(
+            plan.source, source,
+            "provider Markdown must not be reconstructed"
+        );
+        assert_eq!(
+            plan.text_view_key, plan_grown.text_view_key,
+            "streaming must not mint a new TextView key"
+        );
+        assert_ne!(plan.text_view_key, user_plan.text_view_key);
+        assert_eq!(user_plan.source, source);
+    }
+
+    #[test]
+    fn assistant_message_paint_path_selects_native_gfm() {
+        assert_eq!(
+            assistant_message_paint_backend(),
+            AssistantMarkdownBackend::NativeGfm,
+            "assistant turns must paint through TextView::markdown, not the home-grown block painter"
+        );
+    }
+
+    fn question_row(choices: &[&str]) -> ConversationRow {
+        ConversationRow::Question {
+            id: crate::ui::renderers::TimelineItemId::Event(crate::domain::EventId::new()),
+            prompt: "p".into(),
+            choices: choices.iter().map(|choice| (*choice).to_string()).collect(),
+            settled_choice: None,
+        }
+    }
+
+    /// W2 (fix wave 3): the stream's block cadence -- a label 2 px above its
+    /// body, 10 px between blocks, and nothing invisible in between.
+    ///
+    /// Two halves, because the defect had two causes. The numbers are the
+    /// rhythm itself; the source scan is the meta row, which was invisible at
+    /// rest and still cost every block a gap, a caption line and 8 px of
+    /// padding -- roughly 27 of the ~40 px that stood between two blocks in
+    /// `fix-wave-2-panel-grid.png`, and none of it attributable by reading the
+    /// painted pixels.
+    #[test]
+    fn a_message_block_hugs_its_label_and_keeps_ten_pixels_from_the_next() {
+        assert_eq!(ROLE_LABEL_GAP, 2.0);
+        assert_eq!(BLOCK_GAP, 10.0);
+        assert_eq!(CARD_GAP, 4.0, "the 4 px grid step the cards kept");
+        assert!(
+            BLOCK_GAP >= 4.0 * ROLE_LABEL_GAP,
+            "a role label must sit at least four times nearer its own body \
+             than the next block, or it reads as a caption belonging to nothing"
+        );
+
+        // The scroll estimate is exactly the parts the painter lays out, and
+        // the meta row is not one of them any more.
+        let tokens = crate::ui::tokens::dark(
+            crate::ui::tokens::Density::Comfortable,
+            crate::ui::tokens::Scale::Scale100,
+        );
+        let one_line = ConversationRow::Message {
+            id: crate::ui::renderers::TimelineItemId::Event(crate::domain::EventId::new()),
+            role: MessageRole::Assistant,
+            text: "one line".into(),
+            markdown: sample_assistant_document(),
+            occurred_at_ms: None,
+            streaming: false,
+        };
+        assert_eq!(
+            conversation_row_height(&one_line, tokens),
+            (ROLE_LABEL_LINE_HEIGHT + ROLE_LABEL_GAP + BODY_LINE_HEIGHT + BLOCK_GAP) as u32,
+            "the estimate must count the label, its gap, the body and the block gap -- and nothing else"
+        );
+
+        // The shared checkout is CRLF; normalise before slicing or the anchors
+        // below match nothing and every assertion goes vacuously green.
+        let source = include_str!("render.rs").replace("\r\n", "\n");
+        let painter = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("the painter is everything above its tests");
+        let block = painter
+            .split("fn message_row_element(")
+            .nth(1)
+            .expect("the anchor has stopped matching and this test is guarding nothing")
+            .split("fn message_timestamp_format(")
+            .next()
+            .expect("the block painter ends where the next function begins");
+        let compact: String = block.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            compact.contains(".absolute().top_0()")
+                && compact.contains("meta.left_0()")
+                && compact.contains("meta.right_0()"),
+            "the meta row must be positioned over the block rather than laid \
+             out under it, and on the side away from the message: left for the \
+             user's own right-aligned words, right for the answer"
+        );
+        assert!(
+            compact.contains(".pb(px(BLOCK_GAP))"),
+            "the block's own bottom padding is the whole gap between blocks"
+        );
+        assert!(
+            !compact.contains(".pb(px(CONTROL_GAP))"),
+            "the 8 px that used to sit under the meta row is gone"
+        );
+    }
+
+    #[test]
+    fn question_row_height_grows_by_one_line_per_choice() {
+        let tokens = crate::ui::tokens::dark(
+            crate::ui::tokens::Density::Comfortable,
+            crate::ui::tokens::Scale::Scale100,
+        );
+        let two = question_row(&["a", "b"]);
+        let three = question_row(&["a", "b", "c"]);
+        assert_eq!(
+            conversation_row_height(&three, tokens) - conversation_row_height(&two, tokens),
+            CHOICE_ROW_HEIGHT as u32
+        );
+        assert_eq!(CHOICE_ROW_HEIGHT, 26.0);
+    }
+
+    #[test]
+    fn the_recommended_choice_is_the_one_that_says_so_and_its_marker_leaves_the_label() {
+        let choices = vec![
+            "Run now (Recommended)".to_string(),
+            "Defer to next restart".to_string(),
+        ];
+        assert_eq!(recommended_choice(&choices), Some(0));
+        assert_eq!(choice_label(&choices[0]), "Run now");
+        assert_eq!(choice_label(&choices[1]), "Defer to next restart");
+        assert_eq!(recommended_choice(&[]), None);
+        assert_eq!(
+            recommended_choice(&["Defer".to_string(), "Run now".to_string()]),
+            None
+        );
+        // The marker is lifted wherever it sits, brackets and all.
+        assert_eq!(choice_label("(recommended) Run now"), "Run now");
+    }
+
+    #[test]
+    fn a_negated_recommendation_is_not_a_recommendation() {
+        let tokens = crate::ui::tokens::dark(
+            crate::ui::tokens::Density::Comfortable,
+            crate::ui::tokens::Scale::Scale100,
+        );
+        let choices = vec![
+            "Defer to next restart".to_string(),
+            "Force reset (not recommended)".to_string(),
+            "Explain the risk first".to_string(),
+        ];
+        assert_eq!(recommended_choice(&choices), None);
+        // The warning stays in the label rather than being lifted into the
+        // right-hand note, where it would read as an endorsement.
+        assert_eq!(choice_label(&choices[1]), "Force reset (not recommended)");
+        // And the negated row draws the same 0.4 rule as every other row, not
+        // the full-strength amber the recommended row gets.
+        let negated_is_recommended = recommended_choice(&choices) == Some(1);
+        assert_eq!(
+            choice_border(negated_is_recommended, tokens),
+            tokens.status.attention.with_alpha(CHOICE_BORDER_ALPHA)
+        );
+        assert_ne!(
+            choice_border(negated_is_recommended, tokens),
+            choice_border(true, tokens)
+        );
+        assert_eq!(choice_border(true, tokens), tokens.status.attention);
+
+        assert_eq!(
+            recommended_choice(&["Never recommended".to_string()]),
+            None,
+            "\"never recommended\" is the same negation one word along"
+        );
+        // A genuine recommendation in the same list still wins its row.
+        let mixed = vec![
+            "Force reset (not recommended)".to_string(),
+            "Run now (Recommended)".to_string(),
+        ];
+        assert_eq!(recommended_choice(&mixed), Some(1));
+    }
+
+    #[test]
+    fn long_rich_markdown_height_is_not_truncated_at_the_legacy_480px_cap() {
+        let tokens = crate::ui::tokens::theme(
+            ThemeMode::Dark,
+            crate::ui::tokens::Density::Comfortable,
+            crate::ui::tokens::Scale::Scale100,
+        );
+        let text = (0..80)
+            .map(|index| format!("- readable list item {index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let row = ConversationRow::Message {
+            id: crate::ui::renderers::TimelineItemId::Event(crate::domain::EventId::new()),
+            role: MessageRole::Assistant,
+            text,
+            markdown: sample_assistant_document(),
+            occurred_at_ms: None,
+            streaming: false,
+        };
+
+        assert!(
+            conversation_row_height(&row, tokens) > 480,
+            "scroll/follow bookkeeping must cover the full painted answer"
+        );
+    }
+
+    #[test]
+    fn fenced_code_and_table_padding_are_part_of_scroll_height() {
+        let tokens = crate::ui::tokens::theme(
+            ThemeMode::Dark,
+            crate::ui::tokens::Density::Comfortable,
+            crate::ui::tokens::Scale::Scale100,
+        );
+        let plain = "one\ntwo\nthree\nfour";
+        let rich = "```rust\none\ntwo\n```\n\n| three | four |";
+        assert!(
+            markdown_body_height(rich, tokens) > markdown_body_height(plain, tokens),
+            "native code/table chrome adds real vertical extent"
+        );
+    }
+
+    #[test]
+    fn the_stream_type_scale_is_the_redesign_scale() {
+        // Rule 2. Every step the stream paints, pinned in one place, and the
+        // ceiling asserted so a future edit cannot reintroduce chat-sized type.
+        assert_eq!(ROLE_LABEL_FONT_SIZE, 10.5);
+        assert_eq!(CAPTION_FONT_SIZE, 10.5);
+        assert_eq!(SECONDARY_FONT_SIZE, 11.0);
+        assert_eq!(BODY_FONT_SIZE, 11.5);
+        assert_eq!(CODE_FONT_SIZE, 11.5);
+        assert_eq!(HEADING_SIZES, [13.0, 12.5, 12.0, 11.5]);
+        for size in [
+            ROLE_LABEL_FONT_SIZE,
+            CAPTION_FONT_SIZE,
+            SECONDARY_FONT_SIZE,
+            BODY_FONT_SIZE,
+            CODE_FONT_SIZE,
+        ]
+        .into_iter()
+        .chain(HEADING_SIZES)
+        {
+            assert!(
+                size <= 13.0,
+                "nothing in the stream is larger than 13 px, found {size}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_markdown_metrics_the_body_paints_are_the_scale_above() {
+        // The struct handed to TextView and the scroll estimate read the same
+        // constants, at every density -- the redesign has one stream scale.
+        for density in [
+            crate::ui::tokens::Density::Compact,
+            crate::ui::tokens::Density::Comfortable,
+        ] {
+            let metrics = conversation_markdown_metrics(density);
+            assert_eq!(metrics.body_size, BODY_FONT_SIZE);
+            assert_eq!(metrics.body_line_height, BODY_LINE_HEIGHT);
+            assert_eq!(metrics.paragraph_gap_rems, PARAGRAPH_GAP_REMS);
+            assert_eq!(metrics.heading_sizes, HEADING_SIZES);
+        }
+    }
+
+    /// The stream used to refuse both turns a surface of their own. That rule
+    /// was overruled deliberately: a chat reads as a chat when your own words
+    /// sit on the right on their own quiet surface. The assistant's side keeps
+    /// the original treatment -- full column, no card, no shadow -- because an
+    /// answer is long and half a column is harder to read.
+    #[test]
+    fn the_user_turn_sits_right_on_its_own_surface_and_the_answer_stays_plain() {
+        // KNOWN LIMITATION: a source assertion, for the same reason the border
+        // invariant below is one -- GPUI exposes no painted style to a unit
+        // test. It is anchored on the two painter names rather than on any
+        // literal, so a rename fails it loudly.
+        let source = include_str!("render.rs");
+        let renderers = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("renderer source precedes its tests");
+        assert_eq!(
+            renderers.matches("message_block_element(").count(),
+            3,
+            "one definition and exactly two callers -- the user turn and the \
+             assistant turn must paint through the same block"
+        );
+        assert!(
+            renderers.contains(".items_end()") && renderers.contains("USER_MESSAGE_MAX_WIDTH"),
+            "the person's own message is right-aligned and bounded"
+        );
+        assert!(
+            renderers.contains("body.w_full()"),
+            "the answer keeps the full column"
+        );
+        for gone in [
+            "ASSISTANT_PROSE_MAX_WIDTH",
+            "PLAN_CARD_HORIZONTAL_INSET",
+            "shadow_sm()",
+            "shadow_md()",
+        ] {
+            assert!(
+                !renderers.contains(gone),
+                "the stream still has no prose inset and no drop shadow; found {gone}"
+            );
+        }
+        assert_eq!(role_label(USER_TURN_LABEL), "YOU");
+        assert_eq!(role_label(ASSISTANT_TURN_LABEL), "ANSWER");
+    }
+
+    #[test]
+    fn only_a_failed_tool_row_is_coloured() {
+        // Rule 1: amber means "needs you" and red means blocked. A tool that
+        // is merely running must not spend either.
+        let tokens = crate::ui::tokens::dark(
+            crate::ui::tokens::Density::Comfortable,
+            crate::ui::tokens::Scale::Scale100,
+        );
+        let colour = |state| entry_tone(state, tokens).0;
+        assert_eq!(
+            colour(ActivityState::Failure),
+            tokens.status.destructive.to_gpui()
+        );
+        assert_eq!(colour(ActivityState::Active), tokens.text.primary.to_gpui());
+        assert_eq!(colour(ActivityState::Success), tokens.text.muted.to_gpui());
+        assert_eq!(colour(ActivityState::Pending), tokens.text.muted.to_gpui());
+        for state in [
+            ActivityState::Active,
+            ActivityState::Success,
+            ActivityState::Pending,
+        ] {
+            assert_ne!(
+                colour(state),
+                tokens.status.attention.to_gpui(),
+                "the attention hue belongs to the question card alone"
+            );
+            assert_ne!(colour(state), tokens.status.warning.to_gpui());
+        }
+        // Rule 10: every row glyph is a lucide mark from `crate::icons`.
+        for state in [
+            ActivityState::Failure,
+            ActivityState::Active,
+            ActivityState::Success,
+            ActivityState::Pending,
+        ] {
+            let path = entry_tone(state, tokens).1;
+            assert!(
+                path.starts_with("icons/") && path.ends_with(".svg"),
+                "expected a lucide asset path, found {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_conversation_row_renderer_draws_a_border() {
+        // KNOWN LIMITATION: this is a source-text assertion, and source-text
+        // assertions decay silently. GPUI offers no way to inspect a painted
+        // element's computed style from a unit test, so there is no behavioural
+        // equivalent available today. Split before this test module so the
+        // assertion does not count its own needle, and count `border_b`
+        // separately so a changed anchor cannot silently green the guard.
+        // Re-anchor this on the real element tree if a render harness lands.
+        let source = include_str!("render.rs");
+        let renderers = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("renderer source precedes its tests");
+        // The redesign adds exactly two exceptions, and both are scoped rather
+        // than relaxed: rule 3 puts a 1 px `borders.subtle` rule around a code
+        // block, and the amber question card is a card, so the approved mockup
+        // rules it and each of its choice rows. Every *row* the stream paints
+        // still separates by whitespace and surface lightness alone.
+        let (before_the_card, from_the_card) = renderers
+            .split_once("fn question_element")
+            .expect("the question card painter is the only renderer that rules");
+        assert_eq!(
+            before_the_card.matches(".border(px(").count(),
+            1,
+            "the only rule before the card is the code block's well -- \
+             conversation rows themselves are never bordered"
+        );
+        assert!(
+            before_the_card.contains("gpui::StyleRefinement::default()"),
+            "that one rule belongs to the code-block style refinement -- if \
+             this fails the count above is guarding something else"
+        );
+        assert_eq!(
+            from_the_card.matches(".border(px(").count(),
+            2,
+            "the only rules from the card on are its own and its choice rows' \
+             -- if this is 0 the anchor above has stopped matching"
+        );
+        assert_eq!(
+            renderers.matches(".border_b(px(").count(),
+            1,
+            "exactly one hairline exists, the turn fold's -- if this is 0 the \
+             anchor above has stopped matching and is guarding nothing"
+        );
+    }
+
+    #[test]
+    fn the_readable_measure_is_a_ceiling_the_panel_clamps() {
+        // 768 is the widest the column ever gets; inside a redesign panel
+        // `max_w_full` clamps it to the panel. It is the only measure now --
+        // the narrower prose column and the plan card's inset are gone, so
+        // every row is full width (rule 5).
+        assert_eq!(CONVERSATION_CONTENT_MAX_WIDTH, 768.0);
+    }
+
+    #[test]
+    fn each_turn_has_an_explicit_scan_anchor() {
+        assert_eq!(ASSISTANT_TURN_LABEL, "Answer");
+        assert_eq!(USER_TURN_LABEL, "You");
+    }
+
+    #[test]
+    fn message_meta_is_quiet_at_rest_and_full_strength_when_revealed() {
+        // Never zero: a control that only exists under the pointer competed
+        // with selecting the very text it sits on.
+        assert!(message_meta_opacity(false) > 0.0);
+        assert!(message_meta_opacity(false) < message_meta_opacity(true));
+        assert_eq!(message_meta_opacity(true), 1.0);
+    }
+
+    #[test]
+    fn message_timestamp_uses_twelve_hour_local_clock_copy() {
+        assert_eq!(
+            format_message_timestamp_at_offset(0, UtcOffset::UTC).as_deref(),
+            Some("12:00 am")
+        );
+        assert_eq!(
+            format_message_timestamp_at_offset(
+                13 * 60 * 60 * 1_000 + 5 * 60 * 1_000,
+                UtcOffset::UTC
+            )
+            .as_deref(),
+            Some("1:05 pm")
+        );
+    }
+
+    #[test]
+    fn tasks_card_progress_counts_only_completed_plan_steps() {
+        let completed = ActivityEntry {
+            subagent_id: None,
+            identity: "plan:one".into(),
+            kind: ActivityKind::PlanStep,
+            label: "Plan".into(),
+            detail: "One".into(),
+            state: ActivityState::Success,
+        };
+        let active = ActivityEntry {
+            subagent_id: None,
+            identity: "plan:two".into(),
+            kind: ActivityKind::PlanStep,
+            label: "Plan".into(),
+            detail: "Two".into(),
+            state: ActivityState::Active,
+        };
+        let failed = ActivityEntry {
+            subagent_id: None,
+            identity: "plan:three".into(),
+            kind: ActivityKind::PlanStep,
+            label: "Plan".into(),
+            detail: "Three".into(),
+            state: ActivityState::Failure,
+        };
+
+        assert_eq!(plan_progress(&[&completed, &active, &failed]), (1, 3));
+    }
+
+    #[test]
+    fn tasks_card_height_accounts_for_header_padding_and_every_step() {
+        let plan = |identity: &str| ActivityEntry {
+            subagent_id: None,
+            identity: identity.into(),
+            kind: ActivityKind::PlanStep,
+            label: "Plan".into(),
+            detail: identity.into(),
+            state: ActivityState::Active,
+        };
+        let tool = ActivityEntry {
+            subagent_id: None,
+            identity: "tool".into(),
+            kind: ActivityKind::Tool,
+            label: "Command".into(),
+            detail: "cargo fmt".into(),
+            state: ActivityState::Success,
+        };
+
+        let plan_only = activity_row_height(&[plan("one"), plan("two")], 16.0);
+        let mixed = activity_row_height(&[tool, plan("one"), plan("two")], 16.0);
+
+        // One 22 px row per step, plus the card's 4 + 8 + 8 + 2 chrome and its
+        // 16 px label line: 22 + 16 + 44. The last of those four is
+        // ROLE_LABEL_GAP, which W2 took from 4 to 2 -- the card's label is a
+        // role label above its own body like every other one in the stream.
+        assert_eq!(stream_row_height(16.0), 22.0);
+        assert_eq!(plan_only, 82.0);
+        // A tool row above the card adds exactly one more row.
+        assert_eq!(mixed - plan_only, stream_row_height(16.0));
+    }
+}

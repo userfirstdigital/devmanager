@@ -4,6 +4,13 @@ import "./index.css";
 import { notifyPwaSafetyStateChanged, registerPwa } from "./pwa/register";
 import { applyAppBadge } from "./pwa/notifications";
 import { readStoreUpdateSafetyState } from "./pwa/storeSafety";
+import { readNativeUpdateSafetyState } from "./pwa/nativeSafety";
+import {
+  hasExplicitConnectSelection,
+  installConnectDocumentPublication,
+  readConnectHostPublication,
+} from "./connect/identity";
+import { NativeRemoteEntry } from "./connect/NativeRemoteEntry";
 import {
   selectAppBadgeSyncState,
   shouldApplyAppBadge,
@@ -17,13 +24,27 @@ import {
 // test against production builds anyway.
 const root = document.getElementById("root");
 if (!root) throw new Error("root element missing");
-const readSafetyState = () => readStoreUpdateSafetyState(useStore.getState());
+// The Connect marker is installed before React mounts so the store cannot
+// race identity creation and accidentally select the legacy socket. A typed
+// HOLD leaves Connect selected; it never downgrades an authenticated route.
+installConnectDocumentPublication();
+const explicitConnectSelection = hasExplicitConnectSelection(
+  globalThis as Record<string, unknown>,
+);
+const readSafetyState = () =>
+  explicitConnectSelection
+    ? (readNativeUpdateSafetyState() ?? {
+        hasDraft: true,
+        pendingMutations: 1,
+      })
+    : readStoreUpdateSafetyState(useStore.getState());
 let previousSafetyState = readSafetyState();
 let previousBadgeState = selectAppBadgeSyncState(useStore.getState());
 if (previousBadgeState.count !== null) {
   void applyAppBadge(previousBadgeState.count);
 }
 useStore.subscribe((state) => {
+  if (explicitConnectSelection) return;
   const nextSafetyState = readStoreUpdateSafetyState(state);
   if (
     nextSafetyState.hasDraft !== previousSafetyState.hasDraft ||
@@ -47,4 +68,13 @@ void registerPwa(readSafetyState, () => {
       "DevManager could not reconcile the web bundle automatically without risking a reload loop.",
   });
 });
-createRoot(root).render(<App />);
+// Connect selection never awaits authentication, IndexedDB, WASM, or a socket
+// before first paint. An explicit but malformed marker mounts the held Connect
+// shell; only pages with no explicit marker may render the legacy app.
+createRoot(root).render(
+  explicitConnectSelection ? (
+    <NativeRemoteEntry marker={readConnectHostPublication()} />
+  ) : (
+    <App />
+  ),
+);

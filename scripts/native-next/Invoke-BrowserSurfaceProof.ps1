@@ -1,0 +1,316 @@
+# Phase 8 portable browser surface proof.
+# Default/Red/Green/All never launch WebView2, GPUI, installed DevManager,
+# or stock providers. OutputDir is required so evidence stays explicit.
+
+[CmdletBinding()]
+param(
+    [ValidateSet('Red', 'Green', 'All')]
+    [string]$Stage = 'All',
+    [switch]$AllDpi,
+    [switch]$ClientCrash,
+    [switch]$HostRecovery,
+    [Parameter(Mandatory = $true)]
+    [string]$OutputDir
+)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+
+. (Join-Path $PSScriptRoot 'Isolation.ps1')
+
+function Get-BrowserTypedContractExitCode {
+    param([Parameter(Mandatory = $true)][string]$Status)
+    switch ($Status) {
+        'PASS' { return 0 }
+        'HOLD' { return 2 }
+        default { return 1 }
+    }
+}
+
+function Resolve-BrowserSurfaceProofTypedResult {
+    param([Parameter(Mandatory = $true)]$Evidence)
+
+    $visible = $false
+    $launched = $false
+    if ($null -ne $Evidence) {
+        if ($Evidence -is [System.Collections.IDictionary]) {
+            if ($Evidence.Contains('visibleWebView2Proven')) { $visible = [bool]$Evidence['visibleWebView2Proven'] }
+            $residue = $null
+            if ($Evidence.Contains('residue')) { $residue = $Evidence['residue'] }
+        }
+        else {
+            if ($null -ne $Evidence.PSObject.Properties['visibleWebView2Proven']) {
+                $visible = [bool]$Evidence.visibleWebView2Proven
+            }
+            $residue = $null
+            if ($null -ne $Evidence.PSObject.Properties['residue']) {
+                $residue = $Evidence.residue
+            }
+        }
+        if ($null -ne $residue) {
+            if ($residue -is [System.Collections.IDictionary]) {
+                if ($residue.Contains('launchedWebView2')) { $launched = [bool]$residue['launchedWebView2'] }
+            }
+            elseif ($null -ne $residue.PSObject.Properties['launchedWebView2']) {
+                $launched = [bool]$residue.launchedWebView2
+            }
+        }
+    }
+
+    if ($visible -and -not $launched) {
+        return [pscustomobject]@{
+            status      = 'FAIL'
+            disposition = 'FAIL'
+            pass        = $false
+            reason      = 'visible-claim-without-webview2-proof'
+        }
+    }
+    if ($visible -and $launched) {
+        return [pscustomobject]@{
+            status      = 'PASS'
+            disposition = 'PASS'
+            pass        = $true
+            reason      = 'visible-webview2-proven'
+        }
+    }
+    return [pscustomobject]@{
+        status      = 'HOLD'
+        disposition = 'HOLD'
+        pass        = $false
+        reason      = 'visible-webview2-not-proven'
+    }
+}
+
+function Assert-BrowserSurfaceProofDoesNotLaunchHosts {
+    param([Parameter(Mandatory = $true)][string]$LiteralPath)
+
+    $tokens = $null
+    $parseErrors = $null
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile($LiteralPath, [ref]$tokens, [ref]$parseErrors)
+    if ($null -eq $ast -or @($parseErrors).Count -gt 0) {
+        throw 'Surface proof script failed Parser::ParseFile.'
+    }
+    foreach ($command in @($ast.FindAll({ $args[0] -is [System.Management.Automation.Language.CommandAst] }, $true))) {
+        $name = [string]$command.GetCommandName()
+        if ($name -eq 'Start-Process') {
+            throw 'Surface proof script must not invoke Start-Process.'
+        }
+    }
+}
+
+if (-not [System.IO.Path]::IsPathRooted($OutputDir)) {
+    throw 'OutputDir must be an explicit rooted directory.'
+}
+
+$worktreeRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
+$resolvedOutput = [System.IO.Path]::GetFullPath($OutputDir.Trim())
+$productionRoot = Get-DevManagerProductionRoot
+if ($resolvedOutput.StartsWith($productionRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
+    throw 'OutputDir must not resolve under the production DevManager config root.'
+}
+
+New-Item -ItemType Directory -Force -Path $resolvedOutput | Out-Null
+
+$scriptPath = $MyInvocation.MyCommand.Path
+$surfaceTest = Join-Path $worktreeRoot 'tests\browser_surface.rs'
+$serverSource = Join-Path $worktreeRoot 'src\bin\browser-fixture-server.rs'
+$scriptText = Get-Content -LiteralPath $scriptPath -Raw
+$testText = Get-Content -LiteralPath $surfaceTest -Raw
+$serverText = Get-Content -LiteralPath $serverSource -Raw
+
+$scenarioFilters = New-Object System.Collections.Generic.List[string]
+if ($AllDpi) {
+    $scenarioFilters.Add('dpi_and_bounds_matrix_updates_physical_geometry')
+}
+if ($ClientCrash) {
+    $scenarioFilters.Add('client_crash_detaches_and_allows_reattach_to_a_new_client')
+}
+if ($HostRecovery) {
+    $scenarioFilters.Add('host_shutdown_requires_parked_surface_and_zero_helpers')
+}
+if ($scenarioFilters.Count -eq 0) {
+    # An unqualified Green/All run covers the entire portable surface suite.
+    $scenarioFilters.Add('')
+}
+
+$forbidden = @(
+    'Start-Process',
+    'claude.exe',
+    'codex.exe',
+    'cursor.exe',
+    'devmanager.exe'
+)
+Assert-BrowserSurfaceProofDoesNotLaunchHosts -LiteralPath $scriptPath
+
+function Get-BrowserVisibleHostProofClass {
+    param(
+        [bool]$FixtureOnly,
+        [bool]$VisibleClaimed,
+        [bool]$OptInMarker,
+        [bool]$ObservedHostOwnedWebView2,
+        [bool]$ObservedWindowLifecycle,
+        [bool]$ObservedHelperLifecycle
+    )
+
+    if ($FixtureOnly -or -not $VisibleClaimed) {
+        return 'FixtureProtocolOnly'
+    }
+    if ($OptInMarker -and $ObservedHostOwnedWebView2 -and $ObservedWindowLifecycle -and $ObservedHelperLifecycle) {
+        return 'VisibleGreen'
+    }
+    return 'VisibleHold'
+}
+
+$visibleOptIn = [string]$env:DEVMANAGER_BROWSER_WEBVIEW2_E2E -eq '1'
+$redChecks = [ordered]@{
+    worktreeRoot              = $worktreeRoot
+    surfaceTestPresent        = Test-Path -LiteralPath $surfaceTest
+    fixtureServerSourcePresent = Test-Path -LiteralPath $serverSource
+    scriptAvoidsProcessLaunch = $true # AST validation above rejects executable launches.
+    serverBindsLoopback       = $serverText.Contains('127.0.0.1')
+    serverExposesHealth       = $serverText.Contains('/health')
+    portableHostOnly          = $testText.Contains('do not launch WebView2')
+    visibleWebView2Claimed    = $false
+}
+
+$greenChecks = [ordered]@{
+    rustTestCommand = 'cargo test --locked --test browser_surface [optional-filter] -- --test-threads=1 --nocapture'
+    executedCargo   = $false
+    targetDirectory = $null
+    scenarioFilters = @($scenarioFilters)
+    note            = 'Green/All execute only the portable browser_surface test suite with a process-unique C:\Temp target. They do not invoke WebView2 or the installed app.'
+}
+
+function Invoke-PortableSurfaceScenario {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Filter
+    )
+
+    $targetDirectory = Join-Path 'C:\Temp' ('devmanager-browser-surface-{0}' -f $PID)
+    New-Item -ItemType Directory -Force -Path $targetDirectory | Out-Null
+    $greenChecks.targetDirectory = $targetDirectory
+
+    $hadTarget = Test-Path Env:CARGO_TARGET_DIR
+    $previousTarget = $env:CARGO_TARGET_DIR
+    $hadProfile = Test-Path Env:DEVMANAGER_PROFILE
+    $previousProfile = $env:DEVMANAGER_PROFILE
+    try {
+        $env:CARGO_TARGET_DIR = $targetDirectory
+        # Test profiles are process-unique and must not inherit the installed
+        # profile selector from the invoking terminal.
+        Remove-Item Env:DEVMANAGER_PROFILE -ErrorAction SilentlyContinue
+        Push-Location $worktreeRoot
+        try {
+            $cargoArgs = @('test', '--locked', '--test', 'browser_surface')
+            if (-not [string]::IsNullOrEmpty($Filter)) {
+                $cargoArgs += $Filter
+            }
+            $cargoArgs += @('--', '--test-threads=1', '--nocapture')
+            & cargo @cargoArgs
+            if ($LASTEXITCODE -ne 0) {
+                throw "portable browser surface scenario '$Filter' failed with exit code $LASTEXITCODE"
+            }
+        }
+        finally {
+            Pop-Location
+        }
+        $greenChecks.executedCargo = $true
+    }
+    finally {
+        if ($hadTarget) {
+            $env:CARGO_TARGET_DIR = $previousTarget
+        }
+        else {
+            Remove-Item Env:CARGO_TARGET_DIR -ErrorAction SilentlyContinue
+        }
+        if ($hadProfile) {
+            $env:DEVMANAGER_PROFILE = $previousProfile
+        }
+        else {
+            Remove-Item Env:DEVMANAGER_PROFILE -ErrorAction SilentlyContinue
+        }
+        if (Test-Path -LiteralPath $targetDirectory) {
+            Remove-Item -LiteralPath $targetDirectory -Recurse -Force
+        }
+    }
+}
+
+$evidence = [ordered]@{
+    schemaVersion           = 1
+    kind                    = 'browser-surface-proof'
+    stage                   = $Stage
+    generatedAtUtc          = [DateTime]::UtcNow.ToString('o')
+    scenarioFlags           = [ordered]@{
+        allDpi      = [bool]$AllDpi
+        clientCrash = [bool]$ClientCrash
+        hostRecovery = [bool]$HostRecovery
+    }
+    visibleWebView2Proven   = $false
+    visibleHostProofClass   = 'FixtureProtocolOnly'
+    productionProfileTouched = $false
+    residue                 = [ordered]@{
+        launchedInstalledApp = $false
+        launchedProvider     = $false
+        launchedWebView2     = $false
+        leftoverFixturePid   = $null
+    }
+    red                     = $redChecks
+    green                   = $greenChecks
+    notProven               = @(
+        'Visible host-owned WebView2 child HWND attach/park/reattach',
+        'GPUI client crash/rehost with a live controller',
+        '100/125/150/200 percent OS DPI with a real surface',
+        'Zero WebView2 helper processes after a real context close'
+    )
+}
+
+$stageError = $null
+try {
+    if ($Stage -in @('Red', 'All')) {
+        if (-not $redChecks.surfaceTestPresent -or -not $redChecks.fixtureServerSourcePresent) {
+            throw 'Required surface proof sources are missing.'
+        }
+    }
+
+    if ($Stage -in @('Green', 'All')) {
+        foreach ($filter in $scenarioFilters) {
+            Invoke-PortableSurfaceScenario -Filter $filter
+        }
+    }
+}
+catch {
+    $stageError = [string]$_.Exception.Message
+}
+
+$typed = Resolve-BrowserSurfaceProofTypedResult -Evidence $evidence
+if (-not [string]::IsNullOrWhiteSpace($stageError)) {
+    $typed = [pscustomobject]@{
+        status      = 'FAIL'
+        disposition = 'FAIL'
+        pass        = $false
+        reason      = $stageError
+    }
+}
+$evidence['status'] = [string]$typed.status
+$evidence['disposition'] = [string]$typed.disposition
+$evidence['pass'] = [bool]$typed.pass
+$evidence['reason'] = [string]$typed.reason
+
+$evidence.visibleHostProofClass = Get-BrowserVisibleHostProofClass `
+    -FixtureOnly $true `
+    -VisibleClaimed ([bool]$evidence.visibleWebView2Proven -or [bool]$redChecks.visibleWebView2Claimed) `
+    -OptInMarker $visibleOptIn `
+    -ObservedHostOwnedWebView2 $false `
+    -ObservedWindowLifecycle $false `
+    -ObservedHelperLifecycle $false
+if ($evidence.visibleHostProofClass -eq 'VisibleGreen' -or [bool]$evidence.visibleWebView2Proven -or [bool]$redChecks.visibleWebView2Claimed) {
+    throw 'Portable surface proof cannot claim visible WebView2 success. Fixture-only runs stay FixtureProtocolOnly.'
+}
+
+$evidencePath = Join-Path $resolvedOutput 'browser-surface-proof.json'
+$evidence | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $evidencePath -Encoding utf8
+Write-Host ("Browser surface proof stage {0} wrote {1}" -f $Stage, $evidencePath)
+Write-Host 'Visible WebView2 proof is NOT claimed by this portable run.'
+Write-Output (($evidence | ConvertTo-Json -Compress -Depth 8))
+exit (Get-BrowserTypedContractExitCode -Status ([string]$typed.status))

@@ -5,12 +5,12 @@ fn native_terminal_user_input_routes_only_explicit_user_origins() {
     let image_paste = include_str!("../src/remote/web/image_paste.rs");
 
     let remote_start = app
-        .find("remote_host_service.set_terminal_input_handler")
-        .expect("remote terminal input handler");
+        .find("fn remote_terminal_input_callback")
+        .expect("remote terminal input callback");
     let remote_end = app[remote_start..]
-        .find("let resize_manager = process_manager.clone()")
+        .find("fn remote_session_event_callback")
         .map(|offset| remote_start + offset)
-        .expect("end of remote terminal input handler region");
+        .expect("end of remote terminal input callback region");
     let remote_handler = &app[remote_start..remote_end];
     assert!(remote_handler.contains("input_manager.write_user_text_to_session(&session_id, &text)"));
     assert!(
@@ -102,7 +102,7 @@ fn source_region<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
 }
 
 #[test]
-fn replacement_binding_is_installed_before_the_old_session_is_forgotten() {
+fn replacement_binding_is_prepared_before_the_old_session_is_queued_for_close() {
     let source = include_str!("../src/services/process_manager.rs");
     let ensure_start = source
         .find("pub fn ensure_ai_session_for_tab_with_response")
@@ -115,13 +115,13 @@ fn replacement_binding_is_installed_before_the_old_session_is_forgotten() {
     let bind = ensure
         .find("prepare_browser_launch_for_session")
         .expect("replacement binding preparation");
-    let forget = ensure
-        .find("forget_session(existing_session_id)")
-        .expect("old session cleanup");
+    let queued_restart = ensure
+        .find("self.schedule_restart_ai")
+        .expect("queued restart operation");
 
     assert!(
-        bind < forget,
-        "replacement must bind before old PTY cleanup"
+        bind < queued_restart,
+        "replacement must bind before the operation that closes the old PTY"
     );
 }
 

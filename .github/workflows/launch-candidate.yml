@@ -1,0 +1,235 @@
+name: Launch candidate
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["codex/launch-ready-*"]
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    concurrency:
+      group: launch-candidate-${{ github.ref }}-windows
+      cancel-in-progress: false
+    runs-on: windows-latest
+    timeout-minutes: 90
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: "1.94.0"
+          components: rustfmt
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Prepare isolated target and reviewed WASM inputs
+        shell: pwsh
+        run: |
+          python packaging/prepare-ci-checkout.py
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          New-Item -ItemType Directory -Force launch-evidence | Out-Null
+
+      - name: Cache Rust dependencies
+        uses: swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          cache-on-failure: true
+
+      - name: Check formatting and browser build
+        shell: pwsh
+        run: |
+          cargo fmt --all -- --check
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          npm --prefix web ci --no-audit --no-fund
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          npm --prefix web audit --audit-level=high
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          npm --prefix web test
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          npm --prefix web run build
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $env:GIT_OPTIONAL_LOCKS = '0'
+          git diff --exit-code -- web/bundle
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+
+      - name: Check packaging references and dependency provenance
+        shell: pwsh
+        run: |
+          ./packaging/Assert-StaleReferences.ps1
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          ./packaging/Assert-ThirdPartyProvenance.ps1
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+
+      - name: Compile every Windows target
+        shell: pwsh
+        run: |
+          cargo check --locked --lib --bins --tests --target-dir "$env:CARGO_TARGET_DIR" -j 2 2>&1 | Tee-Object launch-evidence/compiler.log
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+
+      - name: Build Windows process test helper
+        shell: pwsh
+        run: |
+          cargo build --locked --bin devmanager-process-test-helper --target-dir "$env:CARGO_TARGET_DIR" -j 2 2>&1 | Tee-Object launch-evidence/process-helper.log
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+
+      - name: Run Windows library tests serially
+        shell: pwsh
+        run: |
+          cargo test --locked --lib --target-dir "$env:CARGO_TARGET_DIR" -j 2 -- --test-threads=1 2>&1 | Tee-Object launch-evidence/library.log
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+
+      - name: Run Windows integration and binary tests serially
+        shell: pwsh
+        run: |
+          cargo test --locked --bins --examples --test '*' --target-dir "$env:CARGO_TARGET_DIR" -j 2 -- --test-threads=1 2>&1 | Tee-Object launch-evidence/tests.log
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+
+      - name: Build desktop acceptance archive
+        shell: pwsh
+        run: |
+          cargo build --locked --bin devmanager --bin devmanager-host --target-dir "$env:CARGO_TARGET_DIR" -j 2
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          python packaging/assemble-launch-candidate.py
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+
+      - name: Check for owned process residue
+        if: always()
+        shell: pwsh
+        run: |
+          if (-not $env:CARGO_TARGET_DIR) { exit 0 }
+          $targetRoot = $env:CARGO_TARGET_DIR
+          $owned = @(Get-CimInstance Win32_Process | Where-Object {
+            $_.ProcessId -ne $PID -and (
+              ($_.ExecutablePath -and $_.ExecutablePath.StartsWith($targetRoot + '\', [StringComparison]::OrdinalIgnoreCase)) -or
+              ($_.Name -in @('cargo.exe', 'rustc.exe', 'rust-lld.exe', 'link.exe') -and $_.CommandLine -and $_.CommandLine.Contains($targetRoot))
+            )
+          })
+          if ($owned.Count) {
+            $owned | Select-Object ProcessId, ParentProcessId, Name, ExecutablePath
+            throw 'Owned test/build processes remain after verification'
+          }
+          Write-Output 'No owned test harness, Cargo, compiler, or linker process remains.'
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        if: always()
+        with:
+          name: windows-launch-verification
+          path: launch-evidence/*.log
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        if: success()
+        with:
+          name: windows-desktop-candidate
+          path: dist/launch-candidates/*
+          if-no-files-found: error
+
+  linux:
+    concurrency:
+      group: launch-candidate-${{ github.ref }}-linux
+      cancel-in-progress: false
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: "1.94.0"
+          components: rustfmt
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install Linux desktop and test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential clang cmake pkg-config libssl-dev \
+            libasound2-dev libfontconfig-dev libglib2.0-dev libwayland-dev \
+            libx11-xcb-dev libxkbcommon-x11-dev libvulkan1 mesa-vulkan-drivers \
+            libgtk-3-dev libwebkit2gtk-4.1-dev xwayland \
+            libzstd-dev dbus-user-session systemd-container lsof xvfb xauth
+          sudo loginctl enable-linger "$USER"
+          sudo systemctl start "user@$(id -u).service"
+          echo "XDG_RUNTIME_DIR=/run/user/$(id -u)" >> "$GITHUB_ENV"
+          echo "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus" >> "$GITHUB_ENV"
+
+      - name: Prepare isolated target and reviewed WASM inputs
+        run: |
+          python packaging/prepare-ci-checkout.py
+          mkdir -p launch-evidence
+          systemctl --user show-environment > /dev/null
+          test -f /sys/fs/cgroup/cgroup.controllers
+
+      - name: Cache Rust dependencies
+        uses: swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          cache-on-failure: true
+
+      - name: Check formatting and browser build
+        run: |
+          cargo fmt --all -- --check
+          npm --prefix web ci --no-audit --no-fund
+          npm --prefix web audit --audit-level=high
+          npm --prefix web test
+          npm --prefix web run build
+          GIT_OPTIONAL_LOCKS=0 git diff --exit-code -- web/bundle
+
+      - name: Compile every Linux target
+        run: |
+          set -o pipefail
+          python packaging/assert-linux-process-clean.py
+          cargo check --locked --lib --bins --tests -j 2 2>&1 | tee launch-evidence/compiler.log
+
+      - name: Build Linux process test helper
+        run: |
+          set -o pipefail
+          cargo build --locked --bin devmanager-process-test-helper -j 2 2>&1 | tee launch-evidence/process-helper.log
+
+      - name: Verify Linux CLI and native contracts
+        run: |
+          set -o pipefail
+          cargo test --locked --test cli_client -j 2 -- --test-threads=1
+          cargo test --locked --lib exact_resume_mismatch -j 2 -- --test-threads=1 2>&1 | tee launch-evidence/session-identity.log
+          xvfb-run -a cargo test --locked --test ui_native_shell -j 2 -- --test-threads=1 2>&1 | tee launch-evidence/native-contract.log
+          GDK_BACKEND=x11 xvfb-run -a cargo test --locked --lib linux_webkit_native_lifecycle -j 2 -- --ignored --test-threads=1 2>&1 | tee launch-evidence/linux-browser-engine.log
+
+      - name: Run Linux library and file tests serially
+        run: |
+          set -o pipefail
+          GDK_BACKEND=x11 xvfb-run -a cargo test --locked --lib -j 2 -- --test-threads=1 2>&1 | tee launch-evidence/library.log
+          cargo test --locked --test file_service -j 2 -- --test-threads=1 2>&1 | tee launch-evidence/files.log
+
+      - name: Build desktop acceptance archive
+        run: |
+          cargo build --locked --bin devmanager --bin devmanager-host -j 2
+          python packaging/assemble-launch-candidate.py
+
+      - name: Check for owned process residue
+        if: always()
+        run: python packaging/assert-linux-process-clean.py
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        if: always()
+        with:
+          name: linux-launch-verification
+          path: launch-evidence/*.log
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        if: success()
+        with:
+          name: linux-desktop-candidate
+          path: dist/launch-candidates/*
+          if-no-files-found: error

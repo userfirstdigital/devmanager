@@ -137,7 +137,9 @@ fn pending_annotation_strip_lives_in_terminal_surface_independent_of_browser_col
     let chips = surface
         .find("render_pending_annotation_chips")
         .expect("terminal surface must render pending annotation chips");
-    let search = surface.find(".children(model.search.as_ref()").unwrap();
+    let search = surface
+        .find("render_search_bar")
+        .expect("terminal surface must render search after pending annotations");
 
     assert!(notice < chips && chips < search);
     assert!(!surface.contains("pane_open"));

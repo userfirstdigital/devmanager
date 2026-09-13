@@ -25,10 +25,10 @@ interface DestinationItem {
 
 const DESTINATIONS: DestinationItem[] = [
   {
-    id: "sessions",
-    label: "Sessions",
+    id: "tasks",
+    label: "Tasks",
     icon: Sparkles,
-    route: { name: "sessions" },
+    route: { name: "tasks" },
   },
   {
     id: "projects",
@@ -79,11 +79,11 @@ export function AppShell({
   children,
 }: AppShellProps) {
   const destination = destinationForRoute(route);
-  const isSession = route.name === "session";
+  const isTask = route.name === "task";
   const showOfflineIndicator = useOfflineIndicator(status);
 
   return (
-    <div className="dm-app-shell" data-session-detail={isSession || undefined}>
+    <div className="dm-app-shell" data-session-detail={isTask || undefined}>
       <aside className="dm-sidebar" aria-label="App navigation">
         <div className="dm-brand">
           <span className="dm-brand-icon" aria-hidden="true">
@@ -108,8 +108,11 @@ export function AppShell({
               >
                 <Icon size={20} strokeWidth={1.8} aria-hidden="true" />
                 <span>{item.label}</span>
-                {item.id === "sessions" && attentionCount > 0 ? (
-                  <span className="dm-nav-badge" aria-label={`${attentionCount} sessions need attention`}>
+                {item.id === "tasks" && attentionCount > 0 ? (
+                  <span
+                    className="dm-nav-badge"
+                    aria-label={`${attentionCount} tasks need attention`}
+                  >
                     {Math.min(attentionCount, 99)}
                   </span>
                 ) : null}
@@ -135,7 +138,11 @@ export function AppShell({
             {lastError ? (
               <div className="dm-app-error" role="alert">
                 <span>{lastError}</span>
-                <button type="button" aria-label="Dismiss error" onClick={onDismissError}>
+                <button
+                  type="button"
+                  aria-label="Dismiss error"
+                  onClick={onDismissError}
+                >
                   <X size={18} aria-hidden="true" />
                 </button>
               </div>
@@ -145,7 +152,7 @@ export function AppShell({
         {children}
       </main>
 
-      {!isSession ? (
+      {!isTask ? (
         <nav className="dm-tab-bar" aria-label="App navigation">
           {DESTINATIONS.map((item) => {
             const Icon = item.icon;
@@ -159,8 +166,12 @@ export function AppShell({
                 onClick={() => onNavigate(item.route)}
               >
                 <span className="dm-tab-icon-wrap">
-                  <Icon size={23} strokeWidth={active ? 2.15 : 1.75} aria-hidden="true" />
-                  {item.id === "sessions" && attentionCount > 0 ? (
+                  <Icon
+                    size={23}
+                    strokeWidth={active ? 2.15 : 1.75}
+                    aria-hidden="true"
+                  />
+                  {item.id === "tasks" && attentionCount > 0 ? (
                     <span className="dm-tab-badge" aria-hidden="true">
                       {Math.min(attentionCount, 99)}
                     </span>

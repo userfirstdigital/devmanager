@@ -1,0 +1,175 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>06-needs-you-question-1-permission</title>
+<style>
+  body { margin:0; padding:28px 32px; background:#0c0c0e; color:#e6e6ea; font: 14px/1.45 "Segoe UI", system-ui, sans-serif; }
+  h2 { margin:0 0 6px; font-size:20px; }
+  h3 { font-size:15px; }
+  .subtitle { color:#9a9aa3; margin:0 0 18px; max-width:1100px; }
+  .options { margin-top:10px; }
+  .option { display:flex; gap:10px; align-items:flex-start; border:1px solid #2c2c33; border-radius:8px; padding:8px 10px; max-width:300px; }
+  .option .letter { font-weight:700; color:#9a9aa3; min-width:16px; }
+  .option h3 { margin:0 0 2px; font-size:13px; }
+  .option p { margin:0; color:#9a9aa3; font-size:12px; }
+  .option[data-choice="1"] { border-color:#f2b441; }
+  .option[data-choice="1"] .letter::after { content:" CHOSEN"; color:#f2b441; font-size:10px; letter-spacing:.06em; }
+  div:has(> .options > .option:not([data-choice="1"])) { opacity:.38; }
+  div:has(> .options > .option[data-choice="1"]) { opacity:1; }
+</style></head><body>
+<h2>The "needs you" moment</h2>
+<p class="subtitle">An agent asked a question. The board row goes amber (already agreed). The question is where the panel's amber goes and where you answer. Three placements for the question inside the panel, at the one-of-eight width. Below them, the same three for a permission prompt, which is the other "needs you" shape.</p>
+
+<style>
+  .ny { font: 13px/1.4 "Segoe UI", system-ui, sans-serif; color:#e6e6ea; }
+  .ny * { box-sizing:border-box; }
+  .row3 { display:grid; grid-template-columns:repeat(3, 1fr); gap:22px; }
+  .pane { width:100%; max-width:470px; height:330px; background:#151518; border:1px solid #26262b; border-radius:9px; display:flex; flex-direction:column; overflow:hidden; position:relative; --pc:#7a86c4; }
+  .pane::before { content:""; position:absolute; left:0; top:0; bottom:0; width:3px; background:var(--pc); }
+  .pane.you { border-color:#7a5a1e; box-shadow:0 0 0 1px rgba(242,180,65,.25); }
+  .hdr { display:flex; align-items:center; gap:8px; padding:8px 10px 0 13px; min-width:0; }
+  .hdr .title { font-weight:600; font-size:13px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; min-width:0; flex:1; display:flex; align-items:center; gap:7px; }
+  .hdr .inline { font-weight:400; font-size:11.5px; white-space:nowrap; flex:none; color:#9a9aa3; }
+  .hdr .inline.q { color:#f2b441; }
+  .ic { color:#6b6b74; font-size:12px; flex:none; }
+  .act { flex:none; border:1px solid #2c2c33; border-radius:6px; padding:2px 9px; font-size:11.5px; color:#c9c9d1; }
+  .menu { flex:none; color:#8a8a94; font-size:15px; line-height:1; padding:0 3px; }
+  .tabs { display:flex; gap:2px; padding:6px 10px 0 13px; font-size:11.5px; color:#8a8a94; border-bottom:1px solid #1f1f24; white-space:nowrap; overflow:hidden; }
+  .tabs span { padding:3px 9px 5px; border-radius:6px 6px 0 0; }
+  .tabs span.on { background:#1c1c21; color:#e6e6ea; }
+  .stream { flex:1; background:#111114; margin:8px 10px 0 13px; border-radius:6px; border:1px solid #1f1f24; padding:8px 10px; font: 11.5px/1.5 "Cascadia Mono", Consolas, monospace; color:#c9c9d1; overflow:hidden; display:flex; flex-direction:column; }
+  .stream .u { color:#8a8a94; } .stream .cmd { color:#9ec1e0; } .stream .ok { color:#7fb07f; }
+  .stream .fill { flex:1; }
+  .compose { margin:8px 10px 10px 13px; border:1px solid #26262b; border-radius:6px; padding:6px 10px; color:#6b6b74; font-size:12px; display:flex; align-items:center; }
+  .compose .k { margin-left:auto; color:#6b6b74; font-size:11px; }
+  /* question card */
+  .qc { border:1px solid #5a4a20; background:#1b1811; border-radius:7px; padding:8px 10px; font: 12px/1.4 "Segoe UI", system-ui, sans-serif; color:#e6e6ea; }
+  .qc .qh { display:flex; align-items:center; gap:6px; color:#f2b441; font-size:10.5px; text-transform:uppercase; letter-spacing:.06em; margin-bottom:4px; }
+  .qc .qt { margin-bottom:6px; }
+  .qc .opt { display:flex; align-items:center; gap:8px; padding:4px 8px; border:1px solid #3a3320; border-radius:5px; margin-bottom:4px; font-size:12px; }
+  .qc .opt b { color:#8a8a94; font-weight:500; min-width:10px; }
+  .qc .opt.rec { border-color:#8a6a2a; }
+  .qc .opt .why { color:#8a8a94; margin-left:auto; font-size:11px; }
+  .qc .foot { display:flex; gap:10px; color:#8a8a94; font-size:11px; margin-top:4px; }
+  .qc .foot .k { margin-left:auto; }
+  .qc.perm { border-color:#5a4a20; }
+  .qc.perm .cmdl { font: 11.5px/1.4 "Cascadia Mono", Consolas, monospace; color:#9ec1e0; background:#111114; border-radius:4px; padding:4px 8px; margin:4px 0 6px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .qc .btns { display:flex; gap:6px; }
+  .qc .btns span { border:1px solid #3a3320; border-radius:5px; padding:3px 9px; font-size:11.5px; }
+  .qc .btns span.pri { border-color:#f2b441; color:#f2b441; }
+  .qc .btns span.dim { color:#8a8a94; }
+  .qc .btns .k { margin-left:auto; color:#6b6b74; font-size:11px; align-self:center; }
+  /* placement 2: docked at bottom replaces compose */
+  .dock { margin:8px 10px 10px 13px; }
+  /* placement 3: status-only, answered via compose */
+  .compose.q { border-color:#5a4a20; color:#c9c9d1; }
+  .cap { color:#9a9aa3; font-size:12px; margin:8px 0 4px; }
+</style>
+
+<div class="ny">
+<div class="row3">
+
+  <!-- 1: inline card in the stream -->
+  <div>
+    <div class="pane you">
+      <div class="hdr"><span class="title">are there any migrations left to run…</span><span class="inline q">? Asked a question · 4m</span><span class="ic">⤢</span><span class="act">Done</span><span class="menu">⋯</span></div>
+      <div class="tabs"><span class="on">Conversation</span><span>Terminal</span><span>Files</span><span>Git</span></div>
+      <div class="stream">
+        <div class="u">› are there any migrations left to run?</div>
+        <div>Two are unapplied: V16 and V17. V17 rebuilds the events index and takes about 40 s on your store.</div>
+        <div class="fill"></div>
+        <div class="qc">
+          <div class="qh">Question</div>
+          <div class="qt">Run V17 now, or defer to the next restart?</div>
+          <div class="opt rec"><b>1</b> Run now <span class="why">recommended · 40 s pause</span></div>
+          <div class="opt"><b>2</b> Defer to next restart</div>
+          <div class="opt"><b>3</b> Explain the risk first</div>
+          <div class="foot">Type to answer in your own words <span class="k">1-3 pick · ⏎ send</span></div>
+        </div>
+      </div>
+      <div class="compose">Reply… <span class="k">⏎ send</span></div>
+    </div>
+    <p class="cap">The question is a card at the end of the stream, in context with what led to it. Number keys pick, the compose box takes a free-text answer. If the stream is scrolled up, the card is out of view; the amber status in the title row is the reminder.</p>
+    <div class="options" style="margin-top:0"><div class="option" data-choice="1" onclick="toggleSelect(this)"><div class="letter">1</div><div class="content"><h3>Card in the stream</h3><p>In context; can scroll out of view.</p></div></div></div>
+  </div>
+
+  <!-- 2: docked at the bottom, replaces compose -->
+  <div>
+    <div class="pane you">
+      <div class="hdr"><span class="title">are there any migrations left to run…</span><span class="inline q">? Asked a question · 4m</span><span class="ic">⤢</span><span class="act">Done</span><span class="menu">⋯</span></div>
+      <div class="tabs"><span class="on">Conversation</span><span>Terminal</span><span>Files</span><span>Git</span></div>
+      <div class="stream">
+        <div class="u">› are there any migrations left to run?</div>
+        <div>Two are unapplied: V16 and V17. V17 rebuilds the events index and takes about 40 s on your store.</div>
+        <div class="cmd">$ sqlite3 kernel.sqlite3 "select max(version) from migrations"</div>
+        <div>15</div>
+        <div class="fill"></div>
+      </div>
+      <div class="qc dock">
+        <div class="qh">Question</div>
+        <div class="qt">Run V17 now, or defer to the next restart?</div>
+        <div class="opt rec"><b>1</b> Run now <span class="why">recommended</span></div>
+        <div class="opt"><b>2</b> Defer to next restart</div>
+        <div class="opt"><b>3</b> Explain the risk first</div>
+        <div class="foot">or type a reply <span class="k">1-3 · ⏎</span></div>
+      </div>
+    </div>
+    <p class="cap">The question docks where the compose box was, so it cannot scroll away and the answer goes exactly where a reply would. The stream keeps its full history above. Same on the Terminal tab: the dock sits under the terminal.</p>
+    <div class="options" style="margin-top:0"><div class="option" data-choice="2" onclick="toggleSelect(this)"><div class="letter">2</div><div class="content"><h3>Docked at the bottom</h3><p>Replaces the compose box; always visible.</p></div></div></div>
+  </div>
+
+  <!-- 3: status only + compose -->
+  <div>
+    <div class="pane you">
+      <div class="hdr"><span class="title">are there any migrations left to run…</span><span class="inline q">? Run V17 now, or defer? · 4m</span><span class="ic">⤢</span><span class="act">Done</span><span class="menu">⋯</span></div>
+      <div class="tabs"><span class="on">Conversation</span><span>Terminal</span><span>Files</span><span>Git</span></div>
+      <div class="stream">
+        <div class="u">› are there any migrations left to run?</div>
+        <div>Two are unapplied: V16 and V17. V17 rebuilds the events index and takes about 40 s on your store.</div>
+        <div class="cmd">$ sqlite3 kernel.sqlite3 "select max(version) from migrations"</div>
+        <div>15</div>
+        <div style="color:#f2b441">? Run V17 now, or defer to the next restart?</div>
+        <div style="color:#8a8a94">  1 Run now (recommended) · 2 Defer · 3 Explain the risk</div>
+        <div class="fill"></div>
+      </div>
+      <div class="compose q">Answer: 1, 2, 3 or your own words… <span class="k">⏎</span></div>
+    </div>
+    <p class="cap">No card at all: the question is a line in the stream and a hint in the compose box, the way a CLI asks. Least chrome, most vertical room, but the options are text you have to read rather than targets you can click.</p>
+    <div class="options" style="margin-top:0"><div class="option" data-choice="3" onclick="toggleSelect(this)"><div class="letter">3</div><div class="content"><h3>Plain text, CLI style</h3><p>Question in the stream, answer in compose.</p></div></div></div>
+  </div>
+</div>
+
+<h3 style="margin-top:28px">The other shape: a permission prompt</h3>
+<p class="subtitle">"Allow this command?" is short and repetitive, so it wants buttons and a keyboard answer more than a card. Shown in the placement of option 2; the choice above decides whether it lives in the stream, the dock, or the compose box.</p>
+<div class="row3">
+  <div>
+    <div class="pane you" style="height:150px">
+      <div class="hdr"><span class="title">Snake Frontend</span><span class="inline q">? Permission · Bash · 8s</span><span class="ic">⤢</span><span class="act">Done</span><span class="menu">⋯</span></div>
+      <div class="qc perm dock">
+        <div class="qh">Allow?</div>
+        <div class="cmdl">cargo test --lib ui:: --release</div>
+        <div class="btns"><span class="pri">Allow ⏎</span><span>Always for this task</span><span class="dim">Deny Esc</span></div>
+      </div>
+    </div>
+    <p class="cap">One line of command, three answers, Enter allows. "Always for this task" is what keeps eight agents from asking eight times.</p>
+  </div>
+  <div>
+    <div class="pane you" style="height:150px">
+      <div class="hdr"><span class="title">Screen history replay</span><span class="inline q">? Permission · Write · 2s</span><span class="ic">⤢</span><span class="act">Done</span><span class="menu">⋯</span></div>
+      <div class="qc perm dock">
+        <div class="qh">Allow?</div>
+        <div class="cmdl">Write src/terminal/pty.rs (+41 −6)</div>
+        <div class="btns"><span class="pri">Allow ⏎</span><span>Always for this task</span><span class="dim">Deny Esc</span><span class="k">D view diff</span></div>
+      </div>
+    </div>
+    <p class="cap">Edits show the file and the line delta; D opens the diff in the Files tab without answering yet.</p>
+  </div>
+  <div>
+    <div class="pane" style="height:150px; --pc:#a78a5c">
+      <div class="hdr"><span class="title">Startup latency: name the lane cost</span><span class="inline">▶ Reading host-stderr.log · 1m</span><span class="ic">⤢</span><span class="act">Done</span><span class="menu">⋯</span></div>
+      <div class="stream" style="margin-bottom:10px"><div class="cmd">$ tail -50 logs/host-stderr.log</div><div>slow maintenance tick held the executor lane for 476 ms</div></div>
+    </div>
+    <p class="cap">For contrast: a panel that does not need you. No amber anywhere, and its status line says what it is doing.</p>
+  </div>
+</div>
+</div>
+
+</body></html>

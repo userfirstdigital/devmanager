@@ -3,6 +3,8 @@
 // browser state is an allowlisted, flat projection and cannot represent host
 // configuration, secrets, environment values, or startup commands.
 
+import type { CapabilityGrant } from "../connect/permissions";
+
 export const WEB_PROTOCOL_VERSION = 3;
 
 export type StableSessionKey = string;
@@ -121,6 +123,52 @@ export interface WebPortStatus {
   processName: string | null;
 }
 
+export type WebPortAuthorityKind =
+  | "managed"
+  | "managedUnready"
+  | "provenExternal"
+  | "unknown"
+  | "probeError"
+  | "free"
+  | "occupied";
+
+export type WebPortControlReason =
+  | "exactManagedFence"
+  | "managedUnready"
+  | "provenExternalNoControl"
+  | "starting"
+  | "free"
+  | "stale"
+  | "probeFault"
+  | "mixedOrUnverified";
+
+export interface WebPortListenerIdentity {
+  pid: number;
+  creationTime100ns: number;
+  executableProven: boolean;
+}
+
+export interface WebPortAuthority {
+  port: number;
+  kind: WebPortAuthorityKind;
+  /** Typed, path-free diagnostic; older hosts may omit this additive field. */
+  diagnostic?: "probeError" | null;
+  resourceGeneration: number | null;
+  listeners: WebPortListenerIdentity[];
+  sessionId: string | null;
+  root: WebPortListenerIdentity | null;
+  membershipRevision: number;
+  observationSequence: number;
+  publicationSequence: number;
+  observedAtEpochMs: number;
+  freshnessDeadlineEpochMs: number;
+  fresh: boolean;
+  /** Older hosts may omit this; absence is fail-closed for URL actions. */
+  reapIncomplete?: boolean;
+  controlReason: WebPortControlReason;
+  error: string | null;
+}
+
 export interface WebWorkspaceSnapshot {
   webProtocolVersion: number;
   runtimeInstanceId: string;
@@ -131,6 +179,8 @@ export interface WebWorkspaceSnapshot {
   tabs: WebTab[];
   sessions: WebSessionSummary[];
   portStatuses: WebPortStatus[];
+  /** Typed port authority; older hosts may omit this additive field. */
+  portAuthorities?: WebPortAuthority[];
   writerLease: WebWriterLeaseState;
 }
 
@@ -138,12 +188,7 @@ export interface WebWorkspaceSnapshot {
 export type WebWorkspaceDelta = WebWorkspaceSnapshot;
 
 export type SemanticSource =
-  | "claude"
-  | "codex"
-  | "shell"
-  | "server"
-  | "ssh"
-  | "system";
+  "claude" | "codex" | "shell" | "server" | "ssh" | "system";
 export type SemanticStream = "stdout" | "stderr";
 export type SemanticToolState = "pending" | "running" | "completed" | "failed";
 
@@ -312,7 +357,10 @@ export type WsInbound =
       visible: boolean;
     }
   | { type: "setVisibility"; clientInstanceId: string; visible: boolean }
-  | ({ type: "composerSubmit"; expectedLeaseGeneration: number } & ComposerSubmission)
+  | ({
+      type: "composerSubmit";
+      expectedLeaseGeneration: number;
+    } & ComposerSubmission)
   | {
       type: "subscribeSemantic";
       stableSessionKey: StableSessionKey;
@@ -364,6 +412,10 @@ export type WsOutbound =
       serverId: string;
       protocolVersion: number;
       webBuildId: string;
+      /** Additive host-authenticated relay advertisement. */
+      relayUrl?: string | null;
+      /** Explicit host role grant; absent metadata is not owner authority. */
+      capabilityGrant?: CapabilityGrant | null;
     }
   | { type: "snapshot"; workspace: WebWorkspaceSnapshot }
   | { type: "delta"; delta: WebWorkspaceDelta }
@@ -483,12 +535,13 @@ export interface LegacyWorkspaceProjection {
   };
   runtimeState: { sessions: Record<string, SessionRuntimeState> };
   portStatuses: Record<string, WebPortStatus>;
+  portAuthorities?: Record<string, WebPortAuthority>;
   controllerClientId: string | null;
   youHaveControl: boolean;
   serverId: string;
 }
 
-// Compatibility aliases retained only while Tasks 5-6 replace the old views.
+// Wire action aliases used by the live store/ws client.
 export type RemoteAction = WebAction;
 export type RemoteActionResult = WebActionResult;
 export type RemoteAiTabPayload = WebActionPayload;

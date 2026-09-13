@@ -1,5 +1,8 @@
 use crate::models::SessionTab;
-use crate::state::{AppState, RuntimeState, SessionRuntimeState, SessionStatus};
+use crate::state::{
+    AppState, ResourceMetricValueState, ResourceSnapshot, RuntimeState, SessionRuntimeState,
+    SessionStatus,
+};
 use crate::{icons, theme};
 use gpui::{
     anchored, deferred, div, px, rgb, AnyElement, App, Corner, Div, InteractiveElement,
@@ -39,6 +42,7 @@ pub enum ServerIndicatorState {
     Unready,
     Ready,
     External,
+    Unknown,
     Stopping,
     Crashed,
     Exited,
@@ -920,13 +924,10 @@ fn render_command_row(
         .unwrap_or(ServerIndicatorState::Stopped);
     let is_active = state.active_tab_id.as_deref() == Some(command.id.as_str());
     let resource_line = session.and_then(|session| {
-        session.resources.last_sample_at.map(|_| {
-            format!(
-                "{:.0}% • {} MB",
-                session.resources.cpu_percent,
-                session.resources.memory_bytes / 1024 / 1024
-            )
-        })
+        session
+            .resources
+            .last_sample_at
+            .map(|_| command_resource_line(&session.resources))
     });
     let menu_open = matches!(
         actions.open_context_menu,
@@ -1080,6 +1081,37 @@ fn render_command_row(
             }
             context_menu_panel(items, (actions.on_dismiss_context_menu)()).into_any_element()
         }))
+}
+
+fn command_resource_line(resources: &ResourceSnapshot) -> String {
+    let cpu = match resources.cpu_value_state {
+        ResourceMetricValueState::Observed => format!("{:.0}% CPU", resources.cpu_percent),
+        ResourceMetricValueState::Partial => {
+            format!("{:.0}% CPU (partial)", resources.cpu_percent)
+        }
+        ResourceMetricValueState::LastKnown => {
+            format!("{:.0}% CPU (last known)", resources.cpu_percent)
+        }
+        ResourceMetricValueState::Unavailable => "CPU unavailable".to_string(),
+    };
+    let memory_mb = resources.memory_bytes / 1024 / 1024;
+    let memory = match resources.memory_value_state {
+        ResourceMetricValueState::Observed => {
+            format!("{} {memory_mb} MB", resources.memory_metric.label())
+        }
+        ResourceMetricValueState::Partial => format!(
+            "{} {memory_mb} MB (partial)",
+            resources.memory_metric.label()
+        ),
+        ResourceMetricValueState::LastKnown => format!(
+            "{} {memory_mb} MB (last known)",
+            resources.memory_metric.label()
+        ),
+        ResourceMetricValueState::Unavailable => {
+            format!("{} unavailable", resources.memory_metric.label())
+        }
+    };
+    format!("{cpu} • {memory}")
 }
 
 fn render_ssh_row(
@@ -1385,7 +1417,8 @@ fn server_status_label(state: ServerIndicatorState) -> &'static str {
         ServerIndicatorState::Stopped
         | ServerIndicatorState::Unready
         | ServerIndicatorState::Ready
-        | ServerIndicatorState::External => "",
+        | ServerIndicatorState::External
+        | ServerIndicatorState::Unknown => "",
         ServerIndicatorState::Stopping => "stopping",
         ServerIndicatorState::Crashed => "crashed",
         ServerIndicatorState::Exited => "exited",
@@ -1400,6 +1433,7 @@ fn server_status_indicator(state: ServerIndicatorState) -> Div {
             | ServerIndicatorState::Unready
             | ServerIndicatorState::Ready
             | ServerIndicatorState::External
+            | ServerIndicatorState::Unknown
     ) {
         div()
             .size(px(6.0))
@@ -1417,6 +1451,7 @@ fn server_status_color(state: ServerIndicatorState) -> u32 {
     match state {
         ServerIndicatorState::Ready => theme::SUCCESS_TEXT,
         ServerIndicatorState::External => theme::EXTERNAL_TEXT,
+        ServerIndicatorState::Unknown => theme::WARNING_TEXT,
         ServerIndicatorState::Unready | ServerIndicatorState::Stopping => theme::WARNING_TEXT,
         ServerIndicatorState::Crashed | ServerIndicatorState::Failed => theme::DANGER_TEXT,
         ServerIndicatorState::Stopped | ServerIndicatorState::Exited => theme::TEXT_SUBTLE,
@@ -1636,6 +1671,22 @@ mod tests {
         session.status = SessionStatus::Running;
         session.ai_activity = Some(AiActivity::Idle);
         session
+    }
+
+    #[test]
+    fn command_resource_line_uses_per_metric_confidence_and_named_memory() {
+        let unavailable = crate::state::ResourceSnapshot {
+            cpu_percent: 0.0,
+            memory_bytes: 0,
+            memory_metric: crate::state::ResourceMemoryMetric::PrivateCommitted,
+            cpu_value_state: crate::state::ResourceMetricValueState::Unavailable,
+            memory_value_state: crate::state::ResourceMetricValueState::Unavailable,
+            ..Default::default()
+        };
+        let label = command_resource_line(&unavailable);
+        assert!(label.contains("CPU unavailable"));
+        assert!(label.contains("private committed unavailable"));
+        assert!(!label.contains("0%"));
     }
 
     #[test]

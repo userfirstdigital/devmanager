@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>DevManager Browser E2E Fixture</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <h1>DevManager local browser fixture</h1>
+    <p id="fixture-status" role="status">Fixture ready</p>
+    <p data-testid="verification-token">DM-BROWSER-E2E-OK</p>
+    <main>
+      <section aria-labelledby="semantic-heading">
+        <h2 id="semantic-heading">Semantic actions</h2>
+        <button
+          id="semantic-target"
+          data-testid="semantic-target"
+          aria-label="Semantic action target"
+        >Semantic target</button>
+        <form data-testid="fixture-form">
+          <label>
+            Display name
+            <input name="displayName" value="Fixture User" autocomplete="name" />
+          </label>
+          <label>
+            Option
+            <select data-testid="fixture-select">
+              <option value="alpha">Alpha</option>
+              <option value="beta">Beta</option>
+            </select>
+          </label>
+          <button type="submit" data-testid="submit-form">Submit fixture form</button>
+        </form>
+        <p data-testid="form-result">Not submitted</p>
+      </section>
+      <section aria-labelledby="tab-heading">
+        <h2 id="tab-heading">Second tab</h2>
+        <a data-testid="new-tab-link" href="./tab.html" target="_blank" rel="opener">
+          Open a second logical tab
+        </a>
+        <a data-testid="redirect-link" href="./redirect.html">Follow redirect</a>
+      </section>
+      <section aria-labelledby="files-heading">
+        <h2 id="files-heading">Download and upload</h2>
+        <a
+          data-testid="fixture-download"
+          href="./download.txt"
+          download="fixture-download.txt"
+        >Download fixture file</a>
+        <label>
+          Upload marker
+          <input data-testid="fixture-upload" type="file" />
+        </label>
+        <p data-testid="upload-result">No files selected</p>
+      </section>
+      <section aria-labelledby="permission-heading">
+        <h2 id="permission-heading">Permission marker</h2>
+        <button data-testid="permission-target">Allow camera permission</button>
+        <p data-testid="permission-result">Permission unsettled</p>
+      </section>
+    </main>
+    <script src="./app.js"></script>
+  </body>
+</html>

@@ -1,0 +1,24 @@
+{
+  "schema": "devmanager.ui.quality/v1",
+  "id": "quality-cancellation",
+  "title": "Cancellation and shutdown",
+  "surface": "isolated_preview",
+  "visual_gate": {
+    "kind": "requires_canonical_shell",
+    "reason": "HOLD: isolated preview is not Phase 5 PASS. Authority: tests/fixtures/ui/phase5-promotion-contract.json. A typed HOLD is not PASS.",
+    "missing": ["phase5-promotion-contract"]
+  },
+  "controls": [
+    {
+      "id": "retry",
+      "kind": "button",
+      "name": "Retry load",
+      "action": "task.list"
+    }
+  ],
+  "virtualization": {
+    "inbox_rows": 5000,
+    "timeline_items": 20000,
+    "window_len": 24
+  }
+}

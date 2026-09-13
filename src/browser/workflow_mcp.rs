@@ -714,7 +714,8 @@ mod tests {
             workspace.clone(),
             "tab-a",
             BrowserUserInputKind::Keyboard,
-        );
+        )
+        .expect("interaction epoch");
         validation_request.respond(Ok(BrowserResponse::WorkspaceState {
             snapshot: super::super::BrowserWorkspaceSnapshot {
                 pane_open: true,
@@ -737,7 +738,8 @@ mod tests {
             .is_none());
 
         let older_input =
-            BrowserHostEvent::user_input(workspace.clone(), "tab-a", BrowserUserInputKind::Pointer);
+            BrowserHostEvent::user_input(workspace.clone(), "tab-a", BrowserUserInputKind::Pointer)
+                .expect("interaction epoch");
         let newer_admission = controller.capture_replay_admission().unwrap();
         bridge.observe_host_event(&older_input);
         let started = controller

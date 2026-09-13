@@ -99,6 +99,9 @@ pub struct BrowserResource {
 
 struct BrowserResourceRootRuntime {
     root: PathBuf,
+    io_root: PathBuf,
+    #[cfg(target_os = "linux")]
+    root_directory: File,
     limits: BrowserResourceLimits,
     gate: Mutex<BrowserResourceRuntimeState>,
     last_created_at: AtomicU64,
@@ -215,7 +218,7 @@ impl BrowserResourceStore {
         &self,
         authority: &BrowserReplayRepairRetentionAuthority,
     ) -> Result<BrowserReplayRepairRetentionLease, BrowserError> {
-        #[cfg(not(target_os = "windows"))]
+        #[cfg(not(any(target_os = "windows", target_os = "linux")))]
         {
             let _ = authority;
             return Err(BrowserError::UnavailablePlatform {
@@ -223,7 +226,7 @@ impl BrowserResourceStore {
             });
         }
 
-        #[cfg(target_os = "windows")]
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
         {
             self.verify_root()?;
             let mut state = lock(&self.inner.runtime.gate);
@@ -385,13 +388,13 @@ impl BrowserResourceStore {
         let mut state = lock(&self.inner.runtime.gate);
         self.verify_root()?;
         self.retry_pending_cleanup_locked(&mut state);
-        let mut resources: Vec<_> = scan_metadata(&self.inner.root)
+        let mut resources: Vec<_> = scan_metadata(&self.inner.runtime.io_root)
             .into_iter()
             .filter(|metadata| &metadata.owner == owner)
             .filter(|metadata| {
-                data_path(&self.inner.root, &metadata.id)
+                data_path(&self.inner.runtime.io_root, &metadata.id)
                     .ok()
-                    .is_some_and(|path| is_direct_regular_file(&self.inner.root, &path))
+                    .is_some_and(|path| is_direct_regular_file(&self.inner.runtime.io_root, &path))
             })
             .collect();
         resources.sort_by(|left, right| {
@@ -414,8 +417,8 @@ impl BrowserResourceStore {
         let mut state = lock(&self.inner.runtime.gate);
         self.verify_root()?;
         self.retry_pending_cleanup_locked(&mut state);
-        let metadata_path = metadata_path(&self.inner.root, id)?;
-        if !is_direct_regular_file(&self.inner.root, &metadata_path) {
+        let metadata_path = metadata_path(&self.inner.runtime.io_root, id)?;
+        if !is_direct_regular_file(&self.inner.runtime.io_root, &metadata_path) {
             return Err(BrowserError::MissingResource { id: id.clone() });
         }
         let encoded = std::fs::read(&metadata_path)
@@ -430,8 +433,8 @@ impl BrowserResourceStore {
                 permission: "resource ownership".to_string(),
             });
         }
-        let data_path = data_path(&self.inner.root, id)?;
-        if !is_direct_regular_file(&self.inner.root, &data_path) {
+        let data_path = data_path(&self.inner.runtime.io_root, id)?;
+        if !is_direct_regular_file(&self.inner.runtime.io_root, &data_path) {
             return Err(BrowserError::MissingResource { id: id.clone() });
         }
         let bytes = std::fs::read(&data_path)
@@ -454,8 +457,8 @@ impl BrowserResourceStore {
         let mut state = lock(&self.inner.runtime.gate);
         self.verify_root()?;
         self.retry_pending_cleanup_locked(&mut state);
-        let metadata_path = metadata_path(&self.inner.root, id)?;
-        if !is_direct_regular_file(&self.inner.root, &metadata_path) {
+        let metadata_path = metadata_path(&self.inner.runtime.io_root, id)?;
+        if !is_direct_regular_file(&self.inner.runtime.io_root, &metadata_path) {
             return Err(BrowserError::MissingResource { id: id.clone() });
         }
         let encoded = std::fs::read(&metadata_path)
@@ -465,8 +468,8 @@ impl BrowserResourceStore {
         if metadata.id != *id || &metadata.owner != owner {
             return Err(BrowserError::MissingResource { id: id.clone() });
         }
-        let data_path = data_path(&self.inner.root, id)?;
-        if !is_direct_regular_file(&self.inner.root, &data_path) {
+        let data_path = data_path(&self.inner.runtime.io_root, id)?;
+        if !is_direct_regular_file(&self.inner.runtime.io_root, &data_path) {
             return Err(BrowserError::MissingResource { id: id.clone() });
         }
         let actual_size = std::fs::metadata(&data_path)
@@ -490,8 +493,8 @@ impl BrowserResourceStore {
         let mut state = lock(&self.inner.runtime.gate);
         self.verify_root()?;
         self.retry_pending_cleanup_locked(&mut state);
-        let metadata_path = metadata_path(&self.inner.root, id)?;
-        if !is_direct_regular_file(&self.inner.root, &metadata_path) {
+        let metadata_path = metadata_path(&self.inner.runtime.io_root, id)?;
+        if !is_direct_regular_file(&self.inner.runtime.io_root, &metadata_path) {
             return Err(BrowserError::MissingResource { id: id.clone() });
         }
         let encoded = std::fs::read(&metadata_path)
@@ -525,7 +528,7 @@ impl BrowserResourceStore {
         let mut state = lock(&self.inner.runtime.gate);
         self.verify_root()?;
         self.retry_pending_cleanup_locked(&mut state);
-        for mut metadata in scan_metadata(&self.inner.root)
+        for mut metadata in scan_metadata(&self.inner.runtime.io_root)
             .into_iter()
             .filter(|metadata| {
                 &metadata.owner == owner
@@ -541,7 +544,7 @@ impl BrowserResourceStore {
                 continue;
             }
             metadata.pinned = pinned;
-            let path = metadata_path(&self.inner.root, &metadata.id)?;
+            let path = metadata_path(&self.inner.runtime.io_root, &metadata.id)?;
             write_metadata(&path, &metadata)?;
         }
         self.retry_pending_cleanup_locked(&mut state);
@@ -557,6 +560,8 @@ impl BrowserResourceStore {
         if let Some(trusted_root) = &self.inner.trusted_root {
             super::downloads::verify_prepared_storage_root(trusted_root, &self.inner.root)?;
         }
+        #[cfg(target_os = "linux")]
+        self.inner.runtime.verify_linux_root()?;
         Ok(())
     }
 
@@ -592,8 +597,8 @@ impl BrowserResourceStore {
             &BrowserResourceMetadata,
         ) -> Result<(), (BrowserError, bool)>,
     ) -> Result<(), BrowserError> {
-        let data_path = data_path(&self.inner.root, &metadata.id)?;
-        let metadata_path = metadata_path(&self.inner.root, &metadata.id)?;
+        let data_path = data_path(&self.inner.runtime.io_root, &metadata.id)?;
+        let metadata_path = metadata_path(&self.inner.runtime.io_root, &metadata.id)?;
         let mut data = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -605,9 +610,9 @@ impl BrowserResourceStore {
         }
         drop(data);
         if let Err((error, metadata_created)) = write_metadata_file(&metadata_path, metadata) {
-            let _ = remove_direct_regular_file(&self.inner.root, &data_path);
+            let _ = remove_direct_regular_file(&self.inner.runtime.io_root, &data_path);
             if metadata_created {
-                let _ = remove_direct_regular_file(&self.inner.root, &metadata_path);
+                let _ = remove_direct_regular_file(&self.inner.runtime.io_root, &metadata_path);
             }
             return Err(error);
         }
@@ -632,7 +637,8 @@ impl BrowserResourceStore {
     }
 
     fn cleanup_locked(&self, state: &mut BrowserResourceRuntimeState) -> Result<(), BrowserError> {
-        let mut temporary: Vec<_> = scan_metadata(&self.inner.root)
+        self.verify_root()?;
+        let mut temporary: Vec<_> = scan_metadata(&self.inner.runtime.io_root)
             .into_iter()
             .filter(|metadata| !metadata.pinned && !state.retained_ids.contains(&metadata.id))
             .collect();
@@ -649,10 +655,12 @@ impl BrowserResourceStore {
             {
                 break;
             }
-            let metadata_path = metadata_path(&self.inner.root, &metadata.id)?;
-            let data_path = data_path(&self.inner.root, &metadata.id)?;
-            if let Err(error) = remove_direct_regular_file(&self.inner.root, &data_path)
-                .and_then(|_| remove_direct_regular_file(&self.inner.root, &metadata_path))
+            let metadata_path = metadata_path(&self.inner.runtime.io_root, &metadata.id)?;
+            let data_path = data_path(&self.inner.runtime.io_root, &metadata.id)?;
+            if let Err(error) = remove_direct_regular_file(&self.inner.runtime.io_root, &data_path)
+                .and_then(|_| {
+                    remove_direct_regular_file(&self.inner.runtime.io_root, &metadata_path)
+                })
             {
                 state.pending_cleanup_retries = state
                     .pending_cleanup_retries
@@ -701,20 +709,71 @@ fn root_runtime(
         if runtime.limits != limits {
             return Err(BrowserError::ResourceRootUnavailable);
         }
+        #[cfg(target_os = "linux")]
+        runtime.verify_linux_root()?;
         return Ok(runtime);
     }
     let stale_handoff = runtimes.remove(root).is_some();
     runtimes.retain(|_, runtime| runtime.strong_count() > 0);
+    #[cfg(target_os = "linux")]
+    let root_directory = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(root)
+            .map_err(|_| BrowserError::ResourceRootUnavailable)?
+    };
     let lock_file = open_root_lock_file_after_stale_handoff(root, stale_handoff)?;
+    #[cfg(target_os = "linux")]
+    let io_root = {
+        use std::os::fd::AsRawFd;
+        // All resource I/O stays relative to this retained directory even if
+        // its public path is renamed after a successful boundary check.
+        PathBuf::from(format!("/proc/self/fd/{}", root_directory.as_raw_fd()))
+    };
+    #[cfg(not(target_os = "linux"))]
+    let io_root = root.to_path_buf();
     let runtime = Arc::new(BrowserResourceRootRuntime {
         root: root.to_path_buf(),
+        io_root,
+        #[cfg(target_os = "linux")]
+        root_directory,
         limits,
         gate: Mutex::new(BrowserResourceRuntimeState::default()),
         last_created_at: AtomicU64::new(max_created_at),
         _lock_file: lock_file,
     });
+    #[cfg(target_os = "linux")]
+    runtime.verify_linux_root()?;
     runtimes.insert(root.to_path_buf(), Arc::downgrade(&runtime));
     Ok(runtime)
+}
+
+#[cfg(target_os = "linux")]
+impl BrowserResourceRootRuntime {
+    fn verify_linux_root(&self) -> Result<(), BrowserError> {
+        use std::os::unix::fs::MetadataExt;
+        let opened = self
+            .root_directory
+            .metadata()
+            .map_err(|_| BrowserError::ResourceRootUnavailable)?;
+        let named = std::fs::symlink_metadata(&self.root)
+            .map_err(|_| BrowserError::ResourceRootUnavailable)?;
+        if !opened.is_dir()
+            || !named.is_dir()
+            || opened.nlink() == 0
+            || (opened.dev(), opened.ino()) != (named.dev(), named.ino())
+        {
+            return Err(BrowserError::ResourceRootUnavailable);
+        }
+        validate_opened_root_lock(
+            &self.root,
+            &self.root.join(ROOT_LOCK_FILE),
+            &self._lock_file,
+            (),
+        )
+    }
 }
 
 fn open_root_lock_file_after_stale_handoff(
@@ -795,7 +854,19 @@ fn open_root_lock_file(root: &Path) -> Result<File, BrowserError> {
         }
     };
 
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "linux")]
+    let result = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+            .open(&path)
+    };
+
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
     let result = match std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -822,6 +893,20 @@ fn open_root_lock_file(root: &Path) -> Result<File, BrowserError> {
         BrowserError::ResourceRootUnavailable
     })?;
     validate_opened_root_lock(root, &path, &file, expected_identity)?;
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            return Err(
+                if std::io::Error::last_os_error().kind() == std::io::ErrorKind::WouldBlock {
+                    BrowserError::ResourceRootBusy
+                } else {
+                    BrowserError::ResourceRootUnavailable
+                },
+            );
+        }
+        validate_opened_root_lock(root, &path, &file, ())?;
+    }
     Ok(file)
 }
 
@@ -876,6 +961,30 @@ fn validate_opened_root_lock(
         }
     }
 
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let opened = file
+            .metadata()
+            .map_err(|_| BrowserError::ResourceRootUnavailable)?;
+        let named =
+            std::fs::symlink_metadata(path).map_err(|_| BrowserError::ResourceRootUnavailable)?;
+        let directory =
+            std::fs::symlink_metadata(root).map_err(|_| BrowserError::ResourceRootUnavailable)?;
+        let owner = unsafe { libc::geteuid() };
+        if !directory.is_dir()
+            || directory.uid() != owner
+            || directory.mode() & 0o022 != 0
+            || !opened.is_file()
+            || !named.is_file()
+            || opened.nlink() != 1
+            || opened.uid() != owner
+            || opened.mode() & 0o022 != 0
+            || (opened.dev(), opened.ino()) != (named.dev(), named.ino())
+        {
+            return Err(BrowserError::ResourceRootUnavailable);
+        }
+    }
     #[cfg(not(target_os = "windows"))]
     let _ = file;
     Ok(())
@@ -1061,7 +1170,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
     fn exact_authority_allows_only_one_live_lease_and_carries_owner_and_scope() {
         let root = std::env::temp_dir().join(format!(
             "devmanager-browser-resource-authority-{}",
@@ -1094,7 +1203,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
     fn retention_is_effectively_pinned_but_persisted_unpinned_until_drop() {
         let root = test_root("effective-pin");
         let first = BrowserResourceStore::open(&root, test_limits(0)).unwrap();
@@ -1130,7 +1239,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
     fn repair_resources_reject_cross_root_wrong_kind_duplicates_and_manual_pins() {
         let first_root = test_root("exact-first");
         let other_root = test_root("exact-other");
@@ -1196,7 +1305,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
     fn dropping_one_lease_releases_only_its_resources() {
         let root = test_root("lease-isolation");
         let store = BrowserResourceStore::open(&root, test_limits(0)).unwrap();
@@ -1273,7 +1382,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
     fn resource_runtime_child_helper() {
         let Ok(mode) = std::env::var("DEVMANAGER_REPAIR_RESOURCE_UNIT_CHILD") else {
             return;
@@ -1308,7 +1417,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
     fn lease_alone_keeps_lock_alive_and_final_drop_releases_it() {
         let root = test_root("lease-lock");
         let store = BrowserResourceStore::open(&root, test_limits(1)).unwrap();
@@ -1343,7 +1452,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
     fn crash_reopen_observes_no_persistent_repair_pin() {
         let root = test_root("crash");
         std::fs::create_dir_all(&root).unwrap();
@@ -1378,6 +1487,29 @@ mod tests {
         ));
         drop(store);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_resource_lock_rejects_linked_and_replaced_mutex_identity() {
+        let root = tempfile::tempdir().expect("resource root");
+        let held = open_root_lock_file(root.path()).expect("lock root");
+        assert!(matches!(
+            open_root_lock_file(root.path()),
+            Err(BrowserError::ResourceRootBusy)
+        ));
+        let path = root.path().join(ROOT_LOCK_FILE);
+        let old = root.path().join("old-lock");
+        std::fs::rename(&path, &old).unwrap();
+        std::fs::write(&path, b"").unwrap();
+        assert!(validate_opened_root_lock(root.path(), &path, &held, ()).is_err());
+        std::fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink(&old, &path).unwrap();
+        assert!(open_root_lock_file(root.path()).is_err());
+        std::fs::remove_file(&path).unwrap();
+        std::fs::hard_link(&old, &path).unwrap();
+        assert!(open_root_lock_file(root.path()).is_err());
+        drop(held);
     }
 
     #[test]
@@ -1452,5 +1584,44 @@ mod tests {
         assert!(!metadata_path.exists());
         drop(store);
         std::fs::remove_dir_all(root).unwrap();
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn admitted_linux_resource_write_stays_in_the_retained_directory_after_rename() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("resources");
+        let retired = temp.path().join("retired");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        let store = BrowserResourceStore::open(&root, BrowserResourceLimits::default()).unwrap();
+        let id = generate_resource_id().unwrap();
+        let metadata = BrowserResourceMetadata {
+            id: id.clone(),
+            owner: test_owner("retained-directory"),
+            mime_type: "application/json".into(),
+            kind: BrowserResourceKind::DomSnapshot,
+            byte_size: 2,
+            created_at_epoch_ms: 1,
+            pinned: false,
+        };
+        store.verify_root().unwrap();
+        store
+            .write_resource_locked_with(&metadata, b"{}", |path, metadata| {
+                std::fs::rename(&root, &retired).unwrap();
+                std::os::unix::fs::symlink(&outside, &root).unwrap();
+                write_metadata_create_new(path, metadata)
+            })
+            .unwrap();
+        assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
+        assert_eq!(
+            std::fs::read(data_path(&retired, &id).unwrap()).unwrap(),
+            b"{}"
+        );
+        assert!(metadata_path(&retired, &id).unwrap().is_file());
+        assert!(store.verify_root().is_err());
+        assert!(store.list(&metadata.owner).is_err());
+        drop(store);
+        assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
+        std::fs::remove_file(root).unwrap();
     }
 }

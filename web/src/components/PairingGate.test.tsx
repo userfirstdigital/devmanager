@@ -4,13 +4,11 @@ import { describe, expect, it } from "vitest";
 import { PairingGate } from "./PairingGate";
 
 describe("PairingGate", () => {
-  it("uses desktop dashboard pairing language and omits sample tokens", () => {
+  it("points to the native pairing settings and omits sample tokens", () => {
     const html = renderToStaticMarkup(<PairingGate />);
 
-    expect(html).toContain("Remote");
-    expect(html).toContain("Host");
-    expect(html).toContain("Browser Access");
-    expect(html).toContain("Browser pair token");
+    expect(html).toContain("Settings → Remote access → Pair a device");
+    expect(html).toContain("Pairing code");
     expect(html).toContain("Pair browser");
 
     expect(html).not.toContain("Browser Web UI");

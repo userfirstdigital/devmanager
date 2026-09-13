@@ -1,0 +1,7 @@
+{
+  "schema_version": 1,
+  "event_type": "task.close_begun",
+  "payload": {
+    "action_epoch": 1
+  }
+}

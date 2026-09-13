@@ -3,12 +3,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { RemoteAction } from "./types";
 import { WEB_PROTOCOL_VERSION } from "./types";
 import { CLIENT_WEB_BUILD_ID } from "../pwa/buildCompatibility";
+import { MAX_INBOUND_TEXT_BYTES } from "../connect/transport";
 import { WsClient } from "./ws";
 
 const resumeContext = {
   seenRuntimeInstanceId: "runtime-1",
   seenRevision: 7,
-  route: "/session/tab/tab-1",
+  route: "/tasks/tab%3Atab-1",
   desiredSessionKey: "tab:tab-1",
   rawSessionId: "pty-tab-1",
   semanticAfterSequence: 12,
@@ -17,7 +18,9 @@ const resumeContext = {
 };
 
 function jsonFrames(socket: FakeWebSocket): Array<Record<string, unknown>> {
-  return socket.sent.map((frame) => JSON.parse(frame) as Record<string, unknown>);
+  return socket.sent.map(
+    (frame) => JSON.parse(frame) as Record<string, unknown>,
+  );
 }
 
 function clientCallbacks(overrides: Record<string, unknown> = {}) {
@@ -141,7 +144,7 @@ describe("WsClient request handling", () => {
     expect(callbacks.onMessage).not.toHaveBeenCalled();
   });
 
-  it.each(["null", '{"type":"hello","protocolVersion":"2"}']) (
+  it.each(["null", '{"type":"hello","protocolVersion":"2"}'])(
     "closes safely for a malformed first frame: %s",
     async (frame) => {
       const callbacks = clientCallbacks();
@@ -276,7 +279,9 @@ describe("WsClient request handling", () => {
       client as unknown as { request(action: RemoteAction): Promise<unknown> }
     ).request(action);
 
-    expect(jsonFrames(socket).filter((frame) => frame.type === "resume")).toHaveLength(1);
+    expect(
+      jsonFrames(socket).filter((frame) => frame.type === "resume"),
+    ).toHaveLength(1);
     const frames = jsonFrames(socket);
     expect(frames[frames.length - 1]).toEqual({
       type: "request",
@@ -314,7 +319,9 @@ describe("WsClient request handling", () => {
         inputKind: "paste",
       }),
     ).toBe(true);
-    expect(jsonFrames(socket).filter((frame) => frame.type === "input")).toEqual([]);
+    expect(
+      jsonFrames(socket).filter((frame) => frame.type === "input"),
+    ).toEqual([]);
 
     socket.emitMessage(
       JSON.stringify({
@@ -339,7 +346,9 @@ describe("WsClient request handling", () => {
       }),
     );
 
-    expect(jsonFrames(socket).filter((frame) => frame.type === "input")).toEqual([
+    expect(
+      jsonFrames(socket).filter((frame) => frame.type === "input"),
+    ).toEqual([
       {
         type: "input",
         sessionId: "pty-a",
@@ -374,7 +383,9 @@ describe("WsClient request handling", () => {
       }),
     );
 
-    expect(jsonFrames(socket).filter((frame) => frame.type === "input")).toEqual([]);
+    expect(
+      jsonFrames(socket).filter((frame) => frame.type === "input"),
+    ).toEqual([]);
   });
 
   it("sends exactly one atomic resume frame whenever a socket opens", async () => {
@@ -430,8 +441,12 @@ describe("WsClient request handling", () => {
     await second.start();
     FakeWebSocket.instances[1]?.emitOpen();
 
-    const firstResume = jsonFrames(FakeWebSocket.instances[0] ?? ({} as FakeWebSocket))[0];
-    const secondResume = jsonFrames(FakeWebSocket.instances[1] ?? ({} as FakeWebSocket))[0];
+    const firstResume = jsonFrames(
+      FakeWebSocket.instances[0] ?? ({} as FakeWebSocket),
+    )[0];
+    const secondResume = jsonFrames(
+      FakeWebSocket.instances[1] ?? ({} as FakeWebSocket),
+    )[0];
     expect(firstResume?.clientInstanceId).toBe(secondResume?.clientInstanceId);
     expect(storage.setItem).toHaveBeenCalledTimes(1);
   });
@@ -457,8 +472,12 @@ describe("WsClient request handling", () => {
     await second.start();
     FakeWebSocket.instances[1]?.emitOpen();
 
-    const firstResume = jsonFrames(FakeWebSocket.instances[0] ?? ({} as FakeWebSocket))[0];
-    const secondResume = jsonFrames(FakeWebSocket.instances[1] ?? ({} as FakeWebSocket))[0];
+    const firstResume = jsonFrames(
+      FakeWebSocket.instances[0] ?? ({} as FakeWebSocket),
+    )[0];
+    const secondResume = jsonFrames(
+      FakeWebSocket.instances[1] ?? ({} as FakeWebSocket),
+    )[0];
     expect(firstResume?.clientInstanceId).toBe(secondResume?.clientInstanceId);
   });
 
@@ -586,11 +605,9 @@ describe("WsClient request handling", () => {
 
     let actionRejected = false;
     let composerRejected = false;
-    void client
-      .request({ type: "stopAllServers" })
-      .catch(() => {
-        actionRejected = true;
-      });
+    void client.request({ type: "stopAllServers" }).catch(() => {
+      actionRejected = true;
+    });
     void client
       .submitComposer({
         mutationId: "mutation-reset",
@@ -627,7 +644,7 @@ describe("WsClient request handling", () => {
         runtimeInstanceId: "runtime-new",
         revision: 1,
         hardReset: true,
-        route: "/sessions",
+        route: "/tasks",
         desiredSessionKey: null,
         workspace: null,
         semanticReplay: null,
@@ -762,7 +779,9 @@ describe("WsClient request handling", () => {
       }),
     );
 
-    expect(jsonFrames(socket).filter((frame) => frame.type === "resize")).toEqual([
+    expect(
+      jsonFrames(socket).filter((frame) => frame.type === "resize"),
+    ).toEqual([
       {
         type: "resize",
         sessionId: "pty-a",
@@ -802,7 +821,9 @@ describe("WsClient request handling", () => {
       }),
     );
 
-    expect(jsonFrames(socket).filter((frame) => frame.type === "input")).toEqual([
+    expect(
+      jsonFrames(socket).filter((frame) => frame.type === "input"),
+    ).toEqual([
       {
         type: "input",
         sessionId: "pty-b",
@@ -941,7 +962,8 @@ describe("WsClient reconnect wake handling", () => {
   it("wake retries immediately instead of waiting for reconnect backoff", async () => {
     vi.stubGlobal(
       "fetch",
-      vi.fn()
+      vi
+        .fn()
         .mockRejectedValueOnce(new Error("offline"))
         .mockResolvedValue({ ok: true, status: 200 }),
     );
@@ -958,7 +980,10 @@ describe("WsClient reconnect wake handling", () => {
   });
 
   it("does not create duplicate sockets while a start is already in flight", async () => {
-    let resolveFetch: (value: { ok: boolean; status: number }) => void = () => {};
+    let resolveFetch: (value: {
+      ok: boolean;
+      status: number;
+    }) => void = () => {};
     const fetchMock = vi.fn(
       () =>
         new Promise((resolve) => {
@@ -1092,9 +1117,14 @@ describe("WsClient reconnect wake handling", () => {
     visible = true;
     client.setVisibility(true);
 
-    const resumes = jsonFrames(socket).filter((frame) => frame.type === "resume");
+    const resumes = jsonFrames(socket).filter(
+      (frame) => frame.type === "resume",
+    );
     expect(resumes).toHaveLength(2);
-    expect(resumes[0]).toMatchObject({ visible: false, wantsWriterLease: false });
+    expect(resumes[0]).toMatchObject({
+      visible: false,
+      wantsWriterLease: false,
+    });
     expect(resumes[1]).toMatchObject({ visible: true, wantsWriterLease: true });
   });
 
@@ -1192,79 +1222,82 @@ describe("WsClient reconnect wake handling", () => {
     "staleGeneration",
     "nativeControllerActive",
     "mutationInFlight",
-  ] as const)("keeps the same promise for transient %s rejection", async (code) => {
-    vi.stubGlobal(
-      "fetch",
-      vi.fn().mockResolvedValue({ ok: true, status: 200 }),
-    );
-    const client = new WsClient(clientCallbacks());
-    await client.start();
-    const socket = FakeWebSocket.instances[0];
-    socket.emitOpen();
-    socket.emitMessage(
-      JSON.stringify({
-        type: "writerLeaseState",
-        writerLease: {
-          ownerClientInstanceId: "browser-install-uuid",
-          generation: 7,
-          expiresAtEpochMs: 8_000,
-          youAreOwner: true,
-        },
-      }),
-    );
-    let rejected = false;
-    const submission = client
-      .submitComposer({
-        mutationId: `mutation-${code}`,
-        stableSessionKey: "tab:tab-1",
-        text: code,
-        attachments: [],
-      })
-      .catch((error: unknown) => {
-        rejected = true;
-        throw error;
-      });
-    socket.emitMessage(
-      JSON.stringify({
-        type: "composerRejected",
-        mutationId: `mutation-${code}`,
-        code,
-        message: "retry",
-        writerLease: {
-          ownerClientInstanceId: "browser-install-uuid",
-          generation: 8,
-          expiresAtEpochMs: 9_000,
-          youAreOwner: true,
-        },
-      }),
-    );
-    await Promise.resolve();
-    expect(rejected).toBe(false);
+  ] as const)(
+    "keeps the same promise for transient %s rejection",
+    async (code) => {
+      vi.stubGlobal(
+        "fetch",
+        vi.fn().mockResolvedValue({ ok: true, status: 200 }),
+      );
+      const client = new WsClient(clientCallbacks());
+      await client.start();
+      const socket = FakeWebSocket.instances[0];
+      socket.emitOpen();
+      socket.emitMessage(
+        JSON.stringify({
+          type: "writerLeaseState",
+          writerLease: {
+            ownerClientInstanceId: "browser-install-uuid",
+            generation: 7,
+            expiresAtEpochMs: 8_000,
+            youAreOwner: true,
+          },
+        }),
+      );
+      let rejected = false;
+      const submission = client
+        .submitComposer({
+          mutationId: `mutation-${code}`,
+          stableSessionKey: "tab:tab-1",
+          text: code,
+          attachments: [],
+        })
+        .catch((error: unknown) => {
+          rejected = true;
+          throw error;
+        });
+      socket.emitMessage(
+        JSON.stringify({
+          type: "composerRejected",
+          mutationId: `mutation-${code}`,
+          code,
+          message: "retry",
+          writerLease: {
+            ownerClientInstanceId: "browser-install-uuid",
+            generation: 8,
+            expiresAtEpochMs: 9_000,
+            youAreOwner: true,
+          },
+        }),
+      );
+      await Promise.resolve();
+      expect(rejected).toBe(false);
 
-    expect(
-      jsonFrames(socket).filter((frame) => frame.type === "composerSubmit"),
-    ).toHaveLength(1);
-    await vi.advanceTimersByTimeAsync(249);
-    expect(
-      jsonFrames(socket).filter((frame) => frame.type === "composerSubmit"),
-    ).toHaveLength(1);
-    await vi.advanceTimersByTimeAsync(1);
-    const sends = jsonFrames(socket).filter(
-      (frame) => frame.type === "composerSubmit",
-    );
-    expect(sends).toHaveLength(2);
-    expect(sends[1]?.mutationId).toBe(`mutation-${code}`);
-    socket.emitMessage(
-      JSON.stringify({
-        type: "composerAccepted",
-        mutationId: `mutation-${code}`,
-        stableSessionKey: "tab:tab-1",
-        acceptedSequence: 21,
-        leaseGeneration: 8,
-      }),
-    );
-    await expect(submission).resolves.toMatchObject({ acceptedSequence: 21 });
-  });
+      expect(
+        jsonFrames(socket).filter((frame) => frame.type === "composerSubmit"),
+      ).toHaveLength(1);
+      await vi.advanceTimersByTimeAsync(249);
+      expect(
+        jsonFrames(socket).filter((frame) => frame.type === "composerSubmit"),
+      ).toHaveLength(1);
+      await vi.advanceTimersByTimeAsync(1);
+      const sends = jsonFrames(socket).filter(
+        (frame) => frame.type === "composerSubmit",
+      );
+      expect(sends).toHaveLength(2);
+      expect(sends[1]?.mutationId).toBe(`mutation-${code}`);
+      socket.emitMessage(
+        JSON.stringify({
+          type: "composerAccepted",
+          mutationId: `mutation-${code}`,
+          stableSessionKey: "tab:tab-1",
+          acceptedSequence: 21,
+          leaseGeneration: 8,
+        }),
+      );
+      await expect(submission).resolves.toMatchObject({ acceptedSequence: 21 });
+    },
+  );
 
   it("resends an unacknowledged composer mutation after reconnect Resume ownership", async () => {
     vi.stubGlobal(
@@ -1313,7 +1346,7 @@ describe("WsClient reconnect wake handling", () => {
         runtimeInstanceId: "runtime-1",
         revision: 7,
         hardReset: false,
-        route: "/session/tab/tab-1",
+        route: "/tasks/tab%3Atab-1",
         desiredSessionKey: "tab:tab-1",
         workspace: null,
         semanticReplay: null,
@@ -1378,7 +1411,7 @@ describe("WsClient reconnect wake handling", () => {
         runtimeInstanceId: "runtime-1",
         revision: 7,
         hardReset: false,
-        route: "/sessions",
+        route: "/tasks",
         desiredSessionKey: null,
         workspace: null,
         semanticReplay: null,
@@ -1506,4 +1539,299 @@ describe("WsClient reconnect wake handling", () => {
       ).toHaveLength(1);
     },
   );
+});
+
+describe("WsClient connect route and inbound bounds", () => {
+  beforeEach(() => {
+    FakeWebSocket.instances = [];
+    vi.stubGlobal("window", globalThis);
+    vi.stubGlobal("location", { protocol: "http:", host: "example.test" });
+    vi.stubGlobal("localStorage", {
+      getItem: vi.fn(() => "browser-install-uuid"),
+      setItem: vi.fn(),
+    });
+    vi.stubGlobal("sessionStorage", {
+      getItem: vi.fn(() => null),
+      setItem: vi.fn(),
+    });
+    vi.stubGlobal("crypto", {
+      randomUUID: vi.fn(() => "browser-install-uuid"),
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({ ok: true, status: 200 }),
+    );
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  it("prefers the direct host socket and still sends raw terminal there", async () => {
+    const client = new WsClient(clientCallbacks());
+    await client.start();
+    const socket = FakeWebSocket.instances[0];
+    socket.emitOpen();
+    socket.emitMessage(
+      JSON.stringify({
+        type: "writerLeaseState",
+        writerLease: {
+          ownerClientInstanceId: "browser-install-uuid",
+          generation: 8,
+          expiresAtEpochMs: 10_000,
+          youAreOwner: true,
+        },
+      }),
+    );
+
+    expect(client.currentRoute()?.kind).toBe("direct");
+    expect(
+      client.sendWithWriterLease({
+        type: "input",
+        sessionId: "pty-a",
+        text: "hello",
+      }),
+    ).toBe(true);
+    expect(
+      jsonFrames(socket).some((frame) => frame.type === "input"),
+    ).toBe(true);
+  });
+
+  it("does not fabricate a same-origin relay when advertisement is absent", async () => {
+    const callbacks = clientCallbacks();
+    const client = new WsClient(callbacks, { directAvailable: false });
+    await client.start();
+    expect(FakeWebSocket.instances).toHaveLength(0);
+    expect(client.currentRoute()).toEqual({
+      kind: "noRoute",
+      reason: "advertisedRelayAbsent",
+    });
+    expect(callbacks.onStatus).toHaveBeenCalledWith({
+      kind: "closed",
+      reason: "advertisedRelayAbsent",
+    });
+  });
+
+  it("drops raw terminal staged before a relay route is selected", async () => {
+    const client = new WsClient(clientCallbacks(), {
+      directAvailable: false,
+      relayUrl: "wss://relay.example.test/connect",
+    });
+    expect(
+      client.sendWithWriterLease({
+        type: "input",
+        sessionId: "pty-a",
+        text: "staged before route",
+      }),
+    ).toBe(true);
+
+    await client.start();
+    const socket = FakeWebSocket.instances[0];
+    socket.emitOpen();
+    socket.emitMessage(
+      JSON.stringify({
+        type: "writerLeaseState",
+        writerLease: {
+          ownerClientInstanceId: "browser-install-uuid",
+          generation: 8,
+          expiresAtEpochMs: 10_000,
+          youAreOwner: true,
+        },
+      }),
+    );
+
+    expect(jsonFrames(socket).filter((frame) => frame.type === "input")).toEqual(
+      [],
+    );
+  });
+
+  it("retains only an explicit host grant and relay advertisement from hello", async () => {
+    const client = new WsClient(clientCallbacks());
+    await client.start();
+    const socket = FakeWebSocket.instances[0];
+    socket.emitOpen(false);
+    socket.emitMessage(
+      JSON.stringify({
+        type: "hello",
+        clientId: "web-client",
+        serverId: "server-1",
+        protocolVersion: WEB_PROTOCOL_VERSION,
+        webBuildId: CLIENT_WEB_BUILD_ID,
+        relayUrl: "wss://relay.example.test/connect",
+        capabilityGrant: {
+          role: "watcher",
+          taskId: "tab:a",
+          actions: ["readTask", "readPresence"],
+        },
+      }),
+    );
+
+    expect(client.currentCapabilityGrant()).toEqual({
+      role: "watcher",
+      taskId: "tab:a",
+      actions: ["readTask", "readPresence"],
+    });
+  });
+
+  it("does not infer a role when hello grant metadata is absent or malformed", async () => {
+    const client = new WsClient(clientCallbacks());
+    await client.start();
+    const socket = FakeWebSocket.instances[0];
+    socket.emitOpen(false);
+    socket.emitMessage(
+      JSON.stringify({
+        type: "hello",
+        clientId: "web-client",
+        serverId: "server-1",
+        protocolVersion: WEB_PROTOCOL_VERSION,
+        webBuildId: CLIENT_WEB_BUILD_ID,
+        capabilityGrant: { role: "owner", taskId: "tab:a" },
+      }),
+    );
+    expect(client.currentCapabilityGrant()).toBeNull();
+  });
+
+  it("drops oversized inbound text after hello without delivering it", async () => {
+    const callbacks = clientCallbacks();
+    const client = new WsClient(callbacks);
+    await client.start();
+    const socket = FakeWebSocket.instances[0];
+    socket.emitOpen();
+
+    expect(() =>
+      socket.emitMessage(`${"x".repeat(MAX_INBOUND_TEXT_BYTES + 1)}`),
+    ).not.toThrow();
+    expect(callbacks.onMessage).not.toHaveBeenCalledWith(
+      expect.objectContaining({ type: "error" }),
+    );
+    const delivered = callbacks.onMessage.mock.calls.map(
+      (call: unknown[]) => call[0],
+    );
+    expect(
+      delivered.every(
+        (message) =>
+          typeof message === "object" &&
+          message !== null &&
+          (message as { type?: string }).type !== undefined &&
+          JSON.stringify(message).length < 1_024,
+      ),
+    ).toBe(true);
+  });
+});
+
+describe("Connect wake and suspension via WsClient", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  it("preserves elapsed hidden duration through setVisibility true for the 10s path", () => {
+    const wake = vi.fn(() => "reconnect" as const);
+    const setBackgrounded = vi.fn();
+    const transport = {
+      state: () => ({ kind: "ready" as const }),
+      wake,
+      setBackgrounded,
+      suspend: vi.fn(),
+      start: vi.fn(),
+      stop: vi.fn(),
+      subscribe: () => () => {},
+      subscribeEnvelope: () => () => {},
+      sendPayload: vi.fn(() => true),
+      requestResync: vi.fn(() => true),
+    };
+    const client = new WsClient(clientCallbacks(), {
+      transport: "connect",
+      connectTransport: transport as never,
+    });
+    client.setVisibility(false);
+    client.setVisibility(false);
+    vi.advanceTimersByTime(10_001);
+    client.setVisibility(true);
+    expect(wake).toHaveBeenCalledTimes(1);
+    expect(wake).toHaveBeenCalledWith({ hiddenDurationMs: 10_001 });
+    expect(setBackgrounded).toHaveBeenCalledWith(false);
+    expect(transport.sendPayload).not.toHaveBeenCalled();
+    expect(transport.requestResync).not.toHaveBeenCalled();
+  });
+
+  it("invokes transport.wake and resumes only on the short-wake path", () => {
+    const wake = vi.fn(() => "resume" as const);
+    const setBackgrounded = vi.fn();
+    const transport = {
+      state: () => ({ kind: "ready" as const }),
+      wake,
+      setBackgrounded,
+      suspend: vi.fn(),
+      start: vi.fn(),
+      stop: vi.fn(),
+      subscribe: () => () => {},
+      subscribeEnvelope: () => () => {},
+      sendPayload: vi.fn(() => true),
+      requestResync: vi.fn(() => true),
+    };
+    const client = new WsClient(clientCallbacks(), {
+      transport: "connect",
+      connectTransport: transport as never,
+      connectResume: () => ({
+        payloadKind: 15,
+        payload: { reason: "replay_unavailable" },
+      }),
+    });
+    client.wake();
+    expect(wake).toHaveBeenCalledWith({ hiddenDurationMs: 0 });
+    expect(transport.sendPayload).toHaveBeenCalled();
+  });
+
+  it("preserves held transport failures without reconnect loops", () => {
+    const wake = vi.fn(() => "held" as const);
+    const onHelloFailure = vi.fn();
+    const transport = {
+      state: () => ({
+        kind: "held" as const,
+        code: "browser-e2e-transport-held",
+        reason: "held",
+      }),
+      wake,
+      setBackgrounded: vi.fn(),
+      suspend: vi.fn(),
+      start: vi.fn(),
+      stop: vi.fn(),
+      subscribe: () => () => {},
+      subscribeEnvelope: () => () => {},
+    };
+    const client = new WsClient(clientCallbacks({ onHelloFailure }), {
+      transport: "connect",
+      connectTransport: transport as never,
+    });
+    client.wake();
+    expect(wake).toHaveBeenCalled();
+    expect(transport.start).not.toHaveBeenCalled();
+  });
+
+  it("suspendConnection forwards to the Connect transport", () => {
+    const suspend = vi.fn();
+    const transport = {
+      state: () => ({ kind: "ready" as const }),
+      wake: vi.fn(),
+      setBackgrounded: vi.fn(),
+      suspend,
+      start: vi.fn(),
+      stop: vi.fn(),
+      subscribe: () => () => {},
+      subscribeEnvelope: () => () => {},
+    };
+    const client = new WsClient(clientCallbacks(), {
+      transport: "connect",
+      connectTransport: transport as never,
+    });
+    client.suspendConnection();
+    expect(suspend).toHaveBeenCalledTimes(1);
+  });
 });

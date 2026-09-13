@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "source_type": "terminal_delta",
+  "provider_event_id": "cursor_evt_term_1",
+  "occurred_at_ms": 1725000001700,
+  "payload": {
+    "kind": "terminal_bytes",
+    "bytes_b64": "G1sxbVJBV19URVJNSU5BTF9CWVRFU19NVVNUX05FVkVSX0JFQ09NRV9TRU1BTlRJQ19URVhU"
+  },
+  "extensions": {}
+}

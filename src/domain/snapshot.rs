@@ -1,0 +1,1289 @@
+use std::collections::BTreeMap;
+use std::fmt;
+
+use serde::de::{self, Deserializer, MapAccess, SeqAccess, Visitor};
+use serde::ser::{self, SerializeMap, Serializer};
+use serde::{Deserialize, Serialize};
+
+use crate::domain::agent::AgentSessionFacts;
+use crate::domain::artifact::PrivacyClass;
+use crate::domain::artifact::{ArtifactFacts, ArtifactSummary};
+use crate::domain::browser::{BrowserBook, BrowserContextView, BrowserTabView};
+use crate::domain::event::DomainEvent;
+use crate::domain::id::{
+    AgentSessionId, ArtifactId, BrowserContextId, BrowserTabId, EventId, OperationId, ResourceId,
+    SnapshotId, TaskId,
+};
+use crate::domain::operation::OperationFacts;
+use crate::domain::provider_input::ProviderSessionProjection;
+use crate::domain::resource::ResourceFacts;
+use crate::domain::task::{
+    ReviewReadiness, TaskActivity, TaskAttention, TaskConnectivity, TaskFacts, TaskLifecycle,
+    VisibleTaskStatus,
+};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskSnapshot {
+    pub task: TaskFacts,
+    pub connectivity: TaskConnectivity,
+    pub attention: TaskAttention,
+    pub activity: TaskActivity,
+    pub review_readiness: ReviewReadiness,
+    pub agents: BTreeMap<AgentSessionId, AgentSessionFacts>,
+    pub primary_agent_id: Option<AgentSessionId>,
+    pub artifacts: BTreeMap<ArtifactId, ArtifactFacts>,
+    pub resources: BTreeMap<ResourceId, ResourceFacts>,
+    pub provider_sessions: BTreeMap<AgentSessionId, ProviderSessionProjection>,
+    pub browser: BrowserBook,
+    pub terminal_facts: BTreeMap<ResourceId, crate::domain::terminal_facts::TerminalFacts>,
+    pub terminal_strip: crate::domain::terminal_facts::TaskTerminalStrip,
+}
+
+impl TaskSnapshot {
+    /// Unstarted draft: open task with a primary agent that has never bound a
+    /// provider conversation/runtime identity. Placeholder titles are irrelevant.
+    /// A launch already in flight without SessionStart identity must be excluded
+    /// by the live host/UI pending-start fence; durable projection alone cannot
+    /// see that ephemeral lease.
+    pub fn is_unstarted_draft(&self) -> bool {
+        if self.task.lifecycle != TaskLifecycle::Open {
+            return false;
+        }
+        if self
+            .agents
+            .values()
+            .any(|agent| agent.provider_session_id.is_some())
+        {
+            return false;
+        }
+        if self.provider_sessions.values().any(|session| {
+            session.current_turn.is_some()
+                || session.open_question.is_some()
+                || session.open_approval.is_some()
+                || !session.waits.is_empty()
+                || session.last_settlement.is_some()
+        }) {
+            return false;
+        }
+        let Some(primary) = self.primary_agent_id else {
+            return false;
+        };
+        self.agents.get(&primary).is_some()
+    }
+
+    pub fn browser_context(&self, context_id: BrowserContextId) -> Option<BrowserContextView> {
+        self.browser.context_view(context_id)
+    }
+
+    pub fn browser_tab(&self, tab_id: BrowserTabId) -> Option<BrowserTabView> {
+        self.browser.tab_view(tab_id)
+    }
+
+    pub fn visible_status(&self) -> VisibleTaskStatus {
+        if self.connectivity == TaskConnectivity::Disconnected {
+            return VisibleTaskStatus::Disconnected;
+        }
+        match self.attention {
+            TaskAttention::Failed => return VisibleTaskStatus::Failed,
+            TaskAttention::UncertainOutcome => return VisibleTaskStatus::UncertainOutcome,
+            TaskAttention::NeedsApproval => return VisibleTaskStatus::NeedsApproval,
+            TaskAttention::NeedsAnswer => return VisibleTaskStatus::NeedsAnswer,
+            TaskAttention::None => {}
+        }
+        // Settled tasks stay in the Done rail section; never re-litigate live turn state.
+        if self.task.lifecycle == TaskLifecycle::Settled {
+            return VisibleTaskStatus::Idle;
+        }
+        if let Some(agent_id) = self.primary_agent_id {
+            if let Some(session) = self.provider_sessions.get(&agent_id) {
+                if session.open_approval.is_some() {
+                    return VisibleTaskStatus::NeedsApproval;
+                }
+                if session.open_question.is_some() {
+                    return VisibleTaskStatus::NeedsAnswer;
+                }
+                if session.current_turn.is_some() {
+                    return VisibleTaskStatus::Working;
+                }
+            }
+        }
+        VisibleTaskStatus::derive(
+            self.connectivity,
+            self.attention,
+            self.activity,
+            self.review_readiness,
+        )
+    }
+}
+
+/// Row-granular durable snapshot sections. Large terminal grids, screenshots,
+/// and artifact bodies are intentionally outside this snapshot model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotSection {
+    Tasks,
+    AgentSessions,
+    Artifacts,
+    Resources,
+    Operations,
+    BrowserContexts,
+    BrowserTabs,
+}
+
+pub const MAX_SNAPSHOT_PAGE_ITEMS: u32 = 1_000;
+pub const MAX_SNAPSHOT_PAGE_ENCODED_BYTES: u32 = 512 * 1024;
+pub const QUOTA_DISPLAY_TTL_MS: u64 = 60 * 60 * 1000;
+
+/// Client snapshots omit a quota display value when it is at least one hour old,
+/// observed in the future, or observed after a clock rollback (`now < observed_at`).
+///
+/// Display cutover consumes `QuotaStripEntry` only. This helper redacts strip
+/// observations; it must not be applied to semantic replay `Status{usage}` as a
+/// second quota truth.
+pub fn omit_stale_quota_display<T>(observed_at: u64, now_ms: u64, display: T) -> Option<T> {
+    if now_ms < observed_at || now_ms.saturating_sub(observed_at) >= QUOTA_DISPLAY_TTL_MS {
+        None
+    } else {
+        Some(display)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanStepKind {
+    Task,
+    Subagent,
+}
+
+impl PlanStepKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Task => "task",
+            Self::Subagent => "subagent",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanStepStatus {
+    Pending,
+    Active,
+    Completed,
+    Failed,
+}
+
+impl PlanStepStatus {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Active => "active",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+        }
+    }
+
+    /// Accept the canonical journal vocabulary plus legacy plan fixtures. An
+    /// unknown provider value deliberately remains unknown instead of being
+    /// presented as completed work.
+    pub fn from_wire(status: &str) -> Option<Self> {
+        match status {
+            "pending" | "taskCreated" => Some(Self::Pending),
+            "active" | "running" | "in_progress" | "inProgress" | "taskInProgress"
+            | "subagentStarted" => Some(Self::Active),
+            "completed" | "succeeded" | "taskCompleted" | "subagentStopped"
+            | "subagentCompleted" => Some(Self::Completed),
+            "failed" => Some(Self::Failed),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProviderPlanStepLifecycle {
+    pub kind: PlanStepKind,
+    pub status: PlanStepStatus,
+}
+
+/// The provider hook lifecycle states that are true plan steps. The later
+/// `subagentCompleted` prompt notification is intentionally excluded: it has
+/// no provider subject identity and is presentation-only.
+pub fn provider_plan_step_lifecycle(state: &str) -> Option<ProviderPlanStepLifecycle> {
+    let (kind, status) = match state {
+        "taskCreated" => (PlanStepKind::Task, PlanStepStatus::Pending),
+        "taskInProgress" => (PlanStepKind::Task, PlanStepStatus::Active),
+        "taskCompleted" => (PlanStepKind::Task, PlanStepStatus::Completed),
+        "subagentStarted" => (PlanStepKind::Subagent, PlanStepStatus::Active),
+        "subagentStopped" => (PlanStepKind::Subagent, PlanStepStatus::Completed),
+        _ => return None,
+    };
+    Some(ProviderPlanStepLifecycle { kind, status })
+}
+
+/// Provider-neutral, bounded semantic payload retained by the journal. Raw
+/// provider envelopes and terminal bytes are deliberately not represented.
+/// Present only when SemanticSubagents was negotiated. The legacy status text
+/// remains available to older clients without changing its interpretation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ToolResultContext {
+    pub name: String,
+    pub failed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SemanticJournalPayload {
+    UserMessage {
+        text: String,
+    },
+    AssistantText {
+        text: String,
+    },
+    ReasoningSummary {
+        text: String,
+    },
+    ToolCall {
+        tool_name: String,
+        call_id: String,
+    },
+    ToolResult {
+        call_id: String,
+        status: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        context: Option<ToolResultContext>,
+    },
+    ApprovalRequest {
+        request_id: String,
+        summary: String,
+    },
+    ApprovalResult {
+        request_id: String,
+        decision: String,
+    },
+    Question {
+        question_id: String,
+        prompt: String,
+        options: Vec<String>,
+    },
+    PlanStep {
+        step_id: String,
+        title: String,
+        status: String,
+    },
+    UsageObservation {
+        remaining_percent: Option<u8>,
+    },
+    Error {
+        code: String,
+        message: String,
+    },
+    TurnState {
+        state: String,
+    },
+    SessionState {
+        state: String,
+    },
+    ArtifactReference {
+        label: String,
+    },
+    Unknown {
+        provider: String,
+        source_type: String,
+        schema_version: u32,
+        diagnostic_ref: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PageLimitsError {
+    ZeroItems,
+    TooManyItems,
+    ZeroEncodedBytes,
+    TooManyEncodedBytes,
+}
+
+impl std::fmt::Display for PageLimitsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ZeroItems => write!(f, "snapshot page item limit must be nonzero"),
+            Self::TooManyItems => write!(
+                f,
+                "snapshot page item limit exceeds {MAX_SNAPSHOT_PAGE_ITEMS}"
+            ),
+            Self::ZeroEncodedBytes => {
+                write!(f, "snapshot page encoded-byte limit must be nonzero")
+            }
+            Self::TooManyEncodedBytes => write!(
+                f,
+                "snapshot page encoded-byte limit exceeds {MAX_SNAPSHOT_PAGE_ENCODED_BYTES}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for PageLimitsError {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PageLimits {
+    pub max_items: u32,
+    pub max_encoded_bytes: u32,
+}
+
+impl Serialize for PageLimits {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.validate().map_err(ser::Error::custom)?;
+        #[derive(Serialize)]
+        struct PageLimitsWire {
+            max_items: u32,
+            max_encoded_bytes: u32,
+        }
+        PageLimitsWire {
+            max_items: self.max_items,
+            max_encoded_bytes: self.max_encoded_bytes,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl PageLimits {
+    pub fn new(max_items: u32, max_encoded_bytes: u32) -> Result<Self, PageLimitsError> {
+        let limits = Self {
+            max_items,
+            max_encoded_bytes,
+        };
+        limits.validate()?;
+        Ok(limits)
+    }
+
+    pub fn validate(&self) -> Result<(), PageLimitsError> {
+        if self.max_items == 0 {
+            return Err(PageLimitsError::ZeroItems);
+        }
+        if self.max_items > MAX_SNAPSHOT_PAGE_ITEMS {
+            return Err(PageLimitsError::TooManyItems);
+        }
+        if self.max_encoded_bytes == 0 {
+            return Err(PageLimitsError::ZeroEncodedBytes);
+        }
+        if self.max_encoded_bytes > MAX_SNAPSHOT_PAGE_ENCODED_BYTES {
+            return Err(PageLimitsError::TooManyEncodedBytes);
+        }
+        Ok(())
+    }
+}
+
+impl<'de> Deserialize<'de> for PageLimits {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct PageLimitsWire {
+            max_items: u32,
+            max_encoded_bytes: u32,
+        }
+
+        let wire = PageLimitsWire::deserialize(deserializer)?;
+        Self::new(wire.max_items, wire.max_encoded_bytes).map_err(de::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotItemKey {
+    Task(TaskId),
+    AgentSession(AgentSessionId),
+    Artifact(ArtifactId),
+    Resource(ResourceId),
+    Operation(OperationId),
+    BrowserContext(BrowserContextId),
+    BrowserTab(BrowserTabId),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskSnapshotItem {
+    pub task: TaskFacts,
+    pub connectivity: TaskConnectivity,
+    pub attention: TaskAttention,
+    pub activity: TaskActivity,
+    pub review_readiness: ReviewReadiness,
+    pub primary_agent_id: Option<AgentSessionId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotItem {
+    Task(TaskSnapshotItem),
+    AgentSession(AgentSessionFacts),
+    Artifact(ArtifactSummary),
+    Resource(ResourceFacts),
+    Operation(OperationFacts),
+    BrowserContext(BrowserContextView),
+    BrowserTab(BrowserTabView),
+}
+
+/// One page from one immutable snapshot view.
+///
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SnapshotPage {
+    pub snapshot_id: SnapshotId,
+    pub through_sequence: u64,
+    pub section: SnapshotSection,
+    /// Exclusive boundary used to produce this page.
+    pub after_item: Option<SnapshotItemKey>,
+    pub items: Vec<SnapshotItem>,
+    /// Exact canonical MessagePack size of this page body.
+    pub encoded_bytes: u32,
+    pub next_cursor: Option<Vec<u8>>,
+}
+
+/// Bounded semantic-journal projection. This is intentionally not a
+/// `SnapshotSection`: the global Task snapshot must never carry raw provider
+/// payloads, terminal bytes, or unknown event bodies.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SemanticJournalFact {
+    pub id: EventId,
+    pub sequence: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub occurred_at_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subagent_id: Option<String>,
+    pub provider: String,
+    pub schema_version: u32,
+    pub kind: String,
+    pub visibility: String,
+    pub privacy_class: PrivacyClass,
+    pub redacted: bool,
+    pub payload: SemanticJournalPayload,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SemanticJournalPage {
+    #[serde(default)]
+    pub oldest_sequence: u64,
+    /// Replace cached history with this retained window before merging facts.
+    #[serde(default)]
+    pub cursor_rolled_over: bool,
+    pub after_sequence: u64,
+    pub through_sequence: u64,
+    pub high_water: u64,
+    pub encoded_bytes: u32,
+    pub next_sequence: Option<u64>,
+    pub facts: Vec<SemanticJournalFact>,
+}
+
+/// One bounded page from a replay session pinned to a durable high-water mark.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EventPage {
+    /// Exclusive sequence boundary used to produce this page.
+    pub after_sequence: u64,
+    /// Fixed high-water sequence captured when replay began.
+    pub through_sequence: u64,
+    pub events: Vec<DomainEvent>,
+    pub next_cursor: Option<Vec<u8>>,
+}
+
+/// One bounded on-demand artifact content page. `payload` is MessagePack binary
+/// bytes (never a byte array). `offset` is the first byte included in this page.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtifactContentPage {
+    pub artifact_id: ArtifactId,
+    pub offset: u64,
+    pub total_bytes: u64,
+    pub sha256: [u8; 32],
+    pub payload: Vec<u8>,
+    pub encoded_bytes: u32,
+    pub next_cursor: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CanonicalPageSizeError {
+    Encode { detail: String },
+    TooLarge { encoded_bytes: usize },
+    DidNotConverge,
+}
+
+impl fmt::Display for CanonicalPageSizeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Encode { detail } => write!(f, "canonical page encode failed: {detail}"),
+            Self::TooLarge { encoded_bytes } => write!(
+                f,
+                "canonical page encoded length {encoded_bytes} does not fit u32"
+            ),
+            Self::DidNotConverge => write!(f, "canonical page encoded length did not converge"),
+        }
+    }
+}
+
+impl std::error::Error for CanonicalPageSizeError {}
+
+const CANONICAL_PAGE_SIZE_MAX_PASSES: usize = 8;
+
+fn canonical_fixed_point_page_size<T, F>(
+    page: &T,
+    mut set_encoded_bytes: F,
+) -> Result<u32, CanonicalPageSizeError>
+where
+    T: Clone + Serialize,
+    F: FnMut(&mut T, u32),
+{
+    let mut encoded_bytes = 0u32;
+    for _ in 0..CANONICAL_PAGE_SIZE_MAX_PASSES {
+        let mut final_page = page.clone();
+        set_encoded_bytes(&mut final_page, encoded_bytes);
+        let encoded = rmp_serde::to_vec_named(&final_page).map_err(|error| {
+            CanonicalPageSizeError::Encode {
+                detail: error.to_string(),
+            }
+        })?;
+        let actual =
+            u32::try_from(encoded.len()).map_err(|_| CanonicalPageSizeError::TooLarge {
+                encoded_bytes: encoded.len(),
+            })?;
+        if actual == encoded_bytes {
+            return Ok(actual);
+        }
+        encoded_bytes = actual;
+    }
+    Err(CanonicalPageSizeError::DidNotConverge)
+}
+
+pub fn canonical_snapshot_page_size(page: &SnapshotPage) -> Result<u32, CanonicalPageSizeError> {
+    canonical_fixed_point_page_size(page, |page, encoded_bytes| {
+        page.encoded_bytes = encoded_bytes;
+    })
+}
+
+pub fn canonical_semantic_page_size(
+    page: &SemanticJournalPage,
+) -> Result<u32, CanonicalPageSizeError> {
+    canonical_fixed_point_page_size(page, |page, encoded_bytes| {
+        page.encoded_bytes = encoded_bytes;
+    })
+}
+
+pub fn canonical_event_page_size(page: &EventPage) -> Result<u32, CanonicalPageSizeError> {
+    let encoded =
+        rmp_serde::to_vec_named(page).map_err(|error| CanonicalPageSizeError::Encode {
+            detail: error.to_string(),
+        })?;
+    u32::try_from(encoded.len()).map_err(|_| CanonicalPageSizeError::TooLarge {
+        encoded_bytes: encoded.len(),
+    })
+}
+
+pub fn canonical_artifact_content_page_size(
+    page: &ArtifactContentPage,
+) -> Result<u32, CanonicalPageSizeError> {
+    canonical_fixed_point_page_size(page, |page, encoded_bytes| {
+        page.encoded_bytes = encoded_bytes;
+    })
+}
+
+struct ArtifactContentBinaryRef<'a>(&'a [u8]);
+
+impl Serialize for ArtifactContentBinaryRef<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_bytes(self.0)
+    }
+}
+
+struct OptionalArtifactContentBinaryRef<'a>(Option<&'a [u8]>);
+
+impl Serialize for OptionalArtifactContentBinaryRef<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self.0 {
+            Some(bytes) => serializer.serialize_some(&ArtifactContentBinaryRef(bytes)),
+            None => serializer.serialize_none(),
+        }
+    }
+}
+
+struct ArtifactContentBinary(Vec<u8>);
+
+impl<'de> Deserialize<'de> for ArtifactContentBinary {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct BinaryVisitor;
+
+        impl<'de> Visitor<'de> for BinaryVisitor {
+            type Value = ArtifactContentBinary;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("MessagePack binary bytes")
+            }
+
+            fn visit_bytes<E: de::Error>(self, value: &[u8]) -> Result<Self::Value, E> {
+                Ok(ArtifactContentBinary(value.to_vec()))
+            }
+
+            fn visit_byte_buf<E: de::Error>(self, value: Vec<u8>) -> Result<Self::Value, E> {
+                Ok(ArtifactContentBinary(value))
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(self, _seq: A) -> Result<Self::Value, A::Error> {
+                Err(de::Error::invalid_type(de::Unexpected::Seq, &self))
+            }
+        }
+
+        deserializer.deserialize_bytes(BinaryVisitor)
+    }
+}
+
+struct OptionalArtifactContentBinary(Option<Vec<u8>>);
+
+impl<'de> Deserialize<'de> for OptionalArtifactContentBinary {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct OptionalBinaryVisitor;
+
+        impl<'de> Visitor<'de> for OptionalBinaryVisitor {
+            type Value = OptionalArtifactContentBinary;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("optional MessagePack binary bytes")
+            }
+
+            fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
+                Ok(OptionalArtifactContentBinary(None))
+            }
+
+            fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+                Ok(OptionalArtifactContentBinary(None))
+            }
+
+            fn visit_some<D: Deserializer<'de>>(
+                self,
+                deserializer: D,
+            ) -> Result<Self::Value, D::Error> {
+                let ArtifactContentBinary(bytes) =
+                    ArtifactContentBinary::deserialize(deserializer)?;
+                Ok(OptionalArtifactContentBinary(Some(bytes)))
+            }
+
+            fn visit_bytes<E: de::Error>(self, value: &[u8]) -> Result<Self::Value, E> {
+                Ok(OptionalArtifactContentBinary(Some(value.to_vec())))
+            }
+
+            fn visit_byte_buf<E: de::Error>(self, value: Vec<u8>) -> Result<Self::Value, E> {
+                Ok(OptionalArtifactContentBinary(Some(value)))
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(self, _seq: A) -> Result<Self::Value, A::Error> {
+                Err(de::Error::invalid_type(de::Unexpected::Seq, &self))
+            }
+        }
+
+        deserializer.deserialize_option(OptionalBinaryVisitor)
+    }
+}
+
+impl Serialize for ArtifactContentPage {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(Some(7))?;
+        map.serialize_entry("artifact_id", &self.artifact_id)?;
+        map.serialize_entry("offset", &self.offset)?;
+        map.serialize_entry("total_bytes", &self.total_bytes)?;
+        map.serialize_entry("sha256", &self.sha256)?;
+        map.serialize_entry("payload", &ArtifactContentBinaryRef(&self.payload))?;
+        map.serialize_entry("encoded_bytes", &self.encoded_bytes)?;
+        map.serialize_entry(
+            "next_cursor",
+            &OptionalArtifactContentBinaryRef(self.next_cursor.as_deref()),
+        )?;
+        map.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for ArtifactContentPage {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(field_identifier, rename_all = "snake_case")]
+        enum Field {
+            ArtifactId,
+            Offset,
+            TotalBytes,
+            Sha256,
+            Payload,
+            EncodedBytes,
+            NextCursor,
+        }
+
+        struct PageVisitor;
+
+        impl<'de> Visitor<'de> for PageVisitor {
+            type Value = ArtifactContentPage;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a named ArtifactContentPage map")
+            }
+
+            fn visit_map<M: MapAccess<'de>>(self, mut map: M) -> Result<Self::Value, M::Error> {
+                let mut artifact_id = None;
+                let mut offset = None;
+                let mut total_bytes = None;
+                let mut sha256 = None;
+                let mut payload = None;
+                let mut encoded_bytes = None;
+                let mut next_cursor = None;
+
+                while let Some(field) = map.next_key()? {
+                    match field {
+                        Field::ArtifactId => {
+                            if artifact_id.is_some() {
+                                return Err(de::Error::duplicate_field("artifact_id"));
+                            }
+                            artifact_id = Some(map.next_value()?);
+                        }
+                        Field::Offset => {
+                            if offset.is_some() {
+                                return Err(de::Error::duplicate_field("offset"));
+                            }
+                            offset = Some(map.next_value()?);
+                        }
+                        Field::TotalBytes => {
+                            if total_bytes.is_some() {
+                                return Err(de::Error::duplicate_field("total_bytes"));
+                            }
+                            total_bytes = Some(map.next_value()?);
+                        }
+                        Field::Sha256 => {
+                            if sha256.is_some() {
+                                return Err(de::Error::duplicate_field("sha256"));
+                            }
+                            sha256 = Some(map.next_value()?);
+                        }
+                        Field::Payload => {
+                            if payload.is_some() {
+                                return Err(de::Error::duplicate_field("payload"));
+                            }
+                            let ArtifactContentBinary(bytes) = map.next_value()?;
+                            payload = Some(bytes);
+                        }
+                        Field::EncodedBytes => {
+                            if encoded_bytes.is_some() {
+                                return Err(de::Error::duplicate_field("encoded_bytes"));
+                            }
+                            encoded_bytes = Some(map.next_value()?);
+                        }
+                        Field::NextCursor => {
+                            if next_cursor.is_some() {
+                                return Err(de::Error::duplicate_field("next_cursor"));
+                            }
+                            let OptionalArtifactContentBinary(bytes) = map.next_value()?;
+                            next_cursor = Some(bytes);
+                        }
+                    }
+                }
+
+                Ok(ArtifactContentPage {
+                    artifact_id: artifact_id
+                        .ok_or_else(|| de::Error::missing_field("artifact_id"))?,
+                    offset: offset.ok_or_else(|| de::Error::missing_field("offset"))?,
+                    total_bytes: total_bytes
+                        .ok_or_else(|| de::Error::missing_field("total_bytes"))?,
+                    sha256: sha256.ok_or_else(|| de::Error::missing_field("sha256"))?,
+                    payload: payload.ok_or_else(|| de::Error::missing_field("payload"))?,
+                    encoded_bytes: encoded_bytes
+                        .ok_or_else(|| de::Error::missing_field("encoded_bytes"))?,
+                    next_cursor: next_cursor
+                        .ok_or_else(|| de::Error::missing_field("next_cursor"))?,
+                })
+            }
+        }
+
+        const FIELDS: &[&str] = &[
+            "artifact_id",
+            "offset",
+            "total_bytes",
+            "sha256",
+            "payload",
+            "encoded_bytes",
+            "next_cursor",
+        ];
+        deserializer.deserialize_struct("ArtifactContentPage", FIELDS, PageVisitor)
+    }
+}
+
+/// The confidence of a background-produced process accounting sample.
+///
+/// A numeric zero is not a substitute for a failed query or an unavailable
+/// first-sample baseline. Consumers must inspect this status before treating
+/// CPU/resource values as complete.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ProcessMetricStatus {
+    Complete,
+    Partial,
+    #[default]
+    Unknown,
+    Failed,
+}
+
+impl ProcessMetricStatus {
+    pub fn is_complete(self) -> bool {
+        matches!(self, Self::Complete)
+    }
+
+    pub fn is_failed(self) -> bool {
+        matches!(self, Self::Failed)
+    }
+}
+
+/// Immutable, background-produced accounting for one owned process tree.
+///
+/// This is intentionally a runtime projection rather than a durable domain
+/// fact. It carries enough information for consumers to distinguish a complete
+/// tree from a partial observation without making the render/input path query
+/// the operating system.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProcessAccountingSnapshot {
+    pub sampled_at: std::time::Duration,
+    pub interval: Option<std::time::Duration>,
+    pub logical_processors: u32,
+    pub machine_cpu_percent: f64,
+    pub core_equivalent_percent: f64,
+    pub memory_bytes: u64,
+    pub process_count: u32,
+    pub metrics_unavailable: bool,
+    pub status: ProcessMetricStatus,
+    /// A bounded, sanitized diagnostic for a failed/partial observation. Raw
+    /// command lines and environment values never enter this projection.
+    pub error: Option<String>,
+    /// Monotonic sampler generation. A new generation fences PID reuse and
+    /// counter baselines even when a PID number is recycled.
+    pub generation: u64,
+    pub io_read_bytes: Option<u64>,
+    pub io_write_bytes: Option<u64>,
+    pub members: Vec<ProcessAccountingMemberSnapshot>,
+}
+
+/// One unique Job-member observation in an accounting snapshot.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProcessAccountingMemberSnapshot {
+    pub pid: u32,
+    pub creation_time_100ns: Option<u64>,
+    pub machine_cpu_percent: Option<f64>,
+    pub core_equivalent_percent: Option<f64>,
+    /// Platform-private memory bytes. Windows uses `PrivateUsage` (private
+    /// committed bytes); Unix uses `/proc/<pid>/smaps_rollup` private
+    /// clean+dirty (private resident bytes). This is deliberately not named
+    /// working set.
+    pub private_memory_bytes: Option<u64>,
+    pub io_read_bytes: Option<u64>,
+    pub io_write_bytes: Option<u64>,
+    pub metrics_unavailable: bool,
+    pub status: ProcessMetricStatus,
+    pub executable: Option<String>,
+    pub generation: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::browser::BrowserBook;
+    use crate::domain::id::{
+        AgentSessionId, ApprovalId, EnvironmentId, ProjectId, QuestionId, TaskId, TurnId,
+    };
+    use crate::domain::task::{TaskAssignment, TaskFacts, TaskLifecycle, WorkspaceRef};
+
+    fn snapshot_with_primary_projection(
+        projection: ProviderSessionProjection,
+        lifecycle: TaskLifecycle,
+    ) -> TaskSnapshot {
+        let task_id = TaskId::new();
+        let agent_id = AgentSessionId::new();
+        let mut browser = BrowserBook::new();
+        let _ = browser.open_task(task_id);
+        let mut provider_sessions = BTreeMap::new();
+        provider_sessions.insert(agent_id, projection);
+        TaskSnapshot {
+            task: TaskFacts {
+                id: task_id,
+                environment_id: EnvironmentId::new(),
+                title: "Status".into(),
+                description: None,
+                project_id: ProjectId::new(),
+                workspace: WorkspaceRef::Main,
+                assignment: TaskAssignment::LocalOwner,
+                lifecycle,
+                action_epoch: 1,
+                revision: 1,
+                created_at_ms: 1,
+            },
+            connectivity: TaskConnectivity::Connected,
+            attention: TaskAttention::None,
+            activity: TaskActivity::Idle,
+            review_readiness: ReviewReadiness::NotReady,
+            agents: BTreeMap::new(),
+            primary_agent_id: Some(agent_id),
+            artifacts: BTreeMap::new(),
+            resources: BTreeMap::new(),
+            provider_sessions,
+            browser,
+            terminal_facts: Default::default(),
+            terminal_strip: Default::default(),
+        }
+    }
+
+    #[test]
+    fn unstarted_draft_requires_open_primary_without_bound_provider_identity() {
+        use crate::domain::agent::{AgentRole, AgentSessionFacts, AgentSessionLifecycle};
+        use crate::providers::ProviderKind;
+
+        let mut snap = snapshot_with_primary_projection(
+            ProviderSessionProjection::default(),
+            TaskLifecycle::Open,
+        );
+        let primary = snap.primary_agent_id.expect("primary");
+        let mut agent =
+            AgentSessionFacts::new(snap.task.id, AgentRole::Primary, ProviderKind::Codex, None)
+                .expect("agent");
+        agent.id = primary;
+        agent.lifecycle = AgentSessionLifecycle::Open;
+        agent.runtime_generation = 1;
+        snap.agents.insert(primary, agent);
+        assert!(snap.is_unstarted_draft());
+
+        snap.agents.get_mut(&primary).unwrap().provider_session_id =
+            Some(crate::domain::ProviderSessionId::new("sess-1").expect("id"));
+        assert!(!snap.is_unstarted_draft());
+    }
+
+    #[test]
+    fn visible_status_derives_from_primary_provider_session_projection() {
+        let mut approval = ProviderSessionProjection::default();
+        approval.open_approval = Some(ApprovalId::new());
+        assert_eq!(
+            snapshot_with_primary_projection(approval, TaskLifecycle::Open).visible_status(),
+            VisibleTaskStatus::NeedsApproval
+        );
+
+        let mut question = ProviderSessionProjection::default();
+        question.open_question = Some(QuestionId::new());
+        assert_eq!(
+            snapshot_with_primary_projection(question, TaskLifecycle::Open).visible_status(),
+            VisibleTaskStatus::NeedsAnswer
+        );
+
+        let mut working = ProviderSessionProjection::default();
+        working.current_turn = Some(TurnId::new());
+        assert_eq!(
+            snapshot_with_primary_projection(working, TaskLifecycle::Open).visible_status(),
+            VisibleTaskStatus::Working
+        );
+
+        assert_eq!(
+            snapshot_with_primary_projection(
+                ProviderSessionProjection::default(),
+                TaskLifecycle::Open
+            )
+            .visible_status(),
+            VisibleTaskStatus::Idle
+        );
+    }
+
+    #[test]
+    fn idle_provider_projection_preserves_explicit_attention_and_review_readiness() {
+        let mut needs_answer = snapshot_with_primary_projection(
+            ProviderSessionProjection::default(),
+            TaskLifecycle::Open,
+        );
+        needs_answer.attention = TaskAttention::NeedsAnswer;
+        assert_eq!(
+            needs_answer.visible_status(),
+            VisibleTaskStatus::NeedsAnswer
+        );
+
+        let mut ready = snapshot_with_primary_projection(
+            ProviderSessionProjection::default(),
+            TaskLifecycle::Open,
+        );
+        ready.review_readiness = ReviewReadiness::Ready;
+        assert_eq!(ready.visible_status(), VisibleTaskStatus::ReadyForReview);
+    }
+
+    #[test]
+    fn settled_lifecycle_stays_done_idle_despite_open_turn_projection() {
+        let mut working = ProviderSessionProjection::default();
+        working.current_turn = Some(TurnId::new());
+        assert_eq!(
+            snapshot_with_primary_projection(working, TaskLifecycle::Settled).visible_status(),
+            VisibleTaskStatus::Idle
+        );
+    }
+
+    #[test]
+    fn provider_plan_lifecycle_is_typed_and_excludes_presentation_only_notifications() {
+        assert_eq!(
+            provider_plan_step_lifecycle("taskCreated"),
+            Some(ProviderPlanStepLifecycle {
+                kind: PlanStepKind::Task,
+                status: PlanStepStatus::Pending,
+            })
+        );
+        assert_eq!(
+            provider_plan_step_lifecycle("subagentStarted"),
+            Some(ProviderPlanStepLifecycle {
+                kind: PlanStepKind::Subagent,
+                status: PlanStepStatus::Active,
+            })
+        );
+        assert_eq!(
+            provider_plan_step_lifecycle("taskCompleted").map(|lifecycle| lifecycle.status),
+            Some(PlanStepStatus::Completed)
+        );
+        assert_eq!(
+            provider_plan_step_lifecycle("subagentStopped").map(|lifecycle| lifecycle.status),
+            Some(PlanStepStatus::Completed)
+        );
+        assert_eq!(provider_plan_step_lifecycle("subagentCompleted"), None);
+    }
+
+    #[test]
+    fn plan_step_status_parser_never_claims_unknown_state_is_completed() {
+        assert_eq!(
+            PlanStepStatus::from_wire("pending"),
+            Some(PlanStepStatus::Pending)
+        );
+        assert_eq!(
+            PlanStepStatus::from_wire("in_progress"),
+            Some(PlanStepStatus::Active)
+        );
+        assert_eq!(
+            PlanStepStatus::from_wire("completed"),
+            Some(PlanStepStatus::Completed)
+        );
+        assert_eq!(
+            PlanStepStatus::from_wire("failed"),
+            Some(PlanStepStatus::Failed)
+        );
+        assert_eq!(PlanStepStatus::from_wire("future-provider-state"), None);
+    }
+
+    fn empty_snapshot_page() -> SnapshotPage {
+        SnapshotPage {
+            snapshot_id: SnapshotId::new(),
+            through_sequence: 1,
+            section: SnapshotSection::Tasks,
+            after_item: None,
+            items: Vec::new(),
+            encoded_bytes: 0,
+            next_cursor: None,
+        }
+    }
+
+    fn golden_snapshot_id() -> SnapshotId {
+        SnapshotId::from_bytes([
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x70, 0x00, 0x80, 0x01, 0x02, 0x03, 0x04, 0x05,
+            0x06, 0x07,
+        ])
+        .expect("valid snapshot UUIDv7")
+    }
+
+    fn golden_artifact_id() -> ArtifactId {
+        ArtifactId::from_bytes([
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x70, 0x01, 0x80, 0x08, 0x09, 0x0a, 0x0b, 0x0c,
+            0x0d, 0x0e,
+        ])
+        .expect("valid artifact UUIDv7")
+    }
+
+    fn golden_snapshot_page() -> SnapshotPage {
+        SnapshotPage {
+            snapshot_id: golden_snapshot_id(),
+            through_sequence: 1,
+            section: SnapshotSection::Tasks,
+            after_item: None,
+            items: Vec::new(),
+            encoded_bytes: 0,
+            next_cursor: None,
+        }
+    }
+
+    fn golden_artifact_content_page() -> ArtifactContentPage {
+        ArtifactContentPage {
+            artifact_id: golden_artifact_id(),
+            offset: 4,
+            total_bytes: 9,
+            sha256: [7; 32],
+            payload: vec![8, 9, 10],
+            encoded_bytes: 0,
+            next_cursor: Some(vec![11, 12]),
+        }
+    }
+
+    const SNAPSHOT_PAGE_NAMED_GOLDEN: &[u8] = &[
+        0x87, 0xab, 0x73, 0x6e, 0x61, 0x70, 0x73, 0x68, 0x6f, 0x74, 0x5f, 0x69, 0x64, 0xc4, 0x10,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x70, 0x00, 0x80, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06,
+        0x07, 0xb0, 0x74, 0x68, 0x72, 0x6f, 0x75, 0x67, 0x68, 0x5f, 0x73, 0x65, 0x71, 0x75, 0x65,
+        0x6e, 0x63, 0x65, 0x01, 0xa7, 0x73, 0x65, 0x63, 0x74, 0x69, 0x6f, 0x6e, 0xa5, 0x74, 0x61,
+        0x73, 0x6b, 0x73, 0xaa, 0x61, 0x66, 0x74, 0x65, 0x72, 0x5f, 0x69, 0x74, 0x65, 0x6d, 0xc0,
+        0xa5, 0x69, 0x74, 0x65, 0x6d, 0x73, 0x90, 0xad, 0x65, 0x6e, 0x63, 0x6f, 0x64, 0x65, 0x64,
+        0x5f, 0x62, 0x79, 0x74, 0x65, 0x73, 0x00, 0xab, 0x6e, 0x65, 0x78, 0x74, 0x5f, 0x63, 0x75,
+        0x72, 0x73, 0x6f, 0x72, 0xc0,
+    ];
+    const EVENT_PAGE_NAMED_GOLDEN: &[u8] = &[
+        0x84, 0xae, 0x61, 0x66, 0x74, 0x65, 0x72, 0x5f, 0x73, 0x65, 0x71, 0x75, 0x65, 0x6e, 0x63,
+        0x65, 0x03, 0xb0, 0x74, 0x68, 0x72, 0x6f, 0x75, 0x67, 0x68, 0x5f, 0x73, 0x65, 0x71, 0x75,
+        0x65, 0x6e, 0x63, 0x65, 0x08, 0xa6, 0x65, 0x76, 0x65, 0x6e, 0x74, 0x73, 0x90, 0xab, 0x6e,
+        0x65, 0x78, 0x74, 0x5f, 0x63, 0x75, 0x72, 0x73, 0x6f, 0x72, 0x93, 0x01, 0x02, 0x03,
+    ];
+    const ARTIFACT_CONTENT_PAGE_NAMED_GOLDEN: &[u8] = &[
+        0x87, 0xab, 0x61, 0x72, 0x74, 0x69, 0x66, 0x61, 0x63, 0x74, 0x5f, 0x69, 0x64, 0xc4, 0x10,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x70, 0x01, 0x80, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
+        0x0e, 0xa6, 0x6f, 0x66, 0x66, 0x73, 0x65, 0x74, 0x04, 0xab, 0x74, 0x6f, 0x74, 0x61, 0x6c,
+        0x5f, 0x62, 0x79, 0x74, 0x65, 0x73, 0x09, 0xa6, 0x73, 0x68, 0x61, 0x32, 0x35, 0x36, 0xdc,
+        0x00, 0x20, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07,
+        0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07,
+        0x07, 0x07, 0x07, 0x07, 0xa7, 0x70, 0x61, 0x79, 0x6c, 0x6f, 0x61, 0x64, 0xc4, 0x03, 0x08,
+        0x09, 0x0a, 0xad, 0x65, 0x6e, 0x63, 0x6f, 0x64, 0x65, 0x64, 0x5f, 0x62, 0x79, 0x74, 0x65,
+        0x73, 0x00, 0xab, 0x6e, 0x65, 0x78, 0x74, 0x5f, 0x63, 0x75, 0x72, 0x73, 0x6f, 0x72, 0xc4,
+        0x02, 0x0b, 0x0c,
+    ];
+
+    #[test]
+    fn snapshot_page_named_messagepack_matches_independent_golden_fixture() {
+        let encoded =
+            rmp_serde::to_vec_named(&golden_snapshot_page()).expect("encode snapshot page fixture");
+        assert_eq!(encoded, SNAPSHOT_PAGE_NAMED_GOLDEN);
+    }
+
+    #[test]
+    fn event_page_named_messagepack_matches_independent_golden_fixture() {
+        let page = EventPage {
+            after_sequence: 3,
+            through_sequence: 8,
+            events: Vec::new(),
+            next_cursor: Some(vec![1, 2, 3]),
+        };
+        let encoded = rmp_serde::to_vec_named(&page).expect("encode event page fixture");
+        assert_eq!(encoded, EVENT_PAGE_NAMED_GOLDEN);
+    }
+
+    #[test]
+    fn artifact_content_page_named_messagepack_matches_independent_golden_fixture() {
+        let encoded = rmp_serde::to_vec_named(&golden_artifact_content_page())
+            .expect("encode artifact content page fixture");
+        assert_eq!(encoded, ARTIFACT_CONTENT_PAGE_NAMED_GOLDEN);
+    }
+
+    #[test]
+    fn artifact_content_page_size_converges_across_messagepack_integer_width_boundary() {
+        let mut page = golden_artifact_content_page();
+
+        page.payload.clear();
+        page.next_cursor = None;
+        page.encoded_bytes = 0;
+        let zero_claim_length = rmp_serde::to_vec_named(&page)
+            .expect("encode zero-claim artifact content page")
+            .len();
+        assert!(
+            zero_claim_length > 127,
+            "fixture must put the final claim beyond positive fixint"
+        );
+
+        let encoded_bytes = canonical_artifact_content_page_size(&page).expect("canonical size");
+        let mut final_page = page.clone();
+        final_page.encoded_bytes = encoded_bytes;
+        let final_length = rmp_serde::to_vec_named(&final_page)
+            .expect("encode final artifact content page")
+            .len();
+
+        assert_eq!(encoded_bytes as usize, zero_claim_length + 1);
+        assert_eq!(encoded_bytes as usize, final_length);
+    }
+
+    #[test]
+    fn snapshot_page_size_converges_across_messagepack_integer_width_boundary() {
+        let mut page = empty_snapshot_page();
+        let mut found_boundary = false;
+
+        for cursor_len in 0..512 {
+            page.next_cursor = Some(vec![0; cursor_len]);
+            page.encoded_bytes = 0;
+            let zero_claim_length = rmp_serde::to_vec_named(&page)
+                .expect("encode zero-claim snapshot page")
+                .len();
+            if zero_claim_length != 128 {
+                continue;
+            }
+
+            let encoded_bytes = canonical_snapshot_page_size(&page).expect("canonical size");
+            let mut final_page = page.clone();
+            final_page.encoded_bytes = encoded_bytes;
+            let final_length = rmp_serde::to_vec_named(&final_page)
+                .expect("encode final snapshot page")
+                .len();
+
+            assert!(encoded_bytes as usize > zero_claim_length);
+            assert_eq!(encoded_bytes as usize, final_length);
+            found_boundary = true;
+            break;
+        }
+
+        assert!(
+            found_boundary,
+            "test fixture must reach the encoded_bytes MessagePack width boundary"
+        );
+    }
+
+    #[test]
+    fn canonical_snapshot_page_size_matches_final_named_messagepack_and_ignores_claim() {
+        let mut page = empty_snapshot_page();
+        page.encoded_bytes = u32::MAX;
+
+        let encoded_bytes = canonical_snapshot_page_size(&page).expect("canonical size");
+        page.encoded_bytes = encoded_bytes;
+
+        assert_eq!(
+            usize::try_from(encoded_bytes).expect("size fits"),
+            rmp_serde::to_vec_named(&page)
+                .expect("encode final snapshot page")
+                .len()
+        );
+    }
+
+    #[test]
+    fn canonical_event_page_size_matches_named_messagepack() {
+        let page = EventPage {
+            after_sequence: 3,
+            through_sequence: 8,
+            events: Vec::new(),
+            next_cursor: Some(vec![1, 2, 3]),
+        };
+
+        let encoded_bytes = canonical_event_page_size(&page).expect("canonical size");
+
+        assert_eq!(
+            usize::try_from(encoded_bytes).expect("size fits"),
+            rmp_serde::to_vec_named(&page)
+                .expect("encode event page")
+                .len()
+        );
+    }
+
+    #[test]
+    fn canonical_artifact_content_page_size_matches_final_named_messagepack_and_ignores_claim() {
+        let mut page = ArtifactContentPage {
+            artifact_id: ArtifactId::new(),
+            offset: 4,
+            total_bytes: 9,
+            sha256: [7; 32],
+            payload: vec![8, 9, 10],
+            encoded_bytes: u32::MAX,
+            next_cursor: Some(vec![11, 12]),
+        };
+
+        let encoded_bytes = canonical_artifact_content_page_size(&page).expect("canonical size");
+        page.encoded_bytes = encoded_bytes;
+
+        assert_eq!(
+            usize::try_from(encoded_bytes).expect("size fits"),
+            rmp_serde::to_vec_named(&page)
+                .expect("encode final artifact content page")
+                .len()
+        );
+    }
+}

@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "kind": "prompt_library_performance_v1",
+  "prompt_count": 5000,
+  "link_count": 2000,
+  "history_count": 500,
+  "virtualize_window": 80,
+  "fts_on_input_path": false,
+  "declared_virtualize_budget_us": 50000
+}

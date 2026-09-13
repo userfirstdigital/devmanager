@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "kind": "claude_code",
+  "version": "fixture-claude-1",
+  "auth_state": "authenticated_subscription",
+  "exact_resume": "supported",
+  "semantic_events": "supported",
+  "provider_session_id": "supported",
+  "build_launch": "unknown",
+  "parse_signal": "unknown",
+  "cooperative_stop": "unknown",
+  "observe_quota": "unknown",
+  "evidence": [
+    {
+      "source": "auth_status_probe",
+      "observed_at": 1700000000000,
+      "expires_at": 1700000001000,
+      "confidence": "high",
+      "auth_source": "claude_code_subscription_login",
+      "status": "authenticated",
+      "diagnostic": null
+    }
+  ]
+}

@@ -1,7 +1,11 @@
+//! Shared Wry task-browser runtime. Platform adapters own native windows and engine callbacks.
+
 use super::{
     acknowledge_attachment_projection_and_reconcile_pins, browser_user_input_initialization_script,
-    validate_browser_url, BrowserAppExitDisposition, BrowserHostState, BrowserMemoryTarget,
-    BrowserNativeWindowBuildLease, BrowserNativeWindowLifetime,
+    require_completed_wry_task_identity, validate_browser_url, BrowserAppExitDisposition,
+    BrowserHostState, BrowserMemoryTarget, BrowserNativeSurfaceBackend, BrowserNativeViewError,
+    BrowserNativeViewReceipt, BrowserNativeViewRegistration, BrowserNativeWindowBuildLease,
+    BrowserNativeWindowLifetime, BrowserTaskSurfaceBindBlocker, HostOwnedNativeSurfaceBackend,
 };
 use crate::browser::downloads::{
     prepare_verified_storage_layout, verified_app_config_root, verified_unique_download_path,
@@ -28,10 +32,12 @@ use crate::browser::{
     BrowserAnnotationLifecycle, BrowserAnnotationRoute, BrowserApprovalPolicy,
     BrowserApprovalRequest, BrowserAttachmentProjection, BrowserBounds, BrowserCommand,
     BrowserCommandRequest, BrowserConsoleEntry, BrowserConsoleOperation, BrowserDiagnosticLevel,
-    BrowserDownloadState, BrowserDownloadStore, BrowserError, BrowserHostControl, BrowserHostEvent,
-    BrowserHostStatus, BrowserInvocationActor, BrowserJournalActor, BrowserJournalEntry,
-    BrowserLocatorFailureTarget, BrowserNetworkEntry, BrowserNetworkOperation,
-    BrowserOperationQueue, BrowserOperationTarget, BrowserPageIpcMessage, BrowserPageLoadState,
+    BrowserDownloadState, BrowserDownloadStore, BrowserError, BrowserGatewayRegistrar,
+    BrowserHostControl, BrowserHostEvent, BrowserHostStatus, BrowserInvocationActor,
+    BrowserInvocationContext, BrowserJournalActor, BrowserJournalEntry,
+    BrowserLocatorFailureTarget, BrowserNativeHostCommand, BrowserNativeHostOutcome,
+    BrowserNativeLeaseFence, BrowserNetworkEntry, BrowserNetworkOperation, BrowserOperationQueue,
+    BrowserOperationTarget, BrowserPageIpcMessage, BrowserPageLoadState,
     BrowserPageRecordingAuthority, BrowserPageRecordingEnvelope, BrowserPageRecordingIngress,
     BrowserPageRecordingIpc, BrowserPageRecordingIpcError, BrowserPageRecordingSubmit,
     BrowserPageRecordingTransport, BrowserPageRecordingTransportFailureKind, BrowserPaneSurface,
@@ -45,11 +51,15 @@ use crate::browser::{
     BrowserWorkflowReviewProjection, BrowserWorkspaceKey, BrowserWorkspaceSnapshot,
     MAX_BROWSER_ACTIONS, MAX_BROWSER_RECIPE_WAIT_MS,
 };
+use crate::domain::id::ClientId;
+use crate::protocol::{
+    BrowserAttachRequest, BrowserDpi, BrowserHostProcessIdentity, BrowserPhysicalBounds,
+    BrowserSurfaceDescriptor, BrowserSurfaceIdentity, BrowserSurfaceLifecycle, BrowserWindowHandle,
+};
 use base64::Engine as _;
 use gpui::{ForegroundExecutor, Task};
 use raw_window_handle::{
-    HandleError, HasWindowHandle, RawWindowHandle, Win32WindowHandle,
-    WindowHandle as BorrowedWindowHandle,
+    HandleError, HasWindowHandle, RawWindowHandle, WindowHandle as BorrowedWindowHandle,
 };
 use rfd::{MessageButtons, MessageDialog, MessageDialogResult, MessageLevel};
 use serde::Deserialize;
@@ -63,6 +73,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+#[cfg(target_os = "windows")]
 use webview2_com::Microsoft::Web::WebView2::Win32::{
     COREWEBVIEW2_PERMISSION_KIND, COREWEBVIEW2_PERMISSION_KIND_CAMERA,
     COREWEBVIEW2_PERMISSION_KIND_CLIPBOARD_READ, COREWEBVIEW2_PERMISSION_KIND_FILE_READ_WRITE,
@@ -70,17 +81,23 @@ use webview2_com::Microsoft::Web::WebView2::Win32::{
     COREWEBVIEW2_PERMISSION_KIND_NOTIFICATIONS, COREWEBVIEW2_PERMISSION_STATE_ALLOW,
     COREWEBVIEW2_PERMISSION_STATE_DENY,
 };
+#[cfg(target_os = "windows")]
 use webview2_com::{
     CallDevToolsProtocolMethodCompletedHandler, ContentLoadingEventHandler,
     NavigationCompletedEventHandler, PermissionRequestedEventHandler,
 };
+#[cfg(target_os = "windows")]
 use windows::core::{BOOL, HSTRING};
-use wry::dpi::{LogicalPosition, LogicalSize};
-use wry::{
-    MemoryUsageLevel, NewWindowResponse, PageLoadEvent, Rect, WebContext, WebView, WebViewBuilder,
-    WebViewExtWindows,
-};
+use wry::dpi::{PhysicalPosition, PhysicalSize};
+#[cfg(target_os = "windows")]
+use wry::{MemoryUsageLevel, WebView, WebViewExtWindows};
+use wry::{NewWindowResponse, PageLoadEvent, Rect, WebContext, WebViewBuilder};
 use zeroize::{Zeroize, Zeroizing};
+#[cfg(target_os = "linux")]
+#[path = "linux_webview.rs"]
+mod linux_webview;
+#[cfg(target_os = "linux")]
+use linux_webview::*;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct BrowserViewKey {
@@ -94,6 +111,17 @@ enum BrowserNativeViewBuildAdmission {
     Queued { build_id: u64 },
     Pending { build_id: u64 },
     Failed { message: String },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BrowserNativeViewBuildError {
+    BuildIdExhausted,
+}
+
+impl std::fmt::Display for BrowserNativeViewBuildError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("browser native view build identity is exhausted")
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -116,25 +144,25 @@ impl BrowserNativeViewBuildQueue {
         &mut self,
         key: BrowserViewKey,
         retry_failed: bool,
-    ) -> BrowserNativeViewBuildAdmission {
+    ) -> Result<BrowserNativeViewBuildAdmission, BrowserNativeViewBuildError> {
         if let Some(build_id) = self.pending.get(&key).copied() {
-            return BrowserNativeViewBuildAdmission::Pending { build_id };
+            return Ok(BrowserNativeViewBuildAdmission::Pending { build_id });
         }
         if let Some(message) = self.failures.get(&key).cloned() {
             if !retry_failed {
-                return BrowserNativeViewBuildAdmission::Failed { message };
+                return Ok(BrowserNativeViewBuildAdmission::Failed { message });
             }
             self.failures.remove(&key);
         }
-        let build_id = self.next_id();
+        let build_id = self.next_id()?;
         self.pending.insert(key.clone(), build_id);
         let project_id = key.workspace_key.project_id.clone();
         if self.active_projects.contains_key(&project_id) {
             self.waiting.push_back((key, build_id));
-            BrowserNativeViewBuildAdmission::Queued { build_id }
+            Ok(BrowserNativeViewBuildAdmission::Queued { build_id })
         } else {
             self.active_projects.insert(project_id, build_id);
-            BrowserNativeViewBuildAdmission::Start { build_id }
+            Ok(BrowserNativeViewBuildAdmission::Start { build_id })
         }
     }
 
@@ -152,8 +180,9 @@ impl BrowserNativeViewBuildQueue {
         let accepted = self.pending.get(key) == Some(&build_id);
         if accepted {
             self.pending.remove(key);
-            if let Err(message) = result {
-                self.failures.insert(key.clone(), message);
+            if result.is_err() {
+                self.failures
+                    .insert(key.clone(), "browser native view build failed".to_string());
             }
         }
         let next = owned_project_lease
@@ -232,18 +261,13 @@ impl BrowserNativeViewBuildQueue {
         Some(next)
     }
 
-    fn next_id(&mut self) -> u64 {
-        loop {
-            self.next_build_id = self.next_build_id.wrapping_add(1).max(1);
-            if !self
-                .pending
-                .values()
-                .chain(self.active_projects.values())
-                .any(|build_id| *build_id == self.next_build_id)
-            {
-                return self.next_build_id;
-            }
-        }
+    fn next_id(&mut self) -> Result<u64, BrowserNativeViewBuildError> {
+        let next = self
+            .next_build_id
+            .checked_add(1)
+            .ok_or(BrowserNativeViewBuildError::BuildIdExhausted)?;
+        self.next_build_id = next;
+        Ok(next)
     }
 }
 
@@ -262,6 +286,25 @@ struct BrowserDocumentSecretInner {
     repair_highlight_token: Option<BrowserReplayRepairHighlightToken>,
     repair_highlight_previous_token: Option<BrowserReplayRepairHighlightToken>,
     repair_highlight_previous_consumed: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BrowserDocumentSecretGenerationError {
+    StateUnavailable,
+    GenerationExhausted,
+    ExposureCountExhausted,
+    ExposureUnderflow,
+}
+
+impl std::fmt::Display for BrowserDocumentSecretGenerationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::StateUnavailable => "browser document secret state is unavailable",
+            Self::GenerationExhausted => "browser document generation is exhausted",
+            Self::ExposureCountExhausted => "browser document exposure count is exhausted",
+            Self::ExposureUnderflow => "browser document exposure count is invalid",
+        })
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -286,75 +329,137 @@ impl Clone for BrowserDocumentSecretExposure {
 }
 
 impl BrowserDocumentSecretExposure {
-    fn finish(&self) {
+    fn finish(&self) -> Result<(), BrowserDocumentSecretGenerationError> {
         if self.finished.swap(true, Ordering::AcqRel) {
-            return;
+            return Ok(());
         }
-        self.state.finish_exposure();
+        self.state.finish_exposure()
+    }
+
+    fn mark_failed(&self) {
+        self.state.mark_failed();
     }
 }
 
 impl BrowserDocumentSecretState {
-    fn begin_exposure(self: &Arc<Self>) -> BrowserDocumentSecretExposure {
+    fn mark_failed(&self) {
         if let Ok(mut inner) = self.inner.lock() {
             inner.tainted = true;
-            inner.exposure_generation = inner.exposure_generation.saturating_add(1);
-            inner.in_flight_exposures = inner.in_flight_exposures.saturating_add(1);
             inner.latest_content_loading = None;
-        }
-        BrowserDocumentSecretExposure {
-            state: Arc::clone(self),
-            finished: Arc::new(AtomicBool::new(false)),
         }
     }
 
-    fn finish_exposure(&self) {
-        if let Ok(mut inner) = self.inner.lock() {
-            inner.in_flight_exposures = inner.in_flight_exposures.saturating_sub(1);
-            inner.exposure_generation = inner.exposure_generation.saturating_add(1);
-        }
+    fn begin_exposure(
+        self: &Arc<Self>,
+    ) -> Result<BrowserDocumentSecretExposure, BrowserDocumentSecretGenerationError> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| BrowserDocumentSecretGenerationError::StateUnavailable)?;
+        let exposure_generation = inner
+            .exposure_generation
+            .checked_add(1)
+            .ok_or(BrowserDocumentSecretGenerationError::GenerationExhausted)?;
+        let in_flight_exposures = inner
+            .in_flight_exposures
+            .checked_add(1)
+            .ok_or(BrowserDocumentSecretGenerationError::ExposureCountExhausted)?;
+        inner.tainted = true;
+        inner.exposure_generation = exposure_generation;
+        inner.in_flight_exposures = in_flight_exposures;
+        inner.latest_content_loading = None;
+        Ok(BrowserDocumentSecretExposure {
+            state: Arc::clone(self),
+            finished: Arc::new(AtomicBool::new(false)),
+        })
+    }
+
+    fn finish_exposure(&self) -> Result<(), BrowserDocumentSecretGenerationError> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| BrowserDocumentSecretGenerationError::StateUnavailable)?;
+        let in_flight_exposures = inner
+            .in_flight_exposures
+            .checked_sub(1)
+            .ok_or(BrowserDocumentSecretGenerationError::ExposureUnderflow)?;
+        let exposure_generation = inner
+            .exposure_generation
+            .checked_add(1)
+            .ok_or(BrowserDocumentSecretGenerationError::GenerationExhausted)?;
+        inner.in_flight_exposures = in_flight_exposures;
+        inner.exposure_generation = exposure_generation;
+        Ok(())
     }
 
     #[cfg(test)]
-    fn mark_tainted(&self) {
-        if let Ok(mut inner) = self.inner.lock() {
-            inner.tainted = true;
-            inner.exposure_generation = inner.exposure_generation.saturating_add(1);
-            inner.latest_content_loading = None;
-        }
+    fn mark_tainted(&self) -> Result<(), BrowserDocumentSecretGenerationError> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| BrowserDocumentSecretGenerationError::StateUnavailable)?;
+        inner.exposure_generation = inner
+            .exposure_generation
+            .checked_add(1)
+            .ok_or(BrowserDocumentSecretGenerationError::GenerationExhausted)?;
+        inner.tainted = true;
+        inner.latest_content_loading = None;
+        Ok(())
     }
 
     fn is_tainted(&self) -> bool {
         self.inner.lock().map_or(true, |inner| inner.tainted)
     }
 
-    fn content_loading(&self, navigation_id: u64, is_error_page: bool) {
-        if let Ok(mut inner) = self.inner.lock() {
-            inner.document_generation = inner.document_generation.saturating_add(1);
-            inner.repair_highlight_token = None;
-            inner.repair_highlight_previous_token = None;
-            inner.repair_highlight_previous_consumed = false;
-            inner.latest_content_loading = Some(BrowserDocumentNavigationCandidate {
-                navigation_id,
-                exposure_generation: inner.exposure_generation,
-                is_error_page,
-            });
-        }
-    }
-
-    fn document_generation(&self) -> u64 {
-        self.inner
+    fn content_loading(
+        &self,
+        navigation_id: u64,
+        is_error_page: bool,
+    ) -> Result<(), BrowserDocumentSecretGenerationError> {
+        let mut inner = self
+            .inner
             .lock()
-            .map_or(u64::MAX, |inner| inner.document_generation)
+            .map_err(|_| BrowserDocumentSecretGenerationError::StateUnavailable)?;
+        inner.document_generation = inner
+            .document_generation
+            .checked_add(1)
+            .ok_or(BrowserDocumentSecretGenerationError::GenerationExhausted)?;
+        inner.repair_highlight_token = None;
+        inner.repair_highlight_previous_token = None;
+        inner.repair_highlight_previous_consumed = false;
+        inner.latest_content_loading = Some(BrowserDocumentNavigationCandidate {
+            navigation_id,
+            exposure_generation: inner.exposure_generation,
+            is_error_page,
+        });
+        Ok(())
     }
 
-    fn invalidate_repair_highlight(&self) {
-        if let Ok(mut inner) = self.inner.lock() {
-            inner.document_generation = inner.document_generation.saturating_add(1);
-            inner.repair_highlight_token = None;
-            inner.repair_highlight_previous_token = None;
-            inner.repair_highlight_previous_consumed = false;
+    fn document_generation(&self) -> Result<u64, BrowserDocumentSecretGenerationError> {
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|_| BrowserDocumentSecretGenerationError::StateUnavailable)?;
+        if inner.document_generation == u64::MAX {
+            Err(BrowserDocumentSecretGenerationError::GenerationExhausted)
+        } else {
+            Ok(inner.document_generation)
         }
+    }
+
+    fn invalidate_repair_highlight(&self) -> Result<(), BrowserDocumentSecretGenerationError> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| BrowserDocumentSecretGenerationError::StateUnavailable)?;
+        inner.document_generation = inner
+            .document_generation
+            .checked_add(1)
+            .ok_or(BrowserDocumentSecretGenerationError::GenerationExhausted)?;
+        inner.repair_highlight_token = None;
+        inner.repair_highlight_previous_token = None;
+        inner.repair_highlight_previous_consumed = false;
+        Ok(())
     }
 
     fn install_repair_highlight(
@@ -466,27 +571,37 @@ impl BrowserDocumentSecretState {
             == page_resulting_token
     }
 
-    fn navigation_completed(&self, navigation_id: u64, is_success: bool) {
-        if let Ok(mut inner) = self.inner.lock() {
-            inner.document_generation = inner.document_generation.saturating_add(1);
-            inner.repair_highlight_token = None;
-            inner.repair_highlight_previous_token = None;
-            inner.repair_highlight_previous_consumed = false;
-            let Some(candidate) = inner.latest_content_loading else {
-                return;
-            };
-            if candidate.navigation_id != navigation_id {
-                return;
-            }
-            inner.latest_content_loading = None;
-            if is_success
-                && !candidate.is_error_page
-                && candidate.exposure_generation == inner.exposure_generation
-                && inner.in_flight_exposures == 0
-            {
-                inner.tainted = false;
-            }
+    fn navigation_completed(
+        &self,
+        navigation_id: u64,
+        is_success: bool,
+    ) -> Result<(), BrowserDocumentSecretGenerationError> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| BrowserDocumentSecretGenerationError::StateUnavailable)?;
+        inner.document_generation = inner
+            .document_generation
+            .checked_add(1)
+            .ok_or(BrowserDocumentSecretGenerationError::GenerationExhausted)?;
+        inner.repair_highlight_token = None;
+        inner.repair_highlight_previous_token = None;
+        inner.repair_highlight_previous_consumed = false;
+        let Some(candidate) = inner.latest_content_loading else {
+            return Ok(());
+        };
+        if candidate.navigation_id != navigation_id {
+            return Ok(());
         }
+        inner.latest_content_loading = None;
+        if is_success
+            && !candidate.is_error_page
+            && candidate.exposure_generation == inner.exposure_generation
+            && inner.in_flight_exposures == 0
+        {
+            inner.tainted = false;
+        }
+        Ok(())
     }
 }
 
@@ -704,7 +819,6 @@ enum BrowserStartResult {
 struct BrowserScriptEnvelope {
     ok: bool,
     value: Option<Value>,
-    error: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -729,7 +843,7 @@ struct BrowserProjectRuntime {
 }
 
 struct BrowserParentWindowLease {
-    handle: Win32WindowHandle,
+    handle: RawWindowHandle,
     window_lease: BrowserNativeWindowBuildLease,
 }
 
@@ -738,25 +852,35 @@ impl BrowserParentWindowLease {
         window: &gpui::Window,
         lifetime: &BrowserNativeWindowLifetime,
     ) -> Result<Self, BrowserError> {
-        let handle = HasWindowHandle::window_handle(window).map_err(view_failure)?;
-        let RawWindowHandle::Win32(handle) = handle.as_raw() else {
-            return Err(BrowserError::CrashedView {
-                message: "GPUI did not expose a Win32 parent window handle".to_string(),
-            });
+        let handle =
+            HasWindowHandle::window_handle(window).map_err(|_| BrowserError::CrashedView {
+                message: "browser parent window handle is unavailable".to_string(),
+            })?;
+        let handle = handle.as_raw();
+        // XCB and Xlib use the same server-side XID. Wry accepts an Xlib
+        // window handle; retain GPUI's exact lifetime lease across this conversion.
+        #[cfg(target_os = "linux")]
+        let handle = match handle {
+            RawWindowHandle::Xcb(xcb) => RawWindowHandle::Xlib(
+                raw_window_handle::XlibWindowHandle::new(u64::from(xcb.window.get())),
+            ),
+            handle => handle,
         };
-        let window_identity = handle.hwnd.get();
+        let window_identity =
+            native_parent_window_identity(handle).ok_or_else(|| BrowserError::CrashedView {
+                message: "embedded browser requires a supported native parent window".to_string(),
+            })?;
         let generation =
             lifetime
                 .bind_window(window_identity)
-                .ok_or_else(|| BrowserError::CrashedView {
-                    message: "browser parent window is closing or still leased by another window"
-                        .to_string(),
+                .map_err(|_| BrowserError::CrashedView {
+                    message: "browser parent window is not accepting native builds".to_string(),
                 })?;
-        let window_lease = lifetime
-            .acquire(window_identity, generation)
-            .ok_or_else(|| BrowserError::CrashedView {
+        let window_lease = lifetime.acquire(window_identity, generation).map_err(|_| {
+            BrowserError::CrashedView {
                 message: "browser parent window stopped accepting native builds".to_string(),
-            })?;
+            }
+        })?;
         Ok(Self {
             handle,
             window_lease,
@@ -776,7 +900,7 @@ impl HasWindowHandle for BrowserParentWindowLease {
         // SAFETY: this non-cloneable wrapper owns a native-window lease acquired with this exact
         // HWND. DevManager closes admission before teardown and defers window destruction until
         // every queued, executing, and completed-but-unpumped wrapper has been dropped.
-        Ok(unsafe { BorrowedWindowHandle::borrow_raw(RawWindowHandle::Win32(self.handle)) })
+        Ok(unsafe { BorrowedWindowHandle::borrow_raw(self.handle) })
     }
 }
 
@@ -795,6 +919,32 @@ impl BrowserNativeViewBuildCancellation {
     }
 }
 
+#[derive(Clone, Copy)]
+struct PreparedTaskSurface {
+    identity: BrowserSurfaceIdentity,
+    agent_session_id: crate::domain::id::AgentSessionId,
+}
+
+fn completed_task_aware_identity(
+    prepared: Option<PreparedTaskSurface>,
+    surface_identity: Option<BrowserSurfaceIdentity>,
+    agent_session_id: Option<crate::domain::id::AgentSessionId>,
+) -> Result<
+    Option<(BrowserSurfaceIdentity, crate::domain::id::AgentSessionId)>,
+    BrowserTaskSurfaceBindBlocker,
+> {
+    match (prepared, surface_identity, agent_session_id) {
+        (None, None, None) => Ok(None),
+        (Some(prepared), Some(identity), Some(agent_session_id))
+            if prepared.identity == identity && prepared.agent_session_id == agent_session_id =>
+        {
+            let identity = require_completed_wry_task_identity(Some(identity))?;
+            Ok(Some((identity, agent_session_id)))
+        }
+        _ => Err(BrowserTaskSurfaceBindBlocker::TaskIdentityUnavailableAtBuildCompletion),
+    }
+}
+
 struct BrowserNativeViewBuildSpec {
     build_id: u64,
     key: BrowserViewKey,
@@ -807,6 +957,8 @@ struct BrowserNativeViewBuildSpec {
     document_secret_state: Arc<BrowserDocumentSecretState>,
     parent_window: BrowserParentWindowLease,
     cancellation: BrowserNativeViewBuildCancellation,
+    surface_identity: Option<BrowserSurfaceIdentity>,
+    agent_session_id: Option<crate::domain::id::AgentSessionId>,
 }
 
 struct BrowserNativeViewBuildJob {
@@ -822,6 +974,8 @@ struct BrowserNativeViewBuildCompletion {
     document_secret_state: Arc<BrowserDocumentSecretState>,
     result: Result<WebView, BrowserError>,
     parent_window: BrowserParentWindowLease,
+    surface_identity: Option<BrowserSurfaceIdentity>,
+    agent_session_id: Option<crate::domain::id::AgentSessionId>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -844,6 +998,8 @@ impl BrowserNativeViewBuildJob {
             document_secret_state,
             parent_window,
             cancellation,
+            surface_identity,
+            agent_session_id,
         } = self.spec;
         let workspace_key = key.workspace_key.clone();
         let tab_id = key.tab_id.clone();
@@ -863,18 +1019,29 @@ impl BrowserNativeViewBuildJob {
                 bounds,
             );
             match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                builder.build_as_child(&parent_window)
+                #[cfg(target_os = "windows")]
+                {
+                    builder.build_as_child(&parent_window)
+                }
+                #[cfg(target_os = "linux")]
+                {
+                    WebView::build_child(builder, &parent_window, bounds)
+                }
             })) {
                 Ok(Ok(webview)) => Ok(webview),
                 Ok(Err(error)) => Err(view_failure(error)),
-                Err(payload) => Err(BrowserError::CrashedView {
-                    message: format!(
-                        "Wry panicked while creating a child WebView: {}",
-                        panic_message(payload)
-                    ),
+                Err(_payload) => Err(BrowserError::CrashedView {
+                    message: "Wry panicked while creating a child WebView".to_string(),
                 }),
             }
             .and_then(|webview| {
+                #[cfg(target_os = "linux")]
+                attach_navigation_error_handler(
+                    &webview,
+                    event_sender.clone(),
+                    workspace_key.clone(),
+                    tab_id.clone(),
+                );
                 attach_document_lifecycle_handlers(&webview, document_secret_state.clone())?;
                 attach_permission_handler(
                     &webview,
@@ -884,6 +1051,7 @@ impl BrowserNativeViewBuildJob {
                     tab_id,
                 )?;
                 webview.set_visible(false).map_err(view_failure)?;
+                #[cfg(target_os = "windows")]
                 webview
                     .set_memory_usage_level(MemoryUsageLevel::Low)
                     .map_err(view_failure)?;
@@ -898,6 +1066,8 @@ impl BrowserNativeViewBuildJob {
             document_secret_state,
             result,
             parent_window,
+            surface_identity,
+            agent_session_id,
         }
     }
 }
@@ -933,6 +1103,15 @@ pub struct BrowserWebViewHost {
     status: BrowserHostStatus,
     trusted_app_config_dir: Option<PathBuf>,
     state: BrowserHostState,
+    /// Sole host-owned native surface backend. No second WebView registry.
+    surface_backend: HostOwnedNativeSurfaceBackend,
+    task_surface_bind_blocker: Option<BrowserTaskSurfaceBindBlocker>,
+    prepared_task_surfaces: HashMap<BrowserViewKey, PreparedTaskSurface>,
+    pending_task_surface: Option<(BrowserWorkspaceKey, PreparedTaskSurface)>,
+    task_surface_capture_active: bool,
+    gateway_registrar: Option<BrowserGatewayRegistrar>,
+    native_shell_lease_fence: BrowserNativeLeaseFence,
+    published_host_bindings: HashMap<BrowserViewKey, String>,
     projects: HashMap<String, BrowserProjectRuntime>,
     views: HashMap<BrowserViewKey, WebView>,
     pending_native_view_teardown: Option<BrowserNativeViewTeardown>,
@@ -976,28 +1155,28 @@ struct BrowserNativeViewTeardown {
 impl BrowserWebViewHost {
     pub fn new(app_config_dir: impl AsRef<Path>) -> Self {
         let app_config_dir = absolute_path(app_config_dir.as_ref());
-        let mut status = match wry::webview_version() {
+        let mut status = match initialize_webview_runtime() {
             Ok(version) => BrowserHostStatus {
                 available: true,
                 platform: std::env::consts::OS.to_string(),
                 version: Some(version),
                 diagnostic: None,
             },
-            Err(error) => BrowserHostStatus {
+            Err(_) => BrowserHostStatus {
                 available: false,
                 platform: std::env::consts::OS.to_string(),
                 version: None,
-                diagnostic: Some(format!("WebView2 runtime is unavailable: {error}")),
+                diagnostic: Some("Embedded browser runtime is unavailable".to_string()),
             },
         };
         let trusted_app_config_dir = if status.available {
             match verified_app_config_root(&app_config_dir) {
                 Ok(trusted_app_config_dir) => Some(trusted_app_config_dir),
-                Err(error) => {
+                Err(_) => {
                     status.available = false;
-                    status.diagnostic = Some(format!(
-                        "Browser storage is unavailable; browser tools are disabled: {error}"
-                    ));
+                    status.diagnostic = Some(
+                        "Browser storage is unavailable; browser tools are disabled".to_string(),
+                    );
                     None
                 }
             }
@@ -1007,7 +1186,7 @@ impl BrowserWebViewHost {
         Self::with_status(app_config_dir, trusted_app_config_dir, status)
     }
 
-    pub fn unavailable(diagnostic: impl Into<String>) -> Self {
+    pub fn unavailable(_diagnostic: impl Into<String>) -> Self {
         Self::with_status(
             PathBuf::new(),
             None,
@@ -1015,7 +1194,7 @@ impl BrowserWebViewHost {
                 available: false,
                 platform: std::env::consts::OS.to_string(),
                 version: None,
-                diagnostic: Some(diagnostic.into()),
+                diagnostic: Some("browser host is unavailable".to_string()),
             },
         )
     }
@@ -1023,7 +1202,7 @@ impl BrowserWebViewHost {
     fn with_status(
         app_config_dir: PathBuf,
         trusted_app_config_dir: Option<PathBuf>,
-        status: BrowserHostStatus,
+        mut status: BrowserHostStatus,
     ) -> Self {
         let (event_sender, event_receiver) = mpsc::channel();
         let (async_sender, async_receiver) = mpsc::channel();
@@ -1033,9 +1212,30 @@ impl BrowserWebViewHost {
             .as_ref()
             .unwrap_or(&app_config_dir)
             .clone();
+        let state = match BrowserHostState::new(&state_app_config_dir) {
+            Ok(state) => state,
+            Err(_) => {
+                let mut unavailable_status = status;
+                unavailable_status.available = false;
+                unavailable_status.version = None;
+                unavailable_status.diagnostic = Some(
+                    "Browser host authority is unavailable; browser tools are disabled".to_string(),
+                );
+                status = unavailable_status;
+                BrowserHostState::unavailable(&state_app_config_dir)
+            }
+        };
         Self {
             status,
-            state: BrowserHostState::new(state_app_config_dir),
+            state,
+            surface_backend: HostOwnedNativeSurfaceBackend::new(),
+            task_surface_bind_blocker: None,
+            prepared_task_surfaces: HashMap::new(),
+            pending_task_surface: None,
+            task_surface_capture_active: false,
+            gateway_registrar: None,
+            native_shell_lease_fence: BrowserNativeLeaseFence::default(),
+            published_host_bindings: HashMap::new(),
             trusted_app_config_dir,
             projects: HashMap::new(),
             views: HashMap::new(),
@@ -1081,7 +1281,773 @@ impl BrowserWebViewHost {
     }
 
     pub fn status(&self) -> BrowserHostStatus {
-        self.status.clone()
+        BrowserHostStatus {
+            available: self.status.available,
+            platform: bounded_host_platform_token(&self.status.platform),
+            version: self
+                .status
+                .version
+                .as_deref()
+                .map(bounded_host_version_token),
+            diagnostic: self
+                .status
+                .diagnostic
+                .as_ref()
+                .map(|_| "browser host reported a diagnostic".to_string()),
+        }
+    }
+
+    /// Delegate registration to the sole host-owned WebView authority.  The
+    /// backend must prove the live, host-owned HWNDs before state is issued.
+    pub fn register_native_view_with_backend<B: super::BrowserNativeSurfaceBackend>(
+        &mut self,
+        registration: BrowserNativeViewRegistration,
+        backend: &mut B,
+    ) -> Result<BrowserNativeViewReceipt, BrowserNativeViewError> {
+        self.state
+            .register_native_view_with_backend(registration, backend)
+    }
+
+    /// Bind an already-built Wry/WebView2 view into task-aware BrowserHostState
+    /// through the host-owned sealed backend. Registration occurs only after
+    /// live child and parking HWNDs are observed from the one owner registry.
+    pub fn bind_task_surface_for_built_view(
+        &mut self,
+        identity: BrowserSurfaceIdentity,
+        workspace_key: &BrowserWorkspaceKey,
+        tab_id: &str,
+        host_process: BrowserHostProcessIdentity,
+        physical_bounds: BrowserPhysicalBounds,
+        dpi: BrowserDpi,
+    ) -> Result<BrowserNativeViewReceipt, BrowserNativeViewError> {
+        let key = BrowserViewKey {
+            workspace_key: workspace_key.clone(),
+            tab_id: tab_id.to_string(),
+        };
+        let webview = self
+            .views
+            .get(&key)
+            .ok_or(BrowserNativeViewError::MissingView)?;
+        let child = child_hwnd_from_webview(webview)?;
+        let parking = parking_hwnd_from_lifetime(&self.native_window_lifetime)?;
+        if child == parking {
+            return Err(BrowserNativeViewError::LiveWryObservationUnavailable);
+        }
+        if self
+            .surface_backend
+            .admit_host_allocation(&child, &parking, physical_bounds)
+            .is_err()
+        {
+            return Err(BrowserNativeViewError::Backend);
+        }
+        let registration = match BrowserNativeViewRegistration::from_host_record(
+            identity,
+            child.clone(),
+            parking.clone(),
+            host_process,
+            physical_bounds,
+            dpi,
+        ) {
+            Ok(registration) => registration,
+            Err(error) => {
+                let _ = self.surface_backend.release_host_allocation(&child);
+                return Err(error);
+            }
+        };
+        let webview = match self.views.get(&key) {
+            Some(webview) => webview,
+            None => {
+                let _ = self.surface_backend.release_host_allocation(&child);
+                return Err(BrowserNativeViewError::MissingView);
+            }
+        };
+        if Self::reparent_wry_view(webview, &parking).is_err() {
+            let _ = self.surface_backend.release_host_allocation(&child);
+            return Err(BrowserNativeViewError::LiveWryObservationUnavailable);
+        }
+        match child_hwnd_from_webview(webview) {
+            Ok(observed) if observed == child => {}
+            _ => {
+                let _ = self.surface_backend.release_host_allocation(&child);
+                return Err(BrowserNativeViewError::LiveWryObservationUnavailable);
+            }
+        }
+        match self
+            .state
+            .register_native_view_with_backend(registration, &mut self.surface_backend)
+        {
+            Ok(receipt) => Ok(receipt),
+            Err(error) => {
+                let _ = self.surface_backend.release_host_allocation(&child);
+                Err(error)
+            }
+        }
+    }
+
+    pub fn host_owned_surface_proof(
+        &self,
+        identity: &BrowserSurfaceIdentity,
+    ) -> Result<super::BrowserHostOwnedSurfaceProof, BrowserNativeViewError> {
+        let descriptor = self.state.unverified_surface_descriptor(identity)?;
+        let webview = self
+            .views
+            .values()
+            .find(|webview| {
+                child_hwnd_from_webview(webview)
+                    .ok()
+                    .is_some_and(|child| child == descriptor.child_hwnd)
+            })
+            .ok_or(BrowserNativeViewError::LiveWryObservationUnavailable)?;
+
+        // `child_hwnd_from_webview` validates the actual Wry container HWND,
+        // its live WebView2 controller parent, and the environment handles.
+        // Only this observation may mint a proof; BrowserHostState alone cannot.
+        let observed_child = child_hwnd_from_webview(webview)?;
+        if observed_child != descriptor.child_hwnd {
+            return Err(BrowserNativeViewError::LiveWryObservationUnavailable);
+        }
+        #[cfg(target_os = "windows")]
+        return Ok(super::BrowserHostOwnedSurfaceProof::from_windows_child_observation(descriptor));
+        #[cfg(target_os = "linux")]
+        return Ok(super::BrowserHostOwnedSurfaceProof::from_linux_child_observation(descriptor));
+    }
+
+    /// Settle one accepted durable browser HOLD from the exact live native
+    /// surface.  The proof is observed from this host's registered Wry view;
+    /// callers cannot provide a copied descriptor or a different Task/
+    /// resource and cannot bypass the BrowserService settler fence.
+    pub fn settle_accepted_browser_hold(
+        &mut self,
+        hello: crate::protocol::CapabilitySet,
+        intent: &crate::browser::protocol::BrowserHostSettleIntent,
+        hold: &crate::kernel::Effect,
+        identity: &BrowserSurfaceIdentity,
+    ) -> Result<
+        crate::domain::browser::BrowserHostOutcome,
+        crate::browser::protocol::BrowserHoldSettleError,
+    > {
+        let proof = self.host_owned_surface_proof(identity).map_err(|_| {
+            crate::browser::protocol::BrowserHoldSettleError::Hold(
+                crate::domain::browser::BrowserIntegrationHold::WebViewSurfaceAbsent,
+            )
+        })?;
+        let authority =
+            crate::browser::protocol::browser_service_authority_for_live_surface(&proof)
+                .map_err(crate::browser::protocol::BrowserHoldSettleError::Hold)?;
+        crate::browser::protocol::settle_accepted_browser_hold_for_live_surface(
+            Some(&authority),
+            intent,
+            hold,
+            &hello,
+            &proof,
+        )
+    }
+
+    pub fn last_task_surface_bind_blocker(&self) -> Option<BrowserTaskSurfaceBindBlocker> {
+        self.task_surface_bind_blocker
+    }
+
+    pub fn attach_gateway_registrar(&mut self, registrar: BrowserGatewayRegistrar) {
+        // A gateway restart must not leave the old registrar holding live
+        // surface bindings. Clear them while the old authority is still
+        // attached, then install the new authority.
+        self.clear_all_published_gateway_bindings();
+        self.gateway_registrar = Some(registrar);
+    }
+
+    /// Detach the gateway authority before the app drops or disables it.
+    /// Published bindings are revoked while the registrar is still available;
+    /// subsequent host work fails closed until a new registrar is attached.
+    pub fn detach_gateway_registrar(&mut self) {
+        self.clear_all_published_gateway_bindings();
+        self.gateway_registrar = None;
+    }
+
+    pub fn prepare_task_surface_identity(
+        &mut self,
+        workspace_key: &BrowserWorkspaceKey,
+        tab_id: &str,
+        identity: BrowserSurfaceIdentity,
+        agent_session_id: crate::domain::id::AgentSessionId,
+    ) {
+        self.prepared_task_surfaces.insert(
+            BrowserViewKey {
+                workspace_key: workspace_key.clone(),
+                tab_id: tab_id.to_string(),
+            },
+            PreparedTaskSurface {
+                identity,
+                agent_session_id,
+            },
+        );
+    }
+
+    fn capture_request_task_surface_identity(
+        &mut self,
+        workspace_key: &BrowserWorkspaceKey,
+        command: &BrowserCommand,
+        context: &BrowserInvocationContext,
+    ) {
+        self.task_surface_capture_active = true;
+        if self
+            .pending_task_surface
+            .as_ref()
+            .is_some_and(|(pending, _)| pending == workspace_key)
+        {
+            self.pending_task_surface = None;
+        }
+        let Some((task_id, agent_session_id, context_id, resource_id)) =
+            context.exact_surface_binding()
+        else {
+            return;
+        };
+        let identity = BrowserSurfaceIdentity {
+            task_id,
+            context_id,
+            resource_id,
+        };
+        let prepared = PreparedTaskSurface {
+            identity,
+            agent_session_id,
+        };
+        if let Some(tab_id) = command.tab_id() {
+            self.prepare_task_surface_identity(
+                workspace_key,
+                tab_id,
+                prepared.identity,
+                prepared.agent_session_id,
+            );
+            return;
+        }
+        self.pending_task_surface = Some((workspace_key.clone(), prepared));
+    }
+
+    fn finish_request_task_surface_identity(&mut self, workspace_key: &BrowserWorkspaceKey) {
+        self.task_surface_capture_active = false;
+        if self
+            .pending_task_surface
+            .as_ref()
+            .is_some_and(|(pending, _)| pending == workspace_key)
+        {
+            self.pending_task_surface = None;
+        }
+    }
+
+    fn bind_completed_identity(
+        &mut self,
+        key: &BrowserViewKey,
+        identity: BrowserSurfaceIdentity,
+    ) -> Result<(), BrowserNativeViewError> {
+        let host_process = current_host_process_identity()?;
+        let physical_bounds = BrowserPhysicalBounds::new(
+            self.bounds.x,
+            self.bounds.y,
+            self.bounds.width.max(1) as u32,
+            self.bounds.height.max(1) as u32,
+        )
+        .map_err(BrowserNativeViewError::Descriptor)?;
+        let dpi = BrowserDpi::new(96, 96).map_err(BrowserNativeViewError::Descriptor)?;
+        self.bind_task_surface_for_built_view(
+            identity,
+            &key.workspace_key,
+            &key.tab_id,
+            host_process,
+            physical_bounds,
+            dpi,
+        )
+        .map(|_| ())
+    }
+
+    fn publish_completed_host_binding(
+        &mut self,
+        key: &BrowserViewKey,
+        identity: BrowserSurfaceIdentity,
+        agent_session_id: crate::domain::id::AgentSessionId,
+    ) -> bool {
+        let Some(registrar) = self.gateway_registrar.as_ref() else {
+            return false;
+        };
+        let Some(process_session_id) =
+            registrar.process_session_id_for_workspace(&key.workspace_key)
+        else {
+            return false;
+        };
+        if !registrar.publish_host_surface_binding(
+            &process_session_id,
+            identity.task_id,
+            agent_session_id,
+            identity.context_id,
+            identity.resource_id,
+        ) {
+            return false;
+        }
+        self.published_host_bindings
+            .insert(key.clone(), process_session_id);
+        true
+    }
+
+    fn clear_published_gateway_binding(&mut self, key: &BrowserViewKey) {
+        let Some(process_session_id) = self.published_host_bindings.remove(key) else {
+            return;
+        };
+        if self
+            .published_host_bindings
+            .values()
+            .any(|published| published == &process_session_id)
+        {
+            return;
+        }
+        if let Some(registrar) = &self.gateway_registrar {
+            let _ = registrar.clear_host_surface_binding(&process_session_id);
+        }
+    }
+
+    fn clear_all_published_gateway_bindings(&mut self) {
+        let process_session_ids = self
+            .published_host_bindings
+            .drain()
+            .map(|(_, process_session_id)| process_session_id)
+            .collect::<Vec<_>>();
+        let Some(registrar) = &self.gateway_registrar else {
+            return;
+        };
+        for process_session_id in process_session_ids {
+            let _ = registrar.clear_host_surface_binding(&process_session_id);
+        }
+    }
+
+    fn ensure_host_parking_hwnd(
+        &mut self,
+        gpui_window_identity: isize,
+    ) -> Result<BrowserWindowHandle, BrowserError> {
+        if let Some(existing) = self.native_window_lifetime.parking_window_handle() {
+            if existing.raw_value() == gpui_window_identity as u64 {
+                return Err(BrowserError::CrashedView {
+                    message: "parking HWND must not alias the GPUI parent".to_string(),
+                });
+            }
+            return Ok(existing);
+        }
+        let parking_raw = create_host_owned_parking_hwnd(gpui_window_identity).map_err(|_| {
+            BrowserError::CrashedView {
+                message: "host-owned parking HWND could not be created".to_string(),
+            }
+        })?;
+        self.native_window_lifetime
+            .install_parking_hwnd(parking_raw, gpui_window_identity)
+            .map_err(|_| BrowserError::CrashedView {
+                message: "host-owned parking HWND failed ownership validation".to_string(),
+            })
+    }
+
+    fn destroy_host_parking_hwnd_if_drained(&mut self) {
+        if !self.views.is_empty()
+            || !self.native_view_build_tasks.is_empty()
+            || !self.pending_native_view_build_task_teardown.is_empty()
+        {
+            return;
+        }
+        if let Some(raw) = self.native_window_lifetime.take_parking_hwnd_for_destroy() {
+            destroy_host_owned_parking_hwnd(raw);
+        }
+    }
+
+    pub fn normalize_legacy_mcp_task_surface(
+        &self,
+        task_id: crate::domain::id::TaskId,
+    ) -> Option<BrowserSurfaceIdentity> {
+        self.state.normalize_legacy_mcp_task_surface(task_id)
+    }
+
+    pub fn park_task_surface(
+        &mut self,
+        request: crate::protocol::BrowserHostRequest,
+    ) -> Result<BrowserNativeViewReceipt, BrowserNativeViewError> {
+        self.park_wry_and_state(request)
+    }
+
+    pub fn attach_task_surface(
+        &mut self,
+        request: crate::protocol::BrowserAttachRequest,
+        destination: BrowserWindowHandle,
+    ) -> Result<BrowserNativeViewReceipt, BrowserNativeViewError> {
+        self.reparent_exact_wry_view(
+            &request.descriptor.identity,
+            &request.descriptor.child_hwnd,
+            &destination,
+        )?;
+        self.state
+            .attach_native_view_with_backend(request, destination, &mut self.surface_backend)
+    }
+
+    pub fn reattach_task_surface(
+        &mut self,
+        request: crate::protocol::BrowserAttachRequest,
+        destination: BrowserWindowHandle,
+    ) -> Result<BrowserNativeViewReceipt, BrowserNativeViewError> {
+        self.reparent_exact_wry_view(
+            &request.descriptor.identity,
+            &request.descriptor.child_hwnd,
+            &destination,
+        )?;
+        self.state.reattach_native_view_with_backend(
+            request,
+            destination,
+            &mut self.surface_backend,
+        )
+    }
+
+    /// NativeShell-facing apply for an already-admitted controller command.
+    /// Rejects mismatched gateway or identity refs; never invents a second host.
+    pub fn apply_native_shell_command(
+        &mut self,
+        command: &BrowserNativeHostCommand,
+    ) -> Result<BrowserNativeHostOutcome, BrowserError> {
+        let lease = command.lease();
+        self.native_shell_lease_fence
+            .admit(lease)
+            .map_err(BrowserError::from)?;
+        let detach = matches!(command, BrowserNativeHostCommand::Detach { .. });
+        let result = match command {
+            BrowserNativeHostCommand::Attach {
+                identity,
+                workspace_key,
+                gateway,
+                destination,
+                bounds,
+                ..
+            } => {
+                self.apply_controller_gateway_binding(identity, workspace_key, gateway)?;
+                let destination = window_handle_from_destination(*destination)?;
+                let Some(receipt) = self.native_view(&identity.protocol_surface()) else {
+                    return Err(native_shell_missing_view());
+                };
+                if receipt
+                    .attached_parent
+                    .as_ref()
+                    .is_some_and(|parent| parent.raw_value() == destination.raw_value())
+                {
+                    self.set_bounds(*bounds)?;
+                    self.set_active_workspace(Some(workspace_key.clone()))?;
+                    return Ok(BrowserNativeHostOutcome::Idempotent);
+                }
+                let request = BrowserAttachRequest::new(receipt.descriptor, ClientId::new());
+                if matches!(receipt.lifecycle, BrowserSurfaceLifecycle::Attached { .. }) {
+                    self.reattach_task_surface(request, destination)
+                        .map_err(native_shell_view_error)?;
+                } else {
+                    self.attach_task_surface(request, destination)
+                        .map_err(native_shell_view_error)?;
+                }
+                self.set_bounds(*bounds)?;
+                self.set_active_workspace(Some(workspace_key.clone()))?;
+                Ok(BrowserNativeHostOutcome::Applied)
+            }
+            BrowserNativeHostCommand::Reattach {
+                identity,
+                workspace_key,
+                gateway,
+                destination,
+                bounds,
+                ..
+            } => {
+                self.apply_controller_gateway_binding(identity, workspace_key, gateway)?;
+                let destination = window_handle_from_destination(*destination)?;
+                let receipt = self
+                    .native_view(&identity.protocol_surface())
+                    .ok_or_else(native_shell_missing_view)?;
+                let request = BrowserAttachRequest::new(receipt.descriptor, ClientId::new());
+                self.reattach_task_surface(request, destination)
+                    .map_err(native_shell_view_error)?;
+                self.set_bounds(*bounds)?;
+                self.set_active_workspace(Some(workspace_key.clone()))?;
+                Ok(BrowserNativeHostOutcome::Applied)
+            }
+            BrowserNativeHostCommand::BindGateway {
+                identity,
+                workspace_key,
+                gateway,
+                ..
+            } => {
+                self.apply_controller_gateway_binding(identity, workspace_key, gateway)?;
+                Ok(BrowserNativeHostOutcome::Applied)
+            }
+            BrowserNativeHostCommand::SubmitCommand { identity, .. } => {
+                if self.native_view(&identity.protocol_surface()).is_none() {
+                    return Err(native_shell_missing_view());
+                }
+                Ok(BrowserNativeHostOutcome::CommandHandoff)
+            }
+            BrowserNativeHostCommand::Resize {
+                identity, bounds, ..
+            } => {
+                if self.native_view(&identity.protocol_surface()).is_none() {
+                    return Err(native_shell_missing_view());
+                }
+                self.set_bounds(*bounds)?;
+                Ok(BrowserNativeHostOutcome::Applied)
+            }
+            BrowserNativeHostCommand::Focus {
+                identity, focused, ..
+            } => {
+                let receipt = self
+                    .native_view(&identity.protocol_surface())
+                    .ok_or_else(native_shell_missing_view)?;
+                self.surface_backend
+                    .set_surface_focus(&receipt.descriptor.child_hwnd, *focused)
+                    .map_err(|_| BrowserError::CrashedView {
+                        message: "browser native focus failed".to_string(),
+                    })?;
+                Ok(BrowserNativeHostOutcome::Applied)
+            }
+            BrowserNativeHostCommand::Detach {
+                identity,
+                workspace_key,
+                ..
+            } => {
+                if self.state.active_workspace() == Some(workspace_key) {
+                    self.set_active_workspace(None)?;
+                }
+                if let Some(receipt) = self.native_view(&identity.protocol_surface()) {
+                    if !matches!(receipt.lifecycle, BrowserSurfaceLifecycle::Parked) {
+                        let request = self
+                            .state
+                            .host_request(&receipt.descriptor.identity)
+                            .map_err(native_shell_view_error)?;
+                        self.park_task_surface(request)
+                            .map_err(native_shell_view_error)?;
+                    }
+                }
+                let key = BrowserViewKey {
+                    workspace_key: workspace_key.clone(),
+                    tab_id: workspace_key.ai_tab_id.clone(),
+                };
+                self.clear_published_gateway_binding(&key);
+                Ok(BrowserNativeHostOutcome::Parked)
+            }
+        };
+        if detach && result.is_ok() {
+            self.native_shell_lease_fence
+                .retire(lease)
+                .map_err(BrowserError::from)?;
+        }
+        result
+    }
+
+    fn apply_controller_gateway_binding(
+        &mut self,
+        identity: &crate::browser::BrowserNativeIdentity,
+        workspace_key: &BrowserWorkspaceKey,
+        gateway: &crate::browser::BrowserGatewayBindingRef,
+    ) -> Result<(), BrowserError> {
+        let registrar =
+            self.gateway_registrar
+                .clone()
+                .ok_or_else(|| BrowserError::InvalidInvocation {
+                    field: "gateway".to_string(),
+                })?;
+        let expected = gateway.process_session_id();
+        let found = registrar.process_session_id_for_workspace(workspace_key);
+        if found.as_deref() != Some(expected) {
+            return Err(BrowserError::InvalidInvocation {
+                field: "gateway".to_string(),
+            });
+        }
+        if !registrar.publish_host_surface_binding(
+            expected,
+            identity.task_id(),
+            identity.agent_session_id(),
+            identity.context_id(),
+            identity.resource_id(),
+        ) {
+            return Err(BrowserError::InvalidInvocation {
+                field: "gateway".to_string(),
+            });
+        }
+        self.prepare_task_surface_identity(
+            workspace_key,
+            &workspace_key.ai_tab_id,
+            identity.protocol_surface(),
+            identity.agent_session_id(),
+        );
+        self.published_host_bindings.insert(
+            BrowserViewKey {
+                workspace_key: workspace_key.clone(),
+                tab_id: workspace_key.ai_tab_id.clone(),
+            },
+            expected.to_string(),
+        );
+        Ok(())
+    }
+
+    fn park_wry_and_state(
+        &mut self,
+        request: crate::protocol::BrowserHostRequest,
+    ) -> Result<BrowserNativeViewReceipt, BrowserNativeViewError> {
+        let parking = parking_hwnd_from_lifetime(&self.native_window_lifetime)?;
+        self.reparent_exact_wry_view(
+            &request.descriptor.identity,
+            &request.descriptor.child_hwnd,
+            &parking,
+        )?;
+        self.state
+            .park_native_view_with_backend(request, &mut self.surface_backend)
+    }
+
+    fn webview_for_exact_surface(
+        &self,
+        identity: &BrowserSurfaceIdentity,
+        expected_child: &BrowserWindowHandle,
+    ) -> Result<&WebView, BrowserNativeViewError> {
+        let registered = self
+            .state
+            .native_view(identity)
+            .ok_or(BrowserNativeViewError::MissingView)?;
+        if registered.descriptor.identity != *identity
+            || registered.descriptor.child_hwnd != *expected_child
+        {
+            return Err(BrowserNativeViewError::MissingView);
+        }
+        let mut found = None;
+        for webview in self.views.values() {
+            let Ok(child) = child_hwnd_from_webview(webview) else {
+                continue;
+            };
+            if child != *expected_child {
+                continue;
+            }
+            if found.is_some() {
+                return Err(BrowserNativeViewError::LiveWryObservationUnavailable);
+            }
+            found = Some(webview);
+        }
+        found.ok_or(BrowserNativeViewError::MissingView)
+    }
+
+    #[cfg(target_os = "windows")]
+    fn reparent_wry_view(
+        webview: &WebView,
+        destination: &BrowserWindowHandle,
+    ) -> Result<(), BrowserNativeViewError> {
+        webview
+            .reparent(destination.raw_value() as isize)
+            .map_err(|_| BrowserNativeViewError::LiveWryObservationUnavailable)?;
+        let hwnd = windows::Win32::Foundation::HWND(destination.raw_value() as usize as *mut _);
+        unsafe {
+            webview
+                .controller()
+                .SetParentWindow(hwnd)
+                .map_err(|_| BrowserNativeViewError::LiveWryObservationUnavailable)?;
+        }
+        child_hwnd_from_webview(webview).map(|_| ())
+    }
+
+    fn reparent_exact_wry_view(
+        &self,
+        identity: &BrowserSurfaceIdentity,
+        expected_child: &BrowserWindowHandle,
+        destination: &BrowserWindowHandle,
+    ) -> Result<(), BrowserNativeViewError> {
+        let webview = self.webview_for_exact_surface(identity, expected_child)?;
+        Self::reparent_wry_view(webview, destination)?;
+        let observed = child_hwnd_from_webview(webview)?;
+        if observed != *expected_child {
+            return Err(BrowserNativeViewError::LiveWryObservationUnavailable);
+        }
+        Ok(())
+    }
+
+    pub fn close_task_surface_with_observed_drain(
+        &mut self,
+        request: crate::protocol::BrowserHostRequest,
+    ) -> Result<BrowserNativeViewReceipt, BrowserNativeViewError> {
+        let child = request.descriptor.child_hwnd.clone();
+        // Cancel queued builds/operations and deny new native input first.
+        self.cancel_all_native_view_builds();
+        self.operation_queue = BrowserOperationQueue::default();
+        self.active_requests.clear();
+        // Park/detach through the same task-bound host path.
+        if !matches!(
+            self.state
+                .native_view(&request.descriptor.identity)
+                .map(|view| view.lifecycle),
+            Some(crate::protocol::BrowserSurfaceLifecycle::Parked)
+        ) {
+            let park_request = self.state.host_request(&request.descriptor.identity)?;
+            let _ = self.park_wry_and_state(park_request)?;
+        }
+        let mut matching_keys = Vec::new();
+        let mut hwnd_observation_failed = false;
+        for (key, webview) in &self.views {
+            match child_hwnd_from_webview(webview) {
+                Ok(hwnd) if hwnd == child => matching_keys.push(key.clone()),
+                Ok(_) => {}
+                Err(_) => hwnd_observation_failed = true,
+            }
+        }
+        if hwnd_observation_failed {
+            return Err(BrowserNativeViewError::LiveWryObservationUnavailable);
+        }
+        let mut retired_projects = Vec::new();
+        for key in matching_keys {
+            self.clear_published_gateway_binding(&key);
+            self.prepared_task_surfaces.remove(&key);
+            self.views.remove(&key);
+            retired_projects.push(key.workspace_key.project_id.clone());
+        }
+        for project_id in retired_projects {
+            if !self
+                .views
+                .keys()
+                .any(|key| key.workspace_key.project_id == project_id)
+            {
+                drop(self.projects.remove(&project_id));
+            }
+        }
+        let outstanding_build_join = !self.native_view_build_tasks.is_empty()
+            || !self.pending_native_view_build_task_teardown.is_empty();
+        if !self.native_view_build_tasks.is_empty() {
+            self.pending_native_view_build_task_teardown
+                .extend(self.native_view_build_tasks.drain().map(|(_, task)| task));
+        }
+        self.finish_native_view_build_task_teardown();
+        if outstanding_build_join {
+            return Err(BrowserNativeViewError::TeardownPending);
+        }
+        self.surface_backend
+            .mark_controller_closed(&child)
+            .map_err(|_| BrowserNativeViewError::Backend)?;
+        let refreshed = self.state.host_request(&request.descriptor.identity)?;
+        match self
+            .state
+            .native_teardown_status_with_backend(&refreshed, &mut self.surface_backend)?
+        {
+            super::BrowserTeardownStatus::Ready => {
+                let closed = self
+                    .state
+                    .close_native_context_with_backend(refreshed, &mut self.surface_backend)?;
+                self.destroy_host_parking_hwnd_if_drained();
+                Ok(closed)
+            }
+            super::BrowserTeardownStatus::Pending => Err(BrowserNativeViewError::TeardownPending),
+            super::BrowserTeardownStatus::Blocked(blocker) => {
+                Err(BrowserNativeViewError::TeardownBlocked(blocker))
+            }
+        }
+    }
+
+    pub fn native_view(
+        &self,
+        identity: &BrowserSurfaceIdentity,
+    ) -> Option<BrowserNativeViewReceipt> {
+        self.state.native_view(identity)
+    }
+
+    pub fn native_view_descriptor(
+        &self,
+        identity: &BrowserSurfaceIdentity,
+    ) -> Option<BrowserSurfaceDescriptor> {
+        self.state.native_view(identity).map(|view| view.descriptor)
     }
 
     pub fn attach_foreground_executor(&mut self, executor: ForegroundExecutor) {
@@ -1093,20 +2059,33 @@ impl BrowserWebViewHost {
     }
 
     pub(crate) fn begin_native_window_teardown(&mut self) -> BrowserAppExitDisposition {
-        let _ = self.native_window_lifetime.begin_teardown();
+        if self.native_window_lifetime.begin_teardown().is_err() {
+            self.cancel_all_native_view_builds();
+            self.recording_views.clear();
+            self.recording_ingresses.clear();
+            self.document_secret_states.clear();
+            self.clear_all_published_gateway_bindings();
+            self.prepared_task_surfaces.clear();
+            self.pending_task_surface = None;
+            self.task_surface_capture_active = false;
+            return BrowserAppExitDisposition::Deferred;
+        }
         self.cancel_all_native_view_builds();
         self.recording_views.clear();
         self.recording_ingresses.clear();
         self.document_secret_states.clear();
+        self.clear_all_published_gateway_bindings();
+        self.prepared_task_surfaces.clear();
+        self.pending_task_surface = None;
+        self.task_surface_capture_active = false;
         if !self.views.is_empty() {
             let retired_views = self.views.drain().map(|(_, view)| view).collect::<Vec<_>>();
             if let Some(pending) = self.pending_native_view_teardown.as_mut() {
                 pending.views.extend(retired_views);
             } else {
-                let lease = self
-                    .native_window_lifetime
-                    .retain_teardown_cleanup()
-                    .expect("native browser teardown cleanup lease");
+                let Ok(lease) = self.native_window_lifetime.retain_teardown_cleanup() else {
+                    return BrowserAppExitDisposition::Deferred;
+                };
                 self.pending_native_view_teardown = Some(BrowserNativeViewTeardown {
                     views: retired_views,
                     lease,
@@ -1327,6 +2306,33 @@ impl BrowserWebViewHost {
         self.handle_command_with_user_capture(window, workspace_key, command, true)
     }
 
+    fn require_agent_mcp_task_identity(
+        &self,
+        context: &BrowserInvocationContext,
+    ) -> Result<(), BrowserError> {
+        if context.actor != BrowserInvocationActor::Agent {
+            return Ok(());
+        }
+        let binding = match context.exact_surface_binding() {
+            Some((task_id, _agent_session_id, context_id, resource_id)) => {
+                if let Some(identity) = self.state.normalize_legacy_mcp_task_surface(task_id) {
+                    if identity.context_id != context_id || identity.resource_id != resource_id {
+                        return Err(BrowserError::InvalidInvocation {
+                            field: "agent_session_id".to_string(),
+                        });
+                    }
+                }
+                Some((task_id, Some(context_id), Some(resource_id)))
+            }
+            None => None,
+        };
+        self.state
+            .require_legacy_mcp_exact_binding(binding)
+            .map_err(|_| BrowserError::InvalidInvocation {
+                field: "task_id".to_string(),
+            })
+    }
+
     fn handle_command_with_user_capture(
         &mut self,
         window: &gpui::Window,
@@ -1345,11 +2351,11 @@ impl BrowserWebViewHost {
                 .begin_user_chrome_capture(workspace_key, &command)
             {
                 Ok(capture) => capture,
-                Err(error) => {
+                Err(_error) => {
                     self.emit_diagnostic(
                         workspace_key,
                         diagnostic_tab.as_deref().unwrap_or(WORKSPACE_OPERATION_TAB),
-                        format!("browser recording invalidated before chrome action: {error}"),
+                        "browser recording invalidated before chrome action".to_string(),
                     );
                     None
                 }
@@ -1363,7 +2369,7 @@ impl BrowserWebViewHost {
         let mut result = self.handle_command_inner(window, workspace_key, command);
         if annotation_command {
             if let Ok(response) = result.as_mut() {
-                if let Err(error) =
+                if let Err(_error) =
                     self.finalize_annotation_command_resources(workspace_key, response)
                 {
                     if let Some(tab_id) = diagnostic_tab
@@ -1373,14 +2379,14 @@ impl BrowserWebViewHost {
                         self.emit_diagnostic(
                             workspace_key,
                             &tab_id,
-                            format!("annotation resource pin reconciliation will retry: {error}"),
+                            "annotation resource pin reconciliation will retry".to_string(),
                         );
                     }
                 }
             }
         }
         if let Some(capture) = user_chrome_capture {
-            if let Err(error) = self
+            if let Err(_error) = self
                 .workflow_coordinator
                 .complete_user_chrome_capture(capture, &result)
             {
@@ -1390,13 +2396,17 @@ impl BrowserWebViewHost {
                 self.emit_diagnostic(
                     workspace_key,
                     tab_id.as_deref().unwrap_or(WORKSPACE_OPERATION_TAB),
-                    format!("browser recording invalidated after chrome action: {error}"),
+                    "browser recording invalidated after chrome action".to_string(),
                 );
             }
         }
-        if let Err(error) = &result {
+        if let Err(_error) = &result {
             if let Some(tab_id) = diagnostic_tab.or_else(|| self.selected_tab_id(workspace_key)) {
-                self.emit_diagnostic(workspace_key, &tab_id, error.to_string());
+                self.emit_diagnostic(
+                    workspace_key,
+                    &tab_id,
+                    "browser host operation failed".to_string(),
+                );
             }
         }
         result
@@ -1474,9 +2484,15 @@ impl BrowserWebViewHost {
             return;
         }
         self.pump_page_recording_ipc();
+        if let Err(error) = self.require_agent_mcp_task_identity(request.context()) {
+            request.respond(Err(error));
+            return;
+        }
         let workspace_key = request.workspace_key().clone();
         let command = request.command().clone();
+        self.capture_request_task_surface_identity(&workspace_key, &command, request.context());
         if let Err(error) = self.require_command_view_ready(window, &workspace_key, &command) {
+            self.finish_request_task_surface_identity(&workspace_key);
             request.respond(Err(error));
             return;
         }
@@ -1487,6 +2503,7 @@ impl BrowserWebViewHost {
                 &command,
                 request.context().declared_risk,
             ) {
+                self.finish_request_task_surface_identity(&workspace_key);
                 self.respond_request(request, Err(map_agent_recording_error(error)));
                 return;
             }
@@ -1507,6 +2524,7 @@ impl BrowserWebViewHost {
                 command,
                 capture_user_chrome,
             );
+            self.finish_request_task_surface_identity(&workspace_key);
             self.respond_request(request, result);
             return;
         }
@@ -1519,6 +2537,7 @@ impl BrowserWebViewHost {
         ) {
             self.start_queued_work(window, target, work);
         }
+        self.finish_request_task_surface_identity(&workspace_key);
     }
 
     pub(crate) fn handle_repair_highlight_cleanup(
@@ -1542,6 +2561,13 @@ impl BrowserWebViewHost {
     }
 
     pub fn pump_async_completions(&mut self, window: &gpui::Window) {
+        #[cfg(target_os = "linux")]
+        {
+            for view in self.views.values() {
+                view.expire_async_calls();
+            }
+            pump_linux_webview_events();
+        }
         self.finish_native_view_build_task_teardown();
         self.finish_native_view_teardown();
         self.pump_native_view_build_completions(window);
@@ -1557,6 +2583,13 @@ impl BrowserWebViewHost {
     }
 
     pub(crate) fn finish_native_window_teardown_cleanup(&mut self) {
+        #[cfg(target_os = "linux")]
+        {
+            for view in self.views.values() {
+                view.expire_async_calls();
+            }
+            pump_linux_webview_events();
+        }
         self.finish_native_view_build_task_teardown();
         self.finish_native_view_teardown();
         self.drop_native_view_build_completions();
@@ -1576,11 +2609,13 @@ impl BrowserWebViewHost {
 
     fn finish_native_view_teardown(&mut self) {
         let Some(pending) = self.pending_native_view_teardown.take() else {
+            self.destroy_host_parking_hwnd_if_drained();
             return;
         };
         let BrowserNativeViewTeardown { views, lease } = pending;
         drop(views);
         drop(lease);
+        self.destroy_host_parking_hwnd_if_drained();
     }
 
     fn operation_target(
@@ -1617,6 +2652,10 @@ impl BrowserWebViewHost {
         request: BrowserCommandRequest,
     ) {
         let operation_id = request.context().operation_id.clone();
+        if let Err(error) = self.require_agent_mcp_task_identity(request.context()) {
+            self.finish_queued_request(window, target, operation_id, request, Err(error));
+            return;
+        }
         if !request.cancellation_is_current() {
             self.finish_queued_request(
                 window,
@@ -1643,9 +2682,16 @@ impl BrowserWebViewHost {
             self.finish_queued_request(window, target, operation_id, request, Err(error));
             return;
         }
+        let workspace_key = request.workspace_key().clone();
+        self.capture_request_task_surface_identity(
+            &workspace_key,
+            request.command(),
+            request.context(),
+        );
         if browser_command_is_automation(request.command()) {
             match self.begin_automation_request(window, &target, &request, None) {
                 BrowserStartResult::Pending(phase) => {
+                    self.finish_request_task_surface_identity(&workspace_key);
                     self.active_requests.insert(
                         target,
                         ActiveBrowserRequest {
@@ -1657,6 +2703,7 @@ impl BrowserWebViewHost {
                     );
                 }
                 BrowserStartResult::Complete(result) => {
+                    self.finish_request_task_surface_identity(&workspace_key);
                     self.finish_queued_request(window, target, operation_id, request, result);
                 }
             }
@@ -1665,6 +2712,7 @@ impl BrowserWebViewHost {
         if matches!(request.command(), BrowserCommand::Annotations { .. }) {
             match self.begin_annotation_request(window, &target, &request, None) {
                 BrowserStartResult::Pending(phase) => {
+                    self.finish_request_task_surface_identity(&workspace_key);
                     self.active_requests.insert(
                         target,
                         ActiveBrowserRequest {
@@ -1676,6 +2724,7 @@ impl BrowserWebViewHost {
                     );
                 }
                 BrowserStartResult::Complete(result) => {
+                    self.finish_request_task_surface_identity(&workspace_key);
                     self.finish_queued_request(window, target, operation_id, request, result);
                 }
             }
@@ -1689,6 +2738,7 @@ impl BrowserWebViewHost {
         ) {
             match self.begin_recording_request(window, &target, &request, None, None) {
                 BrowserStartResult::Pending(phase) => {
+                    self.finish_request_task_surface_identity(&workspace_key);
                     self.active_requests.insert(
                         target,
                         ActiveBrowserRequest {
@@ -1700,14 +2750,15 @@ impl BrowserWebViewHost {
                     );
                 }
                 BrowserStartResult::Complete(result) => {
+                    self.finish_request_task_surface_identity(&workspace_key);
                     self.finish_queued_request(window, target, operation_id, request, result);
                 }
             }
             return;
         }
-        let workspace_key = request.workspace_key().clone();
         let command = request.command().clone();
         let result = self.handle_command_with_user_capture(window, &workspace_key, command, false);
+        self.finish_request_task_surface_identity(&workspace_key);
         self.finish_queued_request(window, target, operation_id, request, result);
     }
 
@@ -1753,7 +2804,7 @@ impl BrowserWebViewHost {
                     self.emit_diagnostic(
                         &workspace_key,
                         &tab_id,
-                        format!("browser workflow capture could not finalize: {error}"),
+                        "browser workflow capture could not finalize".to_string(),
                     );
                 }
             }
@@ -1830,22 +2881,22 @@ impl BrowserWebViewHost {
                 }
                 Err(_) => self.reconcile_annotation_pins(&workspace_key),
             };
-            if let Err(error) = finalized {
+            if let Err(_error) = finalized {
                 if let Some(tab_id) = self.selected_tab_id(&workspace_key) {
                     self.emit_diagnostic(
                         &workspace_key,
                         &tab_id,
-                        format!("annotation resource pin reconciliation will retry: {error}"),
+                        "annotation resource pin reconciliation will retry".to_string(),
                     );
                 }
             }
         } else if journal_actor.is_some() {
-            if let Err(error) = self.reconcile_annotation_pins(&workspace_key) {
+            if let Err(_error) = self.reconcile_annotation_pins(&workspace_key) {
                 if let Some(tab_id) = self.selected_tab_id(&workspace_key) {
                     self.emit_diagnostic(
                         &workspace_key,
                         &tab_id,
-                        format!("annotation resource pin reconciliation will retry: {error}"),
+                        "annotation resource pin reconciliation will retry".to_string(),
                     );
                 }
             }
@@ -1873,6 +2924,10 @@ impl BrowserWebViewHost {
     }
 
     fn cancel_target_operations(&mut self, target: BrowserOperationTarget) {
+        #[cfg(target_os = "linux")]
+        if let Ok(view) = self.view(&target.workspace_key, &target.tab_id) {
+            view.cancel_upload();
+        }
         let active_repair_request = self.active_requests.get(&target).is_some_and(|active| {
             matches!(
                 active.phase,
@@ -2076,11 +3131,11 @@ impl BrowserWebViewHost {
                 .map(|_| ())
         });
         self.annotation_cleanup = ledger;
-        for (cleanup, error) in failures {
+        for (cleanup, _error) in failures {
             self.emit_diagnostic(
                 &cleanup.route.workspace_key,
                 &cleanup.route.tab_id,
-                format!("annotation screenshot cleanup will retry: {error}"),
+                "annotation screenshot cleanup will retry".to_string(),
             );
         }
     }
@@ -2191,11 +3246,22 @@ impl BrowserWebViewHost {
                             .expect("opaque repair preview token is serializable")
                     })
                     .unwrap_or_else(|| "null".to_string());
-                let document_generation = self
+                let Some(document_state) = self
                     .document_secret_states
                     .get(&view_key(workspace_key, tab_id))
-                    .map(|state| state.document_generation())
-                    .unwrap_or(u64::MAX);
+                else {
+                    return BrowserStartResult::Complete(Err(BrowserError::CrashedView {
+                        message: "browser document generation is unavailable".to_string(),
+                    }));
+                };
+                let document_generation = match document_state.document_generation() {
+                    Ok(generation) => generation,
+                    Err(_) => {
+                        return BrowserStartResult::Complete(Err(BrowserError::CrashedView {
+                            message: "browser document generation is exhausted".to_string(),
+                        }))
+                    }
+                };
                 start_result(
                     self.start_repair_highlight_script(
                         target,
@@ -2267,9 +3333,9 @@ impl BrowserWebViewHost {
                 }
                 let encoded = match serde_json::to_string(action_target) {
                     Ok(encoded) => encoded,
-                    Err(error) => {
+                    Err(_error) => {
                         return BrowserStartResult::Complete(Err(BrowserError::CrashedView {
-                            message: format!("could not encode browser secret target: {error}"),
+                            message: "could not encode browser secret target".to_string(),
                         }))
                     }
                 };
@@ -2325,9 +3391,9 @@ impl BrowserWebViewHost {
                 let timeout_ms = (*timeout_ms).clamp(1, MAX_BROWSER_RECIPE_WAIT_MS);
                 let condition = match serde_json::to_string(condition) {
                     Ok(condition) => condition,
-                    Err(error) => {
+                    Err(_error) => {
                         return BrowserStartResult::Complete(Err(BrowserError::CrashedView {
-                            message: format!("could not encode browser wait condition: {error}"),
+                            message: "could not encode browser wait condition".to_string(),
                         }))
                     }
                 };
@@ -2351,9 +3417,9 @@ impl BrowserWebViewHost {
                 }
                 let encoded = match serde_json::to_string(actions) {
                     Ok(encoded) => encoded,
-                    Err(error) => {
+                    Err(_error) => {
                         return BrowserStartResult::Complete(Err(BrowserError::CrashedView {
-                            message: format!("could not encode browser actions: {error}"),
+                            message: "could not encode browser actions".to_string(),
                         }))
                     }
                 };
@@ -2429,9 +3495,9 @@ impl BrowserWebViewHost {
                 };
                 let target_json = match serde_json::to_string(action_target) {
                     Ok(target) => target,
-                    Err(error) => {
+                    Err(_error) => {
                         return BrowserStartResult::Complete(Err(BrowserError::CrashedView {
-                            message: format!("could not encode browser upload target: {error}"),
+                            message: "could not encode browser upload target".to_string(),
                         }))
                     }
                 };
@@ -2666,7 +3732,7 @@ impl BrowserWebViewHost {
             }})()"#
         );
         self.view(&target.workspace_key, &target.tab_id)?
-            .evaluate_script_with_callback(&script, move |result| {
+            .evaluate_browser_script_with_callback(&script, move |result| {
                 let _ = sender.send(BrowserAsyncCompletion {
                     target: callback_target.clone(),
                     operation_id: callback_operation_id.clone(),
@@ -2703,7 +3769,7 @@ impl BrowserWebViewHost {
             }})()"#
         );
         self.view(&target.workspace_key, &target.tab_id)?
-            .evaluate_script_with_callback(&script, move |result| {
+            .evaluate_browser_script_with_callback(&script, move |result| {
                 let _ = sender.send(BrowserAsyncCompletion {
                     target: callback_target.clone(),
                     operation_id: callback_operation_id.clone(),
@@ -2740,7 +3806,7 @@ impl BrowserWebViewHost {
             }})()"#
         );
         self.view(&target.workspace_key, &target.tab_id)?
-            .evaluate_script_with_callback(&script, move |result| {
+            .evaluate_browser_script_with_callback(&script, move |result| {
                 let _ = sender.send(BrowserAsyncCompletion {
                     target: callback_target.clone(),
                     operation_id: callback_operation_id.clone(),
@@ -2775,7 +3841,7 @@ impl BrowserWebViewHost {
             }})()"#
         );
         self.view(&target.workspace_key, &target.tab_id)?
-            .evaluate_script_with_callback(&script, move |result| {
+            .evaluate_browser_script_with_callback(&script, move |result| {
                 let _ = sender.send(BrowserAsyncCompletion {
                     target: callback_target.clone(),
                     operation_id: callback_operation_id.clone(),
@@ -2793,6 +3859,7 @@ impl BrowserWebViewHost {
             .map_err(view_failure)
     }
 
+    #[cfg(target_os = "windows")]
     fn start_cdp(
         &self,
         target: &BrowserOperationTarget,
@@ -2808,7 +3875,9 @@ impl BrowserWebViewHost {
         let callback_operation_id = operation_id.to_string();
         let handler =
             CallDevToolsProtocolMethodCompletedHandler::create(Box::new(move |status, result| {
-                let result = status.map(|()| result).map_err(|error| error.to_string());
+                let result = status
+                    .map(|()| result)
+                    .map_err(|_| "browser CDP callback failed".to_string());
                 let _ = sender.send(BrowserAsyncCompletion {
                     target: callback_target.clone(),
                     operation_id: callback_operation_id.clone(),
@@ -2872,26 +3941,45 @@ impl BrowserWebViewHost {
                 candidate,
             },
         );
-        let method = HSTRING::from("Page.captureScreenshot");
-        let params = HSTRING::from(json!({"format": "png", "fromSurface": true}).to_string());
-        let sender = self.annotation_sender.clone();
-        let callback_route = route.clone();
-        let callback_capture_id = capture_id.clone();
-        let handler =
-            CallDevToolsProtocolMethodCompletedHandler::create(Box::new(move |status, result| {
-                let result = status.map(|()| result).map_err(|error| error.to_string());
+        #[cfg(target_os = "windows")]
+        let started = {
+            let method = HSTRING::from("Page.captureScreenshot");
+            let params = HSTRING::from(json!({"format": "png", "fromSurface": true}).to_string());
+            let sender = self.annotation_sender.clone();
+            let callback_route = route.clone();
+            let callback_capture_id = capture_id.clone();
+            let handler = CallDevToolsProtocolMethodCompletedHandler::create(Box::new(
+                move |status, result| {
+                    let result = status
+                        .map(|()| result)
+                        .map_err(|_| "browser annotation callback failed".to_string());
+                    let _ = sender.send(BrowserAnnotationCompletion {
+                        route: callback_route.clone(),
+                        capture_id: callback_capture_id.clone(),
+                        result,
+                    });
+                    Ok(())
+                },
+            ));
+            unsafe {
+                self.view(workspace_key, tab_id)?
+                    .webview()
+                    .CallDevToolsProtocolMethod(&method, &params, &handler)
+                    .map_err(view_failure)
+            }
+        };
+        #[cfg(target_os = "linux")]
+        let started = {
+            let sender = self.annotation_sender.clone();
+            let callback_route = route.clone();
+            let callback_capture_id = capture_id.clone();
+            capture_linux_webview(self.view(workspace_key, tab_id)?, false, move |result| {
                 let _ = sender.send(BrowserAnnotationCompletion {
-                    route: callback_route.clone(),
-                    capture_id: callback_capture_id.clone(),
+                    route: callback_route,
+                    capture_id: callback_capture_id,
                     result,
                 });
-                Ok(())
-            }));
-        let started = unsafe {
-            self.view(workspace_key, tab_id)?
-                .webview()
-                .CallDevToolsProtocolMethod(&method, &params, &handler)
-                .map_err(view_failure)
+            })
         };
         if let Err(error) = started {
             self.annotation_captures.remove(&route);
@@ -2911,14 +3999,14 @@ impl BrowserWebViewHost {
             .annotation_captures
             .remove(&completion.route)
             .expect("capture was checked above");
-        if let Err(error) = self.ensure_document_content_available(
+        if let Err(_error) = self.ensure_document_content_available(
             &completion.route.workspace_key,
             &completion.route.tab_id,
         ) {
             self.emit_diagnostic(
                 &completion.route.workspace_key,
                 &completion.route.tab_id,
-                error.to_string(),
+                "browser document content is unavailable".to_string(),
             );
             return;
         }
@@ -2970,10 +4058,10 @@ impl BrowserWebViewHost {
                         draft,
                     });
             }
-            Err(error) => self.emit_diagnostic(
+            Err(_error) => self.emit_diagnostic(
                 &completion.route.workspace_key,
                 &completion.route.tab_id,
-                error.to_string(),
+                "browser annotation capture failed".to_string(),
             ),
         }
     }
@@ -3396,9 +4484,11 @@ impl BrowserWebViewHost {
                 &completion.target.tab_id,
             ))
             .cloned();
-        let document_current = document_state
-            .as_ref()
-            .is_some_and(|state| state.document_generation() == document_generation);
+        let document_current = document_state.as_ref().is_some_and(|state| {
+            state
+                .document_generation()
+                .is_ok_and(|current| current == document_generation)
+        });
         let native_installed = page_acknowledged
             && cancellation_current
             && sidecar_valid
@@ -3513,7 +4603,10 @@ impl BrowserWebViewHost {
                 &completion.target.workspace_key,
                 &completion.target.tab_id,
             )) {
-                if state.document_generation() == document_generation {
+                if state
+                    .document_generation()
+                    .is_ok_and(|current| current == document_generation)
+                {
                     let _ = state.acknowledge_repair_highlight_clear(
                         document_generation,
                         authority.token(),
@@ -3575,10 +4668,11 @@ impl BrowserWebViewHost {
                 &completion.target.tab_id,
             ))
             .cloned();
-        if document_state
-            .as_ref()
-            .is_none_or(|state| state.document_generation() != authority.document_generation)
-        {
+        if document_state.as_ref().is_none_or(|state| {
+            !state
+                .document_generation()
+                .is_ok_and(|current| current == authority.document_generation)
+        }) {
             self.finish_repair_highlight_cleanup(
                 window,
                 completion.target,
@@ -3665,11 +4759,15 @@ impl BrowserWebViewHost {
         target: BrowserOperationTarget,
         cleanup: BrowserReplayRepairCleanupWork,
     ) {
-        let document_generation = self
+        let Some(document_state) = self
             .document_secret_states
             .get(&view_key(&target.workspace_key, &target.tab_id))
-            .map(|state| state.document_generation())
-            .unwrap_or(u64::MAX);
+        else {
+            return;
+        };
+        let Ok(document_generation) = document_state.document_generation() else {
+            return;
+        };
         let enqueued_at = cleanup.enqueued_at();
         let deadline = enqueued_at
             .checked_add(REPAIR_HIGHLIGHT_CLEANUP_TIMEOUT)
@@ -3710,7 +4808,11 @@ impl BrowserWebViewHost {
                 .and_then(|active| {
                     self.document_secret_states
                         .get(&view_key(&target.workspace_key, &target.tab_id))
-                        .map(|state| state.document_generation() == active.document_generation)
+                        .map(|state| {
+                            state
+                                .document_generation()
+                                .is_ok_and(|current| current == active.document_generation)
+                        })
                 })
                 .unwrap_or(false);
             if !view_exists || !document_current {
@@ -3815,6 +4917,8 @@ impl BrowserWebViewHost {
         }
         let _ = self.remove_page_recording_view(&target.workspace_key, &target.tab_id);
         let key = view_key(&target.workspace_key, &target.tab_id);
+        self.clear_published_gateway_binding(&key);
+        self.prepared_task_surfaces.remove(&key);
         self.views.remove(&key);
         self.recording_ingresses.remove(&key);
         self.document_secret_states.remove(&key);
@@ -3879,12 +4983,12 @@ impl BrowserWebViewHost {
                     tab_id: cleanup.tab_id().to_string(),
                 });
         }
-        if let Err(error) = self.reconcile_annotation_pins(&workspace_key) {
+        if let Err(_error) = self.reconcile_annotation_pins(&workspace_key) {
             if let Some(tab_id) = self.selected_tab_id(&workspace_key) {
                 self.emit_diagnostic(
                     &workspace_key,
                     &tab_id,
-                    format!("annotation resource pin reconciliation will retry: {error}"),
+                    "annotation resource pin reconciliation will retry".to_string(),
                 );
             }
         }
@@ -4206,8 +5310,10 @@ impl BrowserWebViewHost {
             ));
             let accepted = self
                 .view(&target.workspace_key, &target.tab_id)?
-                .evaluate_script_with_callback(&script, move |result| {
-                    callback_exposure.finish();
+                .evaluate_browser_script_with_callback(&script, move |result| {
+                    if callback_exposure.finish().is_err() {
+                        callback_exposure.mark_failed();
+                    }
                     let result = fixed_secret_type_callback_result(&result).to_string();
                     let _ = sender.send(BrowserAsyncCompletion {
                         target: callback_target.clone(),
@@ -4266,9 +5372,10 @@ impl BrowserWebViewHost {
             tab.title.clone(),
             elements,
         );
-        let encoded = serde_json::to_vec(&snapshot).map_err(|error| BrowserError::CrashedView {
-            message: format!("could not encode browser semantic snapshot: {error}"),
-        })?;
+        let encoded =
+            serde_json::to_vec(&snapshot).map_err(|_error| BrowserError::CrashedView {
+                message: "could not encode browser semantic snapshot".to_string(),
+            })?;
         let resource = if storage.repair {
             let encoded = redact_browser_resource_bytes("application/json", &encoded);
             let store = self.repair_capture_resource_store(request.workspace_key())?;
@@ -4468,8 +5575,8 @@ impl BrowserWebViewHost {
             .map_err(|_| BrowserError::CrashedView {
                 message: "browser console callback returned invalid data".to_string(),
             })?;
-        let encoded = serde_json::to_vec(&entries).map_err(|error| BrowserError::CrashedView {
-            message: format!("could not encode browser console result: {error}"),
+        let encoded = serde_json::to_vec(&entries).map_err(|_error| BrowserError::CrashedView {
+            message: "could not encode browser console result".to_string(),
         })?;
         if encoded.len() > INLINE_RESULT_LIMIT {
             let resource = self.store_resource(
@@ -4534,8 +5641,8 @@ impl BrowserWebViewHost {
             .map_err(|_| BrowserError::CrashedView {
                 message: "browser network callback returned invalid data".to_string(),
             })?;
-        let encoded = serde_json::to_vec(&entries).map_err(|error| BrowserError::CrashedView {
-            message: format!("could not encode browser network result: {error}"),
+        let encoded = serde_json::to_vec(&entries).map_err(|_| BrowserError::CrashedView {
+            message: "could not encode browser network result".to_string(),
         })?;
         if encoded.len() > INLINE_RESULT_LIMIT {
             let resource = self.store_resource(
@@ -4576,8 +5683,8 @@ impl BrowserWebViewHost {
             }),
             BrowserPerformanceOperation::TraceStop => {
                 let encoded =
-                    serde_json::to_vec(&value).map_err(|error| BrowserError::CrashedView {
-                        message: format!("could not encode browser performance trace: {error}"),
+                    serde_json::to_vec(&value).map_err(|_error| BrowserError::CrashedView {
+                        message: "could not encode browser performance trace".to_string(),
                     })?;
                 let resource = self.store_resource(
                     request.workspace_key(),
@@ -4597,8 +5704,8 @@ impl BrowserWebViewHost {
                         message: "browser performance callback returned invalid data".to_string(),
                     })?;
                 let encoded =
-                    serde_json::to_vec(&snapshot).map_err(|error| BrowserError::CrashedView {
-                        message: format!("could not encode browser performance snapshot: {error}"),
+                    serde_json::to_vec(&snapshot).map_err(|_error| BrowserError::CrashedView {
+                        message: "could not encode browser performance snapshot".to_string(),
                     })?;
                 if encoded.len() > INLINE_RESULT_LIMIT {
                     let resource = self.store_resource(
@@ -4678,16 +5785,43 @@ impl BrowserWebViewHost {
             );
             return;
         }
-        let selector = format!("[data-devmanager-upload=\"{token}\"]");
-        let params = json!({
-            "expression": format!("document.querySelector({})", serde_json::to_string(&selector).unwrap()),
-            "returnByValue": false,
-        });
-        active.phase = BrowserAsyncPhase::UploadRuntime { paths, token };
-        if let Err(error) = self.start_cdp(&target, &operation_id, "Runtime.evaluate", &params) {
-            self.finish_queued_request(window, target, operation_id, active.request, Err(error));
-        } else {
-            self.active_requests.insert(target, active);
+        #[cfg(target_os = "linux")]
+        {
+            let result = self.start_linux_upload(&target, &operation_id, &token, &paths);
+            active.phase = BrowserAsyncPhase::UploadSet { paths, token };
+            if let Err(error) = result {
+                self.finish_queued_request(
+                    window,
+                    target,
+                    operation_id,
+                    active.request,
+                    Err(error),
+                );
+            } else {
+                self.active_requests.insert(target, active);
+            }
+            return;
+        }
+        #[cfg(target_os = "windows")]
+        {
+            let selector = format!("[data-devmanager-upload=\"{token}\"]");
+            let params = json!({
+                "expression": format!("document.querySelector({})", serde_json::to_string(&selector).unwrap()),
+                "returnByValue": false,
+            });
+            active.phase = BrowserAsyncPhase::UploadRuntime { paths, token };
+            if let Err(error) = self.start_cdp(&target, &operation_id, "Runtime.evaluate", &params)
+            {
+                self.finish_queued_request(
+                    window,
+                    target,
+                    operation_id,
+                    active.request,
+                    Err(error),
+                );
+            } else {
+                self.active_requests.insert(target, active);
+            }
         }
     }
 
@@ -4756,7 +5890,7 @@ impl BrowserWebViewHost {
         let files = paths
             .iter()
             .map(|path| path.to_string_lossy().into_owned())
-            .collect::<Vec<_>>();
+            .collect::<Vec<String>>();
         active.phase = BrowserAsyncPhase::UploadSet { paths, token };
         let params = json!({"files": files, "backendNodeId": backend_node_id});
         if let Err(error) = self.start_cdp(&target, &operation_id, "DOM.setFileInputFiles", &params)
@@ -4987,14 +6121,14 @@ impl BrowserWebViewHost {
                     BrowserError::Io {
                         operation: "canonicalize upload file".to_string(),
                         path: path.clone(),
-                        message: error.to_string(),
+                        message: "browser host storage operation failed".to_string(),
                     }
                 }
             })?;
-            let metadata = std::fs::metadata(&canonical).map_err(|error| BrowserError::Io {
+            let metadata = std::fs::metadata(&canonical).map_err(|_| BrowserError::Io {
                 operation: "inspect upload file".to_string(),
                 path: canonical.clone(),
-                message: error.to_string(),
+                message: "browser host storage operation failed".to_string(),
             })?;
             if !metadata.is_file() {
                 return Err(BrowserError::MissingFile { path: canonical });
@@ -5032,10 +6166,10 @@ impl BrowserWebViewHost {
                 std::process::Command::new("explorer.exe")
                     .arg(format!("/select,{}", path.display()))
                     .spawn()
-                    .map_err(|error| BrowserError::Io {
+                    .map_err(|_| BrowserError::Io {
                         operation: "reveal browser download".to_string(),
                         path,
-                        message: error.to_string(),
+                        message: "browser host storage operation failed".to_string(),
                     })?;
                 Ok(BrowserResponse::Downloads {
                     downloads: Vec::new(),
@@ -5248,8 +6382,12 @@ impl BrowserWebViewHost {
                 } => {
                     let route = match BrowserAnnotationRoute::new(workspace_key.clone(), tab_id) {
                         Ok(route) => route,
-                        Err(error) => {
-                            self.emit_diagnostic(workspace_key, tab_id, error.to_string());
+                        Err(_error) => {
+                            self.emit_diagnostic(
+                                workspace_key,
+                                tab_id,
+                                "browser annotation route is invalid".to_string(),
+                            );
                             continue;
                         }
                     };
@@ -5267,8 +6405,12 @@ impl BrowserWebViewHost {
                                         enabled: false,
                                     });
                         }
-                        Err(error) => {
-                            self.emit_diagnostic(workspace_key, tab_id, error.to_string());
+                        Err(_error) => {
+                            self.emit_diagnostic(
+                                workspace_key,
+                                tab_id,
+                                "browser annotation candidate was rejected".to_string(),
+                            );
                             continue;
                         }
                     }
@@ -5804,6 +6946,8 @@ impl BrowserWebViewHost {
                 let _ = self.remove_page_recording_view(workspace_key, &tab_id);
                 let key = view_key(workspace_key, &tab_id);
                 self.cancel_native_view_build(&key);
+                self.clear_published_gateway_binding(&key);
+                self.prepared_task_surfaces.remove(&key);
                 self.views.remove(&key);
                 self.recording_ingresses.remove(&key);
                 self.document_secret_states.remove(&key);
@@ -5824,14 +6968,18 @@ impl BrowserWebViewHost {
                     .document_secret_states
                     .get(&view_key(workspace_key, &tab_id))
                 {
-                    state.invalidate_repair_highlight();
+                    state
+                        .invalidate_repair_highlight()
+                        .map_err(|_| BrowserError::CrashedView {
+                            message: "browser document generation is exhausted".to_string(),
+                        })?;
                 }
                 self.terminalize_repair_preview_target(workspace_key, &tab_id);
                 self.view(workspace_key, &tab_id)?
                     .load_url(&url)
-                    .map_err(|error| BrowserError::NavigationFailure {
+                    .map_err(|_| BrowserError::NavigationFailure {
                         url: url.clone(),
-                        message: error.to_string(),
+                        message: "browser navigation failed".to_string(),
                     })?;
                 let mutation = self.state.navigate_tab(workspace_key, &tab_id, &url)?;
                 Ok(BrowserResponse::Workspace { mutation })
@@ -5845,7 +6993,11 @@ impl BrowserWebViewHost {
                     .document_secret_states
                     .get(&view_key(workspace_key, &tab_id))
                 {
-                    state.invalidate_repair_highlight();
+                    state
+                        .invalidate_repair_highlight()
+                        .map_err(|_| BrowserError::CrashedView {
+                            message: "browser document generation is exhausted".to_string(),
+                        })?;
                 }
                 self.terminalize_repair_preview_target(workspace_key, &tab_id);
                 self.evaluate_history(window, workspace_key, &tab_id, "history.back()")?;
@@ -5860,7 +7012,11 @@ impl BrowserWebViewHost {
                     .document_secret_states
                     .get(&view_key(workspace_key, &tab_id))
                 {
-                    state.invalidate_repair_highlight();
+                    state
+                        .invalidate_repair_highlight()
+                        .map_err(|_| BrowserError::CrashedView {
+                            message: "browser document generation is exhausted".to_string(),
+                        })?;
                 }
                 self.terminalize_repair_preview_target(workspace_key, &tab_id);
                 self.evaluate_history(window, workspace_key, &tab_id, "history.forward()")?;
@@ -5876,7 +7032,11 @@ impl BrowserWebViewHost {
                     .document_secret_states
                     .get(&view_key(workspace_key, &tab_id))
                 {
-                    state.invalidate_repair_highlight();
+                    state
+                        .invalidate_repair_highlight()
+                        .map_err(|_| BrowserError::CrashedView {
+                            message: "browser document generation is exhausted".to_string(),
+                        })?;
                 }
                 self.terminalize_repair_preview_target(workspace_key, &tab_id);
                 self.view(workspace_key, &tab_id)?
@@ -5925,6 +7085,24 @@ impl BrowserWebViewHost {
                 self.discard_workflow_state(workspace_key);
                 self.terminalize_repair_preview_workspace(workspace_key);
                 self.cancel_native_workspace_builds(workspace_key);
+                let retired_keys = self
+                    .published_host_bindings
+                    .keys()
+                    .chain(self.prepared_task_surfaces.keys())
+                    .filter(|key| key.workspace_key == *workspace_key)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                for key in retired_keys {
+                    self.clear_published_gateway_binding(&key);
+                    self.prepared_task_surfaces.remove(&key);
+                }
+                if self
+                    .pending_task_surface
+                    .as_ref()
+                    .is_some_and(|(pending, _)| pending == workspace_key)
+                {
+                    self.pending_task_surface = None;
+                }
                 self.views
                     .retain(|key, _| key.workspace_key != *workspace_key);
                 self.recording_ingresses
@@ -5967,7 +7145,7 @@ impl BrowserWebViewHost {
                     .status
                     .diagnostic
                     .clone()
-                    .unwrap_or_else(|| "WebView2 runtime is unavailable".to_string()),
+                    .unwrap_or_else(|| "Embedded browser runtime is unavailable".to_string()),
             })
         }
     }
@@ -6049,6 +7227,22 @@ impl BrowserWebViewHost {
         retry_failed: bool,
     ) -> Result<BrowserViewReadiness, BrowserError> {
         let key = view_key(workspace_key, tab_id);
+        if self.task_surface_capture_active {
+            if let Some((pending_workspace, prepared)) = self.pending_task_surface.take() {
+                if pending_workspace == *workspace_key {
+                    if !self.prepared_task_surfaces.contains_key(&key) {
+                        self.prepare_task_surface_identity(
+                            workspace_key,
+                            tab_id,
+                            prepared.identity,
+                            prepared.agent_session_id,
+                        );
+                    }
+                } else {
+                    self.pending_task_surface = Some((pending_workspace, prepared));
+                }
+            }
+        }
         if self.views.contains_key(&key) {
             return Ok(BrowserViewReadiness::Ready);
         }
@@ -6070,6 +7264,10 @@ impl BrowserWebViewHost {
             })?;
         let parent_window =
             BrowserParentWindowLease::from_gpui(window, &self.native_window_lifetime)?;
+        self.ensure_host_parking_hwnd(
+            native_parent_window_identity(parent_window.handle)
+                .ok_or_else(native_shell_missing_view)?,
+        )?;
         let url = validate_browser_url(url)?;
         let retained_trust_root = self.verified_trusted_app_config_dir()?.to_path_buf();
         let (trusted_app_config_dir, layout) =
@@ -6083,7 +7281,12 @@ impl BrowserWebViewHost {
             .recording_transport
             .ingress(workspace_key.clone(), tab_id.to_string());
         let document_secret_state = Arc::new(BrowserDocumentSecretState::default());
-        let admission = self.native_view_builds.admit(key.clone(), retry_failed);
+        let admission = self
+            .native_view_builds
+            .admit(key.clone(), retry_failed)
+            .map_err(|_| BrowserError::CrashedView {
+                message: "browser native view build identity is exhausted".to_string(),
+            })?;
         let build_id = match admission {
             BrowserNativeViewBuildAdmission::Start { build_id }
             | BrowserNativeViewBuildAdmission::Queued { build_id } => build_id,
@@ -6098,6 +7301,7 @@ impl BrowserWebViewHost {
         let cancellation = BrowserNativeViewBuildCancellation::default();
         self.native_view_build_cancellations
             .insert(build_id, cancellation.clone());
+        let prepared = self.prepared_task_surfaces.get(&key).copied();
         self.native_view_build_specs.insert(
             build_id,
             BrowserNativeViewBuildSpec {
@@ -6112,6 +7316,8 @@ impl BrowserWebViewHost {
                 document_secret_state,
                 parent_window,
                 cancellation,
+                surface_identity: prepared.map(|prepared| prepared.identity),
+                agent_session_id: prepared.map(|prepared| prepared.agent_session_id),
             },
         );
         if starts_now {
@@ -6120,14 +7326,18 @@ impl BrowserWebViewHost {
                 .or_insert_with(|| BrowserProjectRuntime {
                     context: WebContext::new(Some(layout.profile_dir)),
                 });
-            if let Err(error) = self.spawn_native_view_build(&key, build_id) {
+            if let Err(_error) = self.spawn_native_view_build(&key, build_id) {
                 self.native_view_build_specs.remove(&build_id);
                 self.native_view_build_cancellations.remove(&build_id);
-                let failed =
-                    self.native_view_builds
-                        .complete(&key, build_id, Err(error.to_string()));
+                let failed = self.native_view_builds.complete(
+                    &key,
+                    build_id,
+                    Err("browser native view build failed".to_string()),
+                );
                 self.spawn_next_native_view_build(failed.next);
-                return Err(error);
+                return Err(BrowserError::CrashedView {
+                    message: "browser native view build failed".to_string(),
+                });
             }
         }
         Ok(BrowserViewReadiness::Initializing)
@@ -6183,12 +7393,15 @@ impl BrowserWebViewHost {
             document_secret_state,
             result,
             parent_window,
+            surface_identity,
+            agent_session_id,
         } = completion;
         self.native_view_build_tasks.remove(&build_id);
         let project_id = key.workspace_key.project_id.clone();
         let replaced = self.projects.insert(project_id, project);
         debug_assert!(replaced.is_none(), "leased WebContext was restored twice");
         self.native_view_build_cancellations.remove(&build_id);
+        let prepared = self.prepared_task_surfaces.remove(&key);
         let result = if parent_window.build_is_allowed() {
             result.and_then(|webview| {
                 webview
@@ -6203,7 +7416,10 @@ impl BrowserWebViewHost {
         let completion_plan = self.native_view_builds.complete(
             &key,
             build_id,
-            result.as_ref().map(|_| ()).map_err(ToString::to_string),
+            result
+                .as_ref()
+                .map(|_| ())
+                .map_err(|_| "browser native view build failed".to_string()),
         );
         if !completion_plan.accepted {
             drop(result);
@@ -6219,6 +7435,38 @@ impl BrowserWebViewHost {
                 self.document_secret_states
                     .insert(key.clone(), document_secret_state);
                 self.views.insert(key.clone(), webview);
+                match completed_task_aware_identity(prepared, surface_identity, agent_session_id) {
+                    Ok(Some((identity, agent_session_id))) => {
+                        let binding_result = self.bind_completed_identity(&key, identity);
+                        match binding_result {
+                            Ok(()) => {
+                                let published = self.publish_completed_host_binding(
+                                    &key,
+                                    identity,
+                                    agent_session_id,
+                                );
+                                self.task_surface_bind_blocker = if published {
+                                    None
+                                } else {
+                                    Some(
+                                        BrowserTaskSurfaceBindBlocker::TaskIdentityUnavailableAtBuildCompletion,
+                                    )
+                                };
+                            }
+                            Err(BrowserNativeViewError::TaskIdentityUnavailable) => {
+                                self.task_surface_bind_blocker = Some(
+                                    BrowserTaskSurfaceBindBlocker::TaskIdentityUnavailableAtBuildCompletion,
+                                );
+                            }
+                            Err(_) => {
+                                self.task_surface_bind_blocker =
+                                    Some(BrowserTaskSurfaceBindBlocker::ChildHwndUnobservable)
+                            }
+                        }
+                    }
+                    Ok(None) => self.task_surface_bind_blocker = None,
+                    Err(blocker) => self.task_surface_bind_blocker = Some(blocker),
+                }
                 if self
                     .workflow_coordinator
                     .active_instance(&key.workspace_key)
@@ -6235,12 +7483,20 @@ impl BrowserWebViewHost {
                         );
                     }
                 }
-                if let Err(error) = self.apply_visibility_plan() {
-                    self.emit_diagnostic(&key.workspace_key, &key.tab_id, error.to_string());
+                if self.apply_visibility_plan().is_err() {
+                    self.emit_diagnostic(
+                        &key.workspace_key,
+                        &key.tab_id,
+                        "browser host visibility update failed".to_string(),
+                    );
                 }
             }
-            Err(error) => {
-                self.emit_diagnostic(&key.workspace_key, &key.tab_id, error.to_string());
+            Err(_error) => {
+                self.emit_diagnostic(
+                    &key.workspace_key,
+                    &key.tab_id,
+                    "browser native view build failed".to_string(),
+                );
             }
         }
         drop(parent_window);
@@ -6250,13 +7506,19 @@ impl BrowserWebViewHost {
 
     fn spawn_next_native_view_build(&mut self, mut next: Option<(BrowserViewKey, u64)>) {
         while let Some((next_key, next_id)) = next {
-            if let Err(error) = self.spawn_native_view_build(&next_key, next_id) {
+            if let Err(_error) = self.spawn_native_view_build(&next_key, next_id) {
                 self.native_view_build_specs.remove(&next_id);
                 self.native_view_build_cancellations.remove(&next_id);
-                let failed =
-                    self.native_view_builds
-                        .complete(&next_key, next_id, Err(error.to_string()));
-                self.emit_diagnostic(&next_key.workspace_key, &next_key.tab_id, error.to_string());
+                let failed = self.native_view_builds.complete(
+                    &next_key,
+                    next_id,
+                    Err("browser native view build failed".to_string()),
+                );
+                self.emit_diagnostic(
+                    &next_key.workspace_key,
+                    &next_key.tab_id,
+                    "browser native view build failed".to_string(),
+                );
                 next = failed.next;
             } else {
                 return;
@@ -6382,7 +7644,11 @@ impl BrowserWebViewHost {
             .ok_or_else(|| BrowserError::CrashedView {
                 message: "browser secret containment state is unavailable".to_string(),
             })?;
-        let exposure = state.begin_exposure();
+        let exposure = state
+            .begin_exposure()
+            .map_err(|_| BrowserError::CrashedView {
+                message: "browser document secret generation is exhausted".to_string(),
+            })?;
         if let Ok(route) = BrowserAnnotationRoute::new(workspace_key.clone(), tab_id) {
             self.cancel_annotation_route(&route);
         }
@@ -6404,6 +7670,7 @@ impl BrowserWebViewHost {
             let Some(view) = self.views.get(&view_key(&plan.workspace_key, &plan.tab_id)) else {
                 continue;
             };
+            #[cfg(target_os = "windows")]
             let result = if plan.visible {
                 view.set_bounds(wry_bounds(self.bounds))
                     .and_then(|_| view.set_memory_usage_level(MemoryUsageLevel::Normal))
@@ -6412,8 +7679,14 @@ impl BrowserWebViewHost {
                 view.set_visible(false)
                     .and_then(|_| view.set_memory_usage_level(MemoryUsageLevel::Low))
             };
-            if let Err(error) = result {
-                let message = format!("could not update WebView visibility: {error}");
+            #[cfg(target_os = "linux")]
+            let result = if plan.visible {
+                view.show_at_bounds(wry_bounds(self.bounds))
+            } else {
+                view.set_visible(false)
+            };
+            if result.is_err() {
+                let message = "could not update WebView visibility".to_string();
                 diagnostics.push((plan.workspace_key, plan.tab_id, message.clone()));
                 first_error.get_or_insert_with(|| BrowserError::CrashedView { message });
             }
@@ -6436,15 +7709,13 @@ impl BrowserWebViewHost {
         &mut self,
         workspace_key: &BrowserWorkspaceKey,
     ) -> Result<(), BrowserError> {
-        if let Some(key) = self
+        if self
             .native_view_builds
             .pending_for_project(&workspace_key.project_id)
+            .is_some()
         {
             return Err(BrowserError::CrashedView {
-                message: format!(
-                    "cannot clear the browser profile while tab {} is initializing",
-                    key.tab_id
-                ),
+                message: "cannot clear the browser profile while a tab is initializing".to_string(),
             });
         }
         if self
@@ -6469,6 +7740,24 @@ impl BrowserWebViewHost {
 
         self.discard_project_page_recordings(&workspace_key.project_id);
         self.terminalize_repair_preview_project(&workspace_key.project_id);
+        let retired_keys = self
+            .published_host_bindings
+            .keys()
+            .chain(self.prepared_task_surfaces.keys())
+            .filter(|key| key.workspace_key.project_id == workspace_key.project_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        for key in retired_keys {
+            self.clear_published_gateway_binding(&key);
+            self.prepared_task_surfaces.remove(&key);
+        }
+        if self
+            .pending_task_surface
+            .as_ref()
+            .is_some_and(|(pending, _)| pending.project_id == workspace_key.project_id)
+        {
+            self.pending_task_surface = None;
+        }
         self.views
             .retain(|key, _| key.workspace_key.project_id != workspace_key.project_id);
         self.recording_ingresses
@@ -6490,8 +7779,46 @@ impl BrowserWebViewHost {
             workspace_key: workspace_key.clone(),
             tab_id: tab_id.to_string(),
             level: BrowserDiagnosticLevel::Error,
-            message,
+            message: bounded_host_diagnostic(message),
         });
+    }
+}
+
+fn bounded_host_diagnostic(message: String) -> String {
+    const MAX_DIAGNOSTIC_BYTES: usize = 256;
+    const SAFE_DIAGNOSTICS: &[&str] = &["fixed workspace lifecycle diagnostic"];
+    if message.len() <= MAX_DIAGNOSTIC_BYTES
+        && !message.bytes().any(|byte| byte < 0x20 || byte == 0x7f)
+        && SAFE_DIAGNOSTICS.contains(&message.as_str())
+    {
+        message
+    } else {
+        "browser host diagnostic unavailable".to_string()
+    }
+}
+
+fn bounded_host_platform_token(value: &str) -> String {
+    const KNOWN_PLATFORMS: &[&str] = &[
+        "windows", "macos", "linux", "android", "ios", "freebsd", "openbsd", "netbsd",
+    ];
+    if KNOWN_PLATFORMS.contains(&value) {
+        value.to_string()
+    } else {
+        "unknown".to_string()
+    }
+}
+
+fn bounded_host_version_token(value: &str) -> String {
+    const MAX_STATUS_BYTES: usize = 64;
+    if value.len() <= MAX_STATUS_BYTES
+        && !value.is_empty()
+        && value.split('.').all(|component| {
+            !component.is_empty() && component.bytes().all(|byte| byte.is_ascii_digit())
+        })
+    {
+        value.to_string()
+    } else {
+        "unknown".to_string()
     }
 }
 
@@ -6530,9 +7857,9 @@ fn stale_recording_instance() -> BrowserError {
     }
 }
 
-fn map_agent_recording_error(error: BrowserRecordingError) -> BrowserError {
+fn map_agent_recording_error(_error: BrowserRecordingError) -> BrowserError {
     BrowserError::CrashedView {
-        message: format!("browser workflow capture failed: {error}"),
+        message: "browser workflow capture failed".to_string(),
     }
 }
 
@@ -6579,6 +7906,7 @@ fn random_locator_failure_ticket() -> Result<String, BrowserError> {
     Ok(ticket)
 }
 
+#[cfg(target_os = "windows")]
 fn attach_document_lifecycle_handlers(
     webview: &WebView,
     document_secret_state: Arc<BrowserDocumentSecretState>,
@@ -6595,7 +7923,12 @@ fn attach_document_lifecycle_handlers(
             args.NavigationId(&mut navigation_id)?;
             args.IsErrorPage(&mut is_error_page)?;
         }
-        content_document_secret_state.content_loading(navigation_id, is_error_page.as_bool());
+        if content_document_secret_state
+            .content_loading(navigation_id, is_error_page.as_bool())
+            .is_err()
+        {
+            content_document_secret_state.mark_failed();
+        }
         Ok(())
     }));
     let navigation_completed = NavigationCompletedEventHandler::create(Box::new(move |_, args| {
@@ -6608,7 +7941,12 @@ fn attach_document_lifecycle_handlers(
             args.NavigationId(&mut navigation_id)?;
             args.IsSuccess(&mut is_success)?;
         }
-        document_secret_state.navigation_completed(navigation_id, is_success.as_bool());
+        if document_secret_state
+            .navigation_completed(navigation_id, is_success.as_bool())
+            .is_err()
+        {
+            document_secret_state.mark_failed();
+        }
         Ok(())
     }));
     let mut content_token = 0_i64;
@@ -6624,6 +7962,7 @@ fn attach_document_lifecycle_handlers(
     Ok(())
 }
 
+#[cfg(target_os = "windows")]
 fn attach_permission_handler(
     webview: &WebView,
     event_sender: Sender<BrowserHostEvent>,
@@ -6688,6 +8027,7 @@ fn attach_permission_handler(
     }
 }
 
+#[cfg(target_os = "windows")]
 fn permission_name(kind: COREWEBVIEW2_PERMISSION_KIND) -> &'static str {
     match kind {
         COREWEBVIEW2_PERMISSION_KIND_CAMERA => "camera",
@@ -6763,12 +8103,12 @@ fn configured_builder<'a>(
                 });
                 true
             }
-            Err(error) => {
+            Err(_error) => {
                 let _ = navigation_sender.send(BrowserHostEvent::Diagnostic {
                     workspace_key: navigation_workspace.clone(),
                     tab_id: navigation_tab.clone(),
                     level: BrowserDiagnosticLevel::Warning,
-                    message: error.to_string(),
+                    message: "browser navigation was rejected".to_string(),
                 });
                 false
             }
@@ -6806,13 +8146,24 @@ fn configured_builder<'a>(
             if ipc_document_secret_state.is_tainted() {
                 let event = match parse_browser_page_ipc_message(body) {
                     Ok(BrowserPageIpcMessage::UserInput { kind }) => {
-                        Some(BrowserHostEvent::UserInput {
-                            workspace_key: ipc_workspace.clone(),
-                            tab_id: ipc_tab.clone(),
-                            kind,
-                            interaction_epoch:
-                                crate::browser::model::next_browser_interaction_epoch(),
-                        })
+                        match crate::browser::model::next_browser_interaction_epoch() {
+                            Ok(interaction_epoch) => Some(BrowserHostEvent::UserInput {
+                                workspace_key: ipc_workspace.clone(),
+                                tab_id: ipc_tab.clone(),
+                                kind,
+                                interaction_epoch,
+                            }),
+                            Err(_) => {
+                                let _ = ipc_failure_sender.send(BrowserHostEvent::Diagnostic {
+                                    workspace_key: ipc_workspace.clone(),
+                                    tab_id: ipc_tab.clone(),
+                                    level: BrowserDiagnosticLevel::Error,
+                                    message: "browser interaction authority is exhausted; input was discarded"
+                                        .to_string(),
+                                });
+                                None
+                            }
+                        }
                     }
                     Ok(BrowserPageIpcMessage::DomMutation) => Some(BrowserHostEvent::DomMutation {
                         workspace_key: ipc_workspace.clone(),
@@ -6855,38 +8206,52 @@ fn configured_builder<'a>(
                 return;
             }
             let event = match parse_browser_page_ipc_message(body) {
-                Ok(BrowserPageIpcMessage::UserInput { kind }) => BrowserHostEvent::UserInput {
-                    workspace_key: ipc_workspace.clone(),
-                    tab_id: ipc_tab.clone(),
-                    kind,
-                    interaction_epoch:
-                        crate::browser::model::next_browser_interaction_epoch(),
-                },
-                Ok(BrowserPageIpcMessage::DomMutation) => BrowserHostEvent::DomMutation {
-                    workspace_key: ipc_workspace.clone(),
-                    tab_id: ipc_tab.clone(),
-                },
+                Ok(BrowserPageIpcMessage::UserInput { kind }) => {
+                    match crate::browser::model::next_browser_interaction_epoch() {
+                        Ok(interaction_epoch) => Some(BrowserHostEvent::UserInput {
+                            workspace_key: ipc_workspace.clone(),
+                            tab_id: ipc_tab.clone(),
+                            kind,
+                            interaction_epoch,
+                        }),
+                        Err(_) => Some(BrowserHostEvent::Diagnostic {
+                            workspace_key: ipc_workspace.clone(),
+                            tab_id: ipc_tab.clone(),
+                            level: BrowserDiagnosticLevel::Error,
+                            message: "browser interaction authority is exhausted; input was discarded"
+                                .to_string(),
+                        }),
+                    }
+                }
+                Ok(BrowserPageIpcMessage::DomMutation) => {
+                    Some(BrowserHostEvent::DomMutation {
+                        workspace_key: ipc_workspace.clone(),
+                        tab_id: ipc_tab.clone(),
+                    })
+                }
                 Ok(BrowserPageIpcMessage::AnnotationCandidate { candidate }) => {
-                    BrowserHostEvent::AnnotationCandidate {
+                    Some(BrowserHostEvent::AnnotationCandidate {
                         workspace_key: ipc_workspace.clone(),
                         tab_id: ipc_tab.clone(),
                         candidate,
-                    }
+                    })
                 }
                 Ok(BrowserPageIpcMessage::AnnotationCanceled) => {
-                    BrowserHostEvent::AnnotationCanceled {
+                    Some(BrowserHostEvent::AnnotationCanceled {
                         workspace_key: ipc_workspace.clone(),
                         tab_id: ipc_tab.clone(),
-                    }
+                    })
                 }
-                Err(_) => BrowserHostEvent::Diagnostic {
+                Err(_) => Some(BrowserHostEvent::Diagnostic {
                     workspace_key: ipc_workspace.clone(),
                     tab_id: ipc_tab.clone(),
                     level: BrowserDiagnosticLevel::Warning,
                     message: "ignored malformed or oversized browser input metadata".to_string(),
-                },
+                }),
             };
-            let _ = ipc_sender.send(event);
+            if let Some(event) = event {
+                let _ = ipc_sender.send(event);
+            }
         })
         .with_new_window_req_handler(move |url, _features| {
             if window_document_secret_state.is_tainted() {
@@ -6919,12 +8284,12 @@ fn configured_builder<'a>(
                     });
                     true
                 }
-                Err(error) => {
+                Err(_error) => {
                     let _ = download_sender.send(BrowserHostEvent::Diagnostic {
                         workspace_key: download_workspace.clone(),
                         tab_id: download_tab.clone(),
                         level: BrowserDiagnosticLevel::Error,
-                        message: error.to_string(),
+                        message: "browser download path was rejected".to_string(),
                     });
                     false
                 }
@@ -6982,7 +8347,9 @@ fn finish_secret_exposure_on_error<T, E>(
     result: Result<T, E>,
 ) -> Result<T, E> {
     if result.is_err() {
-        exposure.finish();
+        if exposure.finish().is_err() {
+            exposure.mark_failed();
+        }
     }
     result
 }
@@ -7074,6 +8441,7 @@ fn contain_queued_host_event(
     event: BrowserHostEvent,
     document_taint: Option<bool>,
 ) -> Option<BrowserHostEvent> {
+    let event = sanitize_host_diagnostic_event(event);
     if document_taint == Some(false) {
         return Some(event);
     }
@@ -7106,6 +8474,23 @@ fn contain_queued_host_event(
         | BrowserHostEvent::Download { .. }
         | BrowserHostEvent::Diagnostic { .. } => None,
         event => Some(event),
+    }
+}
+
+fn sanitize_host_diagnostic_event(event: BrowserHostEvent) -> BrowserHostEvent {
+    match event {
+        BrowserHostEvent::Diagnostic {
+            workspace_key,
+            tab_id,
+            level,
+            message,
+        } => BrowserHostEvent::Diagnostic {
+            workspace_key,
+            tab_id,
+            level,
+            message: bounded_host_diagnostic(message),
+        },
+        event => event,
     }
 }
 
@@ -7233,6 +8618,8 @@ fn browser_error_code(error: &BrowserError) -> &'static str {
         }
         BrowserError::RecordingResourceUnavailable => "recording_resource_unavailable",
         BrowserError::Interrupted => "user_interrupted",
+        BrowserError::InteractionEpochExhausted => "interaction_epoch_exhausted",
+        BrowserError::CancellationEpochExhausted => "cancellation_epoch_exhausted",
         BrowserError::Timeout { .. } => "timeout",
         BrowserError::NavigationFailure { .. } => "navigation_failure",
         BrowserError::InitializingView { .. } => "initializing_view",
@@ -7345,9 +8732,7 @@ fn script_value(raw: &str) -> Result<Value, BrowserError> {
         })
     } else {
         Err(BrowserError::CrashedView {
-            message: envelope
-                .error
-                .unwrap_or_else(|| "automation_failed".to_string()),
+            message: "browser automation reported a failure".to_string(),
         })
     }
 }
@@ -7372,8 +8757,8 @@ fn decode_screenshot_png(raw: &str) -> Result<Vec<u8>, BrowserError> {
 
 fn random_annotation_capture_id() -> Result<String, BrowserError> {
     let mut bytes = [0_u8; 16];
-    getrandom::fill(&mut bytes).map_err(|error| BrowserError::CrashedView {
-        message: format!("could not generate annotation capture id: {error}"),
+    getrandom::fill(&mut bytes).map_err(|_| BrowserError::CrashedView {
+        message: "could not generate annotation capture id".to_string(),
     })?;
     let mut id = String::from("capture-");
     use std::fmt::Write as _;
@@ -7383,10 +8768,184 @@ fn random_annotation_capture_id() -> Result<String, BrowserError> {
     Ok(id)
 }
 
+fn window_handle_from_destination(
+    destination: crate::browser::BrowserNativeDestination,
+) -> Result<BrowserWindowHandle, BrowserError> {
+    BrowserWindowHandle::from_raw(destination.raw()).map_err(|_| BrowserError::InvalidInvocation {
+        field: "destination".to_string(),
+    })
+}
+
+fn native_shell_missing_view() -> BrowserError {
+    BrowserError::CrashedView {
+        message: "browser native view is not registered".to_string(),
+    }
+}
+
+fn native_shell_view_error(error: BrowserNativeViewError) -> BrowserError {
+    BrowserError::CrashedView {
+        message: error.to_string(),
+    }
+}
+
+fn current_host_process_identity() -> Result<BrowserHostProcessIdentity, BrowserNativeViewError> {
+    let pid = std::process::id();
+    let executable = std::env::current_exe()
+        .map_err(|_| BrowserNativeViewError::LiveWryObservationUnavailable)?;
+    let creation_time = current_process_creation_time_100ns()
+        .ok_or(BrowserNativeViewError::LiveWryObservationUnavailable)?;
+    BrowserHostProcessIdentity::new(
+        pid,
+        creation_time,
+        executable.to_string_lossy().into_owned(),
+    )
+    .map_err(|_| BrowserNativeViewError::LiveWryObservationUnavailable)
+}
+
+#[cfg(target_os = "windows")]
+fn current_process_creation_time_100ns() -> Option<u64> {
+    use windows::Win32::Foundation::FILETIME;
+    use windows::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
+    let mut creation = FILETIME::default();
+    let mut exit = FILETIME::default();
+    let mut kernel = FILETIME::default();
+    let mut user = FILETIME::default();
+    unsafe {
+        GetProcessTimes(
+            GetCurrentProcess(),
+            &mut creation,
+            &mut exit,
+            &mut kernel,
+            &mut user,
+        )
+        .ok()?;
+    }
+    let value = ((creation.dwHighDateTime as u64) << 32) | creation.dwLowDateTime as u64;
+    (value != 0).then_some(value)
+}
+
+#[cfg(target_os = "windows")]
+unsafe extern "system" fn parking_window_proc(
+    hwnd: windows::Win32::Foundation::HWND,
+    msg: u32,
+    wparam: windows::Win32::Foundation::WPARAM,
+    lparam: windows::Win32::Foundation::LPARAM,
+) -> windows::Win32::Foundation::LRESULT {
+    windows::Win32::UI::WindowsAndMessaging::DefWindowProcW(hwnd, msg, wparam, lparam)
+}
+
+#[cfg(target_os = "windows")]
+fn create_host_owned_parking_hwnd(gpui_window_identity: isize) -> Result<u64, ()> {
+    #[cfg(target_os = "windows")]
+    use windows::core::w;
+    use windows::Win32::Foundation::{HINSTANCE, HWND};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, GetWindowLongPtrW, IsWindow, RegisterClassW, GWLP_HINSTANCE, WNDCLASSW,
+        WS_DISABLED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
+    };
+    let gpui = HWND(gpui_window_identity as *mut _);
+    unsafe {
+        if gpui.0.is_null() || !IsWindow(Some(gpui)).as_bool() {
+            return Err(());
+        }
+        let instance = HINSTANCE(GetWindowLongPtrW(gpui, GWLP_HINSTANCE) as *mut _);
+        if instance.0.is_null() {
+            return Err(());
+        }
+        let class_name = w!("DevManagerBrowserParking");
+        let mut class = std::mem::zeroed::<WNDCLASSW>();
+        class.lpfnWndProc = Some(parking_window_proc);
+        class.hInstance = instance;
+        class.lpszClassName = class_name;
+        let _ = RegisterClassW(&class);
+        let hwnd = CreateWindowExW(
+            WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
+            class_name,
+            w!(""),
+            WS_POPUP | WS_DISABLED,
+            -32_000,
+            -32_000,
+            1,
+            1,
+            None,
+            None,
+            Some(instance),
+            None,
+        )
+        .map_err(|_| ())?;
+        if hwnd.0.is_null() || !IsWindow(Some(hwnd)).as_bool() {
+            return Err(());
+        }
+        let raw = hwnd.0 as usize as u64;
+        if raw == 0 || raw == gpui_window_identity as u64 {
+            let _ = windows::Win32::UI::WindowsAndMessaging::DestroyWindow(hwnd);
+            return Err(());
+        }
+        Ok(raw)
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn destroy_host_owned_parking_hwnd(raw: u64) {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{DestroyWindow, IsWindow};
+    let hwnd = HWND(raw as usize as *mut _);
+    unsafe {
+        if !hwnd.0.is_null() && IsWindow(Some(hwnd)).as_bool() {
+            let _ = DestroyWindow(hwnd);
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn child_hwnd_from_webview(
+    webview: &WebView,
+) -> Result<BrowserWindowHandle, BrowserNativeViewError> {
+    // Wry 0.55 does not expose its private `InnerWebView::hwnd`, but its
+    // default WebView id is the container HWND created by `new_as_child`.
+    // Validate that id against the live WebView2 controller/environment and
+    // the Win32 parent before allowing it into host-owned state.
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{GetParent, IsWindow};
+
+    let raw = webview
+        .id()
+        .parse::<u64>()
+        .map_err(|_| BrowserNativeViewError::LiveWryObservationUnavailable)?;
+    let child = BrowserWindowHandle::from_raw(raw)
+        .map_err(|_| BrowserNativeViewError::LiveWryObservationUnavailable)?;
+    let child_hwnd = HWND(raw as usize as *mut _);
+    let controller = webview.controller();
+    let _environment = webview.environment();
+    let mut parent = HWND::default();
+    unsafe {
+        if child_hwnd.0.is_null() || !IsWindow(Some(child_hwnd)).as_bool() {
+            return Err(BrowserNativeViewError::LiveWryObservationUnavailable);
+        }
+        controller
+            .ParentWindow(&mut parent)
+            .map_err(|_| BrowserNativeViewError::LiveWryObservationUnavailable)?;
+        let actual_parent = GetParent(child_hwnd)
+            .map_err(|_| BrowserNativeViewError::LiveWryObservationUnavailable)?;
+        if parent.0.is_null() || actual_parent != parent {
+            return Err(BrowserNativeViewError::LiveWryObservationUnavailable);
+        }
+    }
+    Ok(child)
+}
+
+fn parking_hwnd_from_lifetime(
+    lifetime: &BrowserNativeWindowLifetime,
+) -> Result<BrowserWindowHandle, BrowserNativeViewError> {
+    lifetime
+        .parking_window_handle()
+        .ok_or(BrowserNativeViewError::MissingView)
+}
+
 fn wry_bounds(bounds: BrowserBounds) -> Rect {
     Rect {
-        position: LogicalPosition::new(bounds.x, bounds.y).into(),
-        size: LogicalSize::new(bounds.width.max(1), bounds.height.max(1)).into(),
+        position: PhysicalPosition::new(bounds.x, bounds.y).into(),
+        size: PhysicalSize::new(bounds.width.max(1) as u32, bounds.height.max(1) as u32).into(),
     }
 }
 
@@ -7406,9 +8965,9 @@ fn missing_workspace() -> BrowserError {
     }
 }
 
-fn missing_tab(tab_id: &str) -> BrowserError {
+fn missing_tab(_tab_id: &str) -> BrowserError {
     BrowserError::CrashedView {
-        message: format!("browser tab {tab_id:?} does not exist"),
+        message: "browser tab does not exist".to_string(),
     }
 }
 
@@ -7418,33 +8977,24 @@ fn secret_tainted_document_content() -> BrowserError {
     }
 }
 
-fn view_failure(error: impl std::fmt::Display) -> BrowserError {
+fn view_failure(_error: impl std::fmt::Display) -> BrowserError {
     BrowserError::CrashedView {
-        message: error.to_string(),
-    }
-}
-
-fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
-    if let Some(message) = payload.downcast_ref::<&str>() {
-        (*message).to_string()
-    } else if let Some(message) = payload.downcast_ref::<String>() {
-        message.clone()
-    } else {
-        "unknown panic payload".to_string()
+        message: "browser host operation failed".to_string(),
     }
 }
 
 #[cfg(test)]
 mod secret_document_state_tests {
     use super::{
-        browser_capture_storage_plan, browser_command_journal_actor,
+        bounded_host_diagnostic, browser_capture_storage_plan, browser_command_journal_actor,
         conservative_tainted_document_risk, contain_queued_host_event,
         finish_secret_exposure_on_error, fixed_secret_type_callback_result,
         repair_cleanup_disposition, repair_clear_acknowledgement, repair_highlight_failure,
         view_key, ActiveBrowserRequest, BrowserAsyncPhase, BrowserCaptureStoragePlan,
-        BrowserDocumentSecretState, BrowserNativeViewBuildAdmission, BrowserNativeViewBuildQueue,
-        BrowserNativeWindowBuildLease, BrowserParentWindowLease, BrowserQueuedWork,
-        BrowserWebViewHost, RepairCleanupDisposition, RepairCleanupEvent, WORKSPACE_OPERATION_TAB,
+        BrowserDocumentSecretExposure, BrowserDocumentSecretState, BrowserNativeViewBuildAdmission,
+        BrowserNativeViewBuildQueue, BrowserNativeWindowBuildLease, BrowserParentWindowLease,
+        BrowserQueuedWork, BrowserWebViewHost, RepairCleanupDisposition, RepairCleanupEvent,
+        WORKSPACE_OPERATION_TAB,
     };
     use crate::browser::commands::HostControlQueue;
     use crate::browser::{
@@ -7466,8 +9016,79 @@ mod secret_document_state_tests {
     use static_assertions::assert_not_impl_any;
     use std::{num::NonZeroU64, path::PathBuf, sync::Arc, time::Instant};
 
+    trait ExhaustionOutcome {
+        fn is_exhausted(&self) -> bool;
+    }
+
+    impl ExhaustionOutcome for BrowserNativeViewBuildAdmission {
+        fn is_exhausted(&self) -> bool {
+            false
+        }
+    }
+
+    impl<T, E> ExhaustionOutcome for Result<T, E> {
+        fn is_exhausted(&self) -> bool {
+            self.is_err()
+        }
+    }
+
+    impl ExhaustionOutcome for BrowserDocumentSecretExposure {
+        fn is_exhausted(&self) -> bool {
+            false
+        }
+    }
+
     assert_not_impl_any!(BrowserParentWindowLease: Copy, Clone, Send, Sync);
     assert_not_impl_any!(BrowserNativeWindowBuildLease: Copy, Clone, Send, Sync);
+
+    #[test]
+    fn completed_task_aware_identity_preserves_exact_tuple_and_fails_closed() {
+        use super::{completed_task_aware_identity, PreparedTaskSurface};
+        use crate::browser::host::BrowserTaskSurfaceBindBlocker;
+        use crate::domain::id::{AgentSessionId, BrowserContextId, ResourceId, TaskId};
+        use crate::protocol::BrowserSurfaceIdentity;
+
+        let task_id = TaskId::new();
+        let agent_session_id = AgentSessionId::new();
+        let context_id = BrowserContextId::new();
+        let resource_id = ResourceId::new();
+        let identity = BrowserSurfaceIdentity {
+            task_id,
+            context_id,
+            resource_id,
+        };
+        let prepared = PreparedTaskSurface {
+            identity,
+            agent_session_id,
+        };
+
+        assert_eq!(completed_task_aware_identity(None, None, None), Ok(None));
+        assert_eq!(
+            completed_task_aware_identity(Some(prepared), Some(identity), Some(agent_session_id)),
+            Ok(Some((identity, agent_session_id)))
+        );
+        assert_eq!(
+            completed_task_aware_identity(Some(prepared), Some(identity), None),
+            Err(BrowserTaskSurfaceBindBlocker::TaskIdentityUnavailableAtBuildCompletion)
+        );
+        assert_eq!(
+            completed_task_aware_identity(None, Some(identity), Some(agent_session_id)),
+            Err(BrowserTaskSurfaceBindBlocker::TaskIdentityUnavailableAtBuildCompletion)
+        );
+        let other_session = AgentSessionId::new();
+        assert_eq!(
+            completed_task_aware_identity(Some(prepared), Some(identity), Some(other_session)),
+            Err(BrowserTaskSurfaceBindBlocker::TaskIdentityUnavailableAtBuildCompletion)
+        );
+        let mismatched = PreparedTaskSurface {
+            identity,
+            agent_session_id: other_session,
+        };
+        assert_eq!(
+            completed_task_aware_identity(Some(mismatched), Some(identity), Some(agent_session_id)),
+            Err(BrowserTaskSurfaceBindBlocker::TaskIdentityUnavailableAtBuildCompletion)
+        );
+    }
 
     #[derive(Clone, Copy)]
     enum DocumentStateRemoval {
@@ -7486,16 +9107,16 @@ mod secret_document_state_tests {
         let other_project = view_key(&other_workspace, "tab-a");
         let mut queue = BrowserNativeViewBuildQueue::default();
 
-        let first_id = match queue.admit(first.clone(), false) {
+        let first_id = match queue.admit(first.clone(), false).unwrap() {
             BrowserNativeViewBuildAdmission::Start { build_id } => build_id,
             admission => panic!("unexpected first admission: {admission:?}"),
         };
-        let same_project_id = match queue.admit(same_project.clone(), false) {
+        let same_project_id = match queue.admit(same_project.clone(), false).unwrap() {
             BrowserNativeViewBuildAdmission::Queued { build_id } => build_id,
             admission => panic!("same-project build was not serialized: {admission:?}"),
         };
         assert!(matches!(
-            queue.admit(other_project, false),
+            queue.admit(other_project, false).unwrap(),
             BrowserNativeViewBuildAdmission::Start { .. }
         ));
 
@@ -7509,7 +9130,7 @@ mod secret_document_state_tests {
         let workspace = BrowserWorkspaceKey::new("retry-project", "conversation-a").unwrap();
         let key = view_key(&workspace, "tab-a");
         let mut queue = BrowserNativeViewBuildQueue::default();
-        let build_id = match queue.admit(key.clone(), false) {
+        let build_id = match queue.admit(key.clone(), false).unwrap() {
             BrowserNativeViewBuildAdmission::Start { build_id } => build_id,
             admission => panic!("unexpected first admission: {admission:?}"),
         };
@@ -7518,15 +9139,53 @@ mod secret_document_state_tests {
         assert!(failed.accepted);
         assert!(failed.next.is_none());
         assert_eq!(
-            queue.admit(key.clone(), false),
+            queue.admit(key.clone(), false).unwrap(),
             BrowserNativeViewBuildAdmission::Failed {
-                message: "injected build failure".to_string(),
+                message: "browser native view build failed".to_string(),
             }
         );
         assert!(matches!(
-            queue.admit(key, true),
+            queue.admit(key, true).unwrap(),
             BrowserNativeViewBuildAdmission::Start { .. }
         ));
+    }
+
+    #[test]
+    fn native_view_build_id_exhaustion_is_typed_and_does_not_wrap() {
+        let workspace = BrowserWorkspaceKey::new("build-id-exhaustion", "conversation-a").unwrap();
+        let key = view_key(&workspace, "tab-a");
+        let mut queue = BrowserNativeViewBuildQueue {
+            next_build_id: u64::MAX,
+            ..BrowserNativeViewBuildQueue::default()
+        };
+
+        let outcome = queue.admit(key, false);
+        assert!(
+            outcome.is_exhausted(),
+            "native build IDs must fail closed at exhaustion rather than wrap"
+        );
+    }
+
+    #[test]
+    fn document_secret_generation_exhaustion_is_typed() {
+        let state = Arc::new(BrowserDocumentSecretState::default());
+        state.inner.lock().unwrap().exposure_generation = u64::MAX;
+        let outcome = state.begin_exposure();
+        assert!(
+            outcome.is_exhausted(),
+            "secret exposure generation exhaustion must be reported"
+        );
+    }
+
+    #[test]
+    fn document_generation_lock_failure_is_not_reported_as_u64_max() {
+        let state = BrowserDocumentSecretState::default();
+        state.inner.lock().unwrap().document_generation = u64::MAX;
+        let outcome = state.document_generation();
+        assert!(
+            outcome.is_exhausted(),
+            "document generation exhaustion must not use the lock-error sentinel"
+        );
     }
 
     #[test]
@@ -7536,11 +9195,11 @@ mod secret_document_state_tests {
         let active = view_key(&workspace_a, "tab-a");
         let waiting = view_key(&workspace_b, "tab-b");
         let mut queue = BrowserNativeViewBuildQueue::default();
-        let active_id = match queue.admit(active.clone(), false) {
+        let active_id = match queue.admit(active.clone(), false).unwrap() {
             BrowserNativeViewBuildAdmission::Start { build_id } => build_id,
             admission => panic!("unexpected active admission: {admission:?}"),
         };
-        let waiting_id = match queue.admit(waiting.clone(), false) {
+        let waiting_id = match queue.admit(waiting.clone(), false).unwrap() {
             BrowserNativeViewBuildAdmission::Queued { build_id } => build_id,
             admission => panic!("unexpected waiting admission: {admission:?}"),
         };
@@ -7558,12 +9217,12 @@ mod secret_document_state_tests {
         let active = view_key(&workspace_a, "tab-a");
         let waiting = view_key(&workspace_b, "tab-b");
         let mut queue = BrowserNativeViewBuildQueue::default();
-        let active_id = match queue.admit(active.clone(), false) {
+        let active_id = match queue.admit(active.clone(), false).unwrap() {
             BrowserNativeViewBuildAdmission::Start { build_id } => build_id,
             admission => panic!("unexpected active admission: {admission:?}"),
         };
         assert!(matches!(
-            queue.admit(waiting, false),
+            queue.admit(waiting, false).unwrap(),
             BrowserNativeViewBuildAdmission::Queued { .. }
         ));
 
@@ -7582,7 +9241,7 @@ mod secret_document_state_tests {
         let workspace = BrowserWorkspaceKey::new("leased-project", "conversation-a").unwrap();
         let active = view_key(&workspace, "tab-a");
         let mut queue = BrowserNativeViewBuildQueue::default();
-        let active_id = match queue.admit(active.clone(), false) {
+        let active_id = match queue.admit(active.clone(), false).unwrap() {
             BrowserNativeViewBuildAdmission::Start { build_id } => build_id,
             admission => panic!("unexpected active admission: {admission:?}"),
         };
@@ -7879,11 +9538,14 @@ mod secret_document_state_tests {
         let retained = inbox.recv().await.expect("retained controller request");
 
         host.event_sender
-            .send(BrowserHostEvent::user_input(
-                workspace_key.clone(),
-                tab_id.clone(),
-                BrowserUserInputKind::Keyboard,
-            ))
+            .send(
+                BrowserHostEvent::user_input(
+                    workspace_key.clone(),
+                    tab_id.clone(),
+                    BrowserUserInputKind::Keyboard,
+                )
+                .expect("interaction epoch"),
+            )
             .unwrap();
         let initial_revision = initial.revision;
         let mut observed_revision = None;
@@ -8002,11 +9664,14 @@ mod secret_document_state_tests {
             BrowserPageRecordingSubmit::Accepted
         );
         host.event_sender
-            .send(BrowserHostEvent::user_input(
-                workspace_key.clone(),
-                "tab-a",
-                BrowserUserInputKind::Pointer,
-            ))
+            .send(
+                BrowserHostEvent::user_input(
+                    workspace_key.clone(),
+                    "tab-a",
+                    BrowserUserInputKind::Pointer,
+                )
+                .expect("interaction epoch"),
+            )
             .unwrap();
 
         let workflow = host.workflow_coordinator.clone();
@@ -8070,11 +9735,14 @@ mod secret_document_state_tests {
         // The actual user gesture predates both pieces of work below, even
         // though the UI-thread drain observes it after they have started.
         host.event_sender
-            .send(BrowserHostEvent::user_input(
-                workspace_key.clone(),
-                tab_id.clone(),
-                BrowserUserInputKind::Pointer,
-            ))
+            .send(
+                BrowserHostEvent::user_input(
+                    workspace_key.clone(),
+                    tab_id.clone(),
+                    BrowserUserInputKind::Pointer,
+                )
+                .expect("interaction epoch"),
+            )
             .unwrap();
 
         let (bridge, mut inbox) = browser_command_channel(4);
@@ -8233,11 +9901,14 @@ mod secret_document_state_tests {
         .expect("replay-owned close enqueues");
 
         host.event_sender
-            .send(BrowserHostEvent::user_input(
-                workspace_key.clone(),
-                "tab-a",
-                BrowserUserInputKind::Pointer,
-            ))
+            .send(
+                BrowserHostEvent::user_input(
+                    workspace_key.clone(),
+                    "tab-a",
+                    BrowserUserInputKind::Pointer,
+                )
+                .expect("interaction epoch"),
+            )
             .unwrap();
 
         let observer_bridge = bridge.clone();
@@ -8332,11 +10003,14 @@ mod secret_document_state_tests {
             .unwrap();
         let stale_tab_id = initial.snapshot.selected_tab_id.clone().unwrap();
         host.event_sender
-            .send(BrowserHostEvent::user_input(
-                workspace_key.clone(),
-                stale_tab_id.clone(),
-                BrowserUserInputKind::Keyboard,
-            ))
+            .send(
+                BrowserHostEvent::user_input(
+                    workspace_key.clone(),
+                    stale_tab_id.clone(),
+                    BrowserUserInputKind::Keyboard,
+                )
+                .expect("interaction epoch"),
+            )
             .unwrap();
         let replacement = host.state.close_tab(&workspace_key, &stale_tab_id).unwrap();
         let replacement_tab_id = replacement.snapshot.selected_tab_id.clone().unwrap();
@@ -8866,7 +10540,8 @@ mod secret_document_state_tests {
                 workspace_key.clone(),
                 tab_id.clone(),
                 BrowserUserInputKind::Keyboard,
-            ),
+            )
+            .expect("interaction epoch"),
             BrowserHostEvent::DomMutation {
                 workspace_key: workspace_key.clone(),
                 tab_id: tab_id.clone(),
@@ -8915,6 +10590,22 @@ mod secret_document_state_tests {
                 if tab_id == WORKSPACE_OPERATION_TAB
                     && message == "fixed workspace lifecycle diagnostic"
         )));
+    }
+
+    #[test]
+    fn host_diagnostics_bound_and_redact_raw_paths_and_urls() {
+        const SENTINEL: &str = "windows-host-diagnostic-attacker-sentinel";
+        let message = bounded_host_diagnostic(format!(
+            "WebView2 failure at C:\\secret\\{SENTINEL}: https://example.invalid/{SENTINEL}"
+        ));
+        assert!(!message.contains(SENTINEL));
+        assert!(message.len() <= 256);
+        let attacker_text = bounded_host_diagnostic(format!("diagnostic {SENTINEL}"));
+        assert!(!attacker_text.contains(SENTINEL));
+        assert_eq!(
+            attacker_text, "browser host diagnostic unavailable",
+            "diagnostics must use an allowlisted bounded message"
+        );
     }
 
     #[test]
@@ -9009,7 +10700,7 @@ mod secret_document_state_tests {
     #[test]
     fn in_flight_exposure_blocks_navigation_completed_before_callback() {
         let state = Arc::new(BrowserDocumentSecretState::default());
-        let exposure = state.begin_exposure();
+        let exposure = state.begin_exposure().unwrap();
 
         state.content_loading(70, false);
         state.navigation_completed(70, true);
@@ -9034,7 +10725,7 @@ mod secret_document_state_tests {
     #[test]
     fn callback_boundary_invalidates_an_earlier_content_loading_candidate() {
         let state = Arc::new(BrowserDocumentSecretState::default());
-        let exposure = state.begin_exposure();
+        let exposure = state.begin_exposure().unwrap();
 
         state.content_loading(80, false);
         exposure.finish();
@@ -9055,9 +10746,9 @@ mod secret_document_state_tests {
     #[test]
     fn duplicate_finish_cannot_retire_another_in_flight_exposure() {
         let state = Arc::new(BrowserDocumentSecretState::default());
-        let first = state.begin_exposure();
+        let first = state.begin_exposure().unwrap();
         let first_callback = first.clone();
-        let second = state.begin_exposure();
+        let second = state.begin_exposure().unwrap();
 
         first.finish();
         first_callback.finish();
@@ -9080,7 +10771,7 @@ mod secret_document_state_tests {
     #[test]
     fn immediate_schedule_error_finishes_the_exposure() {
         let state = Arc::new(BrowserDocumentSecretState::default());
-        let exposure = state.begin_exposure();
+        let exposure = state.begin_exposure().unwrap();
         let immediate_schedule_error: Result<(), ()> = Err(());
         assert!(finish_secret_exposure_on_error(&exposure, immediate_schedule_error).is_err());
 
@@ -9095,7 +10786,7 @@ mod secret_document_state_tests {
     #[test]
     fn accepted_schedule_without_callback_remains_fail_closed() {
         let state = Arc::new(BrowserDocumentSecretState::default());
-        let exposure = state.begin_exposure();
+        let exposure = state.begin_exposure().unwrap();
         let accepted_without_callback: Result<(), ()> = Ok(());
         assert!(finish_secret_exposure_on_error(&exposure, accepted_without_callback).is_ok());
 
@@ -9110,9 +10801,9 @@ mod secret_document_state_tests {
     #[test]
     fn synchronous_callback_then_schedule_error_finishes_only_once() {
         let state = Arc::new(BrowserDocumentSecretState::default());
-        let schedule = state.begin_exposure();
+        let schedule = state.begin_exposure().unwrap();
         let callback = schedule.clone();
-        let other = state.begin_exposure();
+        let other = state.begin_exposure().unwrap();
 
         callback.finish();
         let returned_error: Result<(), ()> = Err(());
@@ -9229,5 +10920,41 @@ mod secret_document_state_tests {
             conservative_tainted_document_risk(BrowserRisk::Normal, false),
             BrowserRisk::Normal
         );
+    }
+}
+
+fn native_parent_window_identity(handle: RawWindowHandle) -> Option<isize> {
+    match handle {
+        #[cfg(target_os = "windows")]
+        RawWindowHandle::Win32(handle) => Some(handle.hwnd.get()),
+        #[cfg(target_os = "linux")]
+        RawWindowHandle::Xlib(handle) => isize::try_from(handle.window).ok().filter(|id| *id != 0),
+        #[cfg(target_os = "linux")]
+        RawWindowHandle::Xcb(handle) => isize::try_from(handle.window.get()).ok(),
+        _ => None,
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn initialize_webview_runtime() -> Result<String, ()> {
+    wry::webview_version().map_err(|_| ())
+}
+
+#[cfg(target_os = "windows")]
+trait BrowserScriptEvaluation {
+    fn evaluate_browser_script_with_callback(
+        &self,
+        script: &str,
+        callback: impl Fn(String) + Send + 'static,
+    ) -> wry::Result<()>;
+}
+#[cfg(target_os = "windows")]
+impl BrowserScriptEvaluation for WebView {
+    fn evaluate_browser_script_with_callback(
+        &self,
+        script: &str,
+        callback: impl Fn(String) + Send + 'static,
+    ) -> wry::Result<()> {
+        self.evaluate_script_with_callback(script, callback)
     }
 }

@@ -1,0 +1,2575 @@
+use serde::de::{self, DeserializeSeed, MapAccess, Visitor};
+use serde::ser::SerializeMap;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use sha2::{Digest, Sha256};
+use std::fmt;
+
+pub use crate::domain::agent::SpecialistPermission;
+use crate::domain::agent::{AgentRole, AgentSessionFacts, AgentSessionLifecycle};
+use crate::domain::agent_resource::AgentResourceBinding;
+use crate::domain::artifact::{
+    verify_inline_content_digest, ArtifactContentRef, ArtifactFacts, ArtifactKind, PrivacyClass,
+    MAX_SPECIALIST_RAW_ARTIFACT_BYTES,
+};
+pub use crate::domain::artifact::{SpecialistResult, SpecialistStatus};
+use crate::domain::browser::{BrowserContractError, BrowserRequest};
+use crate::domain::canonical;
+use crate::domain::event::Event;
+use crate::domain::id::{
+    AgentSessionId, ArtifactId, ClientId, CommandId, EnvironmentId, EventId, OperationId,
+    ProjectId, ResourceId, TaskId, TurnId,
+};
+use crate::domain::provider_input::{
+    validate_action_nested_ids, PresentProviderApprovalIntent, PresentProviderQuestionIntent,
+    ProviderInputAction, ProviderInputIntentError, ProviderResolutionWinner,
+    SettleProviderWaitIntent,
+};
+use crate::domain::resource::ResourceFacts;
+use crate::domain::snapshot::TaskSnapshot;
+use crate::domain::task::{
+    ReviewReadiness, TaskActivity, TaskAssignment, TaskAttention, TaskConnectivity, TaskFacts,
+    TaskLifecycle, WorkspaceRef,
+};
+use crate::prompts::{PromptChainCommand, PromptCommand, PromptMutationReceipt};
+use crate::providers::ProviderKind;
+use crate::workspace::WorkspaceRequest;
+use uuid::Uuid;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RejectionCode {
+    NotFound,
+    AlreadyExists,
+    RevisionConflict,
+    InvalidTransition,
+    OwnershipConflict,
+    UnsupportedCapability,
+    Closing,
+    IdempotencyConflict,
+    AlreadyResolved,
+    /// The task already holds MAX_PLAIN_SHELLS_PER_TASK live plain shells.
+    TooManyTerminals,
+}
+
+impl<'de> Deserialize<'de> for RejectionCode {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct RejectionCodeVisitor;
+
+        impl Visitor<'_> for RejectionCodeVisitor {
+            type Value = RejectionCode;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a named RejectionCode")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                match value {
+                    "not_found" => Ok(RejectionCode::NotFound),
+                    "already_exists" => Ok(RejectionCode::AlreadyExists),
+                    "revision_conflict" => Ok(RejectionCode::RevisionConflict),
+                    "invalid_transition" => Ok(RejectionCode::InvalidTransition),
+                    "ownership_conflict" => Ok(RejectionCode::OwnershipConflict),
+                    "unsupported_capability" => Ok(RejectionCode::UnsupportedCapability),
+                    "closing" => Ok(RejectionCode::Closing),
+                    "idempotency_conflict" => Ok(RejectionCode::IdempotencyConflict),
+                    "already_resolved" => Ok(RejectionCode::AlreadyResolved),
+                    "too_many_terminals" => Ok(RejectionCode::TooManyTerminals),
+                    _ => Err(de::Error::unknown_variant(
+                        value,
+                        &[
+                            "not_found",
+                            "already_exists",
+                            "revision_conflict",
+                            "invalid_transition",
+                            "ownership_conflict",
+                            "unsupported_capability",
+                            "closing",
+                            "idempotency_conflict",
+                            "already_resolved",
+                            "too_many_terminals",
+                        ],
+                    )),
+                }
+            }
+        }
+
+        deserializer.deserialize_str(RejectionCodeVisitor)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandEnvelope {
+    pub command_id: CommandId,
+    pub client_id: ClientId,
+    pub task_id: Option<TaskId>,
+    pub issued_at_ms: i64,
+    pub expected_task_revision: Option<u64>,
+    pub command: Command,
+}
+
+impl Serialize for CommandEnvelope {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut map = serializer.serialize_map(Some(6))?;
+        map.serialize_entry("command_id", &self.command_id)?;
+        map.serialize_entry("client_id", &self.client_id)?;
+        map.serialize_entry("task_id", &self.task_id)?;
+        map.serialize_entry("issued_at_ms", &self.issued_at_ms)?;
+        map.serialize_entry("expected_task_revision", &self.expected_task_revision)?;
+        map.serialize_entry("command", &self.command)?;
+        map.end()
+    }
+}
+
+const COMMAND_ENVELOPE_FIELDS: &[&str] = &[
+    "command_id",
+    "client_id",
+    "task_id",
+    "issued_at_ms",
+    "expected_task_revision",
+    "command",
+];
+
+enum CommandEnvelopeField {
+    CommandId,
+    ClientId,
+    TaskId,
+    IssuedAtMs,
+    ExpectedTaskRevision,
+    Command,
+}
+
+impl<'de> Deserialize<'de> for CommandEnvelopeField {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct FieldVisitor;
+
+        impl Visitor<'_> for FieldVisitor {
+            type Value = CommandEnvelopeField;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a CommandEnvelope field name")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                match value {
+                    "command_id" => Ok(CommandEnvelopeField::CommandId),
+                    "client_id" => Ok(CommandEnvelopeField::ClientId),
+                    "task_id" => Ok(CommandEnvelopeField::TaskId),
+                    "issued_at_ms" => Ok(CommandEnvelopeField::IssuedAtMs),
+                    "expected_task_revision" => Ok(CommandEnvelopeField::ExpectedTaskRevision),
+                    "command" => Ok(CommandEnvelopeField::Command),
+                    _ => Err(de::Error::unknown_field(value, COMMAND_ENVELOPE_FIELDS)),
+                }
+            }
+        }
+
+        deserializer.deserialize_identifier(FieldVisitor)
+    }
+}
+
+impl<'de> Deserialize<'de> for CommandEnvelope {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct CommandEnvelopeVisitor;
+
+        impl<'de> Visitor<'de> for CommandEnvelopeVisitor {
+            type Value = CommandEnvelope;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a named CommandEnvelope map")
+            }
+
+            fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+            where
+                M: MapAccess<'de>,
+            {
+                let mut command_id = None;
+                let mut client_id = None;
+                let mut task_id: Option<Option<TaskId>> = None;
+                let mut issued_at_ms = None;
+                let mut expected_task_revision: Option<Option<u64>> = None;
+                let mut command = None;
+
+                while let Some(field) = map.next_key()? {
+                    match field {
+                        CommandEnvelopeField::CommandId => {
+                            if command_id.is_some() {
+                                return Err(de::Error::duplicate_field("command_id"));
+                            }
+                            command_id = Some(map.next_value()?);
+                        }
+                        CommandEnvelopeField::ClientId => {
+                            if client_id.is_some() {
+                                return Err(de::Error::duplicate_field("client_id"));
+                            }
+                            client_id = Some(map.next_value()?);
+                        }
+                        CommandEnvelopeField::TaskId => {
+                            if task_id.is_some() {
+                                return Err(de::Error::duplicate_field("task_id"));
+                            }
+                            task_id = Some(map.next_value()?);
+                        }
+                        CommandEnvelopeField::IssuedAtMs => {
+                            if issued_at_ms.is_some() {
+                                return Err(de::Error::duplicate_field("issued_at_ms"));
+                            }
+                            issued_at_ms = Some(map.next_value()?);
+                        }
+                        CommandEnvelopeField::ExpectedTaskRevision => {
+                            if expected_task_revision.is_some() {
+                                return Err(de::Error::duplicate_field("expected_task_revision"));
+                            }
+                            expected_task_revision = Some(map.next_value()?);
+                        }
+                        CommandEnvelopeField::Command => {
+                            if command.is_some() {
+                                return Err(de::Error::duplicate_field("command"));
+                            }
+                            command = Some(map.next_value()?);
+                        }
+                    }
+                }
+
+                Ok(CommandEnvelope {
+                    command_id: command_id.ok_or_else(|| de::Error::missing_field("command_id"))?,
+                    client_id: client_id.ok_or_else(|| de::Error::missing_field("client_id"))?,
+                    task_id: task_id.ok_or_else(|| de::Error::missing_field("task_id"))?,
+                    issued_at_ms: issued_at_ms
+                        .ok_or_else(|| de::Error::missing_field("issued_at_ms"))?,
+                    expected_task_revision: expected_task_revision
+                        .ok_or_else(|| de::Error::missing_field("expected_task_revision"))?,
+                    command: command.ok_or_else(|| de::Error::missing_field("command"))?,
+                })
+            }
+        }
+
+        deserializer.deserialize_map(CommandEnvelopeVisitor)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommandReceipt {
+    Accepted {
+        command_id: CommandId,
+        operation_id: OperationId,
+        task_revision: Option<u64>,
+        event_ids: Vec<EventId>,
+        prompt_mutation: Option<PromptMutationReceipt>,
+    },
+    Rejected {
+        command_id: CommandId,
+        code: RejectionCode,
+        current_revision: Option<u64>,
+        resolution: Option<ProviderResolutionWinner>,
+    },
+}
+
+impl CommandReceipt {
+    pub const fn command_id(&self) -> CommandId {
+        match self {
+            Self::Accepted { command_id, .. } | Self::Rejected { command_id, .. } => *command_id,
+        }
+    }
+
+    pub const fn accepted_operation_id(&self) -> Option<OperationId> {
+        match self {
+            Self::Accepted { operation_id, .. } => Some(*operation_id),
+            Self::Rejected { .. } => None,
+        }
+    }
+}
+
+struct AcceptedReceiptRef<'a> {
+    command_id: &'a CommandId,
+    operation_id: &'a OperationId,
+    task_revision: &'a Option<u64>,
+    event_ids: &'a [EventId],
+    prompt_mutation: &'a Option<PromptMutationReceipt>,
+}
+
+impl Serialize for AcceptedReceiptRef<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let fields = 4 + usize::from(self.prompt_mutation.is_some());
+        let mut map = serializer.serialize_map(Some(fields))?;
+        map.serialize_entry("command_id", self.command_id)?;
+        map.serialize_entry("operation_id", self.operation_id)?;
+        map.serialize_entry("task_revision", self.task_revision)?;
+        map.serialize_entry("event_ids", self.event_ids)?;
+        if let Some(mutation) = self.prompt_mutation {
+            map.serialize_entry("prompt_mutation", mutation)?;
+        }
+        map.end()
+    }
+}
+
+struct RejectedReceiptRef<'a> {
+    command_id: &'a CommandId,
+    code: &'a RejectionCode,
+    current_revision: &'a Option<u64>,
+    resolution: &'a Option<ProviderResolutionWinner>,
+}
+
+impl Serialize for RejectedReceiptRef<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut map =
+            serializer.serialize_map(Some(if self.resolution.is_some() { 4 } else { 3 }))?;
+        map.serialize_entry("command_id", self.command_id)?;
+        map.serialize_entry("code", self.code)?;
+        map.serialize_entry("current_revision", self.current_revision)?;
+        if let Some(resolution) = self.resolution {
+            map.serialize_entry("resolution", resolution)?;
+        }
+        map.end()
+    }
+}
+
+impl Serialize for CommandReceipt {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut map = serializer.serialize_map(Some(1))?;
+        match self {
+            Self::Accepted {
+                command_id,
+                operation_id,
+                task_revision,
+                event_ids,
+                prompt_mutation,
+            } => map.serialize_entry(
+                "accepted",
+                &AcceptedReceiptRef {
+                    command_id,
+                    operation_id,
+                    task_revision,
+                    event_ids,
+                    prompt_mutation,
+                },
+            )?,
+            Self::Rejected {
+                command_id,
+                code,
+                current_revision,
+                resolution,
+            } => map.serialize_entry(
+                "rejected",
+                &RejectedReceiptRef {
+                    command_id,
+                    code,
+                    current_revision,
+                    resolution,
+                },
+            )?,
+        }
+        map.end()
+    }
+}
+
+enum CommandReceiptVariant {
+    Accepted,
+    Rejected,
+}
+
+impl<'de> Deserialize<'de> for CommandReceiptVariant {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct VariantVisitor;
+
+        impl Visitor<'_> for VariantVisitor {
+            type Value = CommandReceiptVariant;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("accepted or rejected")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                match value {
+                    "accepted" => Ok(CommandReceiptVariant::Accepted),
+                    "rejected" => Ok(CommandReceiptVariant::Rejected),
+                    _ => Err(de::Error::unknown_variant(value, &["accepted", "rejected"])),
+                }
+            }
+        }
+
+        deserializer.deserialize_identifier(VariantVisitor)
+    }
+}
+
+struct AcceptedReceiptSeed;
+
+impl<'de> DeserializeSeed<'de> for AcceptedReceiptSeed {
+    type Value = CommandReceipt;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_map(AcceptedReceiptVisitor)
+    }
+}
+
+const ACCEPTED_RECEIPT_FIELDS: &[&str] = &[
+    "command_id",
+    "operation_id",
+    "task_revision",
+    "event_ids",
+    "prompt_mutation",
+];
+
+enum AcceptedReceiptField {
+    CommandId,
+    OperationId,
+    TaskRevision,
+    EventIds,
+    PromptMutation,
+}
+
+impl<'de> Deserialize<'de> for AcceptedReceiptField {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct FieldVisitor;
+
+        impl Visitor<'_> for FieldVisitor {
+            type Value = AcceptedReceiptField;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("an accepted CommandReceipt field name")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                match value {
+                    "command_id" => Ok(AcceptedReceiptField::CommandId),
+                    "operation_id" => Ok(AcceptedReceiptField::OperationId),
+                    "task_revision" => Ok(AcceptedReceiptField::TaskRevision),
+                    "event_ids" => Ok(AcceptedReceiptField::EventIds),
+                    "prompt_mutation" => Ok(AcceptedReceiptField::PromptMutation),
+                    _ => Err(de::Error::unknown_field(value, ACCEPTED_RECEIPT_FIELDS)),
+                }
+            }
+        }
+
+        deserializer.deserialize_identifier(FieldVisitor)
+    }
+}
+
+struct AcceptedReceiptVisitor;
+
+impl<'de> Visitor<'de> for AcceptedReceiptVisitor {
+    type Value = CommandReceipt;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a named accepted CommandReceipt payload map")
+    }
+
+    fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+    where
+        M: MapAccess<'de>,
+    {
+        let mut command_id = None;
+        let mut operation_id = None;
+        let mut task_revision: Option<Option<u64>> = None;
+        let mut event_ids = None;
+        let mut prompt_mutation = None;
+
+        while let Some(field) = map.next_key()? {
+            match field {
+                AcceptedReceiptField::CommandId => {
+                    if command_id.is_some() {
+                        return Err(de::Error::duplicate_field("command_id"));
+                    }
+                    command_id = Some(map.next_value()?);
+                }
+                AcceptedReceiptField::OperationId => {
+                    if operation_id.is_some() {
+                        return Err(de::Error::duplicate_field("operation_id"));
+                    }
+                    operation_id = Some(map.next_value()?);
+                }
+                AcceptedReceiptField::TaskRevision => {
+                    if task_revision.is_some() {
+                        return Err(de::Error::duplicate_field("task_revision"));
+                    }
+                    task_revision = Some(map.next_value()?);
+                }
+                AcceptedReceiptField::EventIds => {
+                    if event_ids.is_some() {
+                        return Err(de::Error::duplicate_field("event_ids"));
+                    }
+                    event_ids = Some(map.next_value()?);
+                }
+                AcceptedReceiptField::PromptMutation => {
+                    if prompt_mutation.is_some() {
+                        return Err(de::Error::duplicate_field("prompt_mutation"));
+                    }
+                    prompt_mutation = Some(map.next_value()?);
+                }
+            }
+        }
+
+        Ok(CommandReceipt::Accepted {
+            command_id: command_id.ok_or_else(|| de::Error::missing_field("command_id"))?,
+            operation_id: operation_id.ok_or_else(|| de::Error::missing_field("operation_id"))?,
+            task_revision: task_revision
+                .ok_or_else(|| de::Error::missing_field("task_revision"))?,
+            event_ids: event_ids.ok_or_else(|| de::Error::missing_field("event_ids"))?,
+            prompt_mutation,
+        })
+    }
+}
+
+struct RejectedReceiptSeed;
+
+impl<'de> DeserializeSeed<'de> for RejectedReceiptSeed {
+    type Value = CommandReceipt;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_map(RejectedReceiptVisitor)
+    }
+}
+
+const REJECTED_RECEIPT_FIELDS: &[&str] = &["command_id", "code", "current_revision", "resolution"];
+
+enum RejectedReceiptField {
+    CommandId,
+    Code,
+    CurrentRevision,
+    Resolution,
+}
+
+impl<'de> Deserialize<'de> for RejectedReceiptField {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct FieldVisitor;
+
+        impl Visitor<'_> for FieldVisitor {
+            type Value = RejectedReceiptField;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a rejected CommandReceipt field name")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                match value {
+                    "command_id" => Ok(RejectedReceiptField::CommandId),
+                    "code" => Ok(RejectedReceiptField::Code),
+                    "current_revision" => Ok(RejectedReceiptField::CurrentRevision),
+                    "resolution" => Ok(RejectedReceiptField::Resolution),
+                    _ => Err(de::Error::unknown_field(value, REJECTED_RECEIPT_FIELDS)),
+                }
+            }
+        }
+
+        deserializer.deserialize_identifier(FieldVisitor)
+    }
+}
+
+struct RejectedReceiptVisitor;
+
+impl<'de> Visitor<'de> for RejectedReceiptVisitor {
+    type Value = CommandReceipt;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a named rejected CommandReceipt payload map")
+    }
+
+    fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+    where
+        M: MapAccess<'de>,
+    {
+        let mut command_id = None;
+        let mut code = None;
+        let mut current_revision: Option<Option<u64>> = None;
+        let mut resolution: Option<Option<ProviderResolutionWinner>> = None;
+
+        while let Some(field) = map.next_key()? {
+            match field {
+                RejectedReceiptField::CommandId => {
+                    if command_id.is_some() {
+                        return Err(de::Error::duplicate_field("command_id"));
+                    }
+                    command_id = Some(map.next_value()?);
+                }
+                RejectedReceiptField::Code => {
+                    if code.is_some() {
+                        return Err(de::Error::duplicate_field("code"));
+                    }
+                    code = Some(map.next_value()?);
+                }
+                RejectedReceiptField::CurrentRevision => {
+                    if current_revision.is_some() {
+                        return Err(de::Error::duplicate_field("current_revision"));
+                    }
+                    current_revision = Some(map.next_value()?);
+                }
+                RejectedReceiptField::Resolution => {
+                    if resolution.is_some() {
+                        return Err(de::Error::duplicate_field("resolution"));
+                    }
+                    resolution = Some(map.next_value()?);
+                }
+            }
+        }
+
+        Ok(CommandReceipt::Rejected {
+            command_id: command_id.ok_or_else(|| de::Error::missing_field("command_id"))?,
+            code: code.ok_or_else(|| de::Error::missing_field("code"))?,
+            current_revision: current_revision
+                .ok_or_else(|| de::Error::missing_field("current_revision"))?,
+            resolution: resolution.unwrap_or(None),
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for CommandReceipt {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct CommandReceiptVisitor;
+
+        impl<'de> Visitor<'de> for CommandReceiptVisitor {
+            type Value = CommandReceipt;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a one-entry named CommandReceipt map")
+            }
+
+            fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+            where
+                M: MapAccess<'de>,
+            {
+                let variant = map
+                    .next_key()?
+                    .ok_or_else(|| de::Error::custom("CommandReceipt variant is missing"))?;
+                let receipt = match variant {
+                    CommandReceiptVariant::Accepted => map.next_value_seed(AcceptedReceiptSeed)?,
+                    CommandReceiptVariant::Rejected => map.next_value_seed(RejectedReceiptSeed)?,
+                };
+                if map.next_key::<de::IgnoredAny>()?.is_some() {
+                    return Err(de::Error::custom(
+                        "CommandReceipt must contain exactly one variant",
+                    ));
+                }
+                Ok(receipt)
+            }
+        }
+
+        deserializer.deserialize_map(CommandReceiptVisitor)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CreateTaskIntent {
+    pub id: TaskId,
+    pub environment_id: EnvironmentId,
+    pub title: String,
+    pub description: Option<String>,
+    pub project_id: ProjectId,
+    pub workspace: WorkspaceRef,
+    pub assignment: TaskAssignment,
+    pub created_at_ms: i64,
+    pub connectivity: TaskConnectivity,
+    pub attention: TaskAttention,
+    pub activity: TaskActivity,
+    pub review_readiness: ReviewReadiness,
+}
+
+/// Request-shaped task creation accepted only at the authenticated host
+/// boundary. The host resolves `workspace` against the ProjectId root from
+/// host-owned configuration and creates the durable [`CreateTaskIntent`]
+/// privately before persistence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CreateTaskRequestIntent {
+    pub id: TaskId,
+    pub environment_id: EnvironmentId,
+    pub title: String,
+    pub description: Option<String>,
+    pub project_id: ProjectId,
+    pub workspace: WorkspaceRequest,
+    #[serde(default)]
+    pub primary_provider: Option<ProviderKind>,
+    #[serde(default)]
+    pub defer_primary_provider_start: bool,
+    pub assignment: TaskAssignment,
+    pub created_at_ms: i64,
+    pub connectivity: TaskConnectivity,
+    pub attention: TaskAttention,
+    pub activity: TaskActivity,
+    pub review_readiness: ReviewReadiness,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RenameTaskIntent {
+    pub title: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SetTaskAttentionIntent {
+    pub attention: TaskAttention,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ConfirmHostQuitIntent {
+    pub inspection_id: u64,
+    pub allow_uninspected_worktrees: bool,
+}
+
+enum ConfirmHostQuitField {
+    InspectionId,
+    AllowUninspectedWorktrees,
+}
+
+impl<'de> Deserialize<'de> for ConfirmHostQuitField {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct FieldVisitor;
+        impl Visitor<'_> for FieldVisitor {
+            type Value = ConfirmHostQuitField;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("confirm_host_quit field")
+            }
+            fn visit_str<E: de::Error>(self, value: &str) -> Result<Self::Value, E> {
+                match value {
+                    "inspection_id" => Ok(ConfirmHostQuitField::InspectionId),
+                    "allow_uninspected_worktrees" => {
+                        Ok(ConfirmHostQuitField::AllowUninspectedWorktrees)
+                    }
+                    other => Err(E::unknown_field(
+                        other,
+                        &["inspection_id", "allow_uninspected_worktrees"],
+                    )),
+                }
+            }
+        }
+        deserializer.deserialize_identifier(FieldVisitor)
+    }
+}
+
+impl<'de> Deserialize<'de> for ConfirmHostQuitIntent {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct IntentVisitor;
+        impl<'de> Visitor<'de> for IntentVisitor {
+            type Value = ConfirmHostQuitIntent;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("confirm_host_quit named map")
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                let mut inspection_id = None;
+                let mut allow_uninspected_worktrees = None;
+                while let Some(key) = map.next_key::<ConfirmHostQuitField>()? {
+                    match key {
+                        ConfirmHostQuitField::InspectionId => {
+                            if inspection_id.is_some() {
+                                return Err(de::Error::duplicate_field("inspection_id"));
+                            }
+                            inspection_id = Some(map.next_value()?);
+                        }
+                        ConfirmHostQuitField::AllowUninspectedWorktrees => {
+                            if allow_uninspected_worktrees.is_some() {
+                                return Err(de::Error::duplicate_field(
+                                    "allow_uninspected_worktrees",
+                                ));
+                            }
+                            allow_uninspected_worktrees = Some(map.next_value()?);
+                        }
+                    }
+                }
+                Ok(ConfirmHostQuitIntent {
+                    inspection_id: inspection_id
+                        .ok_or_else(|| de::Error::missing_field("inspection_id"))?,
+                    allow_uninspected_worktrees: allow_uninspected_worktrees
+                        .ok_or_else(|| de::Error::missing_field("allow_uninspected_worktrees"))?,
+                })
+            }
+        }
+        deserializer.deserialize_map(IntentVisitor)
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize)]
+pub struct SubmitProviderInputIntent {
+    agent_session_id: AgentSessionId,
+    runtime_generation: u64,
+    turn_id: TurnId,
+    action_epoch: u64,
+    question_id: Option<crate::domain::id::QuestionId>,
+    approval_id: Option<crate::domain::id::ApprovalId>,
+    action: ProviderInputAction,
+}
+
+impl std::fmt::Debug for SubmitProviderInputIntent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SubmitProviderInputIntent")
+            .field("agent_session_id", &self.agent_session_id)
+            .field("runtime_generation", &self.runtime_generation)
+            .field("turn_id", &self.turn_id)
+            .field("action_epoch", &self.action_epoch)
+            .field("question_id", &self.question_id)
+            .field("approval_id", &self.approval_id)
+            .field("action", &self.action)
+            .finish()
+    }
+}
+
+impl SubmitProviderInputIntent {
+    pub fn try_new(
+        agent_session_id: AgentSessionId,
+        runtime_generation: u64,
+        turn_id: TurnId,
+        action_epoch: u64,
+        question_id: Option<crate::domain::id::QuestionId>,
+        approval_id: Option<crate::domain::id::ApprovalId>,
+        action: ProviderInputAction,
+    ) -> Result<Self, ProviderInputIntentError> {
+        validate_action_nested_ids(&action, question_id, approval_id)?;
+        Ok(Self {
+            agent_session_id,
+            runtime_generation,
+            turn_id,
+            action_epoch,
+            question_id,
+            approval_id,
+            action,
+        })
+    }
+
+    pub fn agent_session_id(&self) -> AgentSessionId {
+        self.agent_session_id
+    }
+
+    pub fn runtime_generation(&self) -> u64 {
+        self.runtime_generation
+    }
+
+    pub fn turn_id(&self) -> TurnId {
+        self.turn_id
+    }
+
+    pub fn action_epoch(&self) -> u64 {
+        self.action_epoch
+    }
+
+    pub fn question_id(&self) -> Option<crate::domain::id::QuestionId> {
+        self.question_id
+    }
+
+    pub fn approval_id(&self) -> Option<crate::domain::id::ApprovalId> {
+        self.approval_id
+    }
+
+    pub fn action(&self) -> &ProviderInputAction {
+        &self.action
+    }
+
+    pub fn validate(&self) -> Result<(), ProviderInputIntentError> {
+        validate_action_nested_ids(&self.action, self.question_id, self.approval_id)
+    }
+}
+
+impl<'de> Deserialize<'de> for SubmitProviderInputIntent {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            agent_session_id: AgentSessionId,
+            runtime_generation: u64,
+            turn_id: TurnId,
+            action_epoch: u64,
+            question_id: Option<crate::domain::id::QuestionId>,
+            approval_id: Option<crate::domain::id::ApprovalId>,
+            action: ProviderInputAction,
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        Self::try_new(
+            wire.agent_session_id,
+            wire.runtime_generation,
+            wire.turn_id,
+            wire.action_epoch,
+            wire.question_id,
+            wire.approval_id,
+            wire.action,
+        )
+        .map_err(de::Error::custom)
+    }
+}
+
+pub const DEFAULT_MAX_TOP_LEVEL_RUNTIMES: usize = 2;
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct RequestSpecialistIntent {
+    pub specialist: AgentSessionFacts,
+    pub requested_by: AgentSessionId,
+    pub purpose: String,
+    pub permission: SpecialistPermission,
+    pub workspace: WorkspaceRef,
+    pub expected_artifact_kind: ArtifactKind,
+    pub expected_action_epoch: u64,
+    pub expected_runtime_generation: u64,
+    pub resource_id: Option<ResourceId>,
+    pub max_top_level_runtimes: usize,
+}
+
+impl fmt::Debug for RequestSpecialistIntent {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RequestSpecialistIntent")
+            .field("specialist", &self.specialist)
+            .field("requested_by", &self.requested_by)
+            .field(
+                "purpose",
+                &format_args!("<redacted {} bytes>", self.purpose.len()),
+            )
+            .field("permission", &self.permission)
+            .field("workspace", &"<redacted>")
+            .field("expected_artifact_kind", &self.expected_artifact_kind)
+            .field("expected_action_epoch", &self.expected_action_epoch)
+            .field(
+                "expected_runtime_generation",
+                &self.expected_runtime_generation,
+            )
+            .field("resource_id", &self.resource_id)
+            .field("max_top_level_runtimes", &self.max_top_level_runtimes)
+            .finish()
+    }
+}
+
+impl Serialize for RequestSpecialistIntent {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.validate_bounds().map_err(|_| {
+            serde::ser::Error::custom("specialist request bounds or lineage are invalid")
+        })?;
+        #[derive(Serialize)]
+        struct RequestSpecialistIntentWire<'a> {
+            specialist: &'a AgentSessionFacts,
+            requested_by: AgentSessionId,
+            purpose: &'a str,
+            permission: SpecialistPermission,
+            workspace: &'a WorkspaceRef,
+            expected_artifact_kind: ArtifactKind,
+            expected_action_epoch: u64,
+            expected_runtime_generation: u64,
+            resource_id: Option<ResourceId>,
+            max_top_level_runtimes: usize,
+        }
+        RequestSpecialistIntentWire {
+            specialist: &self.specialist,
+            requested_by: self.requested_by,
+            purpose: &self.purpose,
+            permission: self.permission,
+            workspace: &self.workspace,
+            expected_artifact_kind: self.expected_artifact_kind,
+            expected_action_epoch: self.expected_action_epoch,
+            expected_runtime_generation: self.expected_runtime_generation,
+            resource_id: self.resource_id,
+            max_top_level_runtimes: self.max_top_level_runtimes,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl RequestSpecialistIntent {
+    pub fn validate_bounds(&self) -> Result<(), RejectionCode> {
+        if canonical::bounded_canonical(&self.purpose).is_none() {
+            return Err(RejectionCode::InvalidTransition);
+        }
+        if self.specialist.id == self.requested_by
+            || !matches!(self.specialist.role, AgentRole::Specialist { .. })
+        {
+            return Err(RejectionCode::InvalidTransition);
+        }
+        self.specialist
+            .validate_for_registration()
+            .map_err(|_| RejectionCode::InvalidTransition)?;
+        self.workspace
+            .validate()
+            .map_err(|_| RejectionCode::InvalidTransition)?;
+        if self.expected_artifact_kind != ArtifactKind::ReviewReport {
+            return Err(RejectionCode::UnsupportedCapability);
+        }
+        Ok(())
+    }
+}
+
+impl<'de> Deserialize<'de> for RequestSpecialistIntent {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct RequestSpecialistIntentWire {
+            specialist: AgentSessionFacts,
+            requested_by: AgentSessionId,
+            purpose: String,
+            permission: SpecialistPermission,
+            workspace: WorkspaceRef,
+            expected_artifact_kind: ArtifactKind,
+            expected_action_epoch: u64,
+            expected_runtime_generation: u64,
+            resource_id: Option<ResourceId>,
+            max_top_level_runtimes: usize,
+        }
+
+        let wire = RequestSpecialistIntentWire::deserialize(deserializer)?;
+        let intent = Self {
+            specialist: wire.specialist,
+            requested_by: wire.requested_by,
+            purpose: wire.purpose,
+            permission: wire.permission,
+            workspace: wire.workspace,
+            expected_artifact_kind: wire.expected_artifact_kind,
+            expected_action_epoch: wire.expected_action_epoch,
+            expected_runtime_generation: wire.expected_runtime_generation,
+            resource_id: wire.resource_id,
+            max_top_level_runtimes: wire.max_top_level_runtimes,
+        };
+        intent
+            .validate_bounds()
+            .map_err(|_| de::Error::custom("specialist request bounds or lineage are invalid"))?;
+        Ok(intent)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PromotePrimaryIntent {
+    pub agent_session_id: AgentSessionId,
+    pub expected_action_epoch: u64,
+    pub expected_runtime_generation: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CancelSpecialistIntent {
+    pub agent_session_id: AgentSessionId,
+    pub expected_action_epoch: u64,
+    pub expected_runtime_generation: u64,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct AcceptSpecialistHandoffIntent {
+    pub specialist_id: AgentSessionId,
+    pub artifact_id: ArtifactId,
+    pub expected_action_epoch: u64,
+    pub expected_runtime_generation: u64,
+    pub structured: Option<SpecialistResult>,
+    pub raw_inline_utf8: Option<String>,
+}
+
+impl fmt::Debug for AcceptSpecialistHandoffIntent {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AcceptSpecialistHandoffIntent")
+            .field("specialist_id", &self.specialist_id)
+            .field("artifact_id", &self.artifact_id)
+            .field("expected_action_epoch", &self.expected_action_epoch)
+            .field(
+                "expected_runtime_generation",
+                &self.expected_runtime_generation,
+            )
+            .field(
+                "structured",
+                &self
+                    .structured
+                    .as_ref()
+                    .map(|_| "<redacted structured result>"),
+            )
+            .field(
+                "raw_inline_utf8",
+                &self
+                    .raw_inline_utf8
+                    .as_ref()
+                    .map(|text| format!("<redacted {} bytes>", text.len())),
+            )
+            .finish()
+    }
+}
+
+impl Serialize for AcceptSpecialistHandoffIntent {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if self
+            .raw_inline_utf8
+            .as_ref()
+            .is_some_and(|raw| raw.is_empty() || raw.len() > MAX_SPECIALIST_RAW_ARTIFACT_BYTES)
+            || self.structured.is_none() && self.raw_inline_utf8.is_none()
+        {
+            return Err(serde::ser::Error::custom(
+                "specialist handoff must contain one bounded result",
+            ));
+        }
+        if let Some(result) = &self.structured {
+            result.validate().map_err(serde::ser::Error::custom)?;
+        }
+        #[derive(Serialize)]
+        struct AcceptSpecialistHandoffIntentWire<'a> {
+            specialist_id: AgentSessionId,
+            artifact_id: ArtifactId,
+            expected_action_epoch: u64,
+            expected_runtime_generation: u64,
+            structured: &'a Option<SpecialistResult>,
+            raw_inline_utf8: &'a Option<String>,
+        }
+        AcceptSpecialistHandoffIntentWire {
+            specialist_id: self.specialist_id,
+            artifact_id: self.artifact_id,
+            expected_action_epoch: self.expected_action_epoch,
+            expected_runtime_generation: self.expected_runtime_generation,
+            structured: &self.structured,
+            raw_inline_utf8: &self.raw_inline_utf8,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for AcceptSpecialistHandoffIntent {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct AcceptSpecialistHandoffIntentWire {
+            specialist_id: AgentSessionId,
+            artifact_id: ArtifactId,
+            expected_action_epoch: u64,
+            expected_runtime_generation: u64,
+            structured: Option<SpecialistResult>,
+            raw_inline_utf8: Option<String>,
+        }
+
+        let wire = AcceptSpecialistHandoffIntentWire::deserialize(deserializer)?;
+        if let Some(raw) = &wire.raw_inline_utf8 {
+            if raw.is_empty() || raw.len() > MAX_SPECIALIST_RAW_ARTIFACT_BYTES {
+                return Err(de::Error::custom("raw specialist handoff exceeds bound"));
+            }
+        }
+        if wire.structured.is_none() && wire.raw_inline_utf8.is_none() {
+            return Err(de::Error::custom(
+                "specialist handoff must contain one bounded result",
+            ));
+        }
+        Ok(Self {
+            specialist_id: wire.specialist_id,
+            artifact_id: wire.artifact_id,
+            expected_action_epoch: wire.expected_action_epoch,
+            expected_runtime_generation: wire.expected_runtime_generation,
+            structured: wire.structured,
+            raw_inline_utf8: wire.raw_inline_utf8,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum Command {
+    CreateTask(CreateTaskIntent),
+    CreateTaskV2(CreateTaskRequestIntent),
+    RenameTask(RenameTaskIntent),
+    SetTaskAttention(SetTaskAttentionIntent),
+    SettleTask,
+    BeginCloseTask,
+    ReopenTask,
+    DeleteTask,
+    RegisterAgentSession {
+        agent: AgentSessionFacts,
+    },
+    /// Host-journal ingress only. A correlated current-generation provider
+    /// SessionStart is the sole authority for binding the durable conversation
+    /// identity to an already-registered agent session.
+    BindProviderSession {
+        agent_session_id: AgentSessionId,
+        resource_id: ResourceId,
+        provider_session_id: crate::domain::ProviderSessionId,
+        expected_runtime_generation: u64,
+    },
+    /// Release a durable provider conversation the provider itself refused to
+    /// resume, so the next start can be a fresh one.
+    ///
+    /// Host-journal ingress only, and fenced on the EXACT id the provider
+    /// refused: this is the one command that throws away a durable provider
+    /// identity, and it must never be able to throw away a different one than
+    /// the failure named. Without it a task whose conversation the provider has
+    /// forgotten can only be resumed, which fails forever.
+    AbandonProviderSession {
+        agent_session_id: AgentSessionId,
+        abandoned_provider_session_id: crate::domain::ProviderSessionId,
+        expected_runtime_generation: u64,
+    },
+    SetPrimaryAgent {
+        agent_session_id: AgentSessionId,
+    },
+    /// Host-journal ingress only. Rebinds `provider_kind` on an unstarted
+    /// primary before the first provider SessionStart / input. Preserves
+    /// TaskId, agent session id, resource generation, and folder authority.
+    RebindUnstartedPrimaryProvider {
+        agent_session_id: AgentSessionId,
+        provider_kind: ProviderKind,
+    },
+    RegisterArtifact {
+        artifact: ArtifactFacts,
+    },
+    RegisterResource {
+        resource: ResourceFacts,
+    },
+    ReleaseResource {
+        resource_id: ResourceId,
+    },
+    ConfirmHostQuit(ConfirmHostQuitIntent),
+    SubmitProviderInput(SubmitProviderInputIntent),
+    /// Journal ingress only. Host `ClientRequest` rejects this variant.
+    PresentProviderQuestion(PresentProviderQuestionIntent),
+    /// Journal ingress only. Host `ClientRequest` rejects this variant.
+    PresentProviderApproval(PresentProviderApprovalIntent),
+    /// Journal ingress only. Host `ClientRequest` rejects this variant.
+    SettleProviderWait(SettleProviderWaitIntent),
+    RequestSpecialist(RequestSpecialistIntent),
+    PromotePrimary(PromotePrimaryIntent),
+    CancelSpecialist(CancelSpecialistIntent),
+    AcceptSpecialistHandoff(AcceptSpecialistHandoffIntent),
+    PromptLibrary(PromptCommand),
+    /// Host-scoped prompt-chain mutation carried by the same authenticated
+    /// command envelope as personal prompt mutations. The chain model owns
+    /// its canonical wire format, revision fence, and idempotency identity.
+    PromptChain(PromptChainCommand),
+    /// Host-only configured-service control. This never enters the durable
+    /// task journal; the authenticated host dispatches it to its one owned
+    /// ProcessManager supervisor.
+    ServiceControl(ServiceControlIntent),
+    /// Host-only stock-provider launch. The host must resolve the durable
+    /// task/resource binding before it performs the live process effect.
+    StartProviderSession(StartProviderSessionIntent),
+    Browser(BrowserRequest),
+    /// Host-minted native browser context, initial tab, and resource, atomically.
+    OpenTaskBrowser(crate::domain::native_browser::OpenTaskBrowserIntent),
+    /// Host-boundary update handoff: inspect+prepare with expiring token.
+    PrepareUpdate(PrepareUpdateIntent),
+    /// Confirm drain after PrepareUpdate; stops new launches until abort/arm.
+    ConfirmUpdateDrain(ConfirmUpdateDrainIntent),
+    /// Abort pre-install handoff and restore Ready admission.
+    AbortUpdateHandoff,
+    /// Arm durable staged-install readiness (recoverable). Irreversible only after
+    /// durable stage marker is written by the installer path.
+    ArmUpdateInstall(ArmUpdateInstallIntent),
+    /// Register one plain shell terminal on the task. The intent carries the
+    /// fully resolved launch recipe; the domain refuses anything that is not a
+    /// task-owned plain shell, and refuses the ninth live shell.
+    OpenShellTerminal(OpenShellTerminalIntent),
+    /// Begin releasing one plain shell terminal.
+    CloseTerminal {
+        resource_id: ResourceId,
+    },
+    /// Rename one plain shell terminal. The title is trimmed here and must then
+    /// satisfy `domain::resource::validate_terminal_title`.
+    RenameTerminal {
+        resource_id: ResourceId,
+        title: String,
+    },
+    /// Replace the task's terminal strip. The order must be a permutation of the
+    /// task's live plain shells.
+    SetTerminalStrip(crate::domain::terminal_facts::TaskTerminalStrip),
+}
+
+/// One plain shell terminal registration. The recipe is resolved before it
+/// reaches the domain, so `decide` only has to validate it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub struct OpenShellTerminalIntent {
+    pub resource: ResourceFacts,
+}
+
+/// Typed host supervisor operation selected by a catalog action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ServiceControlAction {
+    Start,
+    Stop,
+    Restart,
+}
+
+/// Exact admission fence for one configured-service control request.
+///
+/// These fields are captured by the client at activation time and are checked
+/// by the host supervisor before any process effect. The command is deliberately
+/// host-only and is rejected by the durable CommandBus if it crosses that seam.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServiceControlIntent {
+    /// Configured-service catalog identifier. The host converts this exactly
+    /// once into `services::model::ServiceId` before supervisor use.
+    pub service_id: crate::domain::id::ConfiguredServiceId,
+    pub resource_generation: u64,
+    pub connection_epoch: u64,
+    pub action_epoch: u64,
+    pub action: ServiceControlAction,
+}
+
+/// Exact identity and admission fences for one stock provider launch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderStartMode {
+    Open,
+    NewConversation,
+    ResumeExact,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub struct StartProviderSessionIntent {
+    pub task_id: TaskId,
+    pub agent_session_id: AgentSessionId,
+    pub resource_id: ResourceId,
+    pub provider_kind: ProviderKind,
+    pub mode: ProviderStartMode,
+    #[serde(default)]
+    pub launch_options: crate::providers::adapter::ProviderLaunchOptions,
+    pub expected_task_revision: u64,
+    pub expected_action_epoch: u64,
+}
+
+/// Canonical SHA-256 over client, task, expected revision, and command.
+/// `issued_at_ms` is excluded. Fence identities (task/agent/generation/
+/// epoch/turn/question/approval/action) are part of `command` and therefore
+/// part of the digest. A retry with a different fence is a conflict.
+pub fn command_payload_digest(envelope: &CommandEnvelope) -> Result<[u8; 32], String> {
+    use sha2::{Digest, Sha256};
+    #[derive(Serialize)]
+    struct DigestBody<'a> {
+        client_id: ClientId,
+        task_id: Option<TaskId>,
+        expected_task_revision: Option<u64>,
+        command: &'a Command,
+    }
+    let packed = rmp_serde::to_vec_named(&DigestBody {
+        client_id: envelope.client_id,
+        task_id: envelope.task_id,
+        expected_task_revision: envelope.expected_task_revision,
+        command: &envelope.command,
+    })
+    .map_err(|error| error.to_string())?;
+    let digest = Sha256::digest(packed);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&digest);
+    Ok(out)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub struct PrepareUpdateIntent {
+    pub target_version: String,
+    pub client_build: String,
+    pub host_build: String,
+    /// Explicit install confirmation also authorizes uninspected worktrees
+    /// when the host has no agent or resource blockers. It does not drain them.
+    pub allow_explicit_confirm_with_active: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub struct ConfirmUpdateDrainIntent {
+    pub token_id: Uuid,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub struct ArmUpdateInstallIntent {
+    pub token_id: Uuid,
+    /// Retire the idle old host after its acknowledgement is physically written.
+    /// This does not permanently close the durable host admission journal.
+    #[serde(default)]
+    pub stop_host_after_ack: bool,
+}
+
+pub fn decide(
+    snapshot: Option<&TaskSnapshot>,
+    envelope: &CommandEnvelope,
+) -> Result<Vec<Event>, RejectionCode> {
+    match &envelope.command {
+        Command::CreateTask(intent) => decide_create_task(snapshot, envelope, intent),
+        // Request-shaped creation must be normalized by the host boundary;
+        // accepting it in the domain would make the client request itself
+        // authoritative over durable workspace state.
+        Command::CreateTaskV2(_) => Err(RejectionCode::InvalidTransition),
+        Command::RenameTask(intent) => {
+            let snap = require_open_or_closing_task(snapshot, envelope)?;
+            require_expected_revision(snap, envelope)?;
+            if intent.title.trim().is_empty() {
+                return Err(RejectionCode::InvalidTransition);
+            }
+            let title = TaskFacts::canonicalize_title(intent.title.clone())
+                .map_err(|_| RejectionCode::InvalidTransition)?;
+            Ok(vec![Event::TaskRenamed { title }])
+        }
+        Command::SetTaskAttention(intent) => {
+            let snap = require_open_or_closing_task(snapshot, envelope)?;
+            require_expected_revision(snap, envelope)?;
+            Ok(vec![Event::TaskAttentionSet {
+                attention: intent.attention,
+            }])
+        }
+        Command::SettleTask => {
+            let snap = require_task(snapshot, envelope)?;
+            require_expected_revision(snap, envelope)?;
+            match snap.task.lifecycle {
+                TaskLifecycle::Open => Ok(vec![Event::TaskSettled]),
+                TaskLifecycle::Settled => Ok(Vec::new()),
+                TaskLifecycle::Closing => Err(RejectionCode::Closing),
+                TaskLifecycle::Archived | TaskLifecycle::Deleted => {
+                    Err(RejectionCode::InvalidTransition)
+                }
+            }
+        }
+        Command::BeginCloseTask => decide_begin_close(snapshot, envelope),
+        Command::ReopenTask => {
+            let snap = require_task(snapshot, envelope)?;
+            require_expected_revision(snap, envelope)?;
+            match snap.task.lifecycle {
+                TaskLifecycle::Settled | TaskLifecycle::Closing | TaskLifecycle::Archived => {
+                    Ok(vec![Event::TaskReopened])
+                }
+                TaskLifecycle::Open | TaskLifecycle::Deleted => {
+                    Err(RejectionCode::InvalidTransition)
+                }
+            }
+        }
+        Command::DeleteTask => {
+            let snap = require_task(snapshot, envelope)?;
+            require_expected_revision(snap, envelope)?;
+            match snap.task.lifecycle {
+                TaskLifecycle::Archived => Ok(vec![Event::TaskDeleted]),
+                TaskLifecycle::Open
+                | TaskLifecycle::Settled
+                | TaskLifecycle::Closing
+                | TaskLifecycle::Deleted => Err(RejectionCode::InvalidTransition),
+            }
+        }
+        Command::RegisterAgentSession { agent } => {
+            let snap = require_runtime_capable_task(snapshot, envelope)?;
+            require_expected_revision(snap, envelope)?;
+            if agent.task_id != snap.task.id {
+                return Err(RejectionCode::OwnershipConflict);
+            }
+            if agent.validate_for_registration().is_err() {
+                return Err(RejectionCode::InvalidTransition);
+            }
+            if snap.agents.contains_key(&agent.id) {
+                return Err(RejectionCode::AlreadyExists);
+            }
+            if matches!(
+                agent.role,
+                crate::domain::agent::AgentRole::Specialist { .. }
+            ) {
+                // Specialists must be admitted through RequestSpecialist so the
+                // primary fence and permission policy remain authoritative.
+                return Err(RejectionCode::InvalidTransition);
+            }
+            if matches!(agent.role, crate::domain::agent::AgentRole::Primary)
+                && snap.agents.values().any(|existing| {
+                    matches!(existing.role, crate::domain::agent::AgentRole::Primary)
+                })
+            {
+                return Err(RejectionCode::AlreadyExists);
+            }
+            Ok(vec![Event::AgentSessionRegistered {
+                agent: agent.clone(),
+            }])
+        }
+        Command::BindProviderSession {
+            agent_session_id,
+            resource_id,
+            provider_session_id,
+            expected_runtime_generation,
+        } => {
+            let snap = require_runtime_capable_task(snapshot, envelope)?;
+            require_expected_revision(snap, envelope)?;
+            let agent = snap
+                .agents
+                .get(agent_session_id)
+                .ok_or(RejectionCode::NotFound)?;
+            require_open_agent(agent)?;
+            if agent.runtime_generation != *expected_runtime_generation {
+                return Err(RejectionCode::InvalidTransition);
+            }
+            let resource = snap
+                .resources
+                .get(resource_id)
+                .ok_or(RejectionCode::NotFound)?;
+            let binding = AgentResourceBinding::from_facts(agent, resource)
+                .map_err(|_| RejectionCode::InvalidTransition)?;
+            if binding.resource_id != *resource_id
+                || binding.runtime_generation != *expected_runtime_generation
+            {
+                return Err(RejectionCode::InvalidTransition);
+            }
+            match agent.provider_session_id.as_ref() {
+                Some(bound) if bound == provider_session_id => Err(RejectionCode::AlreadyExists),
+                Some(_) => Err(RejectionCode::OwnershipConflict),
+                None => Ok(vec![Event::AgentProviderSessionBound {
+                    agent_session_id: *agent_session_id,
+                    resource_id: *resource_id,
+                    provider_session_id: provider_session_id.clone(),
+                    runtime_generation: *expected_runtime_generation,
+                }]),
+            }
+        }
+        Command::AbandonProviderSession {
+            agent_session_id,
+            abandoned_provider_session_id,
+            expected_runtime_generation,
+        } => {
+            let snap = require_runtime_capable_task(snapshot, envelope)?;
+            require_expected_revision(snap, envelope)?;
+            let agent = snap
+                .agents
+                .get(agent_session_id)
+                .ok_or(RejectionCode::NotFound)?;
+            require_open_agent(agent)?;
+            if agent.runtime_generation != *expected_runtime_generation {
+                return Err(RejectionCode::InvalidTransition);
+            }
+            match agent.provider_session_id.as_ref() {
+                Some(bound) if bound == abandoned_provider_session_id => {
+                    Ok(vec![Event::AgentProviderSessionAbandoned {
+                        agent_session_id: *agent_session_id,
+                        abandoned_provider_session_id: abandoned_provider_session_id.clone(),
+                        runtime_generation: *expected_runtime_generation,
+                    }])
+                }
+                // Nothing bound: there is no conversation to abandon, and
+                // emitting the event anyway would claim a release that never
+                // happened. AlreadyResolved is the same answer BindProviderSession
+                // gives for its own already-done case.
+                None => Err(RejectionCode::AlreadyResolved),
+                // A DIFFERENT conversation is bound. The failure this command
+                // carries is about an id that is no longer current, so
+                // honouring it would discard a live binding on stale evidence.
+                Some(_) => Err(RejectionCode::OwnershipConflict),
+            }
+        }
+        Command::SetPrimaryAgent { agent_session_id } => {
+            let snap = require_runtime_capable_task(snapshot, envelope)?;
+            require_expected_revision(snap, envelope)?;
+            let Some(agent) = snap.agents.get(agent_session_id) else {
+                return Err(RejectionCode::NotFound);
+            };
+            if !matches!(agent.role, crate::domain::agent::AgentRole::Primary) {
+                return Err(RejectionCode::InvalidTransition);
+            }
+            Ok(vec![Event::PrimaryAgentSet {
+                agent_session_id: *agent_session_id,
+            }])
+        }
+        Command::RebindUnstartedPrimaryProvider {
+            agent_session_id,
+            provider_kind,
+        } => {
+            let snap = require_runtime_capable_task(snapshot, envelope)?;
+            require_expected_revision(snap, envelope)?;
+            if !snap.is_unstarted_draft() {
+                return Err(RejectionCode::InvalidTransition);
+            }
+            if snap.primary_agent_id != Some(*agent_session_id) {
+                return Err(RejectionCode::OwnershipConflict);
+            }
+            let Some(agent) = snap.agents.get(agent_session_id) else {
+                return Err(RejectionCode::NotFound);
+            };
+            if !matches!(agent.role, crate::domain::agent::AgentRole::Primary)
+                || agent.lifecycle != AgentSessionLifecycle::Open
+                || agent.provider_session_id.is_some()
+            {
+                return Err(RejectionCode::InvalidTransition);
+            }
+            if agent.provider_kind == *provider_kind {
+                return Ok(Vec::new());
+            }
+            Ok(vec![Event::UnstartedPrimaryProviderRebound {
+                agent_session_id: *agent_session_id,
+                provider_kind: *provider_kind,
+            }])
+        }
+        Command::RegisterArtifact { artifact } => {
+            let snap = require_open_or_closing_task(snapshot, envelope)?;
+            require_expected_revision(snap, envelope)?;
+            if artifact.task_id != snap.task.id {
+                return Err(RejectionCode::OwnershipConflict);
+            }
+            if artifact.validate().is_err() {
+                return Err(RejectionCode::InvalidTransition);
+            }
+            if snap.artifacts.contains_key(&artifact.id) {
+                return Err(RejectionCode::AlreadyExists);
+            }
+            Ok(vec![Event::ArtifactRegistered {
+                artifact: artifact.clone(),
+            }])
+        }
+        Command::RegisterResource { resource } => {
+            let snap = require_runtime_capable_task(snapshot, envelope)?;
+            require_expected_revision(snap, envelope)?;
+            if resource.owner_kind != crate::domain::resource::OwnerKind::Task {
+                return Err(RejectionCode::OwnershipConflict);
+            }
+            match resource.task_id {
+                Some(id) if id == snap.task.id => {}
+                _ => return Err(RejectionCode::OwnershipConflict),
+            }
+            if resource.validate().is_err() {
+                return Err(RejectionCode::InvalidTransition);
+            }
+            if resource.lifecycle != crate::domain::resource::ResourceLifecycle::Active {
+                return Err(RejectionCode::InvalidTransition);
+            }
+            if snap.resources.contains_key(&resource.id) {
+                return Err(RejectionCode::AlreadyExists);
+            }
+            Ok(vec![Event::ResourceRegistered {
+                resource: resource.clone(),
+            }])
+        }
+        Command::ReleaseResource { resource_id } => {
+            let snap = require_open_or_closing_task(snapshot, envelope)?;
+            require_expected_revision(snap, envelope)?;
+            let Some(existing) = snap.resources.get(resource_id) else {
+                return Err(RejectionCode::NotFound);
+            };
+            if existing.owner_kind != crate::domain::resource::OwnerKind::Task
+                || existing.task_id != Some(snap.task.id)
+            {
+                return Err(RejectionCode::OwnershipConflict);
+            }
+            match existing.lifecycle {
+                crate::domain::resource::ResourceLifecycle::Active => {
+                    Ok(vec![Event::ResourceReleaseBegun {
+                        resource_id: *resource_id,
+                        runtime_generation: existing.runtime_generation,
+                    }])
+                }
+                crate::domain::resource::ResourceLifecycle::Releasing => Ok(Vec::new()),
+                crate::domain::resource::ResourceLifecycle::Released => {
+                    Err(RejectionCode::InvalidTransition)
+                }
+            }
+        }
+        Command::ConfirmHostQuit(_) => Err(RejectionCode::InvalidTransition),
+        Command::SubmitProviderInput(intent) => {
+            decide_submit_provider_input(snapshot, envelope, intent)
+        }
+        Command::PresentProviderQuestion(intent) => {
+            decide_present_provider_question(snapshot, envelope, intent)
+        }
+        Command::PresentProviderApproval(intent) => {
+            decide_present_provider_approval(snapshot, envelope, intent)
+        }
+        Command::SettleProviderWait(intent) => {
+            decide_settle_provider_wait(snapshot, envelope, intent)
+        }
+        Command::RequestSpecialist(intent) => decide_request_specialist(snapshot, envelope, intent),
+        Command::PromotePrimary(intent) => decide_promote_primary(snapshot, envelope, intent),
+        Command::CancelSpecialist(intent) => decide_cancel_specialist(snapshot, envelope, intent),
+        Command::AcceptSpecialistHandoff(intent) => {
+            decide_accept_specialist_handoff(snapshot, envelope, intent)
+        }
+        Command::PromptLibrary(_) | Command::PromptChain(_) => {
+            Err(RejectionCode::InvalidTransition)
+        }
+        Command::ServiceControl(_) | Command::StartProviderSession(_) => {
+            Err(RejectionCode::InvalidTransition)
+        }
+        Command::Browser(request) => decide_browser(snapshot, envelope, request),
+        Command::OpenTaskBrowser(intent) => {
+            let snapshot = require_runtime_capable_task(snapshot, envelope)?;
+            require_expected_revision(snapshot, envelope)?;
+            crate::domain::native_browser::decide_open(snapshot, envelope, intent)
+        }
+        Command::PrepareUpdate(_)
+        | Command::ConfirmUpdateDrain(_)
+        | Command::AbortUpdateHandoff
+        | Command::ArmUpdateInstall(_) => Err(RejectionCode::InvalidTransition),
+        Command::OpenShellTerminal(intent) => {
+            decide_open_shell_terminal(snapshot, envelope, intent)
+        }
+        Command::CloseTerminal { resource_id } => {
+            let snap = require_open_or_closing_task(snapshot, envelope)?;
+            require_expected_revision(snap, envelope)?;
+            let resource = require_task_plain_shell(snap, resource_id)?;
+            if resource.lifecycle != crate::domain::resource::ResourceLifecycle::Active {
+                return Err(RejectionCode::InvalidTransition);
+            }
+            Ok(vec![Event::ResourceReleaseBegun {
+                resource_id: *resource_id,
+                runtime_generation: resource.runtime_generation,
+            }])
+        }
+        Command::RenameTerminal { resource_id, title } => {
+            let snap = require_open_or_closing_task(snapshot, envelope)?;
+            require_expected_revision(snap, envelope)?;
+            // A provider-owned terminal (`launch: None`) can never carry a
+            // title, so refuse it here with a clean rejection rather than
+            // letting `apply_into` fail the write.
+            require_task_plain_shell(snap, resource_id)?;
+            let trimmed = title.trim();
+            crate::domain::resource::validate_terminal_title(trimmed)
+                .map_err(|_| RejectionCode::InvalidTransition)?;
+            Ok(vec![Event::TerminalRenamed {
+                resource_id: *resource_id,
+                title: trimmed.to_string(),
+            }])
+        }
+        Command::SetTerminalStrip(strip) => {
+            let snap = require_open_or_closing_task(snapshot, envelope)?;
+            require_expected_revision(snap, envelope)?;
+            strip
+                .validate(snap.task.id, &snap.resources)
+                .map_err(|error| {
+                    use crate::domain::terminal_facts::TerminalStripError;
+                    // Exhaustive on purpose, so a new strip error cannot fall
+                    // into a catch-all here while `apply_into` maps it exactly
+                    // (`event.rs`, the TaskTerminalStripSet arm).
+                    match error {
+                        TerminalStripError::TooManyTerminals(_) => RejectionCode::TooManyTerminals,
+                        TerminalStripError::ForeignTask(_) => RejectionCode::NotFound,
+                        TerminalStripError::Duplicate(_)
+                        | TerminalStripError::FocusedNotInOrder(_)
+                        | TerminalStripError::NotATerminal(_) => RejectionCode::InvalidTransition,
+                    }
+                })?;
+            // The strip is a permutation of the shells that hold a slot, never
+            // a subset: a subset would both re-open a registration slot and
+            // hide a shell from every reader of the strip.
+            let ordered: std::collections::BTreeSet<ResourceId> =
+                strip.order.iter().copied().collect();
+            if ordered != occupied_plain_shell_ids(snap) {
+                return Err(RejectionCode::InvalidTransition);
+            }
+            Ok(vec![Event::TaskTerminalStripSet {
+                strip: strip.clone(),
+            }])
+        }
+    }
+}
+
+fn is_plain_shell_terminal(resource: &ResourceFacts) -> bool {
+    resource.resource_kind == crate::domain::resource::ResourceKind::Terminal
+        && resource.recipe.is_plain_shell()
+}
+
+/// The plain shells that hold a registration slot: every one not yet Released.
+///
+/// This is the single definition of the set the strip must be a permutation of
+/// AND the set the per-task bound counts, because `apply_into` maintains the
+/// strip as exactly this set -- `ResourceRegistered` pushes a plain shell on and
+/// only `ResourceReleased` removes it, so a Releasing shell keeps its entry. Two
+/// definitions would drift in both directions: an Active-only set makes every
+/// legitimate strip edit fail during a release window, and an Active-only count
+/// lets `decide` admit a ninth registration that the strip-entry backstop then
+/// refuses as an opaque `ApplyError`.
+fn occupied_plain_shell_ids(snap: &TaskSnapshot) -> std::collections::BTreeSet<ResourceId> {
+    snap.resources
+        .values()
+        .filter(|resource| {
+            is_plain_shell_terminal(resource)
+                && resource.lifecycle != crate::domain::resource::ResourceLifecycle::Released
+        })
+        .map(|resource| resource.id)
+        .collect()
+}
+
+/// Resolve one of this task's plain shell terminals, or say which check failed.
+///
+/// A Released shell is `NotFound`, not a resource in a bad state: `ResourceReleased`
+/// drops its `TerminalFacts` and its strip entry while LEAVING the resource row in
+/// place, so `snap.resources` alone would still answer "yes, a plain shell". Every
+/// terminal event decided here is applied against `terminal_facts`, so accepting
+/// one for a Released shell would mint a durable event that no replay can apply.
+fn require_task_plain_shell<'a>(
+    snap: &'a TaskSnapshot,
+    resource_id: &ResourceId,
+) -> Result<&'a ResourceFacts, RejectionCode> {
+    let resource = snap
+        .resources
+        .get(resource_id)
+        .ok_or(RejectionCode::NotFound)?;
+    if resource.owner_kind != crate::domain::resource::OwnerKind::Task
+        || resource.task_id != Some(snap.task.id)
+    {
+        return Err(RejectionCode::OwnershipConflict);
+    }
+    if !is_plain_shell_terminal(resource) {
+        return Err(RejectionCode::InvalidTransition);
+    }
+    if resource.lifecycle == crate::domain::resource::ResourceLifecycle::Released {
+        return Err(RejectionCode::NotFound);
+    }
+    Ok(resource)
+}
+
+fn decide_open_shell_terminal(
+    snapshot: Option<&TaskSnapshot>,
+    envelope: &CommandEnvelope,
+    intent: &OpenShellTerminalIntent,
+) -> Result<Vec<Event>, RejectionCode> {
+    let snap = require_runtime_capable_task(snapshot, envelope)?;
+    require_expected_revision(snap, envelope)?;
+    let resource = intent.resource.clone();
+    resource
+        .validate_for_registration()
+        .map_err(|_| RejectionCode::InvalidTransition)?;
+    if resource.owner_kind != crate::domain::resource::OwnerKind::Task
+        || resource.task_id != Some(snap.task.id)
+    {
+        return Err(RejectionCode::OwnershipConflict);
+    }
+    if !is_plain_shell_terminal(&resource) {
+        return Err(RejectionCode::InvalidTransition);
+    }
+    if snap.resources.contains_key(&resource.id) {
+        return Err(RejectionCode::AlreadyExists);
+    }
+    if occupied_plain_shell_ids(snap).len()
+        >= crate::domain::terminal_facts::MAX_PLAIN_SHELLS_PER_TASK
+    {
+        return Err(RejectionCode::TooManyTerminals);
+    }
+    Ok(vec![Event::ResourceRegistered { resource }])
+}
+
+fn decide_browser(
+    snapshot: Option<&TaskSnapshot>,
+    envelope: &CommandEnvelope,
+    request: &BrowserRequest,
+) -> Result<Vec<Event>, RejectionCode> {
+    let snap = require_runtime_capable_task(snapshot, envelope)?;
+    require_expected_revision(snap, envelope)?;
+    if request.task_id != snap.task.id {
+        return Err(RejectionCode::OwnershipConflict);
+    }
+    let mut accepted = snap
+        .browser
+        .plan_admit(request)
+        .map_err(browser_rejection)?;
+    accepted.bind_command(envelope.command_id, snap.task.action_epoch);
+    Ok(accepted.facts.into_iter().map(Event::Browser).collect())
+}
+
+fn browser_rejection(error: BrowserContractError) -> RejectionCode {
+    match error {
+        BrowserContractError::CrossTask => RejectionCode::OwnershipConflict,
+        BrowserContractError::GenerationMismatch
+        | BrowserContractError::ClosedTask
+        | BrowserContractError::IdempotencyConflict
+        | BrowserContractError::BoundExceeded
+        | BrowserContractError::InvalidRequest
+        | BrowserContractError::HostEffectUnavailable => RejectionCode::InvalidTransition,
+    }
+}
+
+fn decide_create_task(
+    snapshot: Option<&TaskSnapshot>,
+    envelope: &CommandEnvelope,
+    intent: &CreateTaskIntent,
+) -> Result<Vec<Event>, RejectionCode> {
+    if snapshot.is_some() {
+        return Err(RejectionCode::AlreadyExists);
+    }
+    if envelope.task_id.is_some() {
+        return Err(RejectionCode::InvalidTransition);
+    }
+    if envelope.expected_task_revision.is_some() {
+        return Err(RejectionCode::RevisionConflict);
+    }
+    if intent.title.trim().is_empty() {
+        return Err(RejectionCode::InvalidTransition);
+    }
+    let description = match &intent.description {
+        Some(value) if value.trim().is_empty() => {
+            return Err(RejectionCode::InvalidTransition);
+        }
+        Some(value) => Some(value.trim().to_string()),
+        None => None,
+    };
+    let task = TaskFacts {
+        id: intent.id,
+        environment_id: intent.environment_id,
+        title: intent.title.trim().to_string(),
+        description,
+        project_id: intent.project_id,
+        workspace: intent.workspace.clone(),
+        assignment: intent.assignment.clone(),
+        lifecycle: TaskLifecycle::Open,
+        action_epoch: 0,
+        revision: 1,
+        created_at_ms: intent.created_at_ms,
+    };
+    task.validate_for_create()
+        .map_err(|_| RejectionCode::InvalidTransition)?;
+    Ok(vec![Event::TaskCreated {
+        task,
+        connectivity: intent.connectivity,
+        attention: intent.attention,
+        activity: intent.activity,
+        review_readiness: intent.review_readiness,
+    }])
+}
+
+fn decide_begin_close(
+    snapshot: Option<&TaskSnapshot>,
+    envelope: &CommandEnvelope,
+) -> Result<Vec<Event>, RejectionCode> {
+    let snap = require_task(snapshot, envelope)?;
+    require_expected_revision(snap, envelope)?;
+    match snap.task.lifecycle {
+        TaskLifecycle::Closing => Ok(Vec::new()),
+        TaskLifecycle::Archived | TaskLifecycle::Deleted => Err(RejectionCode::InvalidTransition),
+        TaskLifecycle::Open | TaskLifecycle::Settled => {
+            let action_epoch = snap
+                .task
+                .action_epoch
+                .checked_add(1)
+                .ok_or(RejectionCode::InvalidTransition)?;
+            Ok(vec![Event::TaskCloseBegun { action_epoch }])
+        }
+    }
+}
+
+fn decide_submit_provider_input(
+    snapshot: Option<&TaskSnapshot>,
+    envelope: &CommandEnvelope,
+    intent: &SubmitProviderInputIntent,
+) -> Result<Vec<Event>, RejectionCode> {
+    let snap = require_runtime_capable_task(snapshot, envelope)?;
+    require_expected_revision(snap, envelope)?;
+    intent
+        .validate()
+        .map_err(|_| RejectionCode::InvalidTransition)?;
+    let agent = snap
+        .agents
+        .get(&intent.agent_session_id())
+        .ok_or(RejectionCode::NotFound)?;
+    if agent.task_id != snap.task.id {
+        return Err(RejectionCode::OwnershipConflict);
+    }
+    require_open_agent(agent)?;
+    let provider_kind = agent.provider_kind;
+    let provider_session_id = match (provider_kind, agent.provider_session_id.clone()) {
+        (_, Some(provider_session_id)) => Some(provider_session_id),
+        // The stock Codex adapter currently has no trustworthy upstream
+        // conversation-id signal. Its live task/agent/generation/epoch fence
+        // still authorizes PTY delivery, while exact resume remains visibly
+        // unsupported instead of inventing a provider identity.
+        (ProviderKind::Codex, None) => None,
+        _ => return Err(RejectionCode::UnsupportedCapability),
+    };
+    if agent.runtime_generation != intent.runtime_generation() {
+        return Err(RejectionCode::InvalidTransition);
+    }
+    if snap.task.action_epoch != intent.action_epoch() {
+        return Err(RejectionCode::InvalidTransition);
+    }
+    let session = snap
+        .provider_sessions
+        .get(&intent.agent_session_id())
+        .cloned()
+        .unwrap_or_default();
+    match intent.action() {
+        ProviderInputAction::SendNow { .. } => {
+            if !session.can_begin_send_now_turn(intent.turn_id()) {
+                return Err(RejectionCode::InvalidTransition);
+            }
+        }
+        ProviderInputAction::SteerCurrentTurn { .. }
+        | ProviderInputAction::QueueFollowUp { .. }
+        | ProviderInputAction::StopTurn => {
+            if session.current_turn != Some(intent.turn_id()) {
+                return Err(RejectionCode::InvalidTransition);
+            }
+        }
+        ProviderInputAction::TerminalInput { .. } => {
+            // An interactive CLI can ask an onboarding question before its
+            // first chat turn. The exact task/agent/runtime/epoch checks above
+            // still apply; once a turn exists it must match, never retarget.
+            if session
+                .current_turn
+                .is_some_and(|current| current != intent.turn_id())
+            {
+                return Err(RejectionCode::InvalidTransition);
+            }
+        }
+        ProviderInputAction::AnswerQuestion { question_id, .. } => {
+            if session.question_winners.contains_key(question_id) {
+                return Err(RejectionCode::AlreadyResolved);
+            }
+            if session.open_question != Some(*question_id) {
+                return Err(RejectionCode::InvalidTransition);
+            }
+            if session.current_turn != Some(intent.turn_id()) {
+                return Err(RejectionCode::InvalidTransition);
+            }
+        }
+        ProviderInputAction::ResolveApproval { approval_id, .. } => {
+            if session.approval_winners.contains_key(approval_id) {
+                return Err(RejectionCode::AlreadyResolved);
+            }
+            if session.open_approval != Some(*approval_id) {
+                return Err(RejectionCode::InvalidTransition);
+            }
+            if session.current_turn != Some(intent.turn_id()) {
+                return Err(RejectionCode::InvalidTransition);
+            }
+        }
+    }
+    if intent.action().waits_for_turn()
+        && !session.waits.contains_key(&envelope.command_id)
+        && session
+            .waits
+            .values()
+            .filter(|record| record.pending)
+            .count()
+            >= crate::domain::provider_input::MAX_PROVIDER_WAITS
+    {
+        return Err(RejectionCode::InvalidTransition);
+    }
+    let accepted = Event::ProviderInputAccepted {
+        command_id: envelope.command_id,
+        client_id: envelope.client_id,
+        operation_id: OperationId::new(),
+        agent_session_id: intent.agent_session_id(),
+        provider_kind,
+        provider_session_id,
+        runtime_generation: intent.runtime_generation(),
+        turn_id: intent.turn_id(),
+        action_epoch: intent.action_epoch(),
+        question_id: intent.question_id(),
+        approval_id: intent.approval_id(),
+        action: intent.action().clone(),
+        wait: intent.action().waits_for_turn(),
+        delivery: crate::domain::provider_input::ProviderDeliveryVisibility::hold_until_destination_adapter(),
+    };
+    Ok(vec![accepted])
+}
+
+fn decide_present_provider_question(
+    snapshot: Option<&TaskSnapshot>,
+    envelope: &CommandEnvelope,
+    intent: &PresentProviderQuestionIntent,
+) -> Result<Vec<Event>, RejectionCode> {
+    let snap = require_runtime_capable_task(snapshot, envelope)?;
+    require_expected_revision(snap, envelope)?;
+    let agent = snap
+        .agents
+        .get(&intent.agent_session_id())
+        .ok_or(RejectionCode::NotFound)?;
+    require_open_agent(agent)?;
+    let Some(provider_session_id) = agent.provider_session_id.clone() else {
+        return Err(RejectionCode::UnsupportedCapability);
+    };
+    let provider_kind = agent.provider_kind;
+    if agent.runtime_generation != intent.runtime_generation()
+        || snap.task.action_epoch != intent.action_epoch()
+    {
+        return Err(RejectionCode::InvalidTransition);
+    }
+    let session = snap
+        .provider_sessions
+        .get(&intent.agent_session_id())
+        .cloned()
+        .unwrap_or_default();
+    if let Some(current) = session.current_turn {
+        if current != intent.turn_id() {
+            return Err(RejectionCode::InvalidTransition);
+        }
+    }
+    if session.question_winners.contains_key(&intent.question_id()) {
+        return Err(RejectionCode::AlreadyResolved);
+    }
+    if let Some(open) = session.open_question {
+        if open != intent.question_id() {
+            return Err(RejectionCode::InvalidTransition);
+        }
+        return Err(RejectionCode::AlreadyExists);
+    }
+    Ok(vec![Event::ProviderQuestionPresented {
+        agent_session_id: intent.agent_session_id(),
+        provider_kind,
+        provider_session_id,
+        runtime_generation: intent.runtime_generation(),
+        turn_id: intent.turn_id(),
+        action_epoch: intent.action_epoch(),
+        question_id: intent.question_id(),
+    }])
+}
+
+fn decide_present_provider_approval(
+    snapshot: Option<&TaskSnapshot>,
+    envelope: &CommandEnvelope,
+    intent: &PresentProviderApprovalIntent,
+) -> Result<Vec<Event>, RejectionCode> {
+    let snap = require_runtime_capable_task(snapshot, envelope)?;
+    require_expected_revision(snap, envelope)?;
+    let agent = snap
+        .agents
+        .get(&intent.agent_session_id())
+        .ok_or(RejectionCode::NotFound)?;
+    require_open_agent(agent)?;
+    let Some(provider_session_id) = agent.provider_session_id.clone() else {
+        return Err(RejectionCode::UnsupportedCapability);
+    };
+    let provider_kind = agent.provider_kind;
+    if agent.runtime_generation != intent.runtime_generation()
+        || snap.task.action_epoch != intent.action_epoch()
+    {
+        return Err(RejectionCode::InvalidTransition);
+    }
+    let session = snap
+        .provider_sessions
+        .get(&intent.agent_session_id())
+        .cloned()
+        .unwrap_or_default();
+    if let Some(current) = session.current_turn {
+        if current != intent.turn_id() {
+            return Err(RejectionCode::InvalidTransition);
+        }
+    }
+    if session.approval_winners.contains_key(&intent.approval_id()) {
+        return Err(RejectionCode::AlreadyResolved);
+    }
+    if let Some(open) = session.open_approval {
+        if open != intent.approval_id() {
+            return Err(RejectionCode::InvalidTransition);
+        }
+        return Err(RejectionCode::AlreadyExists);
+    }
+    Ok(vec![Event::ProviderApprovalPresented {
+        agent_session_id: intent.agent_session_id(),
+        provider_kind,
+        provider_session_id,
+        runtime_generation: intent.runtime_generation(),
+        turn_id: intent.turn_id(),
+        action_epoch: intent.action_epoch(),
+        approval_id: intent.approval_id(),
+    }])
+}
+
+fn decide_settle_provider_wait(
+    snapshot: Option<&TaskSnapshot>,
+    envelope: &CommandEnvelope,
+    intent: &SettleProviderWaitIntent,
+) -> Result<Vec<Event>, RejectionCode> {
+    let snap = require_open_or_closing_task(snapshot, envelope)?;
+    require_expected_revision(snap, envelope)?;
+    if intent.fence().task_id() != snap.task.id {
+        return Err(RejectionCode::OwnershipConflict);
+    }
+    crate::domain::provider_input::validate_provider_fence(
+        &intent.fence().identity(),
+        None,
+        None,
+        None,
+    )
+    .map_err(|_| RejectionCode::InvalidTransition)?;
+    let session = snap
+        .provider_sessions
+        .get(&intent.fence().agent_session_id())
+        .ok_or(RejectionCode::NotFound)?;
+    let record = session
+        .waits
+        .get(&intent.fence().command_id())
+        .ok_or(RejectionCode::NotFound)?;
+    if !record.fence.matches(intent.fence()) {
+        return Err(RejectionCode::InvalidTransition);
+    }
+    let agent = snap
+        .agents
+        .get(&intent.fence().agent_session_id())
+        .ok_or(RejectionCode::NotFound)?;
+    require_live_agent(agent)?;
+    if agent.runtime_generation != intent.fence().runtime_generation() {
+        return Err(RejectionCode::InvalidTransition);
+    }
+    if snap.task.action_epoch != intent.fence().action_epoch() {
+        return Err(RejectionCode::InvalidTransition);
+    }
+    if !record.pending {
+        return Err(RejectionCode::AlreadyExists);
+    }
+    Ok(vec![Event::ProviderWaitSettled {
+        fence: intent.fence().clone(),
+    }])
+}
+
+fn require_task<'a>(
+    snapshot: Option<&'a TaskSnapshot>,
+    envelope: &CommandEnvelope,
+) -> Result<&'a TaskSnapshot, RejectionCode> {
+    let Some(snap) = snapshot else {
+        return Err(RejectionCode::NotFound);
+    };
+    let Some(task_id) = envelope.task_id else {
+        return Err(RejectionCode::InvalidTransition);
+    };
+    if snap.task.id != task_id {
+        return Err(RejectionCode::NotFound);
+    }
+    Ok(snap)
+}
+
+fn require_expected_revision(
+    snap: &TaskSnapshot,
+    envelope: &CommandEnvelope,
+) -> Result<(), RejectionCode> {
+    match envelope.expected_task_revision {
+        Some(expected) if expected == snap.task.revision => Ok(()),
+        _ => Err(RejectionCode::RevisionConflict),
+    }
+}
+
+fn require_open_or_closing_task<'a>(
+    snapshot: Option<&'a TaskSnapshot>,
+    envelope: &CommandEnvelope,
+) -> Result<&'a TaskSnapshot, RejectionCode> {
+    let snap = require_task(snapshot, envelope)?;
+    match snap.task.lifecycle {
+        TaskLifecycle::Open | TaskLifecycle::Settled | TaskLifecycle::Closing => Ok(snap),
+        TaskLifecycle::Archived | TaskLifecycle::Deleted => Err(RejectionCode::InvalidTransition),
+    }
+}
+
+fn require_runtime_capable_task<'a>(
+    snapshot: Option<&'a TaskSnapshot>,
+    envelope: &CommandEnvelope,
+) -> Result<&'a TaskSnapshot, RejectionCode> {
+    let snap = require_task(snapshot, envelope)?;
+    match snap.task.lifecycle {
+        TaskLifecycle::Open | TaskLifecycle::Settled => Ok(snap),
+        TaskLifecycle::Closing => Err(RejectionCode::Closing),
+        TaskLifecycle::Archived | TaskLifecycle::Deleted => Err(RejectionCode::InvalidTransition),
+    }
+}
+
+fn require_open_agent(agent: &AgentSessionFacts) -> Result<(), RejectionCode> {
+    match agent.lifecycle {
+        AgentSessionLifecycle::Open => Ok(()),
+        AgentSessionLifecycle::Closing | AgentSessionLifecycle::Closed => {
+            Err(RejectionCode::InvalidTransition)
+        }
+    }
+}
+
+fn require_live_agent(agent: &AgentSessionFacts) -> Result<(), RejectionCode> {
+    match agent.lifecycle {
+        AgentSessionLifecycle::Open | AgentSessionLifecycle::Closing => Ok(()),
+        AgentSessionLifecycle::Closed => Err(RejectionCode::InvalidTransition),
+    }
+}
+
+fn require_orchestration_fences(
+    snap: &TaskSnapshot,
+    expected_action_epoch: u64,
+    agent: &AgentSessionFacts,
+    expected_runtime_generation: u64,
+) -> Result<(), RejectionCode> {
+    if snap.task.action_epoch != expected_action_epoch
+        || agent.runtime_generation != expected_runtime_generation
+    {
+        return Err(RejectionCode::RevisionConflict);
+    }
+    Ok(())
+}
+
+fn top_level_runtime_count(snap: &TaskSnapshot) -> usize {
+    snap.agents
+        .values()
+        .filter(|agent| {
+            agent.lifecycle == AgentSessionLifecycle::Open
+                && matches!(
+                    agent.role,
+                    AgentRole::Primary | AgentRole::Specialist { .. }
+                )
+        })
+        .count()
+}
+
+fn decide_request_specialist(
+    snapshot: Option<&TaskSnapshot>,
+    envelope: &CommandEnvelope,
+    intent: &RequestSpecialistIntent,
+) -> Result<Vec<Event>, RejectionCode> {
+    let snap = require_runtime_capable_task(snapshot, envelope)?;
+    require_expected_revision(snap, envelope)?;
+    intent.validate_bounds()?;
+    let requester = snap
+        .agents
+        .get(&intent.requested_by)
+        .ok_or(RejectionCode::NotFound)?;
+    require_orchestration_fences(
+        snap,
+        intent.expected_action_epoch,
+        requester,
+        intent.expected_runtime_generation,
+    )?;
+    if !matches!(requester.role, AgentRole::Primary)
+        || snap.primary_agent_id != Some(intent.requested_by)
+    {
+        return Err(RejectionCode::OwnershipConflict);
+    }
+    if intent.specialist.task_id != snap.task.id || intent.specialist.id == intent.requested_by {
+        return Err(RejectionCode::OwnershipConflict);
+    }
+    let purpose =
+        canonical::bounded_canonical(&intent.purpose).ok_or(RejectionCode::InvalidTransition)?;
+    intent
+        .workspace
+        .validate()
+        .map_err(|_| RejectionCode::InvalidTransition)?;
+    if intent.expected_artifact_kind != ArtifactKind::ReviewReport {
+        return Err(RejectionCode::UnsupportedCapability);
+    }
+    if intent.specialist.validate_for_registration().is_err()
+        || intent.specialist.runtime_generation != intent.expected_runtime_generation
+    {
+        return Err(RejectionCode::InvalidTransition);
+    }
+    if snap.agents.contains_key(&intent.specialist.id) {
+        return Err(RejectionCode::AlreadyExists);
+    }
+    match intent.permission {
+        SpecialistPermission::ReadOnly => {
+            if intent.workspace != snap.task.workspace {
+                return Err(RejectionCode::OwnershipConflict);
+            }
+        }
+        SpecialistPermission::IsolatedWrite => {
+            if !matches!(snap.task.workspace, WorkspaceRef::Worktree { .. })
+                || intent.workspace != snap.task.workspace
+            {
+                return Err(RejectionCode::InvalidTransition);
+            }
+            return Err(RejectionCode::UnsupportedCapability);
+        }
+        SpecialistPermission::SharedWrite {
+            explicit_approval: true,
+        } => return Err(RejectionCode::UnsupportedCapability),
+        SpecialistPermission::SharedWrite {
+            explicit_approval: false,
+        } => return Err(RejectionCode::InvalidTransition),
+    }
+    if let Some(resource_id) = intent.resource_id {
+        let resource = snap
+            .resources
+            .get(&resource_id)
+            .ok_or(RejectionCode::NotFound)?;
+        if resource.task_id != Some(snap.task.id) {
+            return Err(RejectionCode::OwnershipConflict);
+        }
+        if resource.runtime_generation != intent.expected_runtime_generation {
+            return Err(RejectionCode::RevisionConflict);
+        }
+    }
+    let requested_cap = intent
+        .max_top_level_runtimes
+        .min(DEFAULT_MAX_TOP_LEVEL_RUNTIMES);
+    let next_top_level_count = top_level_runtime_count(snap)
+        .checked_add(1)
+        .ok_or(RejectionCode::InvalidTransition)?;
+    if requested_cap == 0 || next_top_level_count > requested_cap {
+        return Err(RejectionCode::InvalidTransition);
+    }
+    Ok(vec![Event::SpecialistRequested {
+        specialist_id: intent.specialist.id,
+        requested_by: intent.requested_by,
+        purpose,
+        agent: intent.specialist.clone(),
+        permission: intent.permission,
+        workspace: intent.workspace.clone(),
+        action_epoch: intent.expected_action_epoch,
+        runtime_generation: intent.expected_runtime_generation,
+        resource_id: intent.resource_id,
+    }])
+}
+
+fn decide_promote_primary(
+    snapshot: Option<&TaskSnapshot>,
+    envelope: &CommandEnvelope,
+    intent: &PromotePrimaryIntent,
+) -> Result<Vec<Event>, RejectionCode> {
+    let snap = require_runtime_capable_task(snapshot, envelope)?;
+    require_expected_revision(snap, envelope)?;
+    let candidate = snap
+        .agents
+        .get(&intent.agent_session_id)
+        .ok_or(RejectionCode::NotFound)?;
+    require_orchestration_fences(
+        snap,
+        intent.expected_action_epoch,
+        candidate,
+        intent.expected_runtime_generation,
+    )?;
+    let previous = snap.primary_agent_id.ok_or(RejectionCode::NotFound)?;
+    let previous_agent = snap.agents.get(&previous).ok_or(RejectionCode::NotFound)?;
+    if !matches!(candidate.role, AgentRole::Specialist { .. })
+        || candidate.lifecycle != AgentSessionLifecycle::Open
+        || !matches!(previous_agent.role, AgentRole::Primary)
+        || previous_agent.lifecycle != AgentSessionLifecycle::Open
+        || previous_agent.runtime_generation != intent.expected_runtime_generation
+    {
+        return Err(RejectionCode::InvalidTransition);
+    }
+    Ok(vec![Event::PrimaryPromoted {
+        previous,
+        promoted: intent.agent_session_id,
+        action_epoch: intent.expected_action_epoch,
+        runtime_generation: intent.expected_runtime_generation,
+    }])
+}
+
+fn decide_cancel_specialist(
+    snapshot: Option<&TaskSnapshot>,
+    envelope: &CommandEnvelope,
+    intent: &CancelSpecialistIntent,
+) -> Result<Vec<Event>, RejectionCode> {
+    let snap = require_runtime_capable_task(snapshot, envelope)?;
+    require_expected_revision(snap, envelope)?;
+    let specialist = snap
+        .agents
+        .get(&intent.agent_session_id)
+        .ok_or(RejectionCode::NotFound)?;
+    require_orchestration_fences(
+        snap,
+        intent.expected_action_epoch,
+        specialist,
+        intent.expected_runtime_generation,
+    )?;
+    if !matches!(specialist.role, AgentRole::Specialist { .. })
+        || specialist.lifecycle != AgentSessionLifecycle::Open
+    {
+        return Err(RejectionCode::InvalidTransition);
+    }
+    Ok(vec![Event::SpecialistClosed {
+        specialist_id: intent.agent_session_id,
+        action_epoch: intent.expected_action_epoch,
+        runtime_generation: intent.expected_runtime_generation,
+    }])
+}
+
+fn decide_accept_specialist_handoff(
+    snapshot: Option<&TaskSnapshot>,
+    envelope: &CommandEnvelope,
+    intent: &AcceptSpecialistHandoffIntent,
+) -> Result<Vec<Event>, RejectionCode> {
+    let snap = require_runtime_capable_task(snapshot, envelope)?;
+    require_expected_revision(snap, envelope)?;
+    let specialist = snap
+        .agents
+        .get(&intent.specialist_id)
+        .ok_or(RejectionCode::NotFound)?;
+    require_orchestration_fences(
+        snap,
+        intent.expected_action_epoch,
+        specialist,
+        intent.expected_runtime_generation,
+    )?;
+    if !matches!(specialist.role, AgentRole::Specialist { .. })
+        || specialist.lifecycle != AgentSessionLifecycle::Open
+    {
+        return Err(RejectionCode::InvalidTransition);
+    }
+    if snap.artifacts.contains_key(&intent.artifact_id) {
+        return Err(RejectionCode::AlreadyExists);
+    }
+    if intent
+        .raw_inline_utf8
+        .as_ref()
+        .is_some_and(|raw| raw.is_empty() || raw.len() > MAX_SPECIALIST_RAW_ARTIFACT_BYTES)
+    {
+        return Err(RejectionCode::InvalidTransition);
+    }
+    let (body, structured) = match (&intent.structured, &intent.raw_inline_utf8) {
+        // Structured specialist output becomes durable provider truth. Until
+        // the command carries a correlated provider-journal receipt, a caller
+        // may persist only the bounded raw fallback.
+        (Some(result), _) if result.validate().is_ok() => {
+            return Err(RejectionCode::UnsupportedCapability);
+        }
+        (_, Some(raw)) => {
+            if raw.is_empty() || raw.len() > MAX_SPECIALIST_RAW_ARTIFACT_BYTES {
+                return Err(RejectionCode::InvalidTransition);
+            }
+            (raw.clone(), false)
+        }
+        _ => return Err(RejectionCode::InvalidTransition),
+    };
+    let mut hasher = Sha256::new();
+    hasher.update(body.as_bytes());
+    let sha256: [u8; 32] = hasher.finalize().into();
+    let label = if structured {
+        "specialist-handoff-structured"
+    } else {
+        "specialist-handoff-raw"
+    };
+    let artifact = ArtifactFacts {
+        id: intent.artifact_id,
+        task_id: snap.task.id,
+        kind: ArtifactKind::ReviewReport,
+        label: ArtifactFacts::canonicalize_label(label)
+            .map_err(|_| RejectionCode::InvalidTransition)?,
+        content_ref: ArtifactContentRef::inline_utf8(body)
+            .map_err(|_| RejectionCode::InvalidTransition)?,
+        sha256,
+        privacy_class: PrivacyClass::LocalOnly,
+        created_at_ms: envelope.issued_at_ms,
+    };
+    artifact
+        .validate()
+        .map_err(|_| RejectionCode::InvalidTransition)?;
+    verify_inline_content_digest(&artifact).map_err(|_| RejectionCode::InvalidTransition)?;
+    Ok(vec![Event::SpecialistHandoffRecorded {
+        specialist_id: intent.specialist_id,
+        artifact,
+        structured,
+        action_epoch: intent.expected_action_epoch,
+        runtime_generation: intent.expected_runtime_generation,
+    }])
+}

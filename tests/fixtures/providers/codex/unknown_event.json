@@ -1,0 +1,5 @@
+{
+  "hook_event_name": "SomethingNew",
+  "session_id": "019f-fixture-codex-session",
+  "payload": { "note": "unsupported optional event" }
+}

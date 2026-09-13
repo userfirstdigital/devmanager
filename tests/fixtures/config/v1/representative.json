@@ -1,0 +1,173 @@
+{
+  "version": 2,
+  "revision": 41,
+  "projects": [
+    {
+      "id": "project-unicode",
+      "name": "工具箱 🚀",
+      "rootPath": "\\\\server\\share\\Dev Manager\\工具箱",
+      "folders": [
+        {
+          "id": "folder-web",
+          "name": "web — приложение",
+          "folderPath": "C:\\Code\\unicode project\\web",
+          "commands": [
+            {
+              "id": "command-dev",
+              "label": "serve 🚀",
+              "command": "node.exe",
+              "args": ["run", "dev", "--label", "naïve\u0000bytes"],
+              "env": {
+                "NODE_ENV": "development",
+                "ПОРТ": "3000"
+              },
+              "port": null,
+              "autoRestart": true,
+              "clearLogsOnRestart": false,
+              "futureCommandField": {
+                "kind": "preserve",
+                "value": "command-extra"
+              }
+            },
+            {
+              "id": "command-build",
+              "label": "build",
+              "command": "cargo",
+              "args": ["build", "--profile", "dev"],
+              "env": null,
+              "port": 4317,
+              "autoRestart": null,
+              "clearLogsOnRestart": null
+            }
+          ],
+          "envFilePath": null,
+          "portVariable": "PORT",
+          "hidden": false,
+          "archived": false,
+          "futureFolderField": ["keep", 7, true]
+        },
+        {
+          "id": "folder-api",
+          "name": "api",
+          "folderPath": "\\\\server\\share\\Dev Manager\\工具箱\\api",
+          "commands": [],
+          "envFilePath": ".env.local",
+          "portVariable": null,
+          "hidden": null
+        }
+      ],
+      "color": null,
+      "pinned": true,
+      "notes": "line one\nline two\twith unicode ✓",
+      "saveLogFiles": false,
+      "createdAt": "2026-08-01T00:00:00Z",
+      "updatedAt": "2026-08-02T00:00:00Z",
+      "archived": false,
+      "futureProjectField": {
+        "nested": {
+          "keep": "unknown value"
+        }
+      }
+    },
+    {
+      "id": "project-empty",
+      "name": "Empty",
+      "rootPath": "C:\\Code\\empty",
+      "folders": [],
+      "color": "#22c55e",
+      "pinned": null,
+      "notes": null,
+      "saveLogFiles": null,
+      "createdAt": "2026-08-03T00:00:00Z",
+      "updatedAt": "2026-08-03T00:00:00Z"
+    }
+  ],
+  "settings": {
+    "theme": "dark",
+    "logBufferSize": 10000,
+    "confirmOnClose": true,
+    "minimizeToTray": false,
+    "restoreSessionOnStart": null,
+    "defaultTerminal": "pwsh",
+    "macTerminalProfile": "system",
+    "claudeCommand": "claude --resume --label naïve",
+    "codexCommand": null,
+    "notificationSound": "glass",
+    "terminalFontSize": 13,
+    "optionAsMeta": false,
+    "copyOnSelect": true,
+    "keepSelectionOnCopy": false,
+    "showTerminalScrollbar": true,
+    "shellIntegrationEnabled": true,
+    "terminalMouseOverride": false,
+    "terminalReadOnly": false,
+    "browserEnabled": true,
+    "githubTokenRef": "credential:github-token",
+    "defaultDirectories": {
+      "projects": "C:\\Users\\tester\\Projects",
+      "worktrees": "\\\\server\\share\\worktrees",
+      "exports": null,
+      "futureDirectoryField": "preserve-me"
+    },
+    "shellOptions": {
+      "program": "C:\\Program Files\\PowerShell\\7\\pwsh.exe",
+      "args": ["-NoLogo", "--%", "naïve\u0000bytes"],
+      "inheritEnvironment": true,
+      "integrationEnabled": false,
+      "futureShellField": {"keep": true}
+    },
+    "editor": {
+      "kind": "command",
+      "command": "code.cmd",
+      "args": ["--reuse-window"],
+      "futureEditorField": "preserve-editor"
+    },
+    "futureSettingsField": ["forward", {"compatible": true}]
+  },
+  "sshConnections": [
+    {
+      "id": "ssh-default",
+      "label": "Default host",
+      "host": "default.example.test",
+      "port": 22,
+      "username": "builder",
+      "auth": {"mode": "default"}
+    },
+    {
+      "id": "ssh-agent",
+      "label": "Agent host",
+      "host": "agent.example.test",
+      "port": 2200,
+      "username": "agent",
+      "auth": {"mode": "agent", "credentialRef": null}
+    },
+    {
+      "id": "ssh-password-ref",
+      "label": "Password reference",
+      "host": "password.example.test",
+      "port": 22,
+      "username": "ops",
+      "auth": {
+        "mode": "password",
+        "credentialRef": "credential:ssh-password"
+      }
+    },
+    {
+      "id": "ssh-key-ref",
+      "label": "Key reference",
+      "host": "key.example.test",
+      "port": 2222,
+      "username": "deploy",
+      "auth": {
+        "mode": "privateKey",
+        "credentialRef": "credential:ssh-private-key"
+      },
+      "archived": null,
+      "futureSshField": {"preserve": "yes"}
+    }
+  ],
+  "futureRootField": {
+    "schema": 9,
+    "opaque": [1, 2, 3]
+  }
+}

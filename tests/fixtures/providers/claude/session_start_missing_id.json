@@ -1,0 +1,6 @@
+{
+  "hook_event_name": "SessionStart",
+  "source": "startup",
+  "cwd": "SECRET_CWD_SENTINEL",
+  "transcript_path": "SECRET_TRANSCRIPT_PATH_SENTINEL"
+}

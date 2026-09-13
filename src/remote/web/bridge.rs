@@ -17,13 +17,14 @@
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{mpsc as std_mpsc, Arc, MutexGuard};
+use std::sync::{mpsc as std_mpsc, Arc, MutexGuard, Weak};
 use std::time::{Duration, Instant};
 
 use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
 use axum::extract::{ConnectInfo, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
+use axum::Extension;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use futures_util::{Sink, SinkExt, StreamExt};
@@ -53,7 +54,11 @@ use super::wire::{
     ResumeState, SemanticReplayDescriptor, SemanticReplayPage, WebTerminalInputKind, WsInbound,
     WsOutbound,
 };
-use super::{authenticate_request, record_browser_connection, request_is_same_origin, WebState};
+use super::{
+    apply_browser_connection_activity, prepare_browser_connection_activity, request_is_same_origin,
+    validate_authenticated_request, BrowserConnectionActivity, ValidatedWebAuthentication,
+    WebAuthError, WebState,
+};
 use crate::ai::codex_cli::canonical_codex_composer_prompt;
 use crate::state::{SessionDimensions, SessionKind};
 
@@ -89,11 +94,22 @@ pub(crate) struct WsConnectQuery {
     browser_install_id: Option<String>,
 }
 
-fn authorize_ws_request(state: &WebState, headers: &HeaderMap) -> Result<String, StatusCode> {
+struct BrowserConnectionAdmission {
+    authentication: ValidatedWebAuthentication,
+    activity: BrowserConnectionActivity,
+}
+
+fn authorize_ws_request(
+    state: &WebState,
+    headers: &HeaderMap,
+) -> Result<ValidatedWebAuthentication, StatusCode> {
     if !request_is_same_origin(headers) {
         return Err(StatusCode::FORBIDDEN);
     }
-    authenticate_request(state, headers).ok_or(StatusCode::UNAUTHORIZED)
+    validate_authenticated_request(state, headers).map_err(|error| match error {
+        WebAuthError::Unauthorized => StatusCode::UNAUTHORIZED,
+        WebAuthError::Durability => StatusCode::INTERNAL_SERVER_ERROR,
+    })
 }
 
 pub(crate) async fn ws_handler(
@@ -103,10 +119,17 @@ pub(crate) async fn ws_handler(
     ws: WebSocketUpgrade,
     headers: HeaderMap,
 ) -> Response {
-    let client_id = match authorize_ws_request(&state, &headers) {
-        Ok(client_id) => client_id,
+    let authentication = match authorize_ws_request(&state, &headers) {
+        Ok(authentication) => authentication,
         Err(StatusCode::FORBIDDEN) => {
             return (StatusCode::FORBIDDEN, "cross-origin websocket rejected").into_response();
+        }
+        Err(StatusCode::INTERNAL_SERVER_ERROR) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "authentication state unavailable",
+            )
+                .into_response();
         }
         Err(_) => {
             return (
@@ -116,21 +139,807 @@ pub(crate) async fn ws_handler(
                 .into_response();
         }
     };
-    let inner = state.inner.clone();
-    if let Err(error) = record_browser_connection(
-        &inner,
-        &client_id,
+    let Some(inner) = state.upgrade_inner() else {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "host unavailable").into_response();
+    };
+    let listener_generation = state.listener_generation;
+    let activity = match prepare_browser_connection_activity(
+        &authentication.client_id,
         addr.ip(),
         query.browser_install_id,
         &headers,
     ) {
+        Ok(activity) => activity,
+        Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
+    };
+    let admission = BrowserConnectionAdmission {
+        activity,
+        authentication,
+    };
+    let inner = Arc::downgrade(&inner);
+    ws.on_upgrade(move |socket| run_session(socket, inner, listener_generation, admission))
+}
+
+const CONNECT_WS_GREETING_MAGIC: &[u8; 5] = b"DMCN1";
+const CONNECT_WS_MAX_FRAME_BYTES: usize = crate::protocol::MAX_SEALED_FRAME_BYTES as usize;
+pub(crate) const CONNECT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
+const CONNECT_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Binding captured when a one-use attach ticket is consumed.
+#[derive(Debug, Clone)]
+pub(crate) struct CrossOriginTicketBinding {
+    pub(crate) paired_client_id: String,
+    pub(crate) public_key: super::connect_identity::ConnectPeerPublicKey,
+    pub(crate) host_public_id: [u8; 16],
+}
+
+/// How `/api/connect` or `/api/connect/cross-origin` authenticated the peer
+/// before Noise. Remaining encryption/enrollment/duplex is shared.
+#[derive(Debug, Clone)]
+pub(crate) enum ConnectSessionMode {
+    SameOrigin {
+        paired_client_id: String,
+    },
+    CrossOrigin {
+        origin: String,
+        ticket_binding: Option<CrossOriginTicketBinding>,
+    },
+}
+
+fn connect_greeting(host_id: [u8; 16]) -> (Vec<u8>, [u8; 16], [u8; 16]) {
+    // Prologue bindings are also decoded as UUIDv7 by both envelope clients.
+    let route_id = crate::connect::ConnectionId::new().as_bytes();
+    let session_id = crate::connect::SessionId::new().as_bytes();
+    let mut greeting = Vec::with_capacity(CONNECT_WS_GREETING_MAGIC.len() + 48);
+    greeting.extend_from_slice(CONNECT_WS_GREETING_MAGIC);
+    greeting.extend_from_slice(&host_id);
+    greeting.extend_from_slice(&route_id);
+    greeting.extend_from_slice(&session_id);
+    (greeting, route_id, session_id)
+}
+
+pub(crate) async fn connect_ws_handler(
+    State(state): State<Arc<WebState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    verified: Option<Extension<super::VerifiedDirectTransport>>,
+    ws: WebSocketUpgrade,
+    headers: HeaderMap,
+) -> Response {
+    let connect_trace = std::env::var_os("DEVMANAGER_CONNECT_TRACE").is_some();
+    if connect_trace {
+        eprintln!(
+            "devmanager-host: Connect trace websocket request from {}",
+            addr.ip()
+        );
+    }
+    let authentication = match admit_connect_ws_request(
+        &state,
+        &headers,
+        addr.ip(),
+        verified.as_ref().map(|value| &value.0),
+    ) {
+        Ok(authentication) => authentication,
+        Err(response) => {
+            if connect_trace {
+                eprintln!(
+                    "devmanager-host: Connect trace websocket admission rejected status={}",
+                    response.status()
+                );
+            }
+            return response;
+        }
+    };
+    if connect_trace {
+        eprintln!("devmanager-host: Connect trace websocket admission accepted");
+    }
+    let Some(inner) = state.upgrade_inner() else {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "host unavailable").into_response();
+    };
+    inner
+        .connect_encryption_required
+        .store(true, Ordering::Release);
+    let Some(connect_startup) = state.connect_startup.clone() else {
         return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("failed to record browser connection: {error}"),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Connect production startup is unavailable; refusing plaintext fallback",
         )
             .into_response();
+    };
+    let identity_store = connect_startup.session().identity_store().clone();
+    let Ok(mut identity_work) = crate::remote::blocking_work::RemoteBlockingWork::spawn(
+        "connect-identity-read",
+        std::time::Instant::now() + CONNECT_HANDSHAKE_TIMEOUT,
+        move |admission| {
+            if !admission.try_admit() {
+                return Err(crate::connect::IdentityError::TransitionPending);
+            }
+            identity_store.identity_live_state()
+        },
+    ) else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "identity worker unavailable",
+        )
+            .into_response();
+    };
+    let live_state = identity_work.wait().await;
+    match live_state {
+        // Pending permits authentication only. The enrollment owner below
+        // admits only its exact retained peer/command retry and cannot publish
+        // Hello or command authority for any other unfinished transition.
+        Ok(Ok(
+            crate::connect::ConnectIdentityLiveState::Live
+            | crate::connect::ConnectIdentityLiveState::Pending,
+        )) => {}
+        Ok(Ok(crate::connect::ConnectIdentityLiveState::Absent)) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                crate::connect::ConnectStartupError::Production(
+                    crate::connect::ConnectProductionError::Identity(
+                        crate::connect::IdentityError::NotEnabled,
+                    ),
+                )
+                .to_string(),
+            )
+                .into_response();
+        }
+        Ok(Err(error)) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                crate::connect::ConnectStartupError::Production(
+                    crate::connect::ConnectProductionError::Identity(error),
+                )
+                .to_string(),
+            )
+                .into_response();
+        }
+        Err(_) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "identity check unavailable",
+            )
+                .into_response();
+        }
     }
-    ws.on_upgrade(move |socket| run_session(socket, inner, client_id))
+    let inner = Arc::downgrade(&inner);
+    let host_requests = state.host_requests.clone();
+    let paired_client_id = authentication.client_id;
+    let handshake_deadline = tokio::time::Instant::now() + CONNECT_HANDSHAKE_TIMEOUT;
+    ws.max_message_size(CONNECT_WS_MAX_FRAME_BYTES)
+        .max_frame_size(CONNECT_WS_MAX_FRAME_BYTES)
+        .on_upgrade(move |socket| {
+            run_connect_session(
+                socket,
+                inner,
+                connect_startup,
+                host_requests,
+                ConnectSessionMode::SameOrigin { paired_client_id },
+                handshake_deadline,
+            )
+        })
+}
+
+fn admit_connect_ws_request(
+    state: &WebState,
+    headers: &HeaderMap,
+    peer_ip: std::net::IpAddr,
+    verified: Option<&super::VerifiedDirectTransport>,
+) -> Result<ValidatedWebAuthentication, Response> {
+    // The Noise handshake authenticates the peer, but it is not a substitute
+    // for the host's paired-browser admission.  Keep the cookie check in the
+    // HTTP upgrade path so an unauthenticated socket can never reach the
+    // handshake or payload dispatcher.
+    let authentication = authorize_ws_request(state, headers).map_err(|status| match status {
+        StatusCode::FORBIDDEN => {
+            (StatusCode::FORBIDDEN, "cross-origin websocket rejected").into_response()
+        }
+        StatusCode::INTERNAL_SERVER_ERROR => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "authentication state unavailable",
+        )
+            .into_response(),
+        _ => (
+            StatusCode::UNAUTHORIZED,
+            "missing or invalid web auth cookie",
+        )
+            .into_response(),
+    })?;
+    let Some(inner) = state.upgrade_inner() else {
+        return Err((StatusCode::INTERNAL_SERVER_ERROR, "host unavailable").into_response());
+    };
+    let host = headers
+        .get(axum::http::header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    let origin = headers
+        .get(axum::http::header::ORIGIN)
+        .and_then(|value| value.to_str().ok());
+    let referer = headers
+        .get(axum::http::header::REFERER)
+        .and_then(|value| value.to_str().ok());
+    // Only the actual accept path can mint TLS evidence. Headers alone never
+    // authorize LAN control, including when a client claims forwarded HTTPS.
+    let (scheme, policy) =
+        connect_verified_policy(headers, peer_ip, verified).ok_or_else(|| {
+            (
+                StatusCode::FORBIDDEN,
+                "Connect LAN requires a verified secure listener",
+            )
+                .into_response()
+        })?;
+    let view = crate::connect::DirectRequestView {
+        method: "GET",
+        path: "/api/connect",
+        scheme,
+        host,
+        origin,
+        referer,
+        query: None,
+        content_length: None,
+        advertised_hostname: Some(policy.advertised_hostname.as_str()),
+    };
+    crate::connect::admit_direct_request(
+        view,
+        &policy,
+        crate::connect::MAX_DIRECT_PAIRING_BODY_BYTES,
+    )
+    .map_err(|error| {
+        let status = StatusCode::from_u16(error.status_hint()).unwrap_or(StatusCode::FORBIDDEN);
+        (status, error.to_string()).into_response()
+    })?;
+    let _ = inner;
+    Ok(authentication)
+}
+
+/// Trust only actual rustls evidence and exact advertised authority. Never
+/// admits plaintext loopback — cross-origin phone→host requires verified TLS.
+pub(super) fn cross_origin_verified_tls_only(
+    headers: &HeaderMap,
+    peer_ip: std::net::IpAddr,
+    verified: Option<&super::VerifiedDirectTransport>,
+) -> Option<(&'static str, crate::connect::DirectBindPolicy)> {
+    let _ = peer_ip;
+    let transport = verified.filter(|transport| transport.is_tls())?;
+    let actual = headers
+        .get(axum::http::header::HOST)?
+        .to_str()
+        .ok()?
+        .parse::<axum::http::uri::Authority>()
+        .ok()?;
+    let advertised = transport
+        .advertised_authority()
+        .parse::<axum::http::uri::Authority>()
+        .ok()?;
+    if !actual.host().eq_ignore_ascii_case(advertised.host())
+        || actual.port_u16().unwrap_or(443) != advertised.port_u16().unwrap_or(443)
+    {
+        return None;
+    }
+    let hostname = advertised
+        .host()
+        .trim_start_matches('[')
+        .trim_end_matches(']');
+    Some((
+        transport.scheme(),
+        crate::connect::DirectBindPolicy::lan(hostname, true),
+    ))
+}
+
+/// Trust only the actual loopback peer and authority on this plain TCP listener.
+pub(super) fn connect_verified_policy(
+    headers: &HeaderMap,
+    peer_ip: std::net::IpAddr,
+    verified: Option<&super::VerifiedDirectTransport>,
+) -> Option<(&'static str, crate::connect::DirectBindPolicy)> {
+    if let Some(transport) = verified.filter(|transport| transport.is_tls()) {
+        let actual = headers
+            .get(axum::http::header::HOST)?
+            .to_str()
+            .ok()?
+            .parse::<axum::http::uri::Authority>()
+            .ok()?;
+        let advertised = transport
+            .advertised_authority()
+            .parse::<axum::http::uri::Authority>()
+            .ok()?;
+        if !actual.host().eq_ignore_ascii_case(advertised.host())
+            || actual.port_u16().unwrap_or(443) != advertised.port_u16().unwrap_or(443)
+        {
+            return None;
+        }
+        let hostname = advertised
+            .host()
+            .trim_start_matches('[')
+            .trim_end_matches(']');
+        return Some((
+            transport.scheme(),
+            crate::connect::DirectBindPolicy::lan(hostname, true),
+        ));
+    }
+    connect_request_scheme(headers, peer_ip)
+        .map(|scheme| (scheme, crate::connect::DirectBindPolicy::loopback()))
+}
+
+fn connect_request_scheme(headers: &HeaderMap, peer_ip: std::net::IpAddr) -> Option<&'static str> {
+    if !peer_ip.is_loopback() {
+        return None;
+    }
+    let authority = headers
+        .get(axum::http::header::HOST)?
+        .to_str()
+        .ok()?
+        .parse::<axum::http::uri::Authority>()
+        .ok()?;
+    // The shared validator expects an HTTP authority, including IPv6 brackets.
+    crate::connect::is_trustworthy_loopback_host(authority.as_str()).then_some("http")
+}
+
+#[cfg(test)]
+mod verified_transport_tests {
+    use super::*;
+
+    #[test]
+    fn lan_requires_listener_evidence_and_exact_advertised_authority() {
+        let peer = "192.168.1.20".parse().unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("host", "devbox.example:8443".parse().unwrap());
+        headers.insert("x-forwarded-proto", "https".parse().unwrap());
+        assert!(connect_verified_policy(&headers, peer, None).is_none());
+        let tls = super::super::tls::VerifiedDirectTransport::mint_after_rustls_handshake(
+            "devbox.example:8443".into(),
+        );
+        let (scheme, policy) = connect_verified_policy(&headers, peer, Some(&tls)).unwrap();
+        assert_eq!(scheme, "https");
+        assert_eq!(policy.advertised_hostname, "devbox.example");
+        headers.insert("host", "devbox.example:8444".parse().unwrap());
+        assert!(connect_verified_policy(&headers, peer, Some(&tls)).is_none());
+        headers.insert("host", "attacker.example:8443".parse().unwrap());
+        assert!(connect_verified_policy(&headers, peer, Some(&tls)).is_none());
+    }
+
+    #[test]
+    fn verified_https_normalizes_default_port_and_ipv6_authority() {
+        let peer = "::1".parse().unwrap();
+        let tls = super::super::tls::VerifiedDirectTransport::mint_after_rustls_handshake(
+            "[::1]:443".into(),
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert("host", "[::1]".parse().unwrap());
+        let (_, policy) = connect_verified_policy(&headers, peer, Some(&tls)).unwrap();
+        assert_eq!(policy.advertised_hostname, "::1");
+    }
+}
+
+pub(crate) async fn run_connect_session(
+    mut socket: WebSocket,
+    inner: Weak<RemoteHostInner>,
+    connect_startup: std::sync::Arc<crate::connect::ConnectProductionStartup>,
+    host_requests: crate::connect::ConnectHostRequestSlot,
+    mode: ConnectSessionMode,
+    handshake_deadline: tokio::time::Instant,
+) {
+    let connect_trace = std::env::var_os("DEVMANAGER_CONNECT_TRACE").is_some();
+    if connect_trace {
+        eprintln!("devmanager-host: Connect trace session entered");
+    }
+    let Some(inner) = inner.upgrade() else {
+        return;
+    };
+    inner
+        .connect_encryption_required
+        .store(true, Ordering::Release);
+    let session = connect_startup.session();
+    // Enrollment below revalidates live identity off the async executor before
+    // installing any authority, including legacy Host-kind compatibility.
+    let pairing = crate::connect::admit_connect_action(
+        crate::connect::ConnectIdentityLiveState::Live,
+        crate::connect::ConnectAdmission::AnonymousPairing,
+        crate::connect::PermissionRequest {
+            role: crate::connect::ConnectRole::PairedOwner,
+            task_id: None,
+            action: crate::connect::ActionId::REDEEM_PAIRING,
+            credential: None,
+        },
+        None,
+        None,
+    );
+    if !pairing.is_allowed() {
+        let _ = socket.close().await;
+        return;
+    }
+    let mut channel = match tokio::time::timeout_at(
+        handshake_deadline,
+        accept_connect_channel(&mut socket, &connect_startup),
+    )
+    .await
+    {
+        Ok(Some(channel)) => channel,
+        _ => return,
+    };
+    if connect_trace {
+        eprintln!("devmanager-host: Connect trace Noise channel accepted");
+    }
+    let Some(authenticated_peer) = channel.authenticated_peer() else {
+        return;
+    };
+    let peer_static = authenticated_peer.static_public().as_bytes();
+    let Ok(mut peer) = (match &mode {
+        ConnectSessionMode::SameOrigin { paired_client_id } => {
+            crate::remote::validate_or_bind_connect_peer(&inner, paired_client_id, peer_static)
+        }
+        ConnectSessionMode::CrossOrigin {
+            origin,
+            ticket_binding,
+        } => {
+            if let Some(binding) = ticket_binding {
+                if *connect_startup
+                    .session()
+                    .profile_host_public_id()
+                    .as_bytes()
+                    != binding.host_public_id
+                {
+                    return;
+                }
+            }
+            super::connect_identity::validate_cross_origin_connect_peer(
+                &inner,
+                origin,
+                peer_static,
+                ticket_binding
+                    .as_ref()
+                    .map(|binding| binding.paired_client_id.as_str()),
+                ticket_binding.as_ref().map(|binding| binding.public_key),
+            )
+        }
+    }) else {
+        return;
+    };
+    let paired_client_id = peer.paired_client_id().to_string();
+    if connect_trace {
+        eprintln!("devmanager-host: Connect trace paired peer validated");
+    }
+    // Existing pin/cookie membership must remain valid through enrollment.
+    if !peer.is_authorized() {
+        return;
+    }
+    let Some(enrollment) = session.device_enrollment() else {
+        let _ = socket.close().await;
+        return;
+    };
+    let metadata = match super::connect_identity::paired_browser_enrollment_metadata(
+        &inner,
+        &paired_client_id,
+    ) {
+        Ok(metadata) => metadata,
+        Err(_) => {
+            let _ = socket.close().await;
+            return;
+        }
+    };
+    // Drop strong host ownership before blocking enrollment so the socket path
+    // cannot keep the listener alive across vault/disk work.
+    drop(inner);
+    let peer_for_enroll = authenticated_peer;
+    let enrollment_handle = enrollment.clone();
+    let Ok(mut enrollment_work) = crate::remote::blocking_work::RemoteBlockingWork::spawn(
+        "connect-device-enrollment",
+        handshake_deadline.into_std(),
+        move |admission| {
+            let mut context = enrollment_handle.lock();
+            // Serial store ownership precedes admission. A queued retry whose
+            // socket disappeared must not consume the vault's one-use slot.
+            if !admission.try_admit() {
+                return Err(crate::connect::DeviceEnrollmentError::Cancelled);
+            }
+            context.enroll_or_rebind_paired_browser(peer_for_enroll, &metadata)
+        },
+    ) else {
+        return;
+    };
+    let enroll_result = tokio::select! {
+        biased;
+        _ = peer.revoked() => None,
+        result = enrollment_work.wait() => match result {
+            Ok(Ok(authority)) => Some(authority),
+            // Timeout, join failure, or enrollment error: do not publish authority.
+            Ok(Err(_)) | Err(_) => None,
+        },
+    };
+    let Some(authority) = enroll_result else {
+        let _ = socket.close().await;
+        return;
+    };
+    if connect_trace {
+        eprintln!("devmanager-host: Connect trace device enrollment completed");
+    }
+    peer = peer.with_identity_invalidation(
+        authority.subscribe_authority(),
+        authority.authority_generation(),
+    );
+    // Re-validate pin/cookie membership after enrollment settles.
+    if !peer.is_authorized() {
+        let _ = socket.close().await;
+        return;
+    }
+    let mut noise_limits = crate::connect::ConnectLimits::v1_default();
+    // snow transport records are bounded below DevManager's general 1 MiB
+    // frame ceiling. Keep reply pages/chunks below the record boundary with
+    // enough room for the Connect envelope and Noise authenticated metadata.
+    noise_limits.max_physical_frame_bytes = 64 * 1024;
+    noise_limits.max_page_encoded_bytes = 48 * 1024;
+    noise_limits.max_chunk_bytes = 48 * 1024;
+    let mut dispatch = crate::connect::ConnectDispatchSession::bind_paired(
+        paired_client_id,
+        crate::connect::ConnectIdentityLiveState::Live,
+    )
+    .with_assigned_client_id(peer.client_id())
+    .with_limit_ceiling(noise_limits)
+    .with_capability_ceiling(crate::protocol::CapabilitySet::from_bits(
+        u64::MAX
+            & !crate::protocol::Capability::HostShutdown.bit()
+            & !crate::protocol::Capability::UpdateHandoff.bit(),
+    ));
+    dispatch = match authority.device_credential() {
+        Some((proof, session_epoch, _)) if session_epoch != 0 => {
+            dispatch.with_device_credential(proof.clone(), session_epoch)
+        }
+        Some((_, 0, _)) => {
+            let _ = socket.close().await;
+            return;
+        }
+        None if authority.is_legacy_host_compat() => dispatch.with_legacy_host_compat(),
+        None | Some(_) => {
+            let _ = socket.close().await;
+            return;
+        }
+    };
+    if connect_trace {
+        eprintln!("devmanager-host: Connect trace application loop entered");
+    }
+    loop {
+        if !peer.is_authorized() {
+            break;
+        }
+        let bytes = if dispatch.negotiated_limits().is_none() {
+            tokio::select! {
+                biased;
+                _ = peer.revoked() => None,
+                result = tokio::time::timeout_at(handshake_deadline,
+                    recv_connect_binary(&mut socket, CONNECT_WS_MAX_FRAME_BYTES)) => result.ok().flatten(),
+            }
+        } else {
+            recv_connect_binary(&mut socket, CONNECT_WS_MAX_FRAME_BYTES).await
+        };
+        let Some(bytes) = bytes else {
+            break;
+        };
+        let Ok(frame) = crate::protocol::SealedFrame::decode(&bytes) else {
+            break;
+        };
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_secs())
+            .unwrap_or(1);
+        let plaintext = match channel.open_bytes(&frame, now_unix) {
+            Ok(plaintext) => plaintext,
+            Err(_) => break,
+        };
+        let envelope = match dispatch.negotiated_limits() {
+            Some(limits) => crate::connect::ConnectEnvelope::decode_with_limits(&plaintext, limits),
+            None => crate::connect::ConnectEnvelope::decode(&plaintext),
+        };
+        let envelope = match envelope {
+            Ok(envelope) => envelope,
+            Err(_) => break,
+        };
+        if envelope.sequence != frame.sequence() {
+            break;
+        }
+        let Ok(binding) = envelope.binding() else {
+            break;
+        };
+        if binding.connection_id.as_bytes() != channel.prologue().route_id()
+            || channel.bind_session(binding).is_err()
+        {
+            break;
+        }
+        let payload = match envelope.decode_payload() {
+            Ok(payload) => payload,
+            Err(_) => break,
+        };
+        if connect_trace {
+            eprintln!(
+                "devmanager-host: Connect trace received application frame sequence={} kind={:?}",
+                envelope.sequence,
+                payload.channel()
+            );
+        }
+        // Clone the handle then drop the slot lock before execute awaits.
+        let host = host_requests.get();
+        let (reply, disposition) = dispatch
+            .handle_payload(&envelope, payload, host.as_deref())
+            .await;
+        let hello_completed = matches!(&reply, crate::connect::ConnectPayload::Hello(_));
+        let mut nonce = [0_u8; crate::protocol::SEALED_NONCE_BYTES];
+        if getrandom::fill(&mut nonce).is_err() {
+            break;
+        }
+        let binding = dispatch
+            .channel_binding()
+            .or_else(|| envelope.binding().ok());
+        let Some(binding) = binding else {
+            break;
+        };
+        let limits = dispatch.negotiated_limits().unwrap_or(envelope.limits);
+        let response = match crate::connect::ConnectEnvelope::new(
+            binding,
+            reply.channel(),
+            channel.next_send_sequence(),
+            envelope.request_id,
+            envelope.operation_id,
+            limits,
+            crate::connect::ConnectPrivacyClass::LocalOnly,
+            reply,
+        ) {
+            Ok(response) => response,
+            Err(_) => break,
+        };
+        let Ok(sealed) = channel.seal(&response, nonce, now_unix) else {
+            break;
+        };
+        let Ok(encoded) = sealed.encode() else {
+            break;
+        };
+        if encoded.len() > CONNECT_WS_MAX_FRAME_BYTES
+            || !matches!(
+                tokio::time::timeout(
+                    CONNECT_WRITE_TIMEOUT,
+                    socket.send(WsMessage::Binary(encoded))
+                )
+                .await,
+                Ok(Ok(()))
+            )
+        {
+            dispatch.disconnect();
+            return;
+        }
+        if matches!(
+            disposition,
+            crate::connect::ConnectSessionDisposition::Disconnect
+        ) {
+            break;
+        }
+        if hello_completed {
+            if connect_trace {
+                eprintln!("devmanager-host: Connect trace Hello reply flushed");
+            }
+            if let (Some(host), Some(client_id)) = (host, dispatch.bound_client_id()) {
+                match tokio::time::timeout_at(handshake_deadline, host.open_duplex(client_id)).await
+                {
+                    Ok(Ok(Some(duplex))) => {
+                        if connect_trace {
+                            eprintln!(
+                                "devmanager-host: Connect trace handing off duplex client_id={client_id}"
+                            );
+                        }
+                        // Hello was physically flushed by SinkExt::send before
+                        // the single live writer takes ownership of the socket.
+                        if let Err(error) = crate::host::serve_host_connect_duplex(
+                            socket, channel, dispatch, duplex, peer,
+                        )
+                        .await
+                        {
+                            eprintln!(
+                                "devmanager-host: Connect browser duplex ended after Hello: {error}"
+                            );
+                        }
+                        return;
+                    }
+                    Ok(Ok(None)) => {
+                        eprintln!(
+                            "devmanager-host: Connect browser duplex unavailable after Hello"
+                        );
+                        break;
+                    }
+                    Ok(Err(error)) => {
+                        eprintln!(
+                            "devmanager-host: Connect browser duplex registration failed after Hello: {error}"
+                        );
+                        break;
+                    }
+                    Err(_) => {
+                        eprintln!(
+                            "devmanager-host: Connect browser duplex registration timed out after Hello"
+                        );
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    dispatch.disconnect();
+    let _ = socket.close().await;
+}
+
+/// One cancellation-owned Noise exchange; caller supplies a shared absolute
+/// deadline covering greeting, all handshake flights, and application Hello.
+async fn accept_connect_channel(
+    socket: &mut WebSocket,
+    startup: &crate::connect::ConnectProductionStartup,
+) -> Option<crate::connect::EndToEndChannel> {
+    let session = startup.session();
+    let (greeting, route_id, session_id) =
+        connect_greeting(*session.profile_host_public_id().as_bytes());
+    let prologue = crate::connect::connect_prologue(
+        crate::connect::ConnectCredentialPurpose::OwnerPairing,
+        route_id,
+        session_id,
+    )
+    .ok()?;
+    let binding = crate::connect::ConnectNoiseIdentityBinding::host(
+        *session.profile_host_public_id().as_bytes(),
+    );
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    let mut handshake = session
+        .start_handshake(
+            crate::connect::CONNECT_NOISE_FIRST_PAIRING_PATTERN,
+            true,
+            None,
+            prologue,
+            crate::connect::ConnectChannelRole::Responder,
+            binding,
+            now_unix,
+            true,
+            false,
+        )
+        .ok()?;
+    socket.send(WsMessage::Binary(greeting)).await.ok()?;
+    let first = recv_connect_binary(
+        socket,
+        crate::protocol::MAX_HANDSHAKE_MESSAGE_BYTES as usize,
+    )
+    .await?;
+    handshake
+        .read_message(&crate::connect::ConnectNoiseHandshakeMessage::decode(&first).ok()?)
+        .ok()?;
+    let second = handshake.write_message().ok()?.encode().ok()?;
+    socket.send(WsMessage::Binary(second)).await.ok()?;
+    let third = recv_connect_binary(
+        socket,
+        crate::protocol::MAX_HANDSHAKE_MESSAGE_BYTES as usize,
+    )
+    .await?;
+    handshake
+        .read_message(&crate::connect::ConnectNoiseHandshakeMessage::decode(&third).ok()?)
+        .ok()?;
+    let channel = crate::connect::ConnectProductionSession::finish_channel(handshake).ok()?;
+    channel.is_production_grade().then_some(channel)
+}
+
+async fn recv_connect_binary(socket: &mut WebSocket, max_bytes: usize) -> Option<Vec<u8>> {
+    loop {
+        match socket.next().await? {
+            Ok(WsMessage::Binary(bytes)) => {
+                if bytes.is_empty() || bytes.len() > max_bytes {
+                    let _ = socket.close().await;
+                    return None;
+                }
+                return Some(bytes);
+            }
+            Ok(WsMessage::Ping(_) | WsMessage::Pong(_)) => {}
+            Ok(WsMessage::Text(_) | WsMessage::Close(_)) => {
+                let _ = socket.close().await;
+                return None;
+            }
+            Err(_) => {
+                let _ = socket.close().await;
+                return None;
+            }
+        }
+    }
 }
 
 fn initial_web_hello(client_id: &str, snapshot: &RemoteWorkspaceSnapshot) -> WsOutbound {
@@ -166,23 +975,59 @@ fn queue_initial_browser_snapshot(
     )
 }
 
-async fn run_session(socket: WebSocket, inner: Arc<RemoteHostInner>, client_id: String) {
-    let connection_id = inner.next_connection_id.fetch_add(1, Ordering::Relaxed);
+async fn run_session(
+    socket: WebSocket,
+    inner: std::sync::Weak<RemoteHostInner>,
+    listener_generation: u64,
+    admission: BrowserConnectionAdmission,
+) {
+    let client_id = admission.authentication.client_id.clone();
+    let Some(host) = inner.upgrade() else {
+        return;
+    };
+    let connection_id = host.next_connection_id.fetch_add(1, Ordering::Relaxed);
+    drop(host);
     let (outbound, outbound_rx) =
         BrowserOutboundSender::channel(WEB_PUSH_CHANNEL_CAPACITY, WEB_OUTBOUND_MAX_BYTES);
     let tombstone = outbound.tombstone();
     // Seed hello while this sender is still private. Once the client enters
     // the broadcaster map, concurrent deltas may enqueue immediately; keeping
     // hello ahead of registration makes the first-frame contract absolute.
-    if queue_initial_browser_hello(&outbound, &inner, &client_id).is_err() {
+    let Some(host) = inner.upgrade() else {
+        tombstone.deactivate();
+        return;
+    };
+    if queue_initial_browser_hello(&outbound, &host, &client_id).is_err() {
         tombstone.deactivate();
         return;
     }
-    if !register_browser_client(&inner, connection_id, &client_id, outbound.clone()) {
+    drop(host);
+    let Some(host) = inner.upgrade() else {
+        tombstone.deactivate();
+        return;
+    };
+    let registered = register_browser_client_with_admission(
+        &host,
+        listener_generation,
+        connection_id,
+        &client_id,
+        outbound.clone(),
+        &admission,
+    );
+    if let Err(error) = registered.as_ref() {
+        super::super::set_last_connection_note(
+            &host,
+            format!("Browser admission failed: {error}"),
+            true,
+        );
+    }
+    if !matches!(registered, Ok(true)) {
         let _ = outbound
             .try_send_disconnect("This browser is no longer paired with the host.".to_string());
         tombstone.deactivate();
+        return;
     }
+    drop(host);
 
     // Push an initial snapshot so the browser has state to render before any
     // delta arrives. We deliberately use a *lightweight* snapshot that omits
@@ -196,7 +1041,12 @@ async fn run_session(socket: WebSocket, inner: Arc<RemoteHostInner>, client_id: 
     // `auto_bootstrap_subscribed_clients` which sends the bootstrap as a
     // `SessionStream { Bootstrap }` event. That path is async to the initial
     // snapshot and can't stall the handshake.
-    let _ = queue_initial_browser_snapshot(&outbound, &inner, connection_id, &client_id);
+    if let Some(host) = inner.upgrade() {
+        let _ = queue_initial_browser_snapshot(&outbound, &host, connection_id, &client_id);
+    } else {
+        tombstone.deactivate();
+        return;
+    }
 
     let (mut ws_sink, mut ws_stream) = socket.split();
     let writer_inner = inner.clone();
@@ -215,13 +1065,16 @@ async fn run_session(socket: WebSocket, inner: Arc<RemoteHostInner>, client_id: 
         .await;
     });
 
-    // Reader loop: handle inbound WS messages directly against
-    // `RemoteHostInner` state. We do not await while holding any std lock.
+    // Reader loop: upgrade only for the synchronous message operation. The
+    // weak handle is retained across the websocket wait, never the host Arc.
     while let Some(frame) = ws_stream.next().await {
         match frame {
             Ok(WsMessage::Text(text)) => match serde_json::from_str::<WsInbound>(&text) {
                 Ok(inbound) => {
-                    handle_inbound_browser(&inner, connection_id, &client_id, inbound, &outbound);
+                    let Some(host) = inner.upgrade() else {
+                        break;
+                    };
+                    handle_inbound_browser(&host, connection_id, &client_id, inbound, &outbound);
                 }
                 Err(error) => {
                     let _ = outbound.try_send_disconnect(format!("invalid inbound frame: {error}"));
@@ -244,7 +1097,9 @@ async fn run_session(socket: WebSocket, inner: Arc<RemoteHostInner>, client_id: 
     // Teardown order matters: remove from clients first so the broadcaster
     // stops pushing into a dying channel, then let the drainer + writer wind
     // down.
-    unregister_browser_client(&inner, connection_id, &client_id, &tombstone);
+    if let Some(host) = inner.upgrade() {
+        unregister_browser_client(&host, connection_id, &client_id, &tombstone);
+    }
     drop(outbound);
     let _ = writer_task.await;
 }
@@ -252,7 +1107,7 @@ async fn run_session(socket: WebSocket, inner: Arc<RemoteHostInner>, client_id: 
 async fn run_browser_writer<S>(
     ws_sink: &mut S,
     mut outbound: BrowserOutboundReceiver,
-    inner: Arc<RemoteHostInner>,
+    inner: std::sync::Weak<RemoteHostInner>,
     connection_id: u64,
     client_id: String,
     tombstone: Arc<WebConnectionTombstone>,
@@ -356,7 +1211,9 @@ async fn run_browser_writer<S>(
         }
     }
     if delivery_failed {
-        unregister_browser_client(&inner, connection_id, &client_id, &tombstone);
+        if let Some(host) = inner.upgrade() {
+            unregister_browser_client(&host, connection_id, &client_id, &tombstone);
+        }
     }
     let _ = tokio::time::timeout(stall_timeout, ws_sink.close()).await;
 }
@@ -404,49 +1261,53 @@ where
 /// `current_snapshot` when you need the shared state but not the terminal
 /// replay scrollback.
 fn light_snapshot(inner: &Arc<RemoteHostInner>, client_id: &str) -> RemoteWorkspaceSnapshot {
-    let app_state = inner
-        .shared_state
-        .read()
-        .map(|slot| slot.clone())
-        .unwrap_or_default();
-    let runtime_state = inner
-        .runtime_state
-        .read()
-        .map(|slot| slot.clone())
-        .unwrap_or_default();
-    let port_statuses = inner
-        .port_statuses
-        .read()
-        .map(|slot| slot.clone())
-        .unwrap_or_default();
-    let controller_client_id = inner
-        .controller_client_id
-        .read()
-        .map(|slot| slot.clone())
-        .unwrap_or_default();
-    let server_id = inner
-        .config
-        .read()
-        .map(|cfg| cfg.server_id.clone())
-        .unwrap_or_default();
-    let you_have_control = controller_client_id.as_deref() == Some(client_id);
-    RemoteWorkspaceSnapshot {
-        app_state,
-        runtime_state,
-        session_views: HashMap::new(),
-        port_statuses,
-        controller_client_id,
-        you_have_control,
-        server_id,
-    }
+    crate::remote::light_snapshot(inner, client_id)
 }
 
 fn register_browser_client(
     inner: &Arc<RemoteHostInner>,
+    listener_generation: u64,
     connection_id: u64,
     client_id: &str,
     web_sender: BrowserOutboundSender,
 ) -> bool {
+    register_browser_client_inner(
+        inner,
+        listener_generation,
+        connection_id,
+        client_id,
+        web_sender,
+        None,
+    )
+    .unwrap_or(false)
+}
+
+fn register_browser_client_with_admission(
+    inner: &Arc<RemoteHostInner>,
+    listener_generation: u64,
+    connection_id: u64,
+    client_id: &str,
+    web_sender: BrowserOutboundSender,
+    admission: &BrowserConnectionAdmission,
+) -> Result<bool, super::super::HostConfigAdmissionError> {
+    register_browser_client_inner(
+        inner,
+        listener_generation,
+        connection_id,
+        client_id,
+        web_sender,
+        Some(admission),
+    )
+}
+
+fn register_browser_client_inner(
+    inner: &Arc<RemoteHostInner>,
+    listener_generation: u64,
+    connection_id: u64,
+    client_id: &str,
+    web_sender: BrowserOutboundSender,
+    admission: Option<&BrowserConnectionAdmission>,
+) -> Result<bool, super::super::HostConfigAdmissionError> {
     let app_state = inner
         .shared_state
         .read()
@@ -462,48 +1323,306 @@ fn register_browser_client(
         .read()
         .map(|slot| slot.clone())
         .unwrap_or_default();
+    let port_authorities = inner
+        .port_authorities
+        .read()
+        .map(|slot| slot.clone())
+        .unwrap_or_default();
     let controller_client_id = inner
         .controller_client_id
         .read()
         .map(|slot| slot.clone())
         .unwrap_or_default();
     let you_have_control = controller_client_id.as_deref() == Some(client_id);
-    let _operation = inner
-        .web_control_operation_lock
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if !web_client_is_still_paired(inner, client_id) {
-        return false;
-    }
-    let Ok(mut clients) = inner.clients.lock() else {
-        return false;
-    };
-    if clients.contains_key(&connection_id) {
-        return false;
-    }
-    let tombstone = web_sender.tombstone();
+    #[cfg(test)]
+    super::super::notify_client_registration(
+        inner,
+        super::super::ClientRegistrationTestEvent::BeforeFence,
+    );
+    let registered = (|| -> Result<bool, super::super::HostConfigAdmissionError> {
+        // Every host-config writer acquires this serializer before browser or
+        // lifecycle authority. Only this serializer spans durable I/O. The
+        // first write is an explicitly non-success attempt marker; durable
+        // Connected state is written only after the Phase-B auth fence.
+        let _transaction = inner.host_config_tx.lock().map_err(|_| {
+            super::super::HostConfigAdmissionError::Persistence(
+                "host config transaction unavailable".to_string(),
+            )
+        })?;
+        let attempt_id = inner
+            .next_host_config_attempt_id
+            .fetch_add(1, Ordering::Relaxed);
+        let attempt_nonce = super::super::generate_secret("admission");
+        let authorized = |config: &super::super::RemoteHostConfig| match admission {
+            Some(admission) => {
+                admission.authentication.client_id == client_id
+                    && admission.activity.client_id == client_id
+                    && config.web.enabled
+                    && config.web.cookie_secret_hex == admission.authentication.cookie_secret_hex
+                    && config
+                        .web
+                        .paired_clients
+                        .iter()
+                        .any(|client| client.client_id == client_id)
+            }
+            None => config
+                .web
+                .paired_clients
+                .iter()
+                .any(|client| client.client_id == client_id),
+        };
 
-    clients.insert(
-        connection_id,
-        ConnectedRemoteClient {
-            client_id: client_id.to_string(),
-            sender: None,
-            web_sender: Some(web_sender),
-            web_tombstone: Some(tombstone),
-            semantic_cursors: HashMap::new(),
-            subscribed_session_ids: HashSet::new(),
-            bootstrapped_session_ids: HashSet::new(),
-            bootstrap_pending_session_ids: HashSet::new(),
-            focused_session_id: None,
-            last_app_hash: stable_hash(&app_state),
-            last_runtime_hash: stable_hash(&runtime_state),
-            last_port_hash: stable_hash(&port_statuses),
-            last_controller_client_id: controller_client_id,
-            last_you_have_control: you_have_control,
-            last_snapshot_revision: inner.snapshot_revision.load(Ordering::Relaxed),
+        let pending = {
+            let _operation = inner
+                .web_control_operation_lock
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let _lifecycle = inner
+                .lifecycle_lock
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if inner.stop_flag.load(Ordering::Acquire)
+                || inner.native_runtime_generation.load(Ordering::Acquire) != listener_generation
+            {
+                return Ok(false);
+            }
+            let is_authorized = inner
+                .config
+                .read()
+                .map_or(false, |config| authorized(&config));
+            if !is_authorized
+                || inner
+                    .clients
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .contains_key(&connection_id)
+            {
+                return Ok(false);
+            }
+            admission
+                .map(|_| {
+                    let pending_attempt = super::super::PendingRemoteAdmissionAttempt {
+                        attempt_nonce: attempt_nonce.clone(),
+                        source: super::super::RemoteAccessSource::Browser,
+                        client_id: client_id.to_string(),
+                        generation: listener_generation,
+                        attempted_at_epoch_ms: super::super::browser_admission_now_epoch_ms(inner),
+                    };
+                    super::super::stage_host_config_mutation(inner, move |config| {
+                        super::super::append_pending_admission_attempt(config, pending_attempt)
+                    })
+                    .map_err(super::super::HostConfigAdmissionError::Persistence)
+                })
+                .transpose()?
+        };
+        if let Some(pending) = pending.as_ref() {
+            super::super::persist_host_config_snapshot(&pending.candidate).map_err(|error| {
+                super::super::HostConfigAdmissionError::Persistence(error.to_string())
+            })?;
+        }
+
+        let (phase_b_admitted, final_staged) = {
+            let _operation = inner
+                .web_control_operation_lock
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let _lifecycle = inner
+                .lifecycle_lock
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (current_matches, auth_is_current) = inner
+                .config
+                .read()
+                .map(|config| {
+                    (
+                        pending.as_ref().is_none_or(|pending| {
+                            inner.config_revision.load(Ordering::Acquire) == pending.base_revision
+                                && *config == pending.base
+                        }),
+                        authorized(&config),
+                    )
+                })
+                .unwrap_or((false, false));
+            let identity_available = !inner
+                .clients
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .contains_key(&connection_id);
+            if inner.stop_flag.load(Ordering::Acquire)
+                || inner.native_runtime_generation.load(Ordering::Acquire) != listener_generation
+                || !current_matches
+                || !auth_is_current
+                || !identity_available
+            {
+                (false, None)
+            } else {
+                (
+                    true,
+                    pending
+                        .as_ref()
+                        .map(|pending| {
+                            let mut candidate = pending.candidate.clone();
+                            if !super::super::remove_pending_admission_attempt(
+                                &mut candidate,
+                                &attempt_nonce,
+                            ) {
+                                return Err(super::super::HostConfigAdmissionError::Persistence(
+                                    "Browser admission attempt marker disappeared before Phase B."
+                                        .to_string(),
+                                ));
+                            }
+                            // Browser last-seen and Connected/Reconnected
+                            // describe this Phase-B authorization fence. The
+                            // earlier marker retains its own attempt time.
+                            let applied = apply_browser_connection_activity(
+                                &mut candidate,
+                                &admission
+                                    .expect("pending browser admission must have activity")
+                                    .activity,
+                                super::super::browser_admission_now_epoch_ms(inner),
+                            );
+                            if !applied {
+                                return Err(super::super::HostConfigAdmissionError::Persistence(
+                                    "Browser pairing disappeared during Phase-B admission."
+                                        .to_string(),
+                                ));
+                            }
+                            Ok(super::super::StagedHostConfigMutation {
+                                base_revision: pending.base_revision,
+                                base: pending.base.clone(),
+                                candidate,
+                                result: (),
+                            })
+                        })
+                        .transpose()?,
+                )
+            }
+        };
+        if !phase_b_admitted {
+            if let Some(pending) = pending.as_ref() {
+                super::super::compensate_rejected_host_config_admission(pending, attempt_id)?;
+            }
+            return Ok(false);
+        }
+        if let Some(final_staged) = final_staged.as_ref() {
+            if let Err(error) = super::super::persist_host_config_snapshot(&final_staged.candidate)
+            {
+                super::super::compensate_rejected_host_config_candidates(
+                    &[
+                        &final_staged.candidate,
+                        &pending
+                            .as_ref()
+                            .expect("pending browser admission")
+                            .candidate,
+                    ],
+                    &final_staged.base,
+                    attempt_id,
+                )?;
+                return Err(super::super::HostConfigAdmissionError::Persistence(
+                    error.to_string(),
+                ));
+            }
+        }
+
+        let accepted = {
+            let _operation = inner
+                .web_control_operation_lock
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let _lifecycle = inner
+                .lifecycle_lock
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (current_matches, auth_is_current) = inner
+                .config
+                .read()
+                .map(|config| {
+                    (
+                        final_staged.as_ref().is_none_or(|staged| {
+                            inner.config_revision.load(Ordering::Acquire) == staged.base_revision
+                                && *config == staged.base
+                        }),
+                        authorized(&config),
+                    )
+                })
+                .unwrap_or((false, false));
+            let identity_available = !inner
+                .clients
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .contains_key(&connection_id);
+            if inner.stop_flag.load(Ordering::Acquire)
+                || inner.native_runtime_generation.load(Ordering::Acquire) != listener_generation
+                || !current_matches
+                || !auth_is_current
+                || !identity_available
+            {
+                false
+            } else {
+                if let Some(staged) = final_staged.as_ref() {
+                    *inner
+                        .config
+                        .write()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                        staged.candidate.clone();
+                    super::super::bump_host_config_revision(inner);
+                }
+                let tombstone = web_sender.tombstone();
+                inner
+                    .clients
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .insert(
+                        connection_id,
+                        ConnectedRemoteClient {
+                            client_id: client_id.to_string(),
+                            sender: None,
+                            web_sender: Some(web_sender),
+                            web_tombstone: Some(tombstone),
+                            semantic_cursors: HashMap::new(),
+                            subscribed_session_ids: HashSet::new(),
+                            bootstrapped_session_ids: HashSet::new(),
+                            bootstrap_pending_session_ids: HashSet::new(),
+                            focused_session_id: None,
+                            last_app_hash: stable_hash(&app_state),
+                            last_runtime_hash: stable_hash(&runtime_state),
+                            last_port_hash: stable_hash(&port_statuses)
+                                ^ stable_hash(&port_authorities),
+                            last_controller_client_id: controller_client_id,
+                            last_you_have_control: you_have_control,
+                            last_snapshot_revision: inner.snapshot_revision.load(Ordering::Relaxed),
+                        },
+                    );
+                true
+            }
+        };
+        if !accepted {
+            if let Some(final_staged) = final_staged.as_ref() {
+                super::super::compensate_rejected_host_config_candidates(
+                    &[
+                        &final_staged.candidate,
+                        &pending
+                            .as_ref()
+                            .expect("pending browser admission")
+                            .candidate,
+                    ],
+                    &final_staged.base,
+                    attempt_id,
+                )?;
+            }
+        }
+        Ok(accepted)
+    })();
+    #[cfg(test)]
+    super::super::notify_client_registration(
+        inner,
+        if matches!(registered, Ok(true)) {
+            super::super::ClientRegistrationTestEvent::Registered
+        } else {
+            super::super::ClientRegistrationTestEvent::Rejected
         },
     );
-    true
+    registered
 }
 
 fn unregister_browser_client(
@@ -523,7 +1642,13 @@ fn register_client(
     _native_sender: std_mpsc::Sender<ServerMessage>,
     web_sender: BrowserOutboundSender,
 ) -> bool {
-    register_browser_client(inner, connection_id, client_id, web_sender)
+    register_browser_client(
+        inner,
+        inner.native_runtime_generation.load(Ordering::Acquire),
+        connection_id,
+        client_id,
+        web_sender,
+    )
 }
 
 #[cfg(test)]
@@ -734,7 +1859,7 @@ fn handle_inbound_browser(
         message,
         InboundResponder::Browser {
             sender: sender.clone(),
-            inner: inner.clone(),
+            inner: Arc::downgrade(inner),
             connection_id,
             client_id: client_id.to_string(),
         },
@@ -745,7 +1870,7 @@ fn handle_inbound_browser(
 enum InboundResponder {
     Browser {
         sender: BrowserOutboundSender,
-        inner: Arc<RemoteHostInner>,
+        inner: std::sync::Weak<RemoteHostInner>,
         connection_id: u64,
         client_id: String,
     },
@@ -773,11 +1898,14 @@ impl InboundResponder {
                 connection_id,
                 client_id,
             } => {
+                let Some(host) = inner.upgrade() else {
+                    return Err(BrowserEnqueueError::Closed);
+                };
                 let result =
-                    sender.try_send_server_message(&message, inner, *connection_id, client_id);
+                    sender.try_send_server_message(&message, &host, *connection_id, client_id);
                 if result.is_err() {
                     revoke_web_connection(
-                        inner,
+                        &host,
                         *connection_id,
                         client_id,
                         &sender.tombstone(),
@@ -801,10 +1929,13 @@ impl InboundResponder {
                 connection_id,
                 client_id,
             } => {
+                let Some(host) = inner.upgrade() else {
+                    return Err(BrowserEnqueueError::Closed);
+                };
                 let result = sender.try_send(message);
                 if result.is_err() {
                     revoke_web_connection(
-                        inner,
+                        &host,
                         *connection_id,
                         client_id,
                         &sender.tombstone(),
@@ -880,6 +2011,24 @@ fn handle_inbound_core(
         let _ = tokio_tx.send(ServerMessage::Disconnected {
             message: "This browser connection is no longer active. Reconnect or pair again."
                 .to_string(),
+        });
+        return;
+    }
+
+    if inner.connect_encryption_required.load(Ordering::Acquire)
+        && matches!(
+            message,
+            WsInbound::SubscribeSessions { .. }
+                | WsInbound::Input { .. }
+                | WsInbound::PasteImage { .. }
+                | WsInbound::Resize { .. }
+                | WsInbound::InterruptSession { .. }
+                | WsInbound::ComposerSubmit { .. }
+        )
+    {
+        let _ = crate::connect::ConnectListenerKind::ProductionDirect.reject_raw_pty();
+        let _ = web_tx.send(WsOutbound::Error {
+            message: "raw PTY/session-stream is forbidden on Connect production routes".to_string(),
         });
         return;
     }
@@ -1407,6 +2556,7 @@ fn handle_inbound_core(
                     inner,
                     PendingRemoteRequest {
                         client_id: client_id.to_string(),
+                        git_authority: None,
                         action,
                         response: None,
                     },
@@ -1486,6 +2636,7 @@ fn handle_inbound_core(
                     inner,
                     PendingRemoteRequest {
                         client_id: client_id.to_string(),
+                        git_authority: None,
                         action,
                         response: Some(response_tx),
                     },
@@ -1747,7 +2898,7 @@ fn with_registered_web_operation<R>(
 
 #[derive(Clone)]
 struct WebInputFence {
-    inner: Arc<RemoteHostInner>,
+    inner: std::sync::Weak<RemoteHostInner>,
     connection_id: u64,
     client_id: String,
     tombstone: Option<Arc<WebConnectionTombstone>>,
@@ -1761,17 +2912,19 @@ impl WebInputFence {
     }
 
     fn is_current_at(&self, checked_at_epoch_ms: u64) -> bool {
-        if self.runtime_instance_id != self.inner.runtime_instance_id {
+        let Some(inner) = self.inner.upgrade() else {
+            return false;
+        };
+        if self.runtime_instance_id != inner.runtime_instance_id {
             return false;
         }
-        let _operation = self
-            .inner
+        let _operation = inner
             .web_control_operation_lock
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if self.tombstone.as_ref().is_some_and(|expected| {
             !web_connection_is_authoritative_locked(
-                &self.inner,
+                &inner,
                 self.connection_id,
                 &self.client_id,
                 Some(expected),
@@ -1780,7 +2933,7 @@ impl WebInputFence {
             return false;
         }
         let (authorized, lease_changed) = {
-            let Ok(mut control) = self.inner.web_control.lock() else {
+            let Ok(mut control) = inner.web_control.lock() else {
                 return false;
             };
             let before = control.writer_leases().peek();
@@ -1797,17 +2950,16 @@ impl WebInputFence {
                 None => control.legacy_authorizes(self.connection_id, &self.client_id),
             };
             let after = control.writer_leases().peek();
-            clear_controller_after_lease_removal(&self.inner, before.as_ref(), after.as_ref());
+            clear_controller_after_lease_removal(&inner, before.as_ref(), after.as_ref());
             (authorized, before != after)
         };
-        let controller_matches = self
-            .inner
+        let controller_matches = inner
             .controller_client_id
             .read()
             .map(|controller| controller.as_deref() == Some(self.client_id.as_str()))
             .unwrap_or(false);
         if lease_changed {
-            broadcast_writer_lease_state_locked(&self.inner, checked_at_epoch_ms);
+            broadcast_writer_lease_state_locked(&inner, checked_at_epoch_ms);
         }
         authorized && controller_matches
     }
@@ -1826,7 +2978,7 @@ pub(crate) fn web_mutation_authority_is_current(
         return false;
     };
     WebInputFence {
-        inner: inner.clone(),
+        inner: Arc::downgrade(inner),
         connection_id: authority.connection_id,
         client_id: authority.client_id.clone(),
         tombstone: Some(tombstone),
@@ -1882,7 +3034,7 @@ fn reserve_web_input_fence(
         broadcast_writer_lease_state_locked(inner, now_epoch_ms);
     }
     (authorized && controller_matches).then(|| WebInputFence {
-        inner: inner.clone(),
+        inner: Arc::downgrade(inner),
         connection_id,
         client_id: client_id.to_string(),
         tombstone,
@@ -1958,7 +3110,13 @@ fn enqueue_terminal_input(
                 });
                 return;
             }
-            let (session_id, _) = match resolve_unique_session(&fence.inner, &stable_session_key) {
+            let Some(host) = fence.inner.upgrade() else {
+                let _ = response.send(ServerMessage::Error {
+                    message: "The host runtime stopped before terminal input executed.".to_string(),
+                });
+                return;
+            };
+            let (session_id, _) = match resolve_unique_session(&host, &stable_session_key) {
                 Ok(session) => session,
                 Err(_) => {
                     let _ = response.send(ServerMessage::Error {
@@ -1967,12 +3125,12 @@ fn enqueue_terminal_input(
                     return;
                 }
             };
-            let handler = fence
-                .inner
+            let handler = host
                 .terminal_input_handler
                 .read()
                 .ok()
                 .and_then(|slot| slot.as_ref().cloned());
+            drop(host);
             let result = handler.map_or_else(
                 || Err("The target PTY is not ready for input.".to_string()),
                 |handler| {
@@ -2021,22 +3179,28 @@ fn enqueue_terminal_resize(
                     });
                     return;
                 }
-                let (session_id, _) =
-                    match resolve_unique_session(&fence.inner, &stable_session_key) {
-                        Ok(session) => session,
-                        Err(_) => {
-                            let _ = response.send(ServerMessage::Error {
-                                message: "The requested session no longer exists.".to_string(),
-                            });
-                            return;
-                        }
-                    };
-                let handler = fence
-                    .inner
+                let Some(host) = fence.inner.upgrade() else {
+                    let _ = response.send(ServerMessage::Error {
+                        message: "The host runtime stopped before terminal resize executed."
+                            .to_string(),
+                    });
+                    return;
+                };
+                let (session_id, _) = match resolve_unique_session(&host, &stable_session_key) {
+                    Ok(session) => session,
+                    Err(_) => {
+                        let _ = response.send(ServerMessage::Error {
+                            message: "The requested session no longer exists.".to_string(),
+                        });
+                        return;
+                    }
+                };
+                let handler = host
                     .terminal_resize_handler
                     .read()
                     .ok()
                     .and_then(|slot| slot.as_ref().cloned());
+                drop(host);
                 if let Some(handler) = handler {
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         handler(session_id, dimensions);
@@ -2176,6 +3340,14 @@ fn send_resume_state_with_lane(
     if !valid {
         let _ = web_tx.send(WsOutbound::Error {
             message: "Resume request identifiers are too long or empty.".to_string(),
+        });
+        return;
+    }
+    if inner.connect_encryption_required.load(Ordering::Acquire) && request.raw_session_id.is_some()
+    {
+        let _ = crate::connect::ConnectListenerKind::ProductionDirect.reject_raw_pty();
+        let _ = web_tx.send(WsOutbound::Error {
+            message: "raw PTY/session-stream is forbidden on Connect production routes".to_string(),
         });
         return;
     }
@@ -2373,7 +3545,7 @@ fn build_resume_state_locked(
         semantic_after_sequence,
     );
     let (route, desired_session_key) = if hard_reset {
-        ("/sessions".to_string(), None)
+        (super::routes::TASKS_PATH.to_string(), None)
     } else {
         validate_resume_route(&request.route, requested_key.as_ref(), &projection)
     };
@@ -2508,7 +3680,7 @@ fn capture_resume_projection_raw(
     let replay = desired_session_key
         .and_then(|key| semantic_journals.capture_replay_after(key, semantic_after_sequence));
     (
-        light_snapshot(inner, client_id),
+        crate::remote::light_snapshot_locked(inner, client_id),
         inner.snapshot_revision.load(Ordering::Relaxed),
         semantic_journals.metadata_snapshot(),
         replay,
@@ -2523,19 +3695,31 @@ fn validate_resume_route(
     let path = route
         .split(['?', '#'])
         .next()
-        .unwrap_or("/sessions")
+        .unwrap_or(super::routes::TASKS_PATH)
         .trim_end_matches('/');
     let path = if path.is_empty() { "/" } else { path };
     match path {
-        "/sessions" | "/projects" | "/settings" => (path.to_string(), None),
+        "/" | "/sessions" | "/tasks" => (super::routes::TASKS_PATH.to_string(), None),
+        "/projects" | "/settings" => (path.to_string(), None),
         _ => {
+            if let Some((canonical, route_key)) = super::routes::parse_task_path(path) {
+                if requested_key == Some(&route_key)
+                    && workspace
+                        .sessions
+                        .iter()
+                        .any(|session| session.stable_session_key.as_ref() == Some(&route_key))
+                {
+                    return (canonical, Some(route_key));
+                }
+            }
             if let Some(project_id) = path.strip_prefix("/projects/") {
+                let decoded_id = super::routes::decode_component(project_id);
                 if !project_id.is_empty()
                     && !project_id.contains('/')
                     && workspace
                         .projects
                         .iter()
-                        .any(|project| project.id == project_id)
+                        .any(|project| Some(project.id.as_str()) == decoded_id.as_deref())
                 {
                     return (path.to_string(), None);
                 }
@@ -2561,12 +3745,12 @@ fn validate_resume_route(
                             .iter()
                             .any(|session| session.stable_session_key.as_ref() == Some(&route_key));
                         if requested_matches && exists {
-                            return (path.to_string(), Some(route_key));
+                            return (super::routes::task_path(&route_key), Some(route_key));
                         }
                     }
                 }
             }
-            ("/sessions".to_string(), None)
+            (super::routes::TASKS_PATH.to_string(), None)
         }
     }
 }
@@ -3291,8 +4475,8 @@ fn dispatch_composer_submit_for_connection(
             let execution_epoch_ms =
                 fence_check_epoch_ms.unwrap_or_else(super::super::now_epoch_ms);
             if !fence.is_current_at(execution_epoch_ms) {
-                clear_in_flight_composer(&fence.inner, &mutation_id, fingerprint);
-                completion.send(Err(composer_rejected(
+                clear_in_flight_composer_weak(&fence.inner, &mutation_id, fingerprint);
+                completion.send(Err(composer_rejected_from_weak(
                     &fence.inner,
                     connection_id,
                     mutation_id,
@@ -3302,12 +4486,16 @@ fn dispatch_composer_submit_for_connection(
                 )));
                 return;
             }
-            let (session_id, session_kind) =
-                match resolve_unique_session(&fence.inner, &stable_session_key) {
+            let (session_id, session_kind) = match fence
+                .inner
+                .upgrade()
+                .map(|host| resolve_unique_session(&host, &stable_session_key))
+            {
+                Some(result) => match result {
                     Ok(session) => session,
                     Err(code) => {
-                        clear_in_flight_composer(&fence.inner, &mutation_id, fingerprint);
-                        completion.send(Err(composer_rejected(
+                        clear_in_flight_composer_weak(&fence.inner, &mutation_id, fingerprint);
+                        completion.send(Err(composer_rejected_from_weak(
                             &fence.inner,
                             connection_id,
                             mutation_id,
@@ -3317,32 +4505,61 @@ fn dispatch_composer_submit_for_connection(
                         )));
                         return;
                     }
-                };
-            let host_service = RemoteHostService::borrowed(fence.inner.clone());
-            let reconciliation = match session_kind {
-                SessionKind::Claude => host_service.reserve_claude_composer_prompt(
-                    &mutation_id,
-                    &session_id,
-                    &stable_session_key,
-                    &text,
-                ),
-                SessionKind::Codex => {
-                    let provider_visible_text =
-                        canonical_codex_composer_prompt(&text, decoded_attachments.len());
-                    host_service.reserve_codex_composer_prompt(
-                        &mutation_id,
-                        &session_id,
-                        &stable_session_key,
-                        &provider_visible_text,
-                    )
+                },
+                None => {
+                    clear_in_flight_composer_weak(&fence.inner, &mutation_id, fingerprint);
+                    completion.send(Err(composer_rejected_from_weak(
+                        &fence.inner,
+                        connection_id,
+                        mutation_id,
+                        ComposerRejectCode::PtyRejected,
+                        "The host runtime stopped before the prompt executed.",
+                        execution_epoch_ms,
+                    )));
+                    return;
                 }
-                SessionKind::Shell | SessionKind::Server | SessionKind::Ssh => {
-                    ComposerReconciliationReservation::NotNeeded
+            };
+            let reconciliation = match fence.inner.upgrade() {
+                Some(host) => {
+                    let host_service = RemoteHostService::borrowed(host);
+                    match session_kind {
+                        SessionKind::Claude => host_service.reserve_claude_composer_prompt(
+                            &mutation_id,
+                            &session_id,
+                            &stable_session_key,
+                            &text,
+                        ),
+                        SessionKind::Codex => {
+                            let provider_visible_text =
+                                canonical_codex_composer_prompt(&text, decoded_attachments.len());
+                            host_service.reserve_codex_composer_prompt(
+                                &mutation_id,
+                                &session_id,
+                                &stable_session_key,
+                                &provider_visible_text,
+                            )
+                        }
+                        SessionKind::Shell | SessionKind::Server | SessionKind::Ssh => {
+                            ComposerReconciliationReservation::NotNeeded
+                        }
+                    }
+                }
+                None => {
+                    clear_in_flight_composer_weak(&fence.inner, &mutation_id, fingerprint);
+                    completion.send(Err(composer_rejected_from_weak(
+                        &fence.inner,
+                        connection_id,
+                        mutation_id,
+                        ComposerRejectCode::PtyRejected,
+                        "The host runtime stopped before the prompt was reconciled.",
+                        execution_epoch_ms,
+                    )));
+                    return;
                 }
             };
             if reconciliation == ComposerReconciliationReservation::CapacityExceeded {
-                clear_in_flight_composer(&fence.inner, &mutation_id, fingerprint);
-                completion.send(Err(composer_rejected(
+                clear_in_flight_composer_weak(&fence.inner, &mutation_id, fingerprint);
+                completion.send(Err(composer_rejected_from_weak(
                     &fence.inner,
                     connection_id,
                     mutation_id,
@@ -3356,12 +4573,12 @@ fn dispatch_composer_submit_for_connection(
                 && reconciliation == ComposerReconciliationReservation::Reserved;
             let reconcile_codex_prompt = session_kind == SessionKind::Codex
                 && reconciliation == ComposerReconciliationReservation::Reserved;
-            let handler = fence
-                .inner
-                .terminal_input_handler
-                .read()
-                .ok()
-                .and_then(|slot| slot.as_ref().cloned());
+            let handler = fence.inner.upgrade().and_then(|host| {
+                host.terminal_input_handler
+                    .read()
+                    .ok()
+                    .and_then(|slot| slot.as_ref().cloned())
+            });
             let callback_result = handler.map_or_else(
                 || Err("The target PTY is not ready for input.".to_string()),
                 |handler| {
@@ -3372,7 +4589,7 @@ fn dispatch_composer_submit_for_connection(
                             text: format!("{text}\r"),
                             attachments: decoded_attachments,
                             authority: RemoteWebMutationAuthority {
-                                runtime_instance_id: fence.inner.runtime_instance_id.clone(),
+                                runtime_instance_id: fence.runtime_instance_id.clone(),
                                 connection_id,
                                 client_id: fence.client_id.clone(),
                                 lease_generation: Some(lease_generation),
@@ -3384,14 +4601,20 @@ fn dispatch_composer_submit_for_connection(
             );
             if let Err(message) = callback_result {
                 if reconcile_claude_prompt {
-                    host_service.cancel_claude_composer_prompt(&mutation_id);
+                    if let Some(host) = fence.inner.upgrade() {
+                        RemoteHostService::borrowed(host)
+                            .cancel_claude_composer_prompt(&mutation_id);
+                    }
                 }
                 if reconcile_codex_prompt {
-                    host_service.cancel_codex_composer_prompt(&mutation_id);
+                    if let Some(host) = fence.inner.upgrade() {
+                        RemoteHostService::borrowed(host)
+                            .cancel_codex_composer_prompt(&mutation_id);
+                    }
                 }
                 if message == super::image_paste::WEB_COMPOSER_AUTHORITY_CHANGED {
-                    clear_in_flight_composer(&fence.inner, &mutation_id, fingerprint);
-                    completion.send(Err(composer_rejected(
+                    clear_in_flight_composer_weak(&fence.inner, &mutation_id, fingerprint);
+                    completion.send(Err(composer_rejected_from_weak(
                         &fence.inner,
                         connection_id,
                         mutation_id,
@@ -3402,8 +4625,8 @@ fn dispatch_composer_submit_for_connection(
                     return;
                 }
                 let message = bounded_composer_error(&message);
-                store_pty_rejection(&fence.inner, &mutation_id, fingerprint, &message);
-                completion.send(Err(composer_rejected(
+                store_pty_rejection_weak(&fence.inner, &mutation_id, fingerprint, &message);
+                completion.send(Err(composer_rejected_from_weak(
                     &fence.inner,
                     connection_id,
                     mutation_id,
@@ -3431,41 +4654,57 @@ fn dispatch_composer_submit_for_connection(
                 }
             };
             let occurred_at_epoch_ms = execution_epoch_ms;
-            let published = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                publish_semantic_event(
-                    &fence.inner,
-                    SemanticEventDraft {
-                        stable_session_key: stable_session_key.clone(),
-                        occurred_at_epoch_ms,
-                        source,
-                        kind,
-                        retention: SemanticRetention::Canonical,
-                        deduplication_key: Some(format!("composer:{mutation_id}")),
-                    },
-                )
-            }));
+            let published = match fence.inner.upgrade() {
+                Some(host) => std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    publish_semantic_event(
+                        &host,
+                        SemanticEventDraft {
+                            subagent_id: None,
+                            stable_session_key: stable_session_key.clone(),
+                            occurred_at_epoch_ms,
+                            source,
+                            kind,
+                            retention: SemanticRetention::Canonical,
+                            deduplication_key: Some(format!("composer:{mutation_id}")),
+                        },
+                    )
+                })),
+                None => Err(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "host runtime stopped before semantic publication",
+                )) as Box<dyn std::any::Any + Send>),
+            };
             if reconcile_claude_prompt {
-                if published.is_ok() {
-                    host_service.accept_claude_composer_prompt(&mutation_id);
-                } else {
-                    host_service.cancel_claude_composer_prompt(&mutation_id);
+                if let Some(host) = fence.inner.upgrade() {
+                    let host_service = RemoteHostService::borrowed(host);
+                    if published.is_ok() {
+                        host_service.accept_claude_composer_prompt(&mutation_id);
+                    } else {
+                        host_service.cancel_claude_composer_prompt(&mutation_id);
+                    }
                 }
             }
             if reconcile_codex_prompt {
-                if published.is_ok() {
-                    host_service.accept_codex_composer_prompt(&mutation_id);
-                } else {
-                    host_service.cancel_codex_composer_prompt(&mutation_id);
+                if let Some(host) = fence.inner.upgrade() {
+                    let host_service = RemoteHostService::borrowed(host);
+                    if published.is_ok() {
+                        host_service.accept_codex_composer_prompt(&mutation_id);
+                    } else {
+                        host_service.cancel_codex_composer_prompt(&mutation_id);
+                    }
                 }
             }
             let accepted_sequence = published.map(|event| event.sequence).unwrap_or_else(|_| {
                 fence
                     .inner
-                    .semantic_journals
-                    .lock()
-                    .ok()
-                    .and_then(|journals| journals.metadata(&stable_session_key))
-                    .map(|metadata| metadata.latest_sequence)
+                    .upgrade()
+                    .and_then(|host| {
+                        host.semantic_journals
+                            .lock()
+                            .ok()
+                            .and_then(|journals| journals.metadata(&stable_session_key))
+                            .map(|metadata| metadata.latest_sequence)
+                    })
                     .unwrap_or(0)
             });
             let accepted = ComposerAccepted {
@@ -3474,18 +4713,20 @@ fn dispatch_composer_submit_for_connection(
                 accepted_sequence,
                 lease_generation,
             };
-            store_composer_mutation_outcome(
-                &fence.inner,
-                mutation_id,
-                WebComposerMutationRecord {
-                    fingerprint,
-                    status: WebComposerMutationStatus::Accepted {
-                        stable_session_key,
-                        accepted_sequence,
-                        lease_generation,
+            if let Some(host) = fence.inner.upgrade() {
+                store_composer_mutation_outcome(
+                    &host,
+                    mutation_id,
+                    WebComposerMutationRecord {
+                        fingerprint,
+                        status: WebComposerMutationStatus::Accepted {
+                            stable_session_key,
+                            accepted_sequence,
+                            lease_generation,
+                        },
                     },
-                },
-            );
+                );
+            }
             completion.send(Ok(accepted));
         });
     if dispatch.is_err() {
@@ -3724,6 +4965,48 @@ fn composer_rejected_locked(
     }
 }
 
+fn composer_rejected_from_weak(
+    inner: &Weak<RemoteHostInner>,
+    connection_id: u64,
+    mutation_id: String,
+    code: ComposerRejectCode,
+    message: impl Into<String>,
+    now_epoch_ms: u64,
+) -> ComposerRejected {
+    let message = message.into();
+    let writer_lease = inner
+        .upgrade()
+        .map(|host| writer_lease_state(&host, connection_id, now_epoch_ms))
+        .unwrap_or_default();
+    ComposerRejected {
+        mutation_id,
+        code,
+        message,
+        writer_lease,
+    }
+}
+
+fn clear_in_flight_composer_weak(
+    inner: &Weak<RemoteHostInner>,
+    mutation_id: &str,
+    fingerprint: u64,
+) {
+    if let Some(host) = inner.upgrade() {
+        clear_in_flight_composer(&host, mutation_id, fingerprint);
+    }
+}
+
+fn store_pty_rejection_weak(
+    inner: &Weak<RemoteHostInner>,
+    mutation_id: &str,
+    fingerprint: u64,
+    message: &str,
+) {
+    if let Some(host) = inner.upgrade() {
+        store_pty_rejection(&host, mutation_id, fingerprint, message);
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) enum EncodedFrame {
     Text(String),
@@ -3959,10 +5242,12 @@ impl BrowserOutboundSender {
             ServerMessage::SessionStream {
                 event: RemoteSessionStreamEvent::RuntimePatch { .. }
             }
-        ) {
-            // Browser snapshots already carry runtime state. This variant is
-            // intentionally omitted from the web wire and must not be treated
-            // as a serialization failure that revokes the connection.
+        ) || (inner.connect_encryption_required.load(Ordering::Acquire)
+            && matches!(message, ServerMessage::SessionStream { .. }))
+        {
+            // Browser snapshots already carry runtime state. SessionStream
+            // raw PTY is omitted on Connect production routes and must not
+            // revoke the socket as a serialization failure.
             return Ok(());
         }
         if matches!(
@@ -4264,7 +5549,7 @@ fn translate_outbound(
         ServerMessage::Snapshot { .. } | ServerMessage::Delta { .. } => {
             serialize_web_snapshot(capture_web_snapshot(inner, connection_id, client_id))
         }
-        _ => encode_outbound(message),
+        _ => encode_outbound_gated(message, inner),
     }
 }
 
@@ -4278,7 +5563,7 @@ fn translate_outbound_locked(
         ServerMessage::Snapshot { .. } | ServerMessage::Delta { .. } => serialize_web_snapshot(
             capture_web_snapshot_inner(inner, connection_id, client_id, true),
         ),
-        _ => encode_outbound(message),
+        _ => encode_outbound_gated(message, inner),
     }
 }
 
@@ -4319,7 +5604,7 @@ fn capture_web_snapshot_inner(
             };
             let semantic_metadata = semantic_journals.metadata_snapshot();
             (
-                light_snapshot(inner, client_id),
+                crate::remote::light_snapshot_locked(inner, client_id),
                 inner.snapshot_revision.load(Ordering::Relaxed),
                 semantic_metadata,
             )
@@ -4352,12 +5637,13 @@ fn project_web_snapshot(
     semantic_metadata: &HashMap<StableSessionKey, SemanticSessionMetadata>,
     lease: &WebWriterLeaseState,
 ) -> WebWorkspaceSnapshot {
-    let mut projected = WebWorkspaceSnapshot::from_host(
+    let mut projected = WebWorkspaceSnapshot::from_host_with_authorities(
         inner.runtime_instance_id.clone(),
         revision,
         &snapshot.app_state,
         &snapshot.runtime_state,
         &snapshot.port_statuses,
+        &snapshot.port_authorities,
         lease,
         semantic_metadata,
     );
@@ -4372,6 +5658,16 @@ fn serialize_web_snapshot(workspace: WebWorkspaceSnapshot) -> Option<EncodedFram
 /// Translate a `ServerMessage` (the type the broadcaster produces) into a
 /// WS frame. Returns `None` for variants that only make sense on the TCP
 /// path (e.g., `HelloOk`, `PortForwardOk`).
+fn encode_outbound_gated(message: &ServerMessage, inner: &RemoteHostInner) -> Option<EncodedFrame> {
+    if inner.connect_encryption_required.load(Ordering::Acquire)
+        && matches!(message, ServerMessage::SessionStream { .. })
+    {
+        let _ = crate::connect::ConnectListenerKind::ProductionDirect.reject_raw_pty();
+        return None;
+    }
+    encode_outbound(message)
+}
+
 fn encode_outbound(message: &ServerMessage) -> Option<EncodedFrame> {
     match message {
         ServerMessage::Snapshot { .. } | ServerMessage::Delta { .. } => None,
@@ -4394,6 +5690,8 @@ fn encode_outbound(message: &ServerMessage) -> Option<EncodedFrame> {
 }
 
 fn encode_session_stream(event: &RemoteSessionStreamEvent) -> Option<EncodedFrame> {
+    // Legacy `/api/ws` encoder only. Production Connect uses `/api/connect`
+    // sealed frames; translate_outbound drops this path when encryption is required.
     match event {
         RemoteSessionStreamEvent::Output {
             session_id,
@@ -4473,8 +5771,11 @@ mod tests {
     use super::super::action::{WebAction, WebAiKind};
     use super::*;
     use crate::remote::{
-        deliver_pending_bootstraps, PairedWebClient, RemoteActionPayload, RemoteHostConfig,
-        RemoteHostService, RemoteSessionBootstrap, PROTOCOL_VERSION,
+        deliver_pending_bootstraps, load_remote_machine_state, save_remote_machine_state,
+        test_support::TestProfileGuard, HostConfigPersistenceTestPhase, PairedWebClient,
+        RemoteAccessSource, RemoteActionPayload, RemoteHostConfig, RemoteHostService,
+        RemoteMachineState, RemoteSessionBootstrap, HOST_CONFIG_PERSISTENCE_TEST_HOOK,
+        PROTOCOL_VERSION, REMOTE_WORKER_SHUTDOWN_TIMEOUT,
     };
     use crate::state::{AiLaunchSpec, SessionDimensions, SessionKind, SessionRuntimeState};
     use crate::terminal::session::{
@@ -4488,6 +5789,33 @@ mod tests {
     use std::pin::Pin;
     use std::sync::mpsc as std_mpsc;
     use std::task::{Context, Poll};
+
+    struct HostConfigPersistenceHookGuard;
+
+    impl HostConfigPersistenceHookGuard {
+        fn install(
+            hook: Arc<
+                dyn Fn(&RemoteHostConfig, HostConfigPersistenceTestPhase) -> std::io::Result<()>
+                    + Send
+                    + Sync,
+            >,
+        ) -> Self {
+            let mut slot = HOST_CONFIG_PERSISTENCE_TEST_HOOK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            assert!(slot.is_none(), "host config persistence test hook leaked");
+            *slot = Some(hook);
+            Self
+        }
+    }
+
+    impl Drop for HostConfigPersistenceHookGuard {
+        fn drop(&mut self) {
+            *HOST_CONFIG_PERSISTENCE_TEST_HOOK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        }
+    }
 
     fn test_web_sender() -> BrowserOutboundSender {
         let (sender, receiver) = BrowserOutboundSender::channel(4096, WEB_OUTBOUND_MAX_BYTES * 4);
@@ -4516,6 +5844,7 @@ mod tests {
                 hidden: false,
                 has_hyperlink: false,
                 default_background: true,
+                default_foreground: false,
             })
             .collect()];
         snapshot.rows = 1;
@@ -4535,8 +5864,18 @@ mod tests {
         let service = RemoteHostService::new(config);
         pair_web_client(&service, "paired-browser");
         let state = WebState {
-            inner: service.inner.clone(),
+            inner: Arc::downgrade(&service.inner),
+            listener_generation: service
+                .inner
+                .native_runtime_generation
+                .load(Ordering::Acquire),
             pairing_attempts: Arc::new(std::sync::Mutex::new(Default::default())),
+            connect_startup: None,
+            host_requests: crate::connect::ConnectHostRequestSlot::new(),
+            cross_origin: Arc::new(std::sync::Mutex::new(Default::default())),
+            cross_origin_rate: Arc::new(std::sync::Mutex::new(Default::default())),
+            fleet_trust_source: None,
+            fleet_test_publication: None,
         };
         let config = service.config();
         let signed = super::super::sign_cookie(&config.web.cookie_secret_hex, "paired-browser")
@@ -4567,6 +5906,87 @@ mod tests {
             authorize_ws_request(&state, &headers),
             Err(StatusCode::FORBIDDEN)
         );
+    }
+
+    #[test]
+    fn connect_request_scheme_never_trusts_forwarded_tls_claims() {
+        let mut headers = HeaderMap::new();
+        let local = "127.0.0.1".parse().unwrap();
+        let remote = "192.0.2.7".parse().unwrap();
+        headers.insert(
+            axum::http::header::ORIGIN,
+            "https://devmanager.test".parse().unwrap(),
+        );
+        headers.insert(
+            axum::http::header::HOST,
+            "devmanager.test:43872".parse().unwrap(),
+        );
+        assert_eq!(connect_request_scheme(&headers, remote), None);
+
+        headers.insert("x-forwarded-proto", "http, https".parse().unwrap());
+        assert_eq!(connect_request_scheme(&headers, remote), None);
+
+        headers.insert("forwarded", "for=192.0.2.7;proto=https".parse().unwrap());
+        assert_eq!(connect_request_scheme(&headers, local), None);
+        headers.insert(axum::http::header::HOST, "localhost:43872".parse().unwrap());
+        assert_eq!(connect_request_scheme(&headers, local), Some("http"));
+        assert_eq!(connect_request_scheme(&headers, remote), None);
+        headers.insert(axum::http::header::HOST, "[::1]:43872".parse().unwrap());
+        assert_eq!(
+            connect_request_scheme(&headers, "::1".parse().unwrap()),
+            Some("http")
+        );
+    }
+
+    #[test]
+    fn connect_upgrade_requires_the_paired_browser_cookie_before_noise() {
+        let service = RemoteHostService::new(RemoteHostConfig::default());
+        let state = WebState {
+            inner: Arc::downgrade(&service.inner),
+            listener_generation: service
+                .inner
+                .native_runtime_generation
+                .load(Ordering::Acquire),
+            pairing_attempts: Arc::new(std::sync::Mutex::new(Default::default())),
+            connect_startup: None,
+            host_requests: crate::connect::ConnectHostRequestSlot::new(),
+            cross_origin: Arc::new(std::sync::Mutex::new(Default::default())),
+            cross_origin_rate: Arc::new(std::sync::Mutex::new(Default::default())),
+            fleet_trust_source: None,
+            fleet_test_publication: None,
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::HOST,
+            "devmanager.test:43872".parse().unwrap(),
+        );
+        headers.insert(
+            axum::http::header::ORIGIN,
+            "http://devmanager.test:43872".parse().unwrap(),
+        );
+        let response =
+            admit_connect_ws_request(&state, &headers, "127.0.0.1".parse().unwrap(), None)
+                .expect_err("Connect must not reach Noise without browser admission");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn web_input_fence_does_not_retain_host_runtime() {
+        let service = RemoteHostService::new(RemoteHostConfig::default());
+        let host = Arc::downgrade(&service.inner);
+        let fence = WebInputFence {
+            inner: Arc::downgrade(&service.inner),
+            connection_id: 0,
+            client_id: "expired".to_string(),
+            tombstone: None,
+            lease_generation: None,
+            runtime_instance_id: service.inner.runtime_instance_id.clone(),
+        };
+
+        drop(service);
+
+        assert!(host.upgrade().is_none());
+        assert!(!fence.is_current());
     }
 
     fn try_recv_web_text(receiver: &mut BrowserOutboundReceiver) -> String {
@@ -4724,6 +6144,7 @@ mod tests {
         text_bytes: usize,
     ) -> Arc<super::super::super::presentation::SemanticEvent> {
         Arc::new(super::super::super::presentation::SemanticEvent {
+            subagent_id: None,
             stable_session_key: StableSessionKey::from_server("paged"),
             sequence,
             replaces_sequence: None,
@@ -4849,7 +6270,7 @@ mod tests {
                 run_browser_writer(
                     &mut SlowSink::new(Duration::from_millis(20), observed),
                     receiver,
-                    service.inner.clone(),
+                    Arc::downgrade(&service.inner),
                     1,
                     client_id.to_string(),
                     tombstone.clone(),
@@ -5038,7 +6459,7 @@ mod tests {
             .expect("old replay");
         let lane = WebResponseLane(InboundResponder::Browser {
             sender: sender.clone(),
-            inner: service.inner.clone(),
+            inner: Arc::downgrade(&service.inner),
             connection_id: 1,
             client_id: client_id.to_string(),
         });
@@ -5262,6 +6683,586 @@ mod tests {
     }
 
     #[test]
+    fn web_restart_rejects_a_client_paused_before_registration() {
+        let _profile = TestProfileGuard::new("web-client-registration-durable-fence");
+        let web_port = std::net::TcpListener::bind(("127.0.0.1", 0))
+            .expect("reserve isolated browser test port")
+            .local_addr()
+            .expect("isolated browser test address")
+            .port();
+        let mut config = RemoteHostConfig::default();
+        config.web.bind_address = "127.0.0.1".to_string();
+        config.web.port = web_port;
+        let service = RemoteHostService::new(config);
+        let client_id = "generation-fenced-browser";
+        pair_web_client(&service, client_id);
+        service
+            .inner
+            .config
+            .write()
+            .expect("config lock")
+            .web
+            .enabled = true;
+        save_remote_machine_state(&RemoteMachineState {
+            host: service.config(),
+            known_hosts: Vec::new(),
+        })
+        .expect("seed durable browser registration state");
+        let durable_before = load_remote_machine_state()
+            .expect("load durable browser registration state before the attempt");
+        let memory_before = service.config();
+        let old_generation = service
+            .inner
+            .native_runtime_generation
+            .load(Ordering::Acquire);
+        let (registration_event_tx, registration_event_rx) = std_mpsc::sync_channel(3);
+        let (registration_release_tx, registration_release_rx) = std_mpsc::sync_channel(0);
+        let registration_release_rx = Arc::new(std::sync::Mutex::new(registration_release_rx));
+        *service
+            .inner
+            .client_registration_test_hook
+            .write()
+            .expect("registration hook lock") = Some(Arc::new(move |event| {
+            registration_event_tx
+                .send(event)
+                .expect("registration observer should remain");
+            if event == crate::remote::ClientRegistrationTestEvent::BeforeFence {
+                registration_release_rx
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .recv()
+                    .expect("registration should be released");
+            }
+        }));
+
+        let inner = service.inner.clone();
+        let client_id_for_worker = client_id.to_string();
+        let admission = BrowserConnectionAdmission {
+            authentication: ValidatedWebAuthentication {
+                client_id: client_id.to_string(),
+                cookie_secret_hex: service.config().web.cookie_secret_hex,
+            },
+            activity: prepare_browser_connection_activity(
+                client_id,
+                "127.0.0.9".parse().expect("browser test address"),
+                Some("late-browser-install".to_string()),
+                &HeaderMap::new(),
+            )
+            .expect("valid late browser install id"),
+        };
+        let (registered_tx, registered_rx) = std_mpsc::sync_channel(1);
+        let registration = std::thread::spawn(move || {
+            let (sender, _receiver) = test_web_channel();
+            let registered = register_browser_client_with_admission(
+                &inner,
+                old_generation,
+                91,
+                &client_id_for_worker,
+                sender,
+                &admission,
+            )
+            .expect("browser admission should settle");
+            registered_tx
+                .send(registered)
+                .expect("registration result observer should remain");
+        });
+        assert_eq!(
+            registration_event_rx
+                .recv_timeout(Duration::from_secs(3))
+                .expect("browser should pause before registration"),
+            crate::remote::ClientRegistrationTestEvent::BeforeFence
+        );
+
+        service.apply_config(service.config());
+        assert_ne!(
+            service
+                .inner
+                .native_runtime_generation
+                .load(Ordering::Acquire),
+            old_generation,
+            "test restart did not revoke the listener generation"
+        );
+        registration_release_tx
+            .send(())
+            .expect("browser registration should still be waiting");
+        let outcome = registration_event_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("browser registration should report its fenced outcome");
+        let registered = registered_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("browser registration worker should finish");
+        registration
+            .join()
+            .expect("registration worker should join");
+        *service
+            .inner
+            .client_registration_test_hook
+            .write()
+            .expect("registration hook lock") = None;
+
+        assert_eq!(
+            outcome,
+            crate::remote::ClientRegistrationTestEvent::Rejected,
+            "a revoked web listener generation admitted a late browser"
+        );
+        assert!(!registered, "a revoked web listener returned success");
+        assert!(
+            service
+                .inner
+                .clients
+                .lock()
+                .expect("clients lock")
+                .is_empty(),
+            "a revoked web listener left a late browser registered"
+        );
+        let memory_after = service.config();
+        assert_eq!(
+            memory_after.web.paired_clients, memory_before.web.paired_clients,
+            "a rejected browser admission changed paired authorization in memory"
+        );
+        assert_eq!(
+            memory_after.web.activity_log, memory_before.web.activity_log,
+            "a rejected browser admission recorded connection activity in memory"
+        );
+        let durable_after = load_remote_machine_state()
+            .expect("load durable browser registration state after rejection");
+        assert_eq!(
+            durable_after.host.web.paired_clients, durable_before.host.web.paired_clients,
+            "a rejected browser admission persisted paired authorization"
+        );
+        assert_eq!(
+            durable_after.host.web.activity_log, durable_before.host.web.activity_log,
+            "a rejected browser admission persisted connection activity"
+        );
+    }
+
+    #[test]
+    fn successful_browser_admission_uses_phase_b_commit_time_and_one_config_revision() {
+        let _profile = TestProfileGuard::new("browser-admission-final-time-revision");
+        let service = RemoteHostService::new(RemoteHostConfig::default());
+        let client_id = "final-time-browser";
+        pair_web_client(&service, client_id);
+        service
+            .inner
+            .config
+            .write()
+            .expect("config lock")
+            .web
+            .enabled = true;
+        save_remote_machine_state(&RemoteMachineState {
+            host: service.config(),
+            known_hosts: Vec::new(),
+        })
+        .expect("seed final-time browser state");
+        let clock_calls = Arc::new(AtomicUsize::new(0));
+        *service
+            .inner
+            .browser_admission_clock_test_hook
+            .write()
+            .expect("browser admission clock hook") = Some(Arc::new({
+            let clock_calls = clock_calls.clone();
+            move || match clock_calls.fetch_add(1, Ordering::SeqCst) {
+                0 => 111_111,
+                1 => 424_242,
+                call => panic!("browser admission clock called unexpectedly at index {call}"),
+            }
+        }));
+        let (attempt_time_tx, attempt_time_rx) = std_mpsc::sync_channel(1);
+        let attempt_observed = Arc::new(AtomicBool::new(false));
+        let _persistence_hook = HostConfigPersistenceHookGuard::install(Arc::new({
+            let attempt_observed = attempt_observed.clone();
+            move |snapshot, phase| {
+                if phase == HostConfigPersistenceTestPhase::BeforeWrite
+                    && !snapshot.pending_admission_attempts.is_empty()
+                    && !attempt_observed.swap(true, Ordering::SeqCst)
+                {
+                    attempt_time_tx
+                        .send(snapshot.pending_admission_attempts[0].attempted_at_epoch_ms)
+                        .map_err(|_| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::BrokenPipe,
+                                "browser attempt-time observer disappeared",
+                            )
+                        })?;
+                }
+                Ok(())
+            }
+        }));
+        let revision_before = service.config_revision();
+        let generation = service
+            .inner
+            .native_runtime_generation
+            .load(Ordering::Acquire);
+        let admission = BrowserConnectionAdmission {
+            authentication: ValidatedWebAuthentication {
+                client_id: client_id.to_string(),
+                cookie_secret_hex: service.config().web.cookie_secret_hex,
+            },
+            activity: prepare_browser_connection_activity(
+                client_id,
+                "127.0.0.10".parse().expect("browser test address"),
+                Some("final-time-install".to_string()),
+                &HeaderMap::new(),
+            )
+            .expect("valid final-time browser install id"),
+        };
+        let (sender, _receiver) = test_web_channel();
+
+        assert!(register_browser_client_with_admission(
+            &service.inner,
+            generation,
+            93,
+            client_id,
+            sender,
+            &admission,
+        )
+        .expect("browser admission should commit"));
+
+        assert_eq!(
+            attempt_time_rx
+                .recv_timeout(Duration::from_secs(3))
+                .expect("Phase A attempt marker must be persisted"),
+            111_111,
+            "the durable marker timestamp must describe only the Phase A attempt"
+        );
+        assert_eq!(
+            clock_calls.load(Ordering::SeqCst),
+            2,
+            "Phase A attempt and Phase B commit must capture separate timestamps"
+        );
+        assert_eq!(service.config_revision(), revision_before + 1);
+        let config = service.config();
+        assert!(config.pending_admission_attempts.is_empty());
+        let paired = config
+            .web
+            .paired_clients
+            .iter()
+            .find(|client| client.client_id == client_id)
+            .expect("paired browser should remain");
+        assert_eq!(paired.last_seen_epoch_ms, Some(424_242));
+        let event = config
+            .web
+            .activity_log
+            .last()
+            .expect("browser connection event should be recorded");
+        assert_eq!(event.event_at_epoch_ms, Some(424_242));
+        assert_eq!(
+            load_remote_machine_state()
+                .expect("load final-time browser state")
+                .host,
+            config,
+            "one committed revision must match the durable browser admission"
+        );
+    }
+
+    #[test]
+    fn blocked_browser_admission_persistence_cannot_block_root_drop_or_commit_after_stop() {
+        let _profile = TestProfileGuard::new("browser-admission-persistence-drop-fence");
+        let root = RemoteHostService::new(RemoteHostConfig::default());
+        let client_id = "blocked-persistence-browser";
+        pair_web_client(&root, client_id);
+        root.inner.config.write().expect("config lock").web.enabled = true;
+        save_remote_machine_state(&RemoteMachineState {
+            host: root.config(),
+            known_hosts: Vec::new(),
+        })
+        .expect("seed isolated browser admission state");
+        let durable_before = load_remote_machine_state()
+            .expect("load isolated browser admission state before the attempt");
+        let old_generation = root.inner.native_runtime_generation.load(Ordering::Acquire);
+        let admission = BrowserConnectionAdmission {
+            authentication: ValidatedWebAuthentication {
+                client_id: client_id.to_string(),
+                cookie_secret_hex: root.config().web.cookie_secret_hex,
+            },
+            activity: prepare_browser_connection_activity(
+                client_id,
+                "127.0.0.7".parse().expect("browser test address"),
+                Some("blocked-browser-install".to_string()),
+                &HeaderMap::new(),
+            )
+            .expect("valid blocked browser install id"),
+        };
+
+        let (persistence_entered_tx, persistence_entered_rx) = std_mpsc::sync_channel(1);
+        let (persistence_release_tx, persistence_release_rx) = std_mpsc::sync_channel(0);
+        let persistence_release_rx = Arc::new(std::sync::Mutex::new(persistence_release_rx));
+        let candidate_seen = Arc::new(AtomicBool::new(false));
+        let _persistence_hook = HostConfigPersistenceHookGuard::install(Arc::new({
+            let persistence_release_rx = persistence_release_rx.clone();
+            let candidate_seen = candidate_seen.clone();
+            move |snapshot, phase| {
+                if phase == HostConfigPersistenceTestPhase::AfterWrite
+                    && !snapshot.pending_admission_attempts.is_empty()
+                    && !candidate_seen.swap(true, Ordering::SeqCst)
+                {
+                    persistence_entered_tx.send(snapshot.clone()).map_err(|_| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::BrokenPipe,
+                            "browser persistence observer disappeared",
+                        )
+                    })?;
+                    persistence_release_rx
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .recv()
+                        .map_err(|_| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::BrokenPipe,
+                                "browser persistence release disappeared",
+                            )
+                        })?;
+                }
+                Ok(())
+            }
+        }));
+        let host = root.inner.clone();
+        let host_weak = Arc::downgrade(&root.inner);
+        let client_id_for_worker = client_id.to_string();
+        let (registered_tx, registered_rx) = std_mpsc::sync_channel(1);
+        let registration = std::thread::spawn(move || {
+            let (sender, _receiver) = test_web_channel();
+            let result = register_browser_client_with_admission(
+                &host,
+                old_generation,
+                92,
+                &client_id_for_worker,
+                sender,
+                &admission,
+            );
+            registered_tx
+                .send(result)
+                .expect("browser registration result observer should remain");
+        });
+        let durable_attempt = persistence_entered_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("browser admission should enter persistence");
+        assert_eq!(
+            durable_attempt.paired_clients,
+            durable_before.host.paired_clients
+        );
+        assert_eq!(
+            durable_attempt.web.activity_log,
+            durable_before.host.web.activity_log
+        );
+        assert_eq!(durable_attempt.pending_admission_attempts.len(), 1);
+        assert_eq!(
+            durable_attempt.pending_admission_attempts[0].source,
+            RemoteAccessSource::Browser
+        );
+
+        let (drop_done_tx, drop_done_rx) = std_mpsc::sync_channel(1);
+        let dropper = std::thread::spawn(move || {
+            drop(root);
+            let _ = drop_done_tx.try_send(());
+        });
+        let drop_returned_while_persistence_blocked = drop_done_rx
+            .recv_timeout(REMOTE_WORKER_SHUTDOWN_TIMEOUT + Duration::from_millis(500))
+            .is_ok();
+
+        persistence_release_tx
+            .send(())
+            .expect("browser persistence should remain blocked until explicit release");
+        if !drop_returned_while_persistence_blocked {
+            drop_done_rx
+                .recv_timeout(Duration::from_secs(3))
+                .expect("root drop should finish after releasing the stale browser writer");
+        }
+        let registered = registered_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("browser registration should settle after root stop");
+        registration
+            .join()
+            .expect("browser registration worker should join");
+        dropper.join().expect("root drop worker should join");
+
+        assert!(
+            drop_returned_while_persistence_blocked,
+            "blocked browser admission persistence held lifecycle authority across root drop"
+        );
+        assert!(
+            matches!(registered, Ok(false)),
+            "a browser admission committed after its root generation stopped: {registered:?}"
+        );
+        let durable_after = load_remote_machine_state()
+            .expect("load isolated browser admission state after root stop");
+        assert_eq!(
+            durable_after.host, durable_before.host,
+            "stale browser admission persistence changed the isolated durable host config"
+        );
+        assert!(
+            host_weak.upgrade().is_none(),
+            "browser admission worker retained the stopped host runtime"
+        );
+    }
+
+    fn assert_blocked_browser_admission_serializes_config_mutation(
+        profile: &str,
+        mutate: impl FnOnce(RemoteHostService, &str) -> bool + Send + 'static,
+    ) {
+        let _profile = TestProfileGuard::new(profile);
+        let service = RemoteHostService::new(RemoteHostConfig::default());
+        let client_id = "serialized-browser-mutation";
+        pair_web_client(&service, client_id);
+        service
+            .inner
+            .config
+            .write()
+            .expect("config lock")
+            .web
+            .enabled = true;
+        save_remote_machine_state(&RemoteMachineState {
+            host: service.config(),
+            known_hosts: Vec::new(),
+        })
+        .expect("seed serialized browser mutation state");
+        let generation = service
+            .inner
+            .native_runtime_generation
+            .load(Ordering::Acquire);
+        let admission = BrowserConnectionAdmission {
+            authentication: ValidatedWebAuthentication {
+                client_id: client_id.to_string(),
+                cookie_secret_hex: service.config().web.cookie_secret_hex,
+            },
+            activity: prepare_browser_connection_activity(
+                client_id,
+                "127.0.0.11".parse().expect("browser test address"),
+                Some("serialized-browser-install".to_string()),
+                &HeaderMap::new(),
+            )
+            .expect("valid serialized browser install id"),
+        };
+        let (persistence_entered_tx, persistence_entered_rx) = std_mpsc::sync_channel(1);
+        let (persistence_release_tx, persistence_release_rx) = std_mpsc::sync_channel(0);
+        let persistence_release_rx = Arc::new(std::sync::Mutex::new(persistence_release_rx));
+        let candidate_seen = Arc::new(AtomicBool::new(false));
+        let _persistence_hook = HostConfigPersistenceHookGuard::install(Arc::new({
+            let persistence_release_rx = persistence_release_rx.clone();
+            let candidate_seen = candidate_seen.clone();
+            move |snapshot, phase| {
+                if phase == HostConfigPersistenceTestPhase::BeforeWrite
+                    && !snapshot.pending_admission_attempts.is_empty()
+                    && !candidate_seen.swap(true, Ordering::SeqCst)
+                {
+                    persistence_entered_tx.send(()).map_err(|_| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::BrokenPipe,
+                            "serialized browser persistence observer disappeared",
+                        )
+                    })?;
+                    persistence_release_rx
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .recv()
+                        .map_err(|_| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::BrokenPipe,
+                                "serialized browser persistence release disappeared",
+                            )
+                        })?;
+                }
+                Ok(())
+            }
+        }));
+
+        let registration_inner = service.inner.clone();
+        let client_id_for_registration = client_id.to_string();
+        let (registered_tx, registered_rx) = std_mpsc::sync_channel(1);
+        let registration = std::thread::spawn(move || {
+            let (sender, _receiver) = test_web_channel();
+            let result = register_browser_client_with_admission(
+                &registration_inner,
+                generation,
+                94,
+                &client_id_for_registration,
+                sender,
+                &admission,
+            );
+            registered_tx
+                .send(result)
+                .expect("registration result observer should remain");
+        });
+        persistence_entered_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("browser admission should enter persistence");
+        let web_authority = service
+            .inner
+            .web_control_operation_lock
+            .try_lock()
+            .expect("blocked persistence must not retain browser authority");
+
+        let mutation_service = service.clone();
+        let (mutation_started_tx, mutation_started_rx) = std_mpsc::sync_channel(1);
+        let (mutation_done_tx, mutation_done_rx) = std_mpsc::sync_channel(1);
+        let mutation = std::thread::spawn(move || {
+            mutation_started_tx
+                .send(())
+                .expect("mutation start observer should remain");
+            let changed = mutate(mutation_service, client_id);
+            mutation_done_tx
+                .send(changed)
+                .expect("mutation result observer should remain");
+        });
+        mutation_started_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("browser config mutation should start");
+        persistence_release_tx
+            .send(())
+            .expect("release browser admission persistence");
+        drop(web_authority);
+
+        assert!(
+            registered_rx
+                .recv_timeout(Duration::from_secs(3))
+                .expect("browser admission should settle")
+                .expect("browser admission should remain durable"),
+            "the serialized browser admission should commit before the queued mutation"
+        );
+        assert!(
+            mutation_done_rx
+                .recv_timeout(Duration::from_secs(3))
+                .expect("browser config mutation should settle"),
+            "the queued browser config mutation should apply"
+        );
+        registration
+            .join()
+            .expect("browser registration worker should join");
+        mutation
+            .join()
+            .expect("browser config mutation worker should join");
+        assert!(
+            service.config().web.paired_clients.is_empty(),
+            "the serialized revoke/reset should be the final paired-client state"
+        );
+        assert!(
+            service
+                .inner
+                .clients
+                .lock()
+                .expect("clients lock")
+                .is_empty(),
+            "the serialized revoke/reset should remove the admitted live browser"
+        );
+    }
+
+    #[test]
+    fn blocked_browser_admission_serializes_before_revoke_without_lock_inversion() {
+        assert_blocked_browser_admission_serializes_config_mutation(
+            "browser-admission-vs-revoke",
+            |service, client_id| service.revoke_paired_web_client(client_id),
+        );
+    }
+
+    #[test]
+    fn blocked_browser_admission_serializes_before_reset_without_lock_inversion() {
+        assert_blocked_browser_admission_serializes_config_mutation(
+            "browser-admission-vs-reset",
+            |service, _| service.reset_browser_access(),
+        );
+    }
+
+    #[test]
     fn stalled_writer_times_out_and_revokes_exact_registration() {
         let service = RemoteHostService::new(RemoteHostConfig::default());
         let client_id = "stalled-writer";
@@ -5286,7 +7287,7 @@ mod tests {
                 run_browser_writer(
                     &mut StalledSink,
                     receiver,
-                    service.inner.clone(),
+                    Arc::downgrade(&service.inner),
                     1,
                     client_id.to_string(),
                     tombstone.clone(),
@@ -5307,6 +7308,7 @@ mod tests {
     #[test]
     fn one_browser_queue_orders_initial_resume_replay_lease_live_and_raw_frames() {
         let service = RemoteHostService::new(RemoteHostConfig::default());
+        service.set_connect_encryption_required_for_test(false);
         let client_id = "fifo-client";
         pair_web_client(&service, client_id);
         let (native, _native_rx) = std_mpsc::channel();
@@ -5919,7 +7921,14 @@ mod tests {
             browser_version: Some("135".to_string()),
             os_family: Some("Windows".to_string()),
             device_class: Some("desktop".to_string()),
+            permitted_origin: None,
         });
+    }
+
+    fn legacy_web_service() -> RemoteHostService {
+        let service = RemoteHostService::new(RemoteHostConfig::default());
+        service.set_connect_encryption_required_for_test(false);
+        service
     }
 
     fn ai_session(service: &RemoteHostService, tab_id: &str, session_id: &str) {
@@ -5980,8 +7989,8 @@ mod tests {
             seen_revision: None,
             route: desired_session_key
                 .as_ref()
-                .map(|key| format!("/session/{}", key.as_str().replace(':', "/")))
-                .unwrap_or_else(|| "/sessions".to_string()),
+                .map(super::super::routes::task_path)
+                .unwrap_or_else(|| "/tasks".to_string()),
             desired_session_key,
             raw_session_id: None,
             semantic_after_sequence: Some(0),
@@ -5992,7 +8001,7 @@ mod tests {
     }
 
     #[test]
-    fn resume_runtime_mismatch_is_a_hard_reset_to_sessions() {
+    fn resume_runtime_mismatch_is_a_hard_reset_to_tasks() {
         let service = RemoteHostService::new(RemoteHostConfig::default());
         let state = build_resume_state(
             &service.inner,
@@ -6007,10 +8016,85 @@ mod tests {
         );
 
         assert!(state.hard_reset);
-        assert_eq!(state.route, "/sessions");
+        assert_eq!(state.route, "/tasks");
         assert!(state.desired_session_key.is_none());
         assert!(state.semantic_replay.is_none());
         assert!(state.workspace.is_some());
+    }
+
+    #[test]
+    fn websocket_greeting_prologue_ids_are_accepted_by_the_envelope_decoder() {
+        let host = crate::connect::ConnectHostId::new().as_bytes();
+        for _ in 0..16 {
+            let (greeting, route, session) = connect_greeting(host);
+            assert_eq!(&greeting[..5], b"DMCN1");
+            assert_eq!(&greeting[5..21], &host);
+            let wire_route: [u8; 16] = greeting[21..37].try_into().unwrap();
+            let wire_session: [u8; 16] = greeting[37..53].try_into().unwrap();
+            assert_eq!(wire_route, route);
+            assert_eq!(wire_session, session);
+            assert!(crate::connect::ConnectionId::from_bytes(wire_route).is_ok());
+            assert!(crate::connect::SessionId::from_bytes(wire_session).is_ok());
+        }
+    }
+
+    #[test]
+    fn foreground_resume_keeps_the_task_resource_and_semantic_replay() {
+        let service = RemoteHostService::new(RemoteHostConfig::default());
+        ai_session(&service, "tab-a", "pty-a");
+        let key = StableSessionKey::from_tab("tab-a");
+        let mut request = resume_request(
+            Some(service.inner.runtime_instance_id.clone()),
+            Some(key.clone()),
+            "phone",
+        );
+        request.route = "/tasks/tab%3Atab-a/terminal?source=pwa".to_string();
+        request.wants_writer_lease = false;
+        let state = build_resume_state(&service.inner, 1, "phone", request, 1_000);
+        assert!(!state.hard_reset);
+        assert_eq!(state.route, "/tasks/tab%3Atab-a/terminal");
+        assert_eq!(state.desired_session_key, Some(key.clone()));
+        assert_eq!(state.semantic_replay.unwrap().stable_session_key, key);
+    }
+
+    #[test]
+    fn resume_does_not_attach_a_foreign_missing_or_malformed_task_route() {
+        let service = RemoteHostService::new(RemoteHostConfig::default());
+        ai_session(&service, "tab-a", "pty-a");
+        for route in [
+            "/tasks/tab%3Atab-b",
+            "/tasks/tab%3Atab-a%00",
+            "/tasks/tab%3Atab-a/terminal/extra",
+            "/tasks/%E0%A4%A",
+        ] {
+            let mut request = resume_request(
+                Some(service.inner.runtime_instance_id.clone()),
+                Some(StableSessionKey::from_tab("tab-a")),
+                "phone",
+            );
+            request.route = route.to_string();
+            request.wants_writer_lease = false;
+            let state = build_resume_state(&service.inner, 1, "phone", request, 1_000);
+            assert_eq!(state.route, "/tasks", "{route}");
+            assert!(state.desired_session_key.is_none(), "{route}");
+            assert!(state.semantic_replay.is_none(), "{route}");
+        }
+    }
+
+    #[test]
+    fn old_session_links_resume_to_the_current_task_route() {
+        let service = RemoteHostService::new(RemoteHostConfig::default());
+        ai_session(&service, "tab-a", "pty-a");
+        let mut request = resume_request(
+            Some(service.inner.runtime_instance_id.clone()),
+            Some(StableSessionKey::from_tab("tab-a")),
+            "phone",
+        );
+        request.route = "/session/tab/tab-a".to_string();
+        request.wants_writer_lease = false;
+        let state = build_resume_state(&service.inner, 1, "phone", request, 1_000);
+        assert_eq!(state.route, "/tasks/tab%3Atab-a");
+        assert!(state.semantic_replay.is_some());
     }
 
     #[test]
@@ -6193,7 +8277,7 @@ mod tests {
 
     #[test]
     fn raw_resume_marks_only_requested_terminal_bootstrap_pending() {
-        let service = RemoteHostService::new(RemoteHostConfig::default());
+        let service = legacy_web_service();
         pair_web_client(&service, "web-client");
         ai_session(&service, "tab-a", "session-a");
         let (std_tx, _std_rx) = std_mpsc::channel::<ServerMessage>();
@@ -6539,6 +8623,7 @@ mod tests {
         service.push_claude_semantic_draft(
             identity,
             SemanticEventDraft {
+                subagent_id: None,
                 stable_session_key: stable_key.clone(),
                 occurred_at_epoch_ms: 1_200,
                 source: SemanticSource::Claude,
@@ -6644,6 +8729,7 @@ mod tests {
         service.push_codex_semantic_draft(
             identity,
             SemanticEventDraft {
+                subagent_id: None,
                 stable_session_key: stable_key.clone(),
                 occurred_at_epoch_ms: 1_200,
                 source: SemanticSource::Codex,
@@ -6729,6 +8815,7 @@ mod tests {
                 hook_service.push_claude_semantic_draft(
                     hook_identity.clone(),
                     SemanticEventDraft {
+                        subagent_id: None,
                         stable_session_key: hook_identity.stable_session_key.clone(),
                         occurred_at_epoch_ms: 1_100 + number as u64,
                         source: SemanticSource::Claude,
@@ -6776,6 +8863,7 @@ mod tests {
         service.push_claude_semantic_draft(
             identity.clone(),
             SemanticEventDraft {
+                subagent_id: None,
                 stable_session_key: stable_key.clone(),
                 occurred_at_epoch_ms: 1_200,
                 source: SemanticSource::Claude,
@@ -6798,6 +8886,7 @@ mod tests {
                 ..identity.clone()
             },
             SemanticEventDraft {
+                subagent_id: None,
                 stable_session_key: stable_key.clone(),
                 occurred_at_epoch_ms: 1_201,
                 source: SemanticSource::Claude,
@@ -6814,6 +8903,7 @@ mod tests {
             service.push_claude_semantic_draft(
                 identity.clone(),
                 SemanticEventDraft {
+                    subagent_id: None,
                     stable_session_key: stable_key.clone(),
                     occurred_at_epoch_ms,
                     source: SemanticSource::Claude,
@@ -6848,6 +8938,7 @@ mod tests {
         service.push_claude_semantic_draft(
             identity.clone(),
             SemanticEventDraft {
+                subagent_id: None,
                 stable_session_key: stable_key.clone(),
                 occurred_at_epoch_ms: 1_001,
                 source: SemanticSource::Claude,
@@ -6860,6 +8951,7 @@ mod tests {
         );
         service.push_claude_adapter_removed(&identity);
         service.push_semantic_draft(SemanticEventDraft {
+            subagent_id: None,
             stable_session_key: stable_key.clone(),
             occurred_at_epoch_ms: 1_002,
             source: SemanticSource::Claude,
@@ -6906,6 +8998,7 @@ mod tests {
         service.push_claude_semantic_draft(
             identity.clone(),
             SemanticEventDraft {
+                subagent_id: None,
                 stable_session_key: stable_key.clone(),
                 occurred_at_epoch_ms: 1_001,
                 source: SemanticSource::Claude,
@@ -6921,6 +9014,7 @@ mod tests {
             ..identity.clone()
         });
         service.push_semantic_draft(SemanticEventDraft {
+            subagent_id: None,
             stable_session_key: stable_key.clone(),
             occurred_at_epoch_ms: 1_002,
             source: SemanticSource::Claude,
@@ -6964,6 +9058,7 @@ mod tests {
             "late provider hook",
         );
         service.push_semantic_draft(SemanticEventDraft {
+            subagent_id: None,
             stable_session_key: stable_key.clone(),
             occurred_at_epoch_ms: 1_001,
             source: SemanticSource::Claude,
@@ -6980,6 +9075,7 @@ mod tests {
             service.push_claude_semantic_draft(
                 identity.clone(),
                 SemanticEventDraft {
+                    subagent_id: None,
                     stable_session_key: stable_key.clone(),
                     occurred_at_epoch_ms,
                     source: SemanticSource::Claude,
@@ -7026,6 +9122,7 @@ mod tests {
         service.push_claude_semantic_draft(
             identity.clone(),
             SemanticEventDraft {
+                subagent_id: None,
                 stable_session_key: stable_key.clone(),
                 occurred_at_epoch_ms: 1_001,
                 source: SemanticSource::Claude,
@@ -7042,6 +9139,7 @@ mod tests {
         service.push_claude_semantic_draft(
             identity,
             SemanticEventDraft {
+                subagent_id: None,
                 stable_session_key: stable_key.clone(),
                 occurred_at_epoch_ms: 1_002,
                 source: SemanticSource::Claude,
@@ -7105,6 +9203,7 @@ mod tests {
             provider_service.push_codex_semantic_draft(
                 provider_identity.clone(),
                 SemanticEventDraft {
+                    subagent_id: None,
                     stable_session_key: provider_identity.stable_session_key.clone(),
                     occurred_at_epoch_ms: 1_100 + number as u64,
                     source: SemanticSource::Codex,
@@ -7151,6 +9250,7 @@ mod tests {
         service.push_codex_semantic_draft(
             identity.clone(),
             SemanticEventDraft {
+                subagent_id: None,
                 stable_session_key: stable_key.clone(),
                 occurred_at_epoch_ms: 1_200,
                 source: SemanticSource::Codex,
@@ -7169,6 +9269,7 @@ mod tests {
                 ..identity.clone()
             },
             SemanticEventDraft {
+                subagent_id: None,
                 stable_session_key: stable_key.clone(),
                 occurred_at_epoch_ms: 1_201,
                 source: SemanticSource::Codex,
@@ -7184,6 +9285,7 @@ mod tests {
         service.push_codex_semantic_draft(
             identity,
             SemanticEventDraft {
+                subagent_id: None,
                 stable_session_key: stable_key.clone(),
                 occurred_at_epoch_ms: 1_202,
                 source: SemanticSource::Codex,
@@ -7250,6 +9352,7 @@ mod tests {
             provider_service.push_codex_semantic_draft(
                 provider_identity.clone(),
                 SemanticEventDraft {
+                    subagent_id: None,
                     stable_session_key: provider_identity.stable_session_key.clone(),
                     occurred_at_epoch_ms: 1_100 + number as u64,
                     source: SemanticSource::Codex,
@@ -7327,6 +9430,7 @@ mod tests {
         service.push_codex_semantic_draft(
             identity,
             SemanticEventDraft {
+                subagent_id: None,
                 stable_session_key: stable_key.clone(),
                 occurred_at_epoch_ms: 1_200,
                 source: SemanticSource::Codex,
@@ -7354,6 +9458,7 @@ mod tests {
             registration_generation: 9,
         };
         let provider = |text: &str, key: &str, occurred_at_epoch_ms| SemanticEventDraft {
+            subagent_id: None,
             stable_session_key: stable_key.clone(),
             occurred_at_epoch_ms,
             source: SemanticSource::Codex,
@@ -7364,6 +9469,7 @@ mod tests {
             deduplication_key: Some(key.to_string()),
         };
         let composer = |text: &str, mutation: &str, occurred_at_epoch_ms| SemanticEventDraft {
+            subagent_id: None,
             stable_session_key: stable_key.clone(),
             occurred_at_epoch_ms,
             source: SemanticSource::Codex,
@@ -7470,6 +9576,7 @@ mod tests {
             hook_service.push_claude_semantic_draft(
                 identity.clone(),
                 SemanticEventDraft {
+                    subagent_id: None,
                     stable_session_key: identity.stable_session_key.clone(),
                     occurred_at_epoch_ms: 1_101,
                     source: SemanticSource::Claude,
@@ -7573,7 +9680,7 @@ mod tests {
 
     #[test]
     fn blocked_composer_does_not_pin_lease_or_other_session_input() {
-        let service = RemoteHostService::new(RemoteHostConfig::default());
+        let service = legacy_web_service();
         let mut app = crate::state::AppState::default();
         let mut runtime_state = crate::state::RuntimeState::default();
         for (tab_id, session_id) in [("tab-a", "session-a"), ("tab-b", "session-b")] {
@@ -8881,6 +10988,23 @@ mod tests {
     }
 
     #[test]
+    fn connect_encryption_gate_drops_raw_session_stream() {
+        let service = RemoteHostService::new(RemoteHostConfig::default());
+        assert!(service.connect_encryption_required());
+        let message = ServerMessage::SessionStream {
+            event: RemoteSessionStreamEvent::Output {
+                session_id: "abc".to_string(),
+                chunk_seq: 1,
+                emitted_at_epoch_ms: 0,
+                bytes: vec![9, 8, 7],
+            },
+        };
+        assert!(encode_outbound_gated(&message, &service.inner).is_none());
+        service.set_connect_encryption_required_for_test(false);
+        assert!(encode_outbound_gated(&message, &service.inner).is_some());
+    }
+
+    #[test]
     fn encode_outbound_drops_hello_ok() {
         use super::super::super::RemoteWorkspaceSnapshot;
         let message = ServerMessage::HelloOk {
@@ -8955,6 +11079,7 @@ mod tests {
             hidden: false,
             has_hyperlink: false,
             default_background: true,
+            default_foreground: false,
         };
         let message = ServerMessage::SessionStream {
             event: RemoteSessionStreamEvent::Bootstrap {
@@ -9019,7 +11144,7 @@ mod tests {
 
     #[test]
     fn subscribe_sessions_eagerly_bootstraps_ready_sessions() {
-        let service = RemoteHostService::new(RemoteHostConfig::default());
+        let service = legacy_web_service();
         service.set_session_bootstrap_provider(Some(Arc::new(|session_id| {
             Some(RemoteSessionBootstrap {
                 session_id: session_id.to_string(),
@@ -9577,6 +11702,7 @@ mod tests {
             for index in 0..crate::remote::MAX_PENDING_REMOTE_REQUESTS {
                 requests.push(PendingRemoteRequest {
                     client_id: format!("queued-{index}"),
+                    git_authority: None,
                     action: super::super::super::RemoteAction::GitListRepos,
                     response: None,
                 });
@@ -9615,7 +11741,7 @@ mod tests {
 
     #[test]
     fn viewer_mode_paste_image_reports_error_without_disconnect() {
-        let service = RemoteHostService::new(RemoteHostConfig::default());
+        let service = legacy_web_service();
         ai_session(&service, "tab-a", "claude-1");
         let connection_id = 13;
         let client_id = "web-viewer";
@@ -9657,7 +11783,7 @@ mod tests {
 
     #[test]
     fn paste_image_decodes_base64_and_forwards_binary_attachment() {
-        let service = RemoteHostService::new(RemoteHostConfig::default());
+        let service = legacy_web_service();
         ai_session(&service, "tab-a", "claude-1");
         let connection_id = 14;
         let client_id = "web-client";
@@ -9728,7 +11854,7 @@ mod tests {
 
     #[test]
     fn legacy_paste_image_keeps_a_post_staging_connection_authority() {
-        let service = RemoteHostService::new(RemoteHostConfig::default());
+        let service = legacy_web_service();
         ai_session(&service, "tab-a", "claude-legacy-image");
         let connection_id = 15;
         let client_id = "legacy-image-client";
@@ -9785,7 +11911,7 @@ mod tests {
 
     #[test]
     fn legacy_raw_input_is_authorized_for_only_the_exact_claiming_connection() {
-        let service = RemoteHostService::new(RemoteHostConfig::default());
+        let service = legacy_web_service();
         ai_session(&service, "tab-a", "session-a");
         let client_id = "same-cookie";
         pair_web_client(&service, client_id);
@@ -9860,7 +11986,7 @@ mod tests {
 
     #[test]
     fn web_input_kind_maps_to_matching_native_user_origin_variant() {
-        let service = RemoteHostService::new(RemoteHostConfig::default());
+        let service = legacy_web_service();
         ai_session(&service, "tab-a", "session-a");
         let client_id = "input-origin-owner";
         let connection_id = 1;
@@ -9922,7 +12048,7 @@ mod tests {
 
     #[test]
     fn generation_bearing_raw_input_rejects_a_same_cookie_viewer() {
-        let service = RemoteHostService::new(RemoteHostConfig::default());
+        let service = legacy_web_service();
         ai_session(&service, "tab-a", "session-a");
         let client_id = "same-cookie";
         pair_web_client(&service, client_id);
@@ -9969,7 +12095,7 @@ mod tests {
 
     #[test]
     fn interrupt_session_maps_to_ctrl_c_only_for_exact_generation_owner() {
-        let service = RemoteHostService::new(RemoteHostConfig::default());
+        let service = legacy_web_service();
         ai_session(&service, "tab-a", "session-a");
         let client_id = "same-cookie";
         pair_web_client(&service, client_id);
@@ -10027,7 +12153,7 @@ mod tests {
 
     #[test]
     fn raw_payload_bounds_reject_before_any_pty_write() {
-        let service = RemoteHostService::new(RemoteHostConfig::default());
+        let service = legacy_web_service();
         let connection_id = 1;
         let client_id = "web-client";
         pair_web_client(&service, client_id);
@@ -10219,7 +12345,7 @@ mod tests {
         register_client(&service.inner, 1, client_id, std_tx, push_tx.clone());
         let lane = WebResponseLane(InboundResponder::Browser {
             sender: push_tx.clone(),
-            inner: service.inner.clone(),
+            inner: Arc::downgrade(&service.inner),
             connection_id: 1,
             client_id: client_id.to_string(),
         });
@@ -10311,6 +12437,7 @@ mod tests {
         let retained = publish_semantic_event(
             &service.inner,
             SemanticEventDraft {
+                subagent_id: None,
                 stable_session_key: key.clone(),
                 occurred_at_epoch_ms: 1,
                 source: SemanticSource::System,
@@ -10343,6 +12470,7 @@ mod tests {
         let live = publish_semantic_event(
             &service.inner,
             SemanticEventDraft {
+                subagent_id: None,
                 stable_session_key: key.clone(),
                 occurred_at_epoch_ms: 2,
                 source: SemanticSource::System,
@@ -10364,6 +12492,7 @@ mod tests {
         let partial = publish_semantic_event(
             &service.inner,
             SemanticEventDraft {
+                subagent_id: None,
                 stable_session_key: key.clone(),
                 occurred_at_epoch_ms: 3,
                 source: SemanticSource::Claude,
@@ -10384,6 +12513,7 @@ mod tests {
         let replacement = publish_semantic_event(
             &service.inner,
             SemanticEventDraft {
+                subagent_id: None,
                 stable_session_key: key.clone(),
                 occurred_at_epoch_ms: 4,
                 source: SemanticSource::Claude,
@@ -10417,6 +12547,7 @@ mod tests {
         publish_semantic_event(
             &service.inner,
             SemanticEventDraft {
+                subagent_id: None,
                 stable_session_key: key,
                 occurred_at_epoch_ms: 3,
                 source: SemanticSource::System,
@@ -10434,7 +12565,7 @@ mod tests {
 
     #[test]
     fn subscribe_marks_session_before_eager_bootstrap_lookup() {
-        let service = RemoteHostService::new(RemoteHostConfig::default());
+        let service = legacy_web_service();
         let (entered_tx, entered_rx) = std_mpsc::channel::<()>();
         let gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
         let provider_gate = gate.clone();
@@ -10494,7 +12625,7 @@ mod tests {
 
     #[test]
     fn subscribed_web_client_can_receive_output_while_bootstrap_lookup_blocks() {
-        let service = RemoteHostService::new(RemoteHostConfig::default());
+        let service = legacy_web_service();
         let (entered_tx, entered_rx) = std_mpsc::channel::<()>();
         let gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
         let provider_gate = gate.clone();
@@ -10545,7 +12676,7 @@ mod tests {
 
     #[test]
     fn subscribe_without_initial_bootstrap_still_bootstraps_once_session_becomes_ready() {
-        let service = RemoteHostService::new(RemoteHostConfig::default());
+        let service = legacy_web_service();
         let connection_id = 15;
         let client_id = "web-client";
         pair_web_client(&service, client_id);

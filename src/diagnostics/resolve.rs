@@ -127,6 +127,7 @@ mod tests {
     use std::ffi::OsString;
     use std::fs;
 
+    #[cfg(windows)]
     #[test]
     fn pathext_order_prefers_cmd_over_ps1_in_same_dir() {
         let dir = tempfile::tempdir().unwrap();
@@ -141,9 +142,9 @@ mod tests {
     #[test]
     fn same_directory_wrappers_collapse_for_path_consistency() {
         let collapsed = collapse_same_directory_installs(&[
-            PathBuf::from(r"C:\nvm\npm.cmd"),
-            PathBuf::from(r"C:\nvm\npm.ps1"),
-            PathBuf::from(r"C:\Program Files\nodejs\npm.cmd"),
+            std::env::temp_dir().join("nvm").join("npm.cmd"),
+            std::env::temp_dir().join("nvm").join("npm.ps1"),
+            std::env::temp_dir().join("nodejs").join("npm.cmd"),
         ]);
         assert_eq!(collapsed.len(), 2);
         assert!(collapsed.iter().any(|p| p.ends_with("npm.cmd")));

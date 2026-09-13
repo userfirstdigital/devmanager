@@ -1,3 +1,6 @@
+pub mod protocol;
+pub mod replica;
+pub mod service;
 pub mod session;
 pub mod view;
 

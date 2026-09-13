@@ -1,0 +1,2627 @@
+//! Single task-following context dock. UI holds no provider/PTY lifecycle.
+
+use std::collections::BTreeMap;
+
+use crate::client::action::ActionRequest;
+use crate::client::model::{
+    admit_subscription_stream, AdmittedStreamFrame, ClientModel, StreamAdmissionReject,
+};
+use crate::domain::agent::AgentRole;
+use crate::domain::id::{AgentSessionId, RequestId, ResourceId, SubscriptionId, TaskId};
+use crate::domain::snapshot::TaskSnapshot;
+use crate::domain::TaskTerminalProjection;
+use crate::protocol::StreamFrame;
+use crate::services::ProcessManager;
+use crate::terminal::session::TerminalSessionView;
+use crate::terminal::view::{
+    terminal_pane_from_replica, ReplicaPaneRequest, TerminalPaneModel, TerminalReplicaOverlay,
+    TerminalScrollbarModel, TerminalSearchHighlight, TerminalSearchUiModel,
+    TerminalSelectionSnapshot,
+};
+use crate::ui::components::interaction::{
+    redacted_bounded_text, AccessibilityMetadata, AccessibleRole, FocusEpoch, FocusEpochSource,
+    KeyboardKey,
+};
+use crate::ui::task_cockpit::cockpit_projection::TaskCockpitLiveProjection;
+
+pub const DOCK_MIN_SIZE_RATIO: f32 = 0.18;
+pub const DOCK_MAX_SIZE_RATIO: f32 = 0.55;
+pub const DOCK_DEFAULT_SIZE_RATIO: f32 = 0.32;
+pub const MAX_REMEMBERED_TASKS: usize = 256;
+pub const MAX_REPLICA_ROWS: u16 = 256;
+pub const MAX_REPLICA_COLS: u16 = 512;
+pub const MAX_REPLICA_CELLS: usize = 256 * 512;
+pub const MAX_SEARCH_SCALARS: usize = 256;
+pub const MAX_EXIT_SUMMARY_SCALARS: usize = 160;
+
+const DOCK_TOOLS: [DockTool; 6] = [
+    DockTool::Changes,
+    DockTool::Files,
+    DockTool::Browser,
+    DockTool::Services,
+    DockTool::Artifacts,
+    DockTool::Review,
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum DockTool {
+    Changes,
+    Files,
+    Terminal,
+    Browser,
+    Services,
+    Artifacts,
+    Review,
+}
+
+impl DockTool {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Changes => "Changes",
+            Self::Files => "Files",
+            Self::Terminal => "Terminal",
+            Self::Browser => "Browser",
+            Self::Services => "Services",
+            Self::Artifacts => "Artifacts",
+            Self::Review => "Review",
+        }
+    }
+
+    fn from_alt_index(index: u8) -> Option<Self> {
+        match index {
+            1 => Some(Self::Changes),
+            2 => Some(Self::Files),
+            3 => Some(Self::Terminal),
+            4 => Some(Self::Browser),
+            5 => Some(Self::Services),
+            6 => Some(Self::Artifacts),
+            7 => Some(Self::Review),
+            _ => None,
+        }
+    }
+
+    fn alt_index(self) -> u8 {
+        match self {
+            Self::Changes => 1,
+            Self::Files => 2,
+            Self::Terminal => 3,
+            Self::Browser => 4,
+            Self::Services => 5,
+            Self::Artifacts => 6,
+            Self::Review => 7,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DockEdge {
+    Right,
+    Bottom,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DockPointerSurface {
+    Sidebar,
+    Tab(DockTool),
+    ResizeHandle,
+    TerminalGrid,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PointerButton {
+    Left,
+    Right,
+    Middle,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalSurfaceState {
+    Live,
+    Reconnecting,
+    Resyncing,
+    Exited,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalPresentation {
+    Semantic,
+    Raw,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DockUnavailableReason {
+    NoTaskSelected,
+    MissingHostProjection,
+    NoMatchingTerminal,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DockUnavailable {
+    pub tool: DockTool,
+    pub reason: DockUnavailableReason,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DockProjectionError {
+    NoTaskSelected,
+    Unbound,
+    BindingMismatch,
+    GenerationMismatch {
+        expected_runtime: u64,
+        actual_runtime: u64,
+        expected_resource: u64,
+        actual_resource: u64,
+    },
+    ForeignIdentity,
+    ZeroSequence,
+    RegressedSequence {
+        last: u64,
+        actual: u64,
+    },
+    SequenceGap {
+        last: u64,
+        actual: u64,
+    },
+    SnapshotExceedsBounds,
+    OverlayViewRejected,
+    NonFiniteSize,
+    StaleActionNode,
+    NeedsResync,
+    DuplicateRequest,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DependencyUnavailable {
+    RuntimeCensus,
+    HostTerminalStream,
+    LiveRuntimeCensus,
+    PtyInput,
+    NativeShellMount,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TerminalRuntimeIdentity {
+    task_id: TaskId,
+    agent_session_id: AgentSessionId,
+    resource_id: ResourceId,
+    runtime_generation: u64,
+    resource_generation: u64,
+}
+
+impl TerminalRuntimeIdentity {
+    pub fn new(
+        task_id: TaskId,
+        agent_session_id: AgentSessionId,
+        resource_id: ResourceId,
+        runtime_generation: u64,
+        resource_generation: u64,
+    ) -> Self {
+        Self {
+            task_id,
+            agent_session_id,
+            resource_id,
+            runtime_generation,
+            resource_generation,
+        }
+    }
+
+    pub fn task_id(self) -> TaskId {
+        self.task_id
+    }
+
+    pub fn agent_session_id(self) -> AgentSessionId {
+        self.agent_session_id
+    }
+
+    pub fn resource_id(self) -> ResourceId {
+        self.resource_id
+    }
+
+    pub fn runtime_generation(self) -> u64 {
+        self.runtime_generation
+    }
+
+    pub fn resource_generation(self) -> u64 {
+        self.resource_generation
+    }
+
+    fn ids_match(self, other: Self) -> bool {
+        self.task_id == other.task_id
+            && self.agent_session_id == other.agent_session_id
+            && self.resource_id == other.resource_id
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HostTerminalBinding {
+    identity: TerminalRuntimeIdentity,
+}
+
+impl HostTerminalBinding {
+    fn from_task_snapshot(snapshot: &TaskSnapshot) -> Result<Self, DockProjectionError> {
+        let primary_id = snapshot
+            .primary_agent_id
+            .ok_or(DockProjectionError::Unbound)?;
+        let agent = snapshot
+            .agents
+            .get(&primary_id)
+            .ok_or(DockProjectionError::Unbound)?;
+        if agent.task_id != snapshot.task.id || agent.id != primary_id {
+            return Err(DockProjectionError::BindingMismatch);
+        }
+        if !matches!(agent.role, AgentRole::Primary) {
+            return Err(DockProjectionError::Unbound);
+        }
+        // A task's plain shells are Terminal resources owned by the same task
+        // at the same runtime generation, so "the one Active Terminal resource"
+        // finds three the moment a user opens a terminal tab. Defer to the one
+        // shared rule for the provider's resource instead of re-deciding it.
+        let resource = crate::domain::agent_resource::provider_terminal_resource(snapshot, agent)
+            .map_err(|_| DockProjectionError::BindingMismatch)?
+            .ok_or(DockProjectionError::Unbound)?;
+        Ok(Self {
+            identity: TerminalRuntimeIdentity {
+                task_id: snapshot.task.id,
+                agent_session_id: agent.id,
+                resource_id: resource.id,
+                runtime_generation: agent.runtime_generation,
+                resource_generation: resource.runtime_generation,
+            },
+        })
+    }
+
+    pub fn from_client_model(
+        model: &ClientModel,
+        task_id: TaskId,
+    ) -> Result<Self, DockProjectionError> {
+        let snapshot = model
+            .tasks()
+            .get(&task_id)
+            .ok_or(DockProjectionError::ForeignIdentity)?;
+        Self::from_task_snapshot(snapshot)
+    }
+
+    pub fn identity(self) -> TerminalRuntimeIdentity {
+        self.identity
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HostStreamCursor {
+    identity: TerminalRuntimeIdentity,
+    sequence: u64,
+    full_snapshot: bool,
+}
+
+impl HostStreamCursor {
+    pub fn from_identity(
+        identity: TerminalRuntimeIdentity,
+        sequence: u64,
+        full_snapshot: bool,
+    ) -> Self {
+        Self {
+            identity,
+            sequence,
+            full_snapshot,
+        }
+    }
+
+    pub fn delta(
+        model: &ClientModel,
+        task_id: TaskId,
+        sequence: u64,
+    ) -> Result<Self, DockProjectionError> {
+        Self::from_model(model, task_id, sequence, false)
+    }
+
+    pub fn full_snapshot(
+        model: &ClientModel,
+        task_id: TaskId,
+        sequence: u64,
+    ) -> Result<Self, DockProjectionError> {
+        Self::from_model(model, task_id, sequence, true)
+    }
+
+    fn from_model(
+        model: &ClientModel,
+        task_id: TaskId,
+        sequence: u64,
+        full_snapshot: bool,
+    ) -> Result<Self, DockProjectionError> {
+        Ok(Self {
+            identity: HostTerminalBinding::from_client_model(model, task_id)?.identity(),
+            sequence,
+            full_snapshot,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HostAdmitReport {
+    stream: Result<(), DependencyUnavailable>,
+}
+
+impl HostAdmitReport {
+    fn host_stream_hold() -> Self {
+        Self {
+            stream: Err(DependencyUnavailable::HostTerminalStream),
+        }
+    }
+
+    fn host_stream_admitted() -> Self {
+        Self { stream: Ok(()) }
+    }
+
+    pub fn stream(self) -> Result<(), DependencyUnavailable> {
+        self.stream
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RuntimeCensusSnapshot {
+    provider_roots_before: u64,
+    provider_roots_after: u64,
+    pty_readers_before: u64,
+    pty_readers_after: u64,
+}
+
+impl RuntimeCensusSnapshot {
+    pub fn unchanged(self) -> bool {
+        self.provider_roots_before == self.provider_roots_after
+            && self.pty_readers_before == self.pty_readers_after
+    }
+
+    pub fn provider_roots_before(self) -> u64 {
+        self.provider_roots_before
+    }
+
+    pub fn pty_readers_before(self) -> u64 {
+        self.pty_readers_before
+    }
+}
+
+pub struct ProcessManagerCensus<'a> {
+    manager: &'a ProcessManager,
+}
+
+impl<'a> ProcessManagerCensus<'a> {
+    pub fn new(manager: &'a ProcessManager) -> Self {
+        Self { manager }
+    }
+
+    pub fn provider_root_count(&self) -> u64 {
+        self.manager
+            .runtime_state()
+            .sessions
+            .values()
+            .filter(|session| session.session_kind.is_ai())
+            .count() as u64
+    }
+
+    pub fn pty_reader_count(&self) -> u64 {
+        self.manager.all_session_views().len() as u64
+    }
+
+    pub fn one_provider_one_pty_proof(&self) -> Result<(), DependencyUnavailable> {
+        let _ = (self.provider_root_count(), self.pty_reader_count());
+        Err(DependencyUnavailable::LiveRuntimeCensus)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ViewSwitchReport {
+    identity: Option<TerminalRuntimeIdentity>,
+    census: Result<RuntimeCensusSnapshot, DependencyUnavailable>,
+}
+
+impl ViewSwitchReport {
+    pub fn identity(self) -> Option<TerminalRuntimeIdentity> {
+        self.identity
+    }
+
+    pub fn census(self) -> Result<RuntimeCensusSnapshot, DependencyUnavailable> {
+        self.census
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct TerminalViewport {
+    pub selection: Option<TerminalSelectionSnapshot>,
+    pub search: Option<TerminalSearchUiModel>,
+    pub search_highlight: Option<TerminalSearchHighlight>,
+    pub scrollbar: Option<TerminalScrollbarModel>,
+    pub focused: bool,
+}
+
+impl Default for TerminalViewport {
+    fn default() -> Self {
+        Self {
+            selection: None,
+            search: None,
+            search_highlight: None,
+            scrollbar: None,
+            focused: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ActionEpoch {
+    sequence: u64,
+}
+
+impl ActionEpoch {
+    const fn initial() -> Self {
+        Self { sequence: 0 }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DockPressOwner {
+    task_id: TaskId,
+    agent_session_id: Option<AgentSessionId>,
+    resource_id: Option<ResourceId>,
+    runtime_generation: Option<u64>,
+    resource_generation: Option<u64>,
+    focus_epoch: FocusEpoch,
+    pointer_id: u64,
+    button: PointerButton,
+    surface: DockPointerSurface,
+    tool: DockTool,
+    action_epoch: ActionEpoch,
+}
+
+impl DockPressOwner {
+    pub fn pointer_id(self) -> u64 {
+        self.pointer_id
+    }
+
+    pub fn surface(self) -> DockPointerSurface {
+        self.surface
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PointerPress {
+    pub pointer_id: u64,
+    pub button: PointerButton,
+    pub surface: DockPointerSurface,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DockActionDispatch {
+    catalog_request: ActionRequest,
+    tool: Option<DockTool>,
+    toggle_raw: bool,
+    escape: bool,
+    task_id: TaskId,
+    request_id: RequestId,
+    focus_epoch: FocusEpoch,
+    action_epoch: ActionEpoch,
+    agent_session_id: Option<AgentSessionId>,
+    resource_id: Option<ResourceId>,
+    runtime_generation: Option<u64>,
+    resource_generation: Option<u64>,
+}
+
+impl DockActionDispatch {
+    pub fn catalog_request(&self) -> &ActionRequest {
+        &self.catalog_request
+    }
+
+    pub fn request_id(&self) -> RequestId {
+        self.request_id
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PointerPhase {
+    Down,
+    Move,
+    Up,
+    Cancel,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DockShortcut {
+    AltTool(u8),
+    ToggleRawTerminal,
+    Escape,
+}
+
+#[derive(Debug, Clone)]
+pub struct DockTabProjection {
+    pub tool: DockTool,
+    pub name: String,
+    pub selected: bool,
+    pub unavailable: bool,
+    pub shortcut: DockShortcut,
+    pub accessibility: AccessibilityMetadata,
+}
+
+#[derive(Debug, Clone)]
+pub struct DockResizeHandleProjection {
+    pub accessibility: AccessibilityMetadata,
+    pub size_ratio: f32,
+}
+
+#[derive(Debug, Clone)]
+pub struct DockChromeProjection {
+    pub edge: DockEdge,
+    pub collapsed: bool,
+    pub tabs: Vec<DockTabProjection>,
+    pub tab_list: AccessibilityMetadata,
+    pub active_tool: DockTool,
+    pub unavailable: Option<DockUnavailable>,
+    pub resize_handle: Option<DockResizeHandleProjection>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DockProjectionFingerprint {
+    pub last_sequence: u64,
+    pub surface_state: TerminalSurfaceState,
+    pub exit_summary: Option<String>,
+    pub screen_text: Option<String>,
+    pub runtime_generation: Option<u64>,
+    pub resource_generation: Option<u64>,
+    pub needs_resync: bool,
+    pub tool: DockTool,
+    pub presentation: TerminalPresentation,
+}
+
+#[derive(Clone)]
+struct RememberedDockState {
+    tool: DockTool,
+    terminal_presentation: TerminalPresentation,
+    size_ratio: f32,
+    collapsed: bool,
+    viewport: TerminalViewport,
+    identity: Option<TerminalRuntimeIdentity>,
+    /// The one terminal resource the grid is showing for this task. `None`
+    /// means no chip has been focused yet, which is the pre-strip provider-only
+    /// state: every projection for the task is admissible.
+    focused_terminal: Option<ResourceId>,
+    last_sequence: u64,
+    surface_state: TerminalSurfaceState,
+    exit_summary: Option<String>,
+    /// The most recent complete native terminal view admitted for this exact
+    /// task/resource/runtime fence. This is client presentation state only;
+    /// the dock never owns the PTY or provider process.
+    replica_view: Option<TerminalSessionView>,
+    /// Last complete view retained while a bounded reconnect/resync/exit
+    /// overlay is shown. It is never used for a different identity.
+    last_valid_view: Option<TerminalSessionView>,
+    live_output: String,
+}
+
+impl RememberedDockState {
+    fn default_state() -> Self {
+        Self {
+            tool: DockTool::Files,
+            terminal_presentation: TerminalPresentation::Semantic,
+            size_ratio: DOCK_DEFAULT_SIZE_RATIO,
+            collapsed: false,
+            viewport: TerminalViewport::default(),
+            identity: None,
+            focused_terminal: None,
+            last_sequence: 0,
+            surface_state: TerminalSurfaceState::Live,
+            exit_summary: None,
+            replica_view: None,
+            last_valid_view: None,
+            live_output: String::new(),
+        }
+    }
+}
+
+/// Client-local dock. Host projections are applied; the dock never owns a PTY.
+pub struct ContextDock {
+    edge: DockEdge,
+    selected_task: Option<TaskId>,
+    remembered: BTreeMap<TaskId, RememberedDockState>,
+    remembered_order: Vec<TaskId>,
+    focus: FocusEpochSource,
+    action_epoch: ActionEpoch,
+    press_owner: Option<DockPressOwner>,
+    needs_resync: bool,
+    focused_tab_index: Option<usize>,
+    terminal_mouse_report_emitted: bool,
+    terminal_selection_changed: bool,
+    terminal_click_completed: bool,
+    last_request_id: Option<RequestId>,
+    cockpit_projection: Option<TaskCockpitLiveProjection>,
+}
+
+impl ContextDock {
+    pub fn new(edge: DockEdge) -> Self {
+        Self {
+            edge,
+            selected_task: None,
+            remembered: BTreeMap::new(),
+            remembered_order: Vec::new(),
+            focus: FocusEpochSource::new(),
+            action_epoch: ActionEpoch::initial(),
+            press_owner: None,
+            needs_resync: false,
+            focused_tab_index: None,
+            terminal_mouse_report_emitted: false,
+            terminal_selection_changed: false,
+            terminal_click_completed: false,
+            last_request_id: None,
+            cockpit_projection: None,
+        }
+    }
+
+    pub fn tools() -> &'static [DockTool] {
+        &DOCK_TOOLS
+    }
+
+    pub fn placement_for_aspect(width: f32, height: f32, preference: Option<DockEdge>) -> DockEdge {
+        if let Some(edge) = preference {
+            return edge;
+        }
+        if width >= height {
+            DockEdge::Right
+        } else {
+            DockEdge::Bottom
+        }
+    }
+
+    pub fn edge(&self) -> DockEdge {
+        self.edge
+    }
+
+    pub fn set_edge(&mut self, edge: DockEdge) {
+        if self.edge != edge {
+            self.edge = edge;
+            self.advance_epochs();
+        }
+    }
+
+    pub fn selected_task(&self) -> Option<TaskId> {
+        self.selected_task
+    }
+
+    pub fn active_tool(&self) -> DockTool {
+        self.current_memory().tool
+    }
+
+    pub fn terminal_presentation(&self) -> TerminalPresentation {
+        self.current_memory().terminal_presentation
+    }
+
+    pub fn showing_raw_terminal(&self) -> bool {
+        self.terminal_presentation() == TerminalPresentation::Raw
+    }
+
+    /// Return to the semantic conversation canvas without consulting terminal
+    /// runtime identity. Leaving a terminal is a local presentation choice and
+    /// must remain available while that terminal is unbound, reconnecting, or
+    /// waiting for a resync.
+    pub fn show_semantic(&mut self) {
+        self.set_terminal_presentation(TerminalPresentation::Semantic);
+    }
+
+    pub fn is_collapsed(&self) -> bool {
+        self.current_memory().collapsed
+    }
+
+    pub fn size_ratio(&self) -> f32 {
+        self.current_memory().size_ratio
+    }
+
+    pub fn needs_resync(&self) -> bool {
+        self.needs_resync
+    }
+
+    pub fn follow_task(&mut self, task_id: TaskId) {
+        if self.selected_task == Some(task_id) {
+            return;
+        }
+        if self
+            .cockpit_projection
+            .as_ref()
+            .is_some_and(|projection| projection.task_id != task_id)
+        {
+            self.cockpit_projection = None;
+        }
+        self.selected_task = Some(task_id);
+        self.remember_task(task_id);
+        self.press_owner = None;
+        self.focused_tab_index = None;
+        self.terminal_mouse_report_emitted = false;
+        self.terminal_selection_changed = false;
+        self.terminal_click_completed = false;
+        self.advance_epochs();
+    }
+
+    /// Drop the active selection without erasing per-task presentation memory.
+    /// Conversation/Terminal restore depends on `remembered` surviving temporary
+    /// deselection while the idle canvas is shown.
+    pub fn clear_selection(&mut self) {
+        self.selected_task = None;
+        self.cockpit_projection = None;
+        self.press_owner = None;
+        self.focused_tab_index = None;
+        self.terminal_mouse_report_emitted = false;
+        self.terminal_selection_changed = false;
+        self.terminal_click_completed = false;
+        self.advance_epochs();
+    }
+
+    fn select_tool(&mut self, tool: DockTool) {
+        if self.selected_task.is_none() {
+            return;
+        }
+        if tool == DockTool::Terminal {
+            self.set_terminal_presentation(TerminalPresentation::Raw);
+            return;
+        }
+        self.with_memory(|memory| {
+            memory.tool = tool;
+            memory.viewport.focused = false;
+        });
+        self.focused_tab_index = DOCK_TOOLS.iter().position(|candidate| *candidate == tool);
+        self.advance_epochs();
+    }
+
+    fn set_terminal_presentation(&mut self, presentation: TerminalPresentation) {
+        if self.selected_task.is_none() {
+            return;
+        }
+        self.with_memory(|memory| {
+            memory.terminal_presentation = presentation;
+            memory.viewport.focused = presentation == TerminalPresentation::Raw;
+        });
+        self.advance_epochs();
+    }
+
+    pub fn collapse(&mut self) {
+        self.with_memory(|memory| {
+            memory.collapsed = true;
+            memory.viewport.focused = false;
+        });
+        self.press_owner = None;
+        self.terminal_click_completed = false;
+        self.advance_epochs();
+    }
+
+    pub fn reopen(&mut self) {
+        self.with_memory(|memory| memory.collapsed = false);
+        self.advance_epochs();
+    }
+
+    pub fn resize(&mut self, size_ratio: f32) -> Result<(), DockProjectionError> {
+        if !size_ratio.is_finite() {
+            return Err(DockProjectionError::NonFiniteSize);
+        }
+        if self.selected_task.is_none() {
+            return Err(DockProjectionError::NoTaskSelected);
+        }
+        let clamped = size_ratio.clamp(DOCK_MIN_SIZE_RATIO, DOCK_MAX_SIZE_RATIO);
+        self.with_memory(|memory| memory.size_ratio = clamped);
+        Ok(())
+    }
+
+    pub fn tool_availability(&self, tool: DockTool) -> Result<(), DockUnavailable> {
+        let Some(_) = self.selected_task else {
+            return Err(DockUnavailable {
+                tool,
+                reason: DockUnavailableReason::NoTaskSelected,
+            });
+        };
+        match tool {
+            DockTool::Terminal => {
+                if self.current_memory().identity.is_some() {
+                    Ok(())
+                } else {
+                    Err(DockUnavailable {
+                        tool,
+                        reason: DockUnavailableReason::NoMatchingTerminal,
+                    })
+                }
+            }
+            DockTool::Changes | DockTool::Files | DockTool::Services => {
+                match self.cockpit_projection.as_ref() {
+                    Some(_) => Ok(()),
+                    None => Err(DockUnavailable {
+                        tool,
+                        reason: DockUnavailableReason::MissingHostProjection,
+                    }),
+                }
+            }
+            DockTool::Browser | DockTool::Artifacts | DockTool::Review => Err(DockUnavailable {
+                tool,
+                reason: DockUnavailableReason::MissingHostProjection,
+            }),
+        }
+    }
+
+    pub fn bind_cockpit_projection(&mut self, projection: TaskCockpitLiveProjection) {
+        if self.selected_task == Some(projection.task_id) {
+            self.cockpit_projection = Some(projection);
+        }
+    }
+
+    pub fn cockpit_projection(&self) -> Option<&TaskCockpitLiveProjection> {
+        self.cockpit_projection.as_ref()
+    }
+
+    pub fn live_output(&self) -> String {
+        self.current_memory().live_output
+    }
+
+    pub fn admit_subscription_stream(
+        &mut self,
+        expected_subscription: SubscriptionId,
+        frame: &StreamFrame,
+    ) -> Result<AdmittedStreamFrame, DockProjectionError> {
+        if self.selected_task.is_none() {
+            return Err(DockProjectionError::NoTaskSelected);
+        }
+        let memory = self.current_memory();
+        let expected = memory.identity.ok_or(DockProjectionError::Unbound)?;
+        let admitted = admit_subscription_stream(
+            expected_subscription,
+            expected.resource_id,
+            expected.resource_generation,
+            memory.last_sequence,
+            frame,
+        )
+        .map_err(dock_stream_reject)?;
+        self.with_memory(|memory| {
+            memory.last_sequence = admitted.sequence;
+            memory.surface_state = TerminalSurfaceState::Live;
+            if let Some(output) = &admitted.output {
+                if !memory.live_output.is_empty() {
+                    memory.live_output.push('\n');
+                }
+                memory.live_output.push_str(output);
+            }
+        });
+        self.needs_resync = false;
+        Ok(admitted)
+    }
+
+    pub fn bind_from_projection(
+        &mut self,
+        snapshot: &TaskSnapshot,
+    ) -> Result<(), DockProjectionError> {
+        let _ = snapshot;
+        Err(DockProjectionError::ForeignIdentity)
+    }
+
+    pub fn bind_from_model(&mut self, model: &ClientModel) -> Result<(), DockProjectionError> {
+        let Some(task_id) = self.selected_task else {
+            return Err(DockProjectionError::NoTaskSelected);
+        };
+        let identity = HostTerminalBinding::from_client_model(model, task_id)?.identity();
+        let previous = self.current_memory().identity;
+        if let Some(previous) = previous {
+            if !previous.ids_match(identity) {
+                return Err(DockProjectionError::BindingMismatch);
+            }
+            if previous.runtime_generation != identity.runtime_generation
+                || previous.resource_generation != identity.resource_generation
+            {
+                self.with_memory(|memory| {
+                    memory.viewport = TerminalViewport::default();
+                    memory.last_sequence = 0;
+                    memory.surface_state = TerminalSurfaceState::Live;
+                    memory.exit_summary = None;
+                    memory.identity = Some(identity);
+                    memory.terminal_presentation = TerminalPresentation::Semantic;
+                    memory.replica_view = None;
+                    memory.last_valid_view = None;
+                    memory.live_output.clear();
+                });
+                self.needs_resync = true;
+                self.press_owner = None;
+                self.terminal_click_completed = false;
+                self.advance_epochs();
+                return Ok(());
+            }
+        }
+        self.with_memory(|memory| memory.identity = Some(identity));
+        Ok(())
+    }
+
+    pub fn admit_host_cursor(
+        &mut self,
+        cursor: HostStreamCursor,
+    ) -> Result<HostAdmitReport, DockProjectionError> {
+        let expected = self
+            .current_memory()
+            .identity
+            .ok_or(DockProjectionError::Unbound)?;
+        if cursor.identity.task_id != expected.task_id
+            || cursor.identity.agent_session_id != expected.agent_session_id
+            || cursor.identity.resource_id != expected.resource_id
+        {
+            return Err(DockProjectionError::ForeignIdentity);
+        }
+        if cursor.identity.runtime_generation != expected.runtime_generation
+            || cursor.identity.resource_generation != expected.resource_generation
+        {
+            return Err(DockProjectionError::GenerationMismatch {
+                expected_runtime: expected.runtime_generation,
+                actual_runtime: cursor.identity.runtime_generation,
+                expected_resource: expected.resource_generation,
+                actual_resource: cursor.identity.resource_generation,
+            });
+        }
+        if cursor.sequence == 0 {
+            return Err(DockProjectionError::ZeroSequence);
+        }
+        if self.needs_resync && !cursor.full_snapshot {
+            return Err(DockProjectionError::NeedsResync);
+        }
+        let last = self.current_memory().last_sequence;
+        if cursor.full_snapshot {
+            if last != 0 && cursor.sequence <= last {
+                return Err(DockProjectionError::RegressedSequence {
+                    last,
+                    actual: cursor.sequence,
+                });
+            }
+        } else {
+            if last == 0 && cursor.sequence != 1 {
+                self.mark_needs_resync();
+                return Err(DockProjectionError::SequenceGap {
+                    last,
+                    actual: cursor.sequence,
+                });
+            }
+            if last != 0 {
+                if cursor.sequence <= last {
+                    return Err(DockProjectionError::RegressedSequence {
+                        last,
+                        actual: cursor.sequence,
+                    });
+                }
+                if cursor.sequence != last + 1 {
+                    self.mark_needs_resync();
+                    return Err(DockProjectionError::SequenceGap {
+                        last,
+                        actual: cursor.sequence,
+                    });
+                }
+            }
+        }
+        self.with_memory(|memory| {
+            memory.last_sequence = cursor.sequence;
+            if cursor.full_snapshot {
+                memory.surface_state = TerminalSurfaceState::Live;
+                memory.exit_summary = None;
+            }
+        });
+        self.needs_resync = false;
+        Ok(HostAdmitReport::host_stream_admitted())
+    }
+
+    /// Admit a complete native terminal view from the task-owned stream.
+    ///
+    /// The cursor performs all identity, generation, and sequence fencing;
+    /// only a view admitted by that fence reaches the renderer. A complete
+    /// view is required for every update because the native renderer consumes
+    /// a coherent screen snapshot rather than a loosely correlated cell list.
+    pub fn admit_host_view(
+        &mut self,
+        cursor: HostStreamCursor,
+        view: TerminalSessionView,
+    ) -> Result<HostAdmitReport, DockProjectionError> {
+        let full_snapshot = cursor.full_snapshot;
+        self.admit_host_cursor(cursor)?;
+        self.with_memory(|memory| {
+            memory.replica_view = Some(view.clone());
+            memory.last_valid_view = Some(view);
+            if full_snapshot {
+                memory.surface_state = TerminalSurfaceState::Live;
+                memory.exit_summary = None;
+            }
+        });
+        Ok(HostAdmitReport::host_stream_admitted())
+    }
+
+    /// Convenience seam for the native shell's task-owned subscription. The
+    /// client model remains the authority for task/session/resource identity;
+    /// the stream is allowed to supply only sequence/full-snapshot metadata
+    /// and the already-materialized native view.
+    pub fn admit_host_view_from_model(
+        &mut self,
+        model: &ClientModel,
+        task_id: TaskId,
+        sequence: u64,
+        full_snapshot: bool,
+        view: TerminalSessionView,
+    ) -> Result<HostAdmitReport, DockProjectionError> {
+        let cursor = if full_snapshot {
+            HostStreamCursor::full_snapshot(model, task_id, sequence)?
+        } else {
+            HostStreamCursor::delta(model, task_id, sequence)?
+        };
+        self.admit_host_view(cursor, view)
+    }
+
+    /// Point the grid at one exact terminal resource.
+    ///
+    /// A focus change is a different PTY, so everything the dock remembers
+    /// about the previous one -- its replica, its retained overlay view, its
+    /// admitted sequence and its runtime identity -- is dropped rather than
+    /// carried across. Re-notifying the same focus is not a change and keeps
+    /// the admitted screen.
+    pub fn set_focused_terminal(&mut self, resource_id: Option<ResourceId>) {
+        if self.current_memory().focused_terminal == resource_id {
+            return;
+        }
+        self.with_memory(|memory| {
+            memory.focused_terminal = resource_id;
+            memory.identity = None;
+            memory.last_sequence = 0;
+            memory.replica_view = None;
+            memory.last_valid_view = None;
+            memory.surface_state = TerminalSurfaceState::Live;
+            memory.exit_summary = None;
+            memory.live_output.clear();
+            memory.viewport = TerminalViewport::default();
+        });
+        self.needs_resync = false;
+        self.press_owner = None;
+        self.terminal_click_completed = false;
+        self.advance_epochs();
+    }
+
+    /// The terminal resource the grid is showing, when one has been focused.
+    pub fn focused_terminal(&self) -> Option<ResourceId> {
+        self.current_memory().focused_terminal
+    }
+
+    /// Admit the host's bounded task-terminal query into the existing replica
+    /// seam. A provider projection must exactly match the current ClientModel
+    /// fence; a plain shell is authorized by its own durable resource instead.
+    /// Repeated polls at the same sequence are harmless no-ops, and a
+    /// projection for a terminal that is not the focused one is dropped.
+    pub fn admit_task_terminal_projection(
+        &mut self,
+        model: &ClientModel,
+        projection: &TaskTerminalProjection,
+    ) -> Result<bool, DockProjectionError> {
+        let plain_shell = projection.is_plain_shell();
+        let actual = TerminalRuntimeIdentity::new(
+            projection.task_id,
+            projection.agent_session_id,
+            projection.resource_id,
+            projection.runtime_generation,
+            projection.resource_generation,
+        );
+        if plain_shell {
+            // A shell has no agent session, no provider runtime generation and
+            // no launch action epoch, so the ClientModel's provider binding is
+            // not its authority and comparing against it would refuse every
+            // shell. Its own durable resource generation and stream sequence
+            // are still required.
+            if projection.resource_generation == 0 || projection.sequence == 0 {
+                return Err(DockProjectionError::BindingMismatch);
+            }
+        } else {
+            let expected =
+                HostTerminalBinding::from_client_model(model, projection.task_id)?.identity();
+            if actual != expected || projection.action_epoch == 0 || projection.sequence == 0 {
+                return Err(DockProjectionError::BindingMismatch);
+            }
+        }
+        if self.selected_task != Some(projection.task_id) {
+            return Err(DockProjectionError::ForeignIdentity);
+        }
+        // The grid renders exactly one chip. A live answer for any other
+        // terminal on the task is dropped rather than painted over the visible
+        // replica; it is not an error, because both queries are legitimate.
+        if let Some(focused) = self.current_memory().focused_terminal {
+            if projection.resource_id != focused {
+                return Ok(false);
+            }
+        }
+        match self.current_memory().identity {
+            None => {
+                if plain_shell {
+                    self.with_memory(|memory| memory.identity = Some(actual));
+                } else {
+                    self.bind_from_model(model)?;
+                }
+            }
+            // A shell's PTY can be replaced under the same durable resource,
+            // which bumps the resource generation. The provider gets its reset
+            // from `bind_from_model` re-reading the client model; a shell has
+            // no such binding to re-read, so without this the stream cursor
+            // refuses every later poll as a GenerationMismatch and the dock
+            // wedges on the retired screen. A LOWER generation is still a
+            // refusal -- a retired PTY never replaces the live one.
+            Some(previous)
+                if plain_shell
+                    && previous.ids_match(actual)
+                    && actual.resource_generation() > previous.resource_generation() =>
+            {
+                self.with_memory(|memory| {
+                    memory.identity = Some(actual);
+                    memory.last_sequence = 0;
+                    memory.viewport = TerminalViewport::default();
+                    memory.surface_state = TerminalSurfaceState::Live;
+                    memory.exit_summary = None;
+                    memory.replica_view = None;
+                    memory.last_valid_view = None;
+                    memory.live_output.clear();
+                });
+                self.needs_resync = false;
+                self.press_owner = None;
+                self.terminal_click_completed = false;
+                self.advance_epochs();
+            }
+            Some(_) => {}
+        }
+        if self.current_memory().last_sequence == projection.sequence {
+            return Ok(false);
+        }
+        let view = Self::terminal_session_view_from_projection(projection);
+        self.admit_host_view(
+            HostStreamCursor::from_identity(actual, projection.sequence, true),
+            view,
+        )?;
+        Ok(true)
+    }
+
+    pub fn terminal_pane_model_for_projection(
+        projection: &TaskTerminalProjection,
+    ) -> TerminalPaneModel {
+        let view = Self::terminal_session_view_from_projection(projection);
+        // One derivation, shared with the legacy app view. `hovered` is false
+        // because the cockpit path builds this model from a projection alone
+        // and has no pointer state to consult, so the terminal shows the idle
+        // 4 px bar and does not widen; the legacy view, which does track the
+        // pointer, passes its own hover through.
+        let scrollbar =
+            crate::terminal::view::scrollbar_model_for_screen(&view.screen, None, true, false);
+        terminal_pane_from_replica(ReplicaPaneRequest {
+            active_project: "",
+            session_label: projection.title.as_deref().unwrap_or("task terminal"),
+            replica_view: Some(&view),
+            last_valid_view: None,
+            overlay: TerminalReplicaOverlay::None,
+            selection: None,
+            search: None,
+            search_highlight: None,
+            scrollbar,
+        })
+    }
+
+    fn terminal_session_view_from_projection(
+        projection: &TaskTerminalProjection,
+    ) -> TerminalSessionView {
+        let mut dimensions = crate::state::SessionDimensions::default();
+        dimensions.cols = projection.screen.cols.clamp(1, u16::MAX as usize) as u16;
+        dimensions.rows = projection.screen.rows.clamp(1, u16::MAX as usize) as u16;
+        let mut runtime = crate::state::SessionRuntimeState::new(
+            projection.session_id.to_string(),
+            std::path::PathBuf::from("."),
+            dimensions,
+            crate::terminal::session::TerminalBackend::default(),
+        );
+        runtime.status = crate::state::SessionStatus::Running;
+        runtime.interactive_shell = true;
+        runtime.title = projection.title.clone();
+        let mut screen = projection.screen.clone();
+        if screen.lines.is_empty() && !projection.text_lines.is_empty() {
+            screen.lines = projection
+                .text_lines
+                .iter()
+                .map(|line| {
+                    let mut cells = line
+                        .chars()
+                        .take(screen.cols)
+                        .map(|character| crate::terminal::session::TerminalCellSnapshot {
+                            character,
+                            zero_width: Vec::new(),
+                            foreground: 0,
+                            background: 0,
+                            bold: false,
+                            dim: false,
+                            italic: false,
+                            underline: false,
+                            undercurl: false,
+                            strike: false,
+                            hidden: false,
+                            has_hyperlink: false,
+                            default_background: true,
+                            default_foreground: true,
+                        })
+                        .collect::<Vec<_>>();
+                    cells.resize_with(screen.cols, || {
+                        crate::terminal::session::TerminalCellSnapshot {
+                            character: ' ',
+                            zero_width: Vec::new(),
+                            foreground: 0,
+                            background: 0,
+                            bold: false,
+                            dim: false,
+                            italic: false,
+                            underline: false,
+                            undercurl: false,
+                            strike: false,
+                            hidden: false,
+                            has_hyperlink: false,
+                            default_background: true,
+                            default_foreground: true,
+                        }
+                    });
+                    cells
+                })
+                .collect();
+        }
+        if !screen.lines.is_empty() {
+            for indexed in &screen.cells {
+                if let Some(cell) = screen
+                    .lines
+                    .get_mut(indexed.row)
+                    .and_then(|row| row.get_mut(indexed.column))
+                {
+                    *cell = indexed.cell.clone();
+                }
+            }
+        }
+        if screen.cells.is_empty() || !screen.lines.is_empty() {
+            screen.cells = screen
+                .lines
+                .iter()
+                .enumerate()
+                .flat_map(|(row, cells)| {
+                    cells
+                        .iter()
+                        .cloned()
+                        .enumerate()
+                        .map(move |(column, cell)| {
+                            crate::terminal::session::TerminalIndexedCellSnapshot {
+                                row,
+                                column,
+                                cell,
+                            }
+                        })
+                })
+                .collect();
+        }
+        TerminalSessionView { runtime, screen }
+    }
+
+    pub fn present_host_overlay(
+        &mut self,
+        model: &ClientModel,
+        surface_state: TerminalSurfaceState,
+        exit_summary: Option<&str>,
+    ) -> Result<(), DockProjectionError> {
+        if surface_state == TerminalSurfaceState::Live {
+            return Err(DockProjectionError::OverlayViewRejected);
+        }
+        let expected = self
+            .current_memory()
+            .identity
+            .ok_or(DockProjectionError::Unbound)?;
+        let Some(task_id) = self.selected_task else {
+            return Err(DockProjectionError::NoTaskSelected);
+        };
+        let presented = HostTerminalBinding::from_client_model(model, task_id)?.identity();
+        if presented != expected {
+            if !presented.ids_match(expected) {
+                return Err(DockProjectionError::ForeignIdentity);
+            }
+            return Err(DockProjectionError::GenerationMismatch {
+                expected_runtime: expected.runtime_generation,
+                actual_runtime: presented.runtime_generation,
+                expected_resource: expected.resource_generation,
+                actual_resource: presented.resource_generation,
+            });
+        }
+        let summary = exit_summary
+            .map(bound_exit_summary)
+            .filter(|value| !value.is_empty());
+        self.with_memory(|memory| {
+            memory.surface_state = surface_state;
+            memory.exit_summary = summary;
+        });
+        Ok(())
+    }
+
+    pub fn switch_to_semantic(
+        &mut self,
+        model: &ClientModel,
+        census: Option<&ProcessManagerCensus<'_>>,
+    ) -> Result<ViewSwitchReport, DockProjectionError> {
+        self.switch_presentation(model, TerminalPresentation::Semantic, census)
+    }
+
+    pub fn switch_to_raw_terminal(
+        &mut self,
+        model: &ClientModel,
+        census: Option<&ProcessManagerCensus<'_>>,
+    ) -> Result<ViewSwitchReport, DockProjectionError> {
+        self.switch_presentation(model, TerminalPresentation::Raw, census)
+    }
+
+    fn switch_presentation(
+        &mut self,
+        model: &ClientModel,
+        presentation: TerminalPresentation,
+        census: Option<&ProcessManagerCensus<'_>>,
+    ) -> Result<ViewSwitchReport, DockProjectionError> {
+        if self.needs_resync {
+            return Err(DockProjectionError::NeedsResync);
+        }
+        let identity = self.require_bound_model_identity(model)?;
+        let census = snapshot_census(census);
+        self.set_terminal_presentation(presentation);
+        Ok(ViewSwitchReport {
+            identity: Some(identity),
+            census,
+        })
+    }
+
+    fn require_bound_model_identity(
+        &self,
+        model: &ClientModel,
+    ) -> Result<TerminalRuntimeIdentity, DockProjectionError> {
+        let expected = self
+            .current_memory()
+            .identity
+            .ok_or(DockProjectionError::Unbound)?;
+        let presented = HostTerminalBinding::from_client_model(model, expected.task_id)?.identity();
+        if presented != expected {
+            if !presented.ids_match(expected) {
+                return Err(DockProjectionError::ForeignIdentity);
+            }
+            return Err(DockProjectionError::GenerationMismatch {
+                expected_runtime: expected.runtime_generation,
+                actual_runtime: presented.runtime_generation,
+                expected_resource: expected.resource_generation,
+                actual_resource: presented.resource_generation,
+            });
+        }
+        Ok(expected)
+    }
+
+    pub fn terminal_binding(&self) -> Option<HostTerminalBinding> {
+        self.current_memory()
+            .identity
+            .map(|identity| HostTerminalBinding { identity })
+    }
+
+    pub fn replica_view(&self) -> Option<TerminalSessionView> {
+        self.current_memory().replica_view
+    }
+
+    pub fn last_valid_view(&self) -> Option<TerminalSessionView> {
+        self.current_memory().last_valid_view
+    }
+
+    pub fn emit_terminal_mouse_to_host(&self) -> Result<(), DependencyUnavailable> {
+        Err(DependencyUnavailable::PtyInput)
+    }
+
+    pub fn viewport(&self) -> TerminalViewport {
+        self.current_memory().viewport
+    }
+
+    pub fn set_viewport(&mut self, mut viewport: TerminalViewport) {
+        if let Some(search) = viewport.search.as_mut() {
+            search.query = bound_search_query(&search.query);
+            search.summary = bound_search_query(&search.summary);
+        }
+        self.with_memory(|memory| memory.viewport = viewport);
+    }
+
+    pub fn projection_fingerprint(&self) -> DockProjectionFingerprint {
+        let memory = self.current_memory();
+        DockProjectionFingerprint {
+            last_sequence: memory.last_sequence,
+            surface_state: memory.surface_state,
+            exit_summary: memory.exit_summary.clone(),
+            screen_text: None,
+            runtime_generation: memory.identity.map(|identity| identity.runtime_generation),
+            resource_generation: memory.identity.map(|identity| identity.resource_generation),
+            needs_resync: self.needs_resync,
+            tool: memory.tool,
+            presentation: memory.terminal_presentation,
+        }
+    }
+
+    pub fn focus_epoch(&self) -> FocusEpoch {
+        self.focus.current()
+    }
+
+    pub fn action_epoch(&self) -> ActionEpoch {
+        self.action_epoch
+    }
+
+    pub fn focus_terminal(&mut self) {
+        if self.needs_resync
+            || self.active_tool() != DockTool::Terminal
+            || !self.showing_raw_terminal()
+            || self.is_collapsed()
+        {
+            return;
+        }
+        self.with_memory(|memory| memory.viewport.focused = true);
+        self.press_owner = None;
+        self.terminal_click_completed = false;
+        self.terminal_mouse_report_emitted = false;
+        self.advance_epochs();
+    }
+
+    pub fn pointer_down(&mut self, press: PointerPress) -> bool {
+        if self.needs_resync {
+            return false;
+        }
+        let Some(task_id) = self.selected_task else {
+            return false;
+        };
+        match press.surface {
+            DockPointerSurface::Tab(_) => {
+                self.advance_epochs();
+                self.capture_press(task_id, press);
+                true
+            }
+            DockPointerSurface::ResizeHandle | DockPointerSurface::Sidebar => {
+                self.advance_epochs();
+                self.with_memory(|memory| memory.viewport.focused = false);
+                self.terminal_click_completed = false;
+                self.capture_press(task_id, press);
+                true
+            }
+            DockPointerSurface::TerminalGrid => {
+                if self.active_tool() != DockTool::Terminal
+                    || !self.showing_raw_terminal()
+                    || self.is_collapsed()
+                    || !self.current_memory().viewport.focused
+                {
+                    return false;
+                }
+                self.capture_press(task_id, press);
+                true
+            }
+        }
+    }
+
+    pub fn pointer_move(&mut self, press: PointerPress) -> bool {
+        if self.needs_resync {
+            return false;
+        }
+        let Some(owner) = self.press_owner else {
+            return false;
+        };
+        if !self.owner_matches_current(owner) || !Self::press_fields_match(owner, press) {
+            return false;
+        }
+        match owner.surface {
+            DockPointerSurface::TerminalGrid => {
+                self.terminal_selection_changed = true;
+                true
+            }
+            DockPointerSurface::ResizeHandle => true,
+            DockPointerSurface::Tab(_) | DockPointerSurface::Sidebar => false,
+        }
+    }
+
+    pub fn pointer_up(&mut self, press: PointerPress) -> bool {
+        if self.needs_resync {
+            return false;
+        }
+        let Some(owner) = self.press_owner else {
+            return false;
+        };
+        if !self.owner_matches_current(owner) || !Self::press_fields_match(owner, press) {
+            return false;
+        }
+        self.press_owner = None;
+        if owner.surface == DockPointerSurface::TerminalGrid {
+            self.terminal_click_completed = true;
+            self.terminal_mouse_report_emitted = true;
+        }
+        true
+    }
+
+    pub fn pointer_cancel(&mut self, press: PointerPress) -> bool {
+        if self.needs_resync {
+            return false;
+        }
+        let Some(owner) = self.press_owner else {
+            return false;
+        };
+        if !self.owner_matches_current(owner) || !Self::press_fields_match(owner, press) {
+            return false;
+        }
+        self.press_owner = None;
+        true
+    }
+
+    pub fn release_press(&mut self, owner: DockPressOwner) -> bool {
+        if self.needs_resync {
+            return false;
+        }
+        let Some(current) = self.press_owner else {
+            return false;
+        };
+        if current != owner || !self.owner_matches_current(owner) {
+            return false;
+        }
+        self.press_owner = None;
+        true
+    }
+
+    pub fn press_owner(&self) -> Option<DockPressOwner> {
+        self.press_owner
+    }
+
+    pub fn terminal_mouse_reports_enabled(&self) -> bool {
+        self.terminal_click_completed
+            && self.active_tool() == DockTool::Terminal
+            && !self.is_collapsed()
+            && self.showing_raw_terminal()
+    }
+
+    pub fn terminal_mouse_report_emitted(&self) -> bool {
+        self.terminal_mouse_report_emitted
+    }
+
+    pub fn terminal_selection_changed(&self) -> bool {
+        self.terminal_selection_changed
+    }
+
+    pub fn capture_action(
+        &self,
+        tool: DockTool,
+        request_id: RequestId,
+    ) -> Result<DockActionDispatch, DockProjectionError> {
+        self.capture_dispatch(Some(tool), false, false, request_id)
+    }
+
+    pub fn dispatch_shortcut(
+        &mut self,
+        shortcut: DockShortcut,
+        request_id: RequestId,
+        model: &ClientModel,
+    ) -> Result<(), DockProjectionError> {
+        let dispatch = match shortcut {
+            DockShortcut::AltTool(index) => {
+                let tool = DockTool::from_alt_index(index).ok_or(DockProjectionError::Unbound)?;
+                self.capture_dispatch(Some(tool), false, false, request_id)?
+            }
+            DockShortcut::ToggleRawTerminal => {
+                self.capture_dispatch(None, true, false, request_id)?
+            }
+            DockShortcut::Escape => self.capture_dispatch(None, false, true, request_id)?,
+        };
+        self.dispatch_action(dispatch, model)
+    }
+
+    pub fn dispatch_action(
+        &mut self,
+        dispatch: DockActionDispatch,
+        model: &ClientModel,
+    ) -> Result<(), DockProjectionError> {
+        if self.needs_resync {
+            return Err(DockProjectionError::NeedsResync);
+        }
+        if dispatch.focus_epoch != self.focus.current()
+            || dispatch.action_epoch != self.action_epoch
+        {
+            return Err(DockProjectionError::StaleActionNode);
+        }
+        if self.last_request_id == Some(dispatch.request_id) {
+            return Err(DockProjectionError::DuplicateRequest);
+        }
+        let Some(task_id) = self.selected_task else {
+            return Err(DockProjectionError::NoTaskSelected);
+        };
+        if task_id != dispatch.task_id {
+            return Err(DockProjectionError::ForeignIdentity);
+        }
+        match dispatch.catalog_request {
+            ActionRequest::TaskShow {
+                task_id: request_task,
+            } if request_task == task_id => {}
+            _ => return Err(DockProjectionError::BindingMismatch),
+        }
+        if let Some(current) = self.current_memory().identity {
+            let presented = HostTerminalBinding::from_client_model(model, task_id)?.identity();
+            if dispatch.agent_session_id != Some(current.agent_session_id)
+                || dispatch.resource_id != Some(current.resource_id)
+                || dispatch.runtime_generation != Some(current.runtime_generation)
+                || dispatch.resource_generation != Some(current.resource_generation)
+                || presented != current
+            {
+                return Err(DockProjectionError::BindingMismatch);
+            }
+        }
+        self.last_request_id = Some(dispatch.request_id);
+        if dispatch.escape {
+            self.focused_tab_index = None;
+            self.press_owner = None;
+            self.advance_epochs();
+            return Ok(());
+        }
+        if dispatch.toggle_raw {
+            let next = if self.showing_raw_terminal() {
+                TerminalPresentation::Semantic
+            } else {
+                TerminalPresentation::Raw
+            };
+            self.set_terminal_presentation(next);
+            return Ok(());
+        }
+        if let Some(tool) = dispatch.tool {
+            self.select_tool(tool);
+        }
+        Ok(())
+    }
+
+    fn capture_dispatch(
+        &self,
+        tool: Option<DockTool>,
+        toggle_raw: bool,
+        escape: bool,
+        request_id: RequestId,
+    ) -> Result<DockActionDispatch, DockProjectionError> {
+        if self.needs_resync {
+            return Err(DockProjectionError::NeedsResync);
+        }
+        let task_id = self
+            .selected_task
+            .ok_or(DockProjectionError::NoTaskSelected)?;
+        let identity = self.current_memory().identity;
+        Ok(DockActionDispatch {
+            catalog_request: ActionRequest::TaskShow { task_id },
+            tool,
+            toggle_raw,
+            escape,
+            task_id,
+            request_id,
+            focus_epoch: self.focus.current(),
+            action_epoch: self.action_epoch,
+            agent_session_id: identity.map(|identity| identity.agent_session_id),
+            resource_id: identity.map(|identity| identity.resource_id),
+            runtime_generation: identity.map(|identity| identity.runtime_generation),
+            resource_generation: identity.map(|identity| identity.resource_generation),
+        })
+    }
+
+    pub fn handle_key(&mut self, key: KeyboardKey) {
+        if key != KeyboardKey::Tab {
+            return;
+        }
+        let next = match self.focused_tab_index {
+            Some(index) => (index + 1) % DOCK_TOOLS.len(),
+            None => 0,
+        };
+        self.focused_tab_index = Some(next);
+    }
+
+    pub fn focus_tab_index(&mut self, index: usize) {
+        if index < DOCK_TOOLS.len() {
+            self.focused_tab_index = Some(index);
+        }
+    }
+
+    pub fn focused_tab_index(&self) -> Option<usize> {
+        self.focused_tab_index
+    }
+
+    pub fn chrome(&self) -> DockChromeProjection {
+        let active = self.active_tool();
+        let tabs = DOCK_TOOLS
+            .iter()
+            .enumerate()
+            .map(|(index, tool)| {
+                let unavailable = self.tool_availability(*tool).is_err();
+                let mut accessibility =
+                    AccessibilityMetadata::new(AccessibleRole::Tab, tool.label())
+                        .expect("dock tool name");
+                accessibility.set_disabled(unavailable);
+                accessibility.set_focused(self.focused_tab_index == Some(index));
+                DockTabProjection {
+                    tool: *tool,
+                    name: tool.label().to_string(),
+                    selected: *tool == active,
+                    unavailable,
+                    shortcut: DockShortcut::AltTool(tool.alt_index()),
+                    accessibility,
+                }
+            })
+            .collect();
+        let tab_list = AccessibilityMetadata::new(AccessibleRole::TabList, "Context dock tools")
+            .expect("tab list name");
+        let resize_handle = (!self.is_collapsed()).then(|| DockResizeHandleProjection {
+            accessibility: AccessibilityMetadata::new(AccessibleRole::Button, "Resize dock")
+                .expect("resize name"),
+            size_ratio: self.size_ratio(),
+        });
+        DockChromeProjection {
+            edge: self.edge,
+            collapsed: self.is_collapsed(),
+            tabs,
+            tab_list,
+            active_tool: active,
+            unavailable: self.tool_availability(active).err(),
+            resize_handle,
+        }
+    }
+
+    pub fn handle_gpui_pointer(&mut self, phase: PointerPhase, press: PointerPress) -> bool {
+        match phase {
+            PointerPhase::Down => self.pointer_down(press),
+            PointerPhase::Move => self.pointer_move(press),
+            PointerPhase::Up => self.pointer_up(press),
+            PointerPhase::Cancel => self.pointer_cancel(press),
+        }
+    }
+
+    pub fn terminal_pane_model(&self) -> TerminalPaneModel {
+        let memory = self.current_memory();
+        terminal_pane_from_replica(ReplicaPaneRequest {
+            active_project: "",
+            session_label: "task terminal",
+            replica_view: memory.replica_view.as_ref(),
+            last_valid_view: memory.last_valid_view.as_ref(),
+            overlay: overlay_from(memory.surface_state, memory.exit_summary.as_deref()),
+            selection: memory.viewport.selection,
+            search: memory.viewport.search.clone(),
+            search_highlight: memory.viewport.search_highlight,
+            scrollbar: memory.viewport.scrollbar,
+        })
+    }
+
+    fn capture_press(&mut self, task_id: TaskId, press: PointerPress) {
+        let identity = self.current_memory().identity;
+        self.press_owner = Some(DockPressOwner {
+            task_id,
+            agent_session_id: identity.map(|identity| identity.agent_session_id),
+            resource_id: identity.map(|identity| identity.resource_id),
+            runtime_generation: identity.map(|identity| identity.runtime_generation),
+            resource_generation: identity.map(|identity| identity.resource_generation),
+            focus_epoch: self.focus.current(),
+            pointer_id: press.pointer_id,
+            button: press.button,
+            surface: press.surface,
+            tool: self.active_tool(),
+            action_epoch: self.action_epoch,
+        });
+        self.terminal_mouse_report_emitted = false;
+        self.terminal_selection_changed = false;
+    }
+
+    fn owner_matches_current(&self, owner: DockPressOwner) -> bool {
+        let identity = self.current_memory().identity;
+        self.selected_task == Some(owner.task_id)
+            && owner.focus_epoch == self.focus.current()
+            && owner.action_epoch == self.action_epoch
+            && owner.agent_session_id == identity.map(|identity| identity.agent_session_id)
+            && owner.resource_id == identity.map(|identity| identity.resource_id)
+            && owner.runtime_generation == identity.map(|identity| identity.runtime_generation)
+            && owner.resource_generation == identity.map(|identity| identity.resource_generation)
+    }
+
+    fn press_fields_match(owner: DockPressOwner, press: PointerPress) -> bool {
+        owner.pointer_id == press.pointer_id
+            && owner.button == press.button
+            && owner.surface == press.surface
+    }
+
+    fn mark_needs_resync(&mut self) {
+        self.needs_resync = true;
+        self.press_owner = None;
+        self.terminal_click_completed = false;
+        self.terminal_mouse_report_emitted = false;
+    }
+
+    fn advance_epochs(&mut self) {
+        let _ = self.focus.advance();
+        self.action_epoch.sequence = self.action_epoch.sequence.saturating_add(1);
+    }
+
+    fn current_memory(&self) -> RememberedDockState {
+        self.selected_task
+            .and_then(|task_id| self.remembered.get(&task_id).cloned())
+            .unwrap_or_else(RememberedDockState::default_state)
+    }
+
+    fn with_memory(&mut self, update: impl FnOnce(&mut RememberedDockState)) {
+        let Some(task_id) = self.selected_task else {
+            return;
+        };
+        self.remember_task(task_id);
+        if let Some(memory) = self.remembered.get_mut(&task_id) {
+            update(memory);
+        }
+    }
+
+    fn remember_task(&mut self, task_id: TaskId) {
+        if self.remembered.contains_key(&task_id) {
+            return;
+        }
+        while self.remembered_order.len() >= MAX_REMEMBERED_TASKS {
+            let evict_at = self
+                .remembered_order
+                .iter()
+                .position(|candidate| Some(*candidate) != self.selected_task);
+            let Some(evict_at) = evict_at else {
+                break;
+            };
+            let evicted = self.remembered_order.remove(evict_at);
+            self.remembered.remove(&evicted);
+        }
+        self.remembered
+            .insert(task_id, RememberedDockState::default_state());
+        self.remembered_order.push(task_id);
+    }
+}
+
+fn snapshot_census(
+    census: Option<&ProcessManagerCensus<'_>>,
+) -> Result<RuntimeCensusSnapshot, DependencyUnavailable> {
+    let Some(census) = census else {
+        return Err(DependencyUnavailable::RuntimeCensus);
+    };
+    let before_roots = census.provider_root_count();
+    let before_readers = census.pty_reader_count();
+    Ok(RuntimeCensusSnapshot {
+        provider_roots_before: before_roots,
+        provider_roots_after: census.provider_root_count(),
+        pty_readers_before: before_readers,
+        pty_readers_after: census.pty_reader_count(),
+    })
+}
+
+fn dock_stream_reject(reject: StreamAdmissionReject) -> DockProjectionError {
+    match reject {
+        StreamAdmissionReject::SubscriptionMismatch | StreamAdmissionReject::ResourceMismatch => {
+            DockProjectionError::ForeignIdentity
+        }
+        StreamAdmissionReject::GenerationMismatch { expected, actual } => {
+            DockProjectionError::GenerationMismatch {
+                expected_runtime: expected,
+                actual_runtime: actual,
+                expected_resource: expected,
+                actual_resource: actual,
+            }
+        }
+        StreamAdmissionReject::ZeroSequence => DockProjectionError::ZeroSequence,
+        StreamAdmissionReject::StaleSequence { last, actual } => {
+            DockProjectionError::RegressedSequence { last, actual }
+        }
+        StreamAdmissionReject::SequenceGap { last, actual } => {
+            DockProjectionError::SequenceGap { last, actual }
+        }
+    }
+}
+
+fn overlay_from(state: TerminalSurfaceState, summary: Option<&str>) -> TerminalReplicaOverlay {
+    match state {
+        TerminalSurfaceState::Live => TerminalReplicaOverlay::None,
+        TerminalSurfaceState::Reconnecting => TerminalReplicaOverlay::Reconnecting,
+        TerminalSurfaceState::Resyncing => TerminalReplicaOverlay::Resyncing,
+        TerminalSurfaceState::Exited => TerminalReplicaOverlay::Exited {
+            summary: summary.unwrap_or("Terminal exited").to_string(),
+        },
+    }
+}
+
+fn bound_search_query(value: &str) -> String {
+    if value.trim().is_empty() {
+        return String::new();
+    }
+    redacted_bounded_text(
+        "dock search",
+        value,
+        MAX_SEARCH_SCALARS,
+        MAX_SEARCH_SCALARS * 4,
+    )
+    .unwrap_or_default()
+}
+
+fn bound_exit_summary(value: &str) -> String {
+    if value.trim().is_empty() {
+        return String::new();
+    }
+    redacted_bounded_text(
+        "dock exit summary",
+        value,
+        MAX_EXIT_SUMMARY_SCALARS,
+        MAX_EXIT_SUMMARY_SCALARS * 4,
+    )
+    .unwrap_or_else(|_| String::from("Terminal exited"))
+}
+
+#[cfg(test)]
+mod process_census_tests {
+    use super::*;
+
+    #[test]
+    fn projected_terminal_overlays_sparse_ansi_cells_on_plain_text_rows() {
+        use crate::terminal::session::{
+            TerminalCellSnapshot, TerminalIndexedCellSnapshot, TerminalScreenSnapshot,
+        };
+
+        let task_id = TaskId::new();
+        let agent_session_id = AgentSessionId::new();
+        let styled = TerminalCellSnapshot {
+            character: '!',
+            zero_width: Vec::new(),
+            foreground: 0xffb000,
+            background: 0,
+            bold: true,
+            dim: false,
+            italic: false,
+            underline: false,
+            undercurl: false,
+            strike: false,
+            hidden: false,
+            has_hyperlink: false,
+            default_background: true,
+            default_foreground: false,
+        };
+        let projection = TaskTerminalProjection {
+            task_id,
+            terminal_id: crate::domain::TerminalId::new(),
+            session_id: crate::terminal::protocol::TerminalSessionId::new(),
+            agent_session_id,
+            resource_id: crate::domain::ResourceId::new(),
+            runtime_generation: 1,
+            resource_generation: 1,
+            action_epoch: 1,
+            focus_epoch: crate::terminal::protocol::FocusEpoch::initial(),
+            accepted_input_sequence: 0,
+            accepts_input_without_conversation_id: false,
+            sequence: 1,
+            title: None,
+            text_lines: vec!["x!".into()],
+            screen: TerminalScreenSnapshot {
+                cols: 2,
+                rows: 1,
+                cells: vec![TerminalIndexedCellSnapshot {
+                    row: 0,
+                    column: 1,
+                    cell: styled.clone(),
+                }],
+                ..TerminalScreenSnapshot::default()
+            },
+            is_provider: true,
+            runtime_state: crate::domain::cockpit::TerminalRuntimeStateWire::Running,
+        };
+
+        let view = ContextDock::terminal_session_view_from_projection(&projection);
+
+        assert_eq!(view.screen.lines[0][0].character, 'x');
+        assert!(view.screen.lines[0][0].default_foreground);
+        assert_eq!(view.screen.lines[0][1], styled);
+    }
+
+    fn terminal_view() -> TerminalSessionView {
+        use crate::state::SessionDimensions;
+        use crate::terminal::session::TerminalScreenSnapshot;
+
+        TerminalSessionView {
+            runtime: crate::state::SessionRuntimeState::new(
+                "task-terminal",
+                std::path::PathBuf::from("."),
+                SessionDimensions::default(),
+                crate::terminal::session::TerminalBackend::default(),
+            ),
+            screen: TerminalScreenSnapshot::default(),
+        }
+    }
+
+    fn census_client_model() -> (ClientModel, TaskId) {
+        let built = client_model_with_shells(0);
+        (built.model, built.task_id)
+    }
+
+    struct BuiltClientModel {
+        model: ClientModel,
+        task_id: TaskId,
+        agent_id: AgentSessionId,
+        provider_resource: ResourceId,
+        shells: Vec<ResourceId>,
+    }
+
+    /// One Task with a primary agent, its provider terminal resource, and
+    /// `shells` plain-shell terminal resources registered at the same runtime
+    /// generation -- which is exactly the shape that makes "the one Active
+    /// Terminal resource" ambiguous.
+    fn client_model_with_shells(shells: usize) -> BuiltClientModel {
+        build_client_model(shells, 1)
+    }
+
+    fn build_client_model(shells: usize, providers: usize) -> BuiltClientModel {
+        use crate::client::model::ClientModelBuilder;
+        use crate::domain::{
+            AgentRole, AgentSessionFacts, AgentSessionLifecycle, EnvironmentId, OwnerKind,
+            ProjectId, ResourceFacts, ResourceKind, ResourceLifecycle, ResourceRecipe,
+            ReviewReadiness, SnapshotId, SnapshotItem, SnapshotPage, SnapshotSection, TaskActivity,
+            TaskAssignment, TaskAttention, TaskConnectivity, TaskFacts, TaskLifecycle,
+            TaskSnapshotItem, WorkspaceRef,
+        };
+
+        let uuid = |tail: u8| {
+            [
+                0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, tail,
+            ]
+        };
+        let task_id = TaskId::from_bytes(uuid(0x91)).expect("task");
+        let agent_id = AgentSessionId::from_bytes(uuid(0x91)).expect("agent");
+        let resource_id = ResourceId::from_bytes(uuid(0x91)).expect("resource");
+        let snap = SnapshotId::from_bytes(uuid(0x10)).expect("snapshot");
+        let page = |section, items| SnapshotPage {
+            snapshot_id: snap,
+            through_sequence: 1,
+            section,
+            after_item: None,
+            items,
+            encoded_bytes: 1,
+            next_cursor: None,
+        };
+        let mut builder = ClientModelBuilder::new();
+        builder
+            .ingest_page(page(
+                SnapshotSection::Tasks,
+                vec![SnapshotItem::Task(TaskSnapshotItem {
+                    task: TaskFacts {
+                        id: task_id,
+                        environment_id: EnvironmentId::from_bytes(uuid(0x01)).expect("env"),
+                        title: "Census dock".into(),
+                        description: None,
+                        project_id: ProjectId::from_bytes(uuid(0x02)).expect("project"),
+                        workspace: WorkspaceRef::Main,
+                        assignment: TaskAssignment::LocalOwner,
+                        lifecycle: TaskLifecycle::Open,
+                        action_epoch: 0,
+                        revision: 1,
+                        created_at_ms: 1,
+                    },
+                    connectivity: TaskConnectivity::Connected,
+                    attention: TaskAttention::None,
+                    activity: TaskActivity::Idle,
+                    review_readiness: ReviewReadiness::NotReady,
+                    primary_agent_id: Some(agent_id),
+                })],
+            ))
+            .expect("tasks");
+        builder
+            .ingest_page(page(
+                SnapshotSection::AgentSessions,
+                vec![SnapshotItem::AgentSession(AgentSessionFacts {
+                    id: agent_id,
+                    task_id,
+                    role: AgentRole::Primary,
+                    provider_kind: crate::providers::ProviderKind::ClaudeCode,
+                    provider_session_id: None,
+                    lifecycle: AgentSessionLifecycle::Open,
+                    runtime_generation: 1,
+                    revision: 0,
+                })],
+            ))
+            .expect("agents");
+        builder
+            .ingest_page(page(SnapshotSection::Artifacts, Vec::new()))
+            .expect("artifacts");
+        let terminal_resource = |id: ResourceId, plain_shell: bool| {
+            SnapshotItem::Resource(ResourceFacts {
+                id,
+                task_id: Some(task_id),
+                owner_kind: OwnerKind::Task,
+                resource_kind: ResourceKind::Terminal,
+                recipe: if plain_shell {
+                    ResourceRecipe::Terminal {
+                        cols: 40,
+                        rows: 8,
+                        launch: Some(crate::domain::resource::TerminalLaunch {
+                            cwd: std::env::temp_dir(),
+                            program: std::path::PathBuf::from("pwsh"),
+                            args: Vec::new(),
+                        }),
+                        title: None,
+                    }
+                } else {
+                    ResourceRecipe::terminal(40, 8)
+                },
+                lifecycle: ResourceLifecycle::Active,
+                runtime_generation: 1,
+                updated_at_ms: 1,
+            })
+        };
+        let mut resources = Vec::new();
+        let mut provider_ids = Vec::new();
+        for index in 0..providers {
+            let id = if index == 0 {
+                resource_id
+            } else {
+                ResourceId::from_bytes(uuid(0xc0 + index as u8)).expect("provider resource")
+            };
+            provider_ids.push(id);
+            resources.push(terminal_resource(id, false));
+        }
+        let mut shell_ids = Vec::new();
+        for index in 0..shells {
+            let id = ResourceId::from_bytes(uuid(0xa0 + index as u8)).expect("shell resource");
+            shell_ids.push(id);
+            resources.push(terminal_resource(id, true));
+        }
+        builder
+            .ingest_page(page(SnapshotSection::Resources, resources))
+            .expect("resources");
+        builder
+            .ingest_page(page(SnapshotSection::Operations, Vec::new()))
+            .expect("operations");
+        BuiltClientModel {
+            model: builder.finish().expect("client model"),
+            task_id,
+            agent_id,
+            provider_resource: provider_ids.first().copied().unwrap_or(resource_id),
+            shells: shell_ids,
+        }
+    }
+
+    fn shell_projection(
+        task_id: TaskId,
+        resource_id: ResourceId,
+        sequence: u64,
+    ) -> TaskTerminalProjection {
+        TaskTerminalProjection {
+            task_id,
+            terminal_id: crate::domain::TerminalId::new(),
+            session_id: crate::terminal::protocol::TerminalSessionId::new(),
+            // The documented plain-shell sentinels, exactly as the host sends
+            // them: no agent session and no provider runtime generation.
+            agent_session_id: AgentSessionId::nil(),
+            resource_id,
+            runtime_generation: 0,
+            resource_generation: 1,
+            action_epoch: 0,
+            focus_epoch: crate::terminal::protocol::FocusEpoch::initial(),
+            accepted_input_sequence: 0,
+            accepts_input_without_conversation_id: false,
+            sequence,
+            title: None,
+            text_lines: vec!["shell".into()],
+            screen: crate::terminal::session::TerminalScreenSnapshot {
+                cols: 5,
+                rows: 1,
+                ..crate::terminal::session::TerminalScreenSnapshot::default()
+            },
+            is_provider: false,
+            runtime_state: crate::domain::cockpit::TerminalRuntimeStateWire::Running,
+        }
+    }
+
+    fn provider_projection(
+        task_id: TaskId,
+        agent_session_id: AgentSessionId,
+        resource_id: ResourceId,
+        sequence: u64,
+    ) -> TaskTerminalProjection {
+        TaskTerminalProjection {
+            task_id,
+            terminal_id: crate::domain::TerminalId::new(),
+            session_id: crate::terminal::protocol::TerminalSessionId::new(),
+            agent_session_id,
+            resource_id,
+            runtime_generation: 1,
+            resource_generation: 1,
+            action_epoch: 1,
+            focus_epoch: crate::terminal::protocol::FocusEpoch::initial(),
+            accepted_input_sequence: 0,
+            accepts_input_without_conversation_id: false,
+            sequence,
+            title: None,
+            text_lines: vec!["provider".into()],
+            screen: crate::terminal::session::TerminalScreenSnapshot {
+                cols: 8,
+                rows: 1,
+                ..crate::terminal::session::TerminalScreenSnapshot::default()
+            },
+            is_provider: true,
+            runtime_state: crate::domain::cockpit::TerminalRuntimeStateWire::Running,
+        }
+    }
+
+    /// I3/I4: the cockpit's terminal used to derive its own scrollbar model,
+    /// and its answer for a screen with no scrollback was the opposite of the
+    /// legacy app view's. There is one derivation now, and this walks the
+    /// cockpit's real entry point to it rather than calling it directly.
+    #[test]
+    fn the_cockpit_terminal_takes_its_scrollbar_from_the_shared_derivation() {
+        let task_id = TaskId::new();
+        let resource_id = ResourceId::new();
+
+        // A screen that fits paints no bar at all -- the same predicate every
+        // shell surface uses.
+        let fits = shell_projection(task_id, resource_id, 1);
+        assert!(ContextDock::terminal_pane_model_for_projection(&fits)
+            .scrollbar
+            .is_none());
+
+        // One row of scrollback is overflow, so the bar appears, and it is the
+        // shared function's answer to the same screen.
+        let mut scrolled = shell_projection(task_id, resource_id, 2);
+        scrolled.screen.rows = 2;
+        scrolled.screen.total_lines = 3;
+        scrolled.screen.history_size = 1;
+        scrolled.screen.display_offset = 0;
+        let model = ContextDock::terminal_pane_model_for_projection(&scrolled)
+            .scrollbar
+            .expect("a screen with scrollback carries a scrollbar");
+        let shared =
+            crate::terminal::view::scrollbar_model_for_screen(&scrolled.screen, None, true, false)
+                .expect("shared model");
+        assert_eq!(model.thumb_top_ratio, shared.thumb_top_ratio);
+        assert_eq!(model.thumb_height_ratio, shared.thumb_height_ratio);
+        assert_eq!(model.hovered, shared.hovered);
+    }
+
+    #[test]
+    fn provider_binding_ignores_the_tasks_plain_shells() {
+        let built = client_model_with_shells(2);
+        let binding = HostTerminalBinding::from_client_model(&built.model, built.task_id)
+            .expect("a task with open shells still has exactly one provider terminal");
+        assert_eq!(binding.identity().resource_id(), built.provider_resource);
+        assert_eq!(binding.identity().agent_session_id(), built.agent_id);
+    }
+
+    #[test]
+    fn two_provider_terminals_are_a_binding_mismatch_not_a_choice() {
+        let built = build_client_model(2, 2);
+        assert_eq!(
+            HostTerminalBinding::from_client_model(&built.model, built.task_id),
+            Err(DockProjectionError::BindingMismatch)
+        );
+    }
+
+    #[test]
+    fn focused_shell_projection_is_admitted_without_a_provider_fence() {
+        let built = client_model_with_shells(1);
+        let shell = built.shells[0];
+        let mut dock = ContextDock::new(DockEdge::Right);
+        dock.follow_task(built.task_id);
+        dock.set_focused_terminal(Some(shell));
+        let projection = shell_projection(built.task_id, shell, 1);
+        assert_eq!(
+            dock.admit_task_terminal_projection(&built.model, &projection),
+            Ok(true),
+            "a shell carries no agent session or action epoch; its authority is its resource"
+        );
+    }
+
+    #[test]
+    fn a_projection_for_an_unfocused_terminal_is_dropped_not_admitted() {
+        let built = client_model_with_shells(1);
+        let shell = built.shells[0];
+        let mut dock = ContextDock::new(DockEdge::Right);
+        dock.follow_task(built.task_id);
+        dock.set_focused_terminal(Some(shell));
+        let provider =
+            provider_projection(built.task_id, built.agent_id, built.provider_resource, 1);
+        assert_eq!(
+            dock.admit_task_terminal_projection(&built.model, &provider),
+            Ok(false),
+            "the grid shows the focused chip; another terminal screen must not overwrite it"
+        );
+    }
+
+    #[test]
+    fn changing_focus_drops_the_previous_terminal_replica_and_sequence() {
+        let built = client_model_with_shells(1);
+        let shell = built.shells[0];
+        let mut dock = ContextDock::new(DockEdge::Right);
+        dock.follow_task(built.task_id);
+        dock.set_focused_terminal(Some(built.provider_resource));
+        let provider =
+            provider_projection(built.task_id, built.agent_id, built.provider_resource, 7);
+        assert_eq!(
+            dock.admit_task_terminal_projection(&built.model, &provider),
+            Ok(true)
+        );
+        assert!(dock.terminal_pane_model().session.is_some());
+
+        dock.set_focused_terminal(Some(shell));
+        assert!(
+            dock.terminal_pane_model().session.is_none(),
+            "the previous terminal screen must not paint under the newly focused chip"
+        );
+        // Sequence memory belongs to the previous terminal, so a lower
+        // sequence from the newly focused one must still be admissible.
+        assert_eq!(
+            dock.admit_task_terminal_projection(
+                &built.model,
+                &shell_projection(built.task_id, shell, 1)
+            ),
+            Ok(true)
+        );
+    }
+
+    /// A shell's PTY can be replaced under the same durable resource (the
+    /// resource generation bumps). The provider path resets its dock memory on
+    /// a generation bump through `bind_from_model`; a shell has no client-model
+    /// binding to re-read, so without an equivalent the dock wedges on the
+    /// stale screen and every later poll is refused as a GenerationMismatch.
+    #[test]
+    fn a_shell_generation_bump_re_derives_identity_instead_of_wedging() {
+        let built = client_model_with_shells(1);
+        let shell = built.shells[0];
+        let mut dock = ContextDock::new(DockEdge::Right);
+        dock.follow_task(built.task_id);
+        dock.set_focused_terminal(Some(shell));
+        assert_eq!(
+            dock.admit_task_terminal_projection(
+                &built.model,
+                &shell_projection(built.task_id, shell, 4)
+            ),
+            Ok(true)
+        );
+        assert_eq!(
+            dock.current_memory()
+                .identity
+                .map(|identity| identity.resource_generation()),
+            Some(1)
+        );
+        assert!(dock.terminal_pane_model().session.is_some());
+
+        let mut replaced = shell_projection(built.task_id, shell, 1);
+        replaced.resource_generation = 2;
+        assert_eq!(
+            dock.admit_task_terminal_projection(&built.model, &replaced),
+            Ok(true),
+            "a newer PTY on the same resource must be admitted, not refused forever"
+        );
+        assert_eq!(
+            dock.current_memory()
+                .identity
+                .map(|identity| identity.resource_generation()),
+            Some(2),
+            "the dock must re-derive identity at the new generation"
+        );
+        assert_eq!(
+            dock.current_memory().last_sequence,
+            1,
+            "the previous generation's sequence memory must not fence the new PTY"
+        );
+    }
+
+    #[test]
+    fn a_shell_projection_from_an_older_generation_is_still_refused() {
+        let built = client_model_with_shells(1);
+        let shell = built.shells[0];
+        let mut dock = ContextDock::new(DockEdge::Right);
+        dock.follow_task(built.task_id);
+        dock.set_focused_terminal(Some(shell));
+        let mut current = shell_projection(built.task_id, shell, 1);
+        current.resource_generation = 2;
+        assert_eq!(
+            dock.admit_task_terminal_projection(&built.model, &current),
+            Ok(true)
+        );
+
+        let stale = shell_projection(built.task_id, shell, 9);
+        assert!(
+            matches!(
+                dock.admit_task_terminal_projection(&built.model, &stale),
+                Err(DockProjectionError::GenerationMismatch { .. })
+            ),
+            "a retired PTY's screen must never replace the live one"
+        );
+        assert_eq!(
+            dock.current_memory()
+                .identity
+                .map(|identity| identity.resource_generation()),
+            Some(2),
+            "a refused stale projection must not move the bound generation"
+        );
+    }
+
+    #[test]
+    fn setting_the_same_focus_twice_keeps_the_admitted_screen() {
+        let built = client_model_with_shells(1);
+        let shell = built.shells[0];
+        let mut dock = ContextDock::new(DockEdge::Right);
+        dock.follow_task(built.task_id);
+        dock.set_focused_terminal(Some(shell));
+        assert_eq!(
+            dock.admit_task_terminal_projection(
+                &built.model,
+                &shell_projection(built.task_id, shell, 3)
+            ),
+            Ok(true)
+        );
+        dock.set_focused_terminal(Some(shell));
+        assert!(
+            dock.terminal_pane_model().session.is_some(),
+            "a repeated focus notification is not a focus change"
+        );
+    }
+
+    #[test]
+    fn view_switch_reads_process_manager_and_does_not_spawn() {
+        let manager = ProcessManager::new();
+        let census = ProcessManagerCensus::new(&manager);
+        assert_eq!(census.provider_root_count(), 0);
+        assert_eq!(census.pty_reader_count(), 0);
+        let (model, task_id) = census_client_model();
+        let mut dock = ContextDock::new(DockEdge::Right);
+        dock.follow_task(task_id);
+        dock.bind_from_model(&model).expect("bind");
+        let report = dock
+            .switch_to_raw_terminal(&model, Some(&census))
+            .expect("switch");
+        let snapshot = report.census().expect("count snapshot");
+        assert!(snapshot.unchanged());
+        assert_eq!(snapshot.provider_roots_before(), 0);
+        assert_eq!(snapshot.pty_readers_before(), 0);
+        assert_eq!(census.provider_root_count(), 0);
+        assert_eq!(census.pty_reader_count(), 0);
+        assert_eq!(
+            census.one_provider_one_pty_proof(),
+            Err(DependencyUnavailable::LiveRuntimeCensus)
+        );
+    }
+
+    #[test]
+    fn terminal_shortcut_switches_canvas_without_becoming_a_context_dock_tool() {
+        let (model, task_id) = census_client_model();
+        let mut dock = ContextDock::new(DockEdge::Right);
+        dock.follow_task(task_id);
+        dock.bind_from_model(&model).expect("bind");
+
+        let context_tool = dock.active_tool();
+        assert!(!ContextDock::tools().contains(&DockTool::Terminal));
+        dock.dispatch_shortcut(DockShortcut::AltTool(3), RequestId::new(), &model)
+            .expect("terminal canvas shortcut");
+
+        assert!(dock.showing_raw_terminal());
+        assert_eq!(dock.active_tool(), context_tool);
+        let chrome = dock.chrome();
+        assert!(chrome.tabs.iter().all(|tab| tab.tool != DockTool::Terminal));
+        assert_eq!(
+            chrome
+                .tabs
+                .iter()
+                .find(|tab| tab.tool == DockTool::Browser)
+                .map(|tab| tab.shortcut),
+            Some(DockShortcut::AltTool(4))
+        );
+    }
+
+    #[test]
+    fn semantic_canvas_remains_available_without_a_terminal_binding() {
+        let task_id = TaskId::new();
+        let mut dock = ContextDock::new(DockEdge::Right);
+        dock.follow_task(task_id);
+        dock.set_terminal_presentation(TerminalPresentation::Raw);
+
+        assert!(dock.showing_raw_terminal());
+        dock.show_semantic();
+        assert!(!dock.showing_raw_terminal());
+    }
+
+    #[test]
+    fn admitted_native_view_reaches_renderer_and_survives_overlay() {
+        let (model, task_id) = census_client_model();
+        let mut dock = ContextDock::new(DockEdge::Right);
+        dock.follow_task(task_id);
+        dock.bind_from_model(&model).expect("bind");
+
+        let cursor = HostStreamCursor::full_snapshot(&model, task_id, 1).expect("cursor");
+        dock.admit_host_view(cursor, terminal_view())
+            .expect("admit native view");
+        assert!(dock.replica_view().is_some());
+        assert!(dock.terminal_pane_model().session.is_some());
+
+        dock.present_host_overlay(&model, TerminalSurfaceState::Reconnecting, None)
+            .expect("overlay");
+        assert!(dock.terminal_pane_model().session.is_some());
+        assert!(dock.terminal_pane_model().blocking_notice.is_some());
+    }
+
+    #[test]
+    fn stale_generation_cannot_replace_native_view() {
+        let (model, task_id) = census_client_model();
+        let mut dock = ContextDock::new(DockEdge::Right);
+        dock.follow_task(task_id);
+        dock.bind_from_model(&model).expect("bind");
+        let cursor = HostStreamCursor::full_snapshot(&model, task_id, 1).expect("cursor");
+        dock.admit_host_view(cursor, terminal_view())
+            .expect("admit native view");
+
+        let mut stale = HostStreamCursor::full_snapshot(&model, task_id, 2).expect("cursor");
+        stale.identity.runtime_generation = 2;
+        assert!(matches!(
+            dock.admit_host_view(stale, terminal_view()),
+            Err(DockProjectionError::GenerationMismatch { .. })
+        ));
+        assert_eq!(
+            dock.terminal_pane_model()
+                .session
+                .unwrap()
+                .runtime
+                .session_id,
+            "task-terminal"
+        );
+    }
+
+    #[test]
+    fn subscription_stream_admits_live_output_and_rejects_stale_or_foreign() {
+        use crate::domain::id::SubscriptionId;
+        use crate::protocol::{StreamFrame, StreamKey, StreamPayloadKind};
+
+        let (model, task_id) = census_client_model();
+        let resource_id = model
+            .tasks()
+            .get(&task_id)
+            .and_then(|snapshot| snapshot.resources.keys().next().copied())
+            .expect("terminal resource");
+        let mut dock = ContextDock::new(DockEdge::Right);
+        dock.follow_task(task_id);
+        dock.bind_from_model(&model).expect("bind");
+        assert!(dock.tool_availability(DockTool::Files).is_err());
+
+        let mut projection = TaskCockpitLiveProjection::empty(task_id);
+        projection.begin_query(crate::client::action::ACTION_GIT_STATUS);
+        projection.apply_result(&crate::domain::TaskCockpitResult::Git(
+            crate::domain::TaskGitProjection {
+                task_id,
+                selector: Some(crate::domain::TaskRepositorySelector::Workspace),
+                label: Some("Workspace".into()),
+                branch: Some("codex/final-e2e-ui".into()),
+                ahead: 0,
+                behind: 0,
+                change_count: 1,
+                detached: false,
+                entries: Vec::new(),
+            },
+        ));
+        dock.bind_cockpit_projection(projection);
+        assert!(dock.tool_availability(DockTool::Changes).is_ok());
+        assert!(dock.tool_availability(DockTool::Files).is_ok());
+
+        let subscription = SubscriptionId::from_bytes([
+            0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0xe1,
+        ])
+        .expect("subscription");
+        let frame = StreamFrame {
+            subscription_id: subscription,
+            stream: StreamKey::from(resource_id),
+            generation: 1,
+            sequence: 1,
+            payload_kind: StreamPayloadKind::new(3).expect("kind"),
+            schema_version: 1,
+            payload: b"live pty output".to_vec(),
+        };
+        dock.admit_subscription_stream(subscription, &frame)
+            .expect("admit live stream");
+        assert_eq!(dock.live_output(), "live pty output");
+
+        let mut stale = frame.clone();
+        stale.sequence = 1;
+        assert!(matches!(
+            dock.admit_subscription_stream(subscription, &stale),
+            Err(DockProjectionError::RegressedSequence { .. })
+        ));
+
+        let mut foreign = frame.clone();
+        foreign.sequence = 2;
+        foreign.subscription_id = SubscriptionId::from_bytes([
+            0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0xe2,
+        ])
+        .expect("foreign");
+        assert!(matches!(
+            dock.admit_subscription_stream(subscription, &foreign),
+            Err(DockProjectionError::ForeignIdentity)
+        ));
+        assert_eq!(dock.live_output(), "live pty output");
+    }
+}

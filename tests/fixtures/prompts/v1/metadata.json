@@ -1,0 +1,19 @@
+{
+  "schema": "phase07-prompts-v1",
+  "prompt": {
+    "id": "0192f5d0-0000-7000-8000-000000000001",
+    "current_version_id": "0192f5d0-0000-7000-8000-000000000002",
+    "title": "Sanitized review prompt",
+    "description": "Metadata-only fixture for prompt projection tests.",
+    "tags": ["rust", "review"],
+    "revision": 1,
+    "archived_at_ms": null
+  },
+  "version": {
+    "id": "0192f5d0-0000-7000-8000-000000000002",
+    "version": 1,
+    "variables": [],
+    "body_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "created_at_ms": 1728000000000
+  }
+}

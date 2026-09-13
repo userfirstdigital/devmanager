@@ -1,0 +1,12 @@
+{
+  "schema": "devmanager.conversation.fixture/v1",
+  "id": "basic-turn",
+  "events": [
+    { "kind": "user_message", "text": "what changed in this diff" },
+    { "kind": "assistant_text", "text": "three files, one behavior change" }
+  ],
+  "expected_rows": [
+    { "kind": "message", "role": "user", "text": "what changed in this diff" },
+    { "kind": "message", "role": "assistant", "text": "three files, one behavior change" }
+  ]
+}
