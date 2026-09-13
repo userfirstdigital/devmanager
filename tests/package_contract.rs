@@ -52,12 +52,20 @@ fn cargo_package_version(cargo_toml: &str) -> &str {
 }
 
 fn assert_packager_binary(cargo_toml: &str, name: &str, main: bool) {
-    let main_literal = if main { "true" } else { "false" };
-    let needle =
-        format!("[[package.metadata.packager.binaries]]\npath = \"{name}\"\nmain = {main_literal}");
+    let manifest: toml::Value = toml::from_str(cargo_toml).expect("Cargo.toml must be valid TOML");
+    let binaries = manifest
+        .get("package")
+        .and_then(|value| value.get("metadata"))
+        .and_then(|value| value.get("packager"))
+        .and_then(|value| value.get("binaries"))
+        .and_then(toml::Value::as_array)
+        .expect("Cargo.toml must declare package.metadata.packager.binaries");
     assert!(
-        cargo_toml.contains(&needle),
-        "Cargo.toml must declare packager binary {name} with main={main_literal}"
+        binaries.iter().any(|binary| {
+            binary.get("path").and_then(toml::Value::as_str) == Some(name)
+                && binary.get("main").and_then(toml::Value::as_bool) == Some(main)
+        }),
+        "Cargo.toml must declare packager binary {name} with main={main}"
     );
 }
 
