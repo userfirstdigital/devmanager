@@ -114,6 +114,7 @@ fn current_source_tree_state() -> String {
             if name == ".git"
                 || name == ".devmanager-next"
                 || name == "launch-evidence"
+                || name == "node_modules"
                 || name == "target"
                 || name == "target-native-next"
                 || name.starts_with(".tmp")
@@ -152,18 +153,27 @@ fn current_source_tree_state() -> String {
 
 #[cfg(windows)]
 #[test]
-fn source_tree_attestation_excludes_generated_launch_evidence() {
+fn source_tree_attestation_excludes_generated_ci_inputs() {
     let before = current_source_tree_state();
-    let evidence_root = std::env::current_dir()
-        .expect("current worktree")
-        .join("launch-evidence");
+    let worktree = std::env::current_dir().expect("current worktree");
+    let evidence_root = worktree.join("launch-evidence");
     fs::create_dir_all(&evidence_root).expect("create generated evidence root");
-    let generated = tempfile::tempdir_in(evidence_root).expect("generated evidence directory");
+    let generated = tempfile::tempdir_in(&evidence_root).expect("generated evidence directory");
     fs::write(
         generated.path().join("large-ci-log.txt"),
         b"generated CI output",
     )
     .expect("write generated evidence");
+
+    let dependencies_root = worktree.join("web/node_modules");
+    fs::create_dir_all(&dependencies_root).expect("create generated dependency root");
+    let dependency =
+        tempfile::tempdir_in(&dependencies_root).expect("generated dependency directory");
+    fs::write(
+        dependency.path().join("installed-package.js"),
+        b"generated dependency",
+    )
+    .expect("write generated dependency");
     assert_eq!(before, current_source_tree_state());
 }
 
@@ -856,6 +866,9 @@ fn process_soak_script_uses_bounded_io_and_restored_default_interface() {
     assert!(!source.contains("Kill($true)"));
     assert!(!source.contains("target\\debug"));
     assert!(source.contains("$name -eq 'launch-evidence'"));
+    assert!(source.contains("$name -eq 'node_modules'"));
+    assert!(source.contains("$commonDirectory = $gitDirectory"));
+    assert!(source.contains("Test-Path -LiteralPath $commonMarker -PathType Leaf"));
     assert!(
         phase_gate.find("$deadline =").expect("bounded deadline")
             < phase_gate
@@ -888,6 +901,7 @@ fn rust_supervisor_does_not_reset_cleanup_deadline_on_launch_failure() {
     assert!(!source.contains("Duration::from_secs(5)"));
     assert!(source.contains("name == \"target\""));
     assert!(source.contains("name == \"launch-evidence\""));
+    assert!(source.contains("name == \"node_modules\""));
 }
 
 #[test]

@@ -179,15 +179,28 @@ function Get-ExternalGitRevision {
     $head = [IO.File]::ReadAllText((Join-Path $gitDirectory 'HEAD')).Trim()
     if ($head.StartsWith('ref: ', [StringComparison]::Ordinal)) {
         $reference = $head.Substring(5).Trim()
-        $direct = @(
-            (Join-Path $gitDirectory $reference),
-            (Join-Path (Join-Path $gitDirectory ([IO.File]::ReadAllText((Join-Path $gitDirectory 'commondir')).Trim())) $reference)
-        ) | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
+        $commonDirectory = $gitDirectory
+        $commonMarker = Join-Path $gitDirectory 'commondir'
+        if (Test-Path -LiteralPath $commonMarker -PathType Leaf) {
+            $commonValue = [IO.File]::ReadAllText($commonMarker).Trim()
+            $commonDirectory = if ([IO.Path]::IsPathRooted($commonValue)) {
+                [IO.Path]::GetFullPath($commonValue)
+            }
+            else {
+                [IO.Path]::GetFullPath((Join-Path $gitDirectory $commonValue))
+            }
+        }
+        $gitSearchDirectories = @($gitDirectory)
+        if (-not $commonDirectory.Equals($gitDirectory, [StringComparison]::OrdinalIgnoreCase)) {
+            $gitSearchDirectories += $commonDirectory
+        }
+        $direct = @($gitSearchDirectories | ForEach-Object { Join-Path $_ $reference }) |
+            Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } |
+            Select-Object -First 1
         if ($null -ne $direct) { return [IO.File]::ReadAllText($direct).Trim().ToLowerInvariant() }
-        $packed = @(
-            (Join-Path $gitDirectory 'packed-refs'),
-            (Join-Path (Join-Path $gitDirectory ([IO.File]::ReadAllText((Join-Path $gitDirectory 'commondir')).Trim())) 'packed-refs')
-        ) | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
+        $packed = @($gitSearchDirectories | ForEach-Object { Join-Path $_ 'packed-refs' }) |
+            Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } |
+            Select-Object -First 1
         if ($null -eq $packed) { throw "git reference '$reference' is not present." }
         foreach ($line in [IO.File]::ReadAllLines($packed)) {
             $parts = $line -split '\s+'
@@ -214,7 +227,7 @@ function Get-ExternalSourceTreeState {
         )
         foreach ($entry in Get-ChildItem -LiteralPath $CurrentPath -Force -ErrorAction Stop) {
             $name = [string]$entry.Name
-            if ($name -eq '.git' -or $name -eq '.devmanager-next' -or $name -eq 'launch-evidence' -or $name -eq 'target' -or
+            if ($name -eq '.git' -or $name -eq '.devmanager-next' -or $name -eq 'launch-evidence' -or $name -eq 'node_modules' -or $name -eq 'target' -or
                 $name -eq 'target-native-next' -or $name.StartsWith('.tmp', [StringComparison]::Ordinal)) {
                 continue
             }
