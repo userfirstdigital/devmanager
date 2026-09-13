@@ -18,8 +18,16 @@ struct CapturedOutput {
     stderr: Vec<u8>,
 }
 
+#[cfg(not(windows))]
 fn helper_path() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_devmanager-process-test-helper"))
+}
+
+#[cfg(windows)]
+fn helper_path() -> PathBuf {
+    std::env::current_dir()
+        .expect("current worktree")
+        .join("target-native-next/debug/devmanager-process-test-helper.exe")
 }
 
 fn configure_helper(command: &mut Command) {
@@ -990,6 +998,12 @@ fn ansi_corpus_reference_is_versioned_and_contains_split_sequences() {
         .expect("ANSI cases")
         .iter()
         .any(|case| case["name"] == "unicode"));
+}
+
+#[test]
+fn ansi_corpus_checkout_bytes_are_pinned_to_lf() {
+    let attributes = fs::read_to_string(".gitattributes").expect("Git attributes");
+    assert!(attributes.contains("tests/fixtures/ansi/** text eol=lf"));
 }
 
 fn assert_ready_and_done(captured: &CapturedOutput, expected_mode: &str) -> (Value, Value) {
