@@ -3,20 +3,21 @@ use devmanager::workspace::apply_browser_enabled_preference;
 
 #[test]
 fn legacy_settings_default_and_browser_toggle_round_trip() {
+    let platform_default = cfg!(any(windows, target_os = "linux"));
     let legacy: Settings = serde_json::from_str("{}").expect("legacy settings");
-    assert_eq!(legacy.browser_enabled, cfg!(windows));
+    assert_eq!(legacy.browser_enabled, platform_default);
 
     let mut toggled = legacy;
-    apply_browser_enabled_preference(&mut toggled, !cfg!(windows));
-    assert_eq!(toggled.browser_enabled, !cfg!(windows));
+    apply_browser_enabled_preference(&mut toggled, !platform_default);
+    assert_eq!(toggled.browser_enabled, !platform_default);
 
     let value = serde_json::to_value(&toggled).expect("serialize settings");
     assert_eq!(
         value.get("browserEnabled"),
-        Some(&serde_json::json!(!cfg!(windows)))
+        Some(&serde_json::json!(!platform_default))
     );
     let round_trip: Settings = serde_json::from_value(value).expect("round-trip settings");
-    assert_eq!(round_trip.browser_enabled, !cfg!(windows));
+    assert_eq!(round_trip.browser_enabled, !platform_default);
 }
 
 #[test]
