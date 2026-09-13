@@ -25,8 +25,8 @@ use devmanager::client::{
 use devmanager::config::paths::{resolve_app_paths, AppProfile, BuildKind, ResolvedAppPaths};
 use devmanager::config::{ConfigCommand, ConfigStore, Project};
 use devmanager::domain::command::{
-    Command, CommandEnvelope, CommandReceipt, ConfirmHostQuitIntent, CreateTaskIntent,
-    CreateTaskRequestIntent, RejectionCode,
+    Command, CommandEnvelope, CommandReceipt, ConfirmHostQuitIntent, CreateTaskRequestIntent,
+    RejectionCode,
 };
 use devmanager::domain::event::{DomainEvent, Event};
 use devmanager::domain::id::{
@@ -41,7 +41,6 @@ use devmanager::domain::resource::{
 use devmanager::domain::snapshot::{SnapshotItem, SnapshotSection};
 use devmanager::domain::task::{
     ReviewReadiness, TaskActivity, TaskAssignment, TaskAttention, TaskConnectivity, TaskLifecycle,
-    WorkspaceRef,
 };
 use devmanager::domain::{
     AgentRole, AgentSessionFacts, AgentSessionLifecycle, ArtifactContentRef, ArtifactFacts,
@@ -96,6 +95,42 @@ fn isolated_paths(base: &TempDir, profile: &str) -> ResolvedAppPaths {
     assert_eq!(paths.root.parent(), Some(root));
     assert!(paths.database.starts_with(&paths.root));
     paths
+}
+
+struct LifecycleProject {
+    id: ProjectId,
+    root: PathBuf,
+}
+
+fn configure_lifecycle_project(paths: &ResolvedAppPaths) -> LifecycleProject {
+    fs::create_dir_all(&paths.root).expect("create isolated profile root");
+    let configured_id = "host-lifecycle-fixture-project".to_string();
+    let mut store = ConfigStore::open_host(paths).expect("open isolated host config");
+    store
+        .execute(
+            store.snapshot().revision,
+            ConfigCommand::CreateProject {
+                project: Project {
+                    id: configured_id.clone(),
+                    name: "Host lifecycle fixture project".to_string(),
+                    root_path: paths.root.to_string_lossy().into_owned(),
+                    created_at: "now".to_string(),
+                    updated_at: "now".to_string(),
+                    ..Project::default()
+                },
+            },
+        )
+        .expect("persist isolated host project");
+    let revision = store.snapshot().revision;
+    let roots = WorkspaceProjectRoots::from_host_config_store(&mut store, revision, 1, 1)
+        .expect("issue isolated host project roots");
+    let id = roots
+        .project_id_for_config_id(&configured_id)
+        .expect("opaque isolated host project id");
+    LifecycleProject {
+        id,
+        root: paths.root.clone(),
+    }
 }
 
 fn read_identity(path: &Path) -> Option<HostIdentity> {
@@ -297,7 +332,7 @@ fn create_task_named(
     command_tail: u8,
     task_tail: u8,
     environment_tail: u8,
-    project_tail: u8,
+    project: &LifecycleProject,
     title: &str,
 ) -> (CommandEnvelope, CommandId, TaskId) {
     let command_id = CommandId::from_bytes(fixed_uuid_v7(command_tail)).expect("command id");
@@ -309,14 +344,16 @@ fn create_task_named(
             task_id: None,
             issued_at_ms: 1_725_000_000_100,
             expected_task_revision: None,
-            command: Command::CreateTask(CreateTaskIntent {
+            command: Command::CreateTaskV2(CreateTaskRequestIntent {
                 id: task_id,
                 environment_id: EnvironmentId::from_bytes(fixed_uuid_v7(environment_tail))
                     .expect("environment id"),
                 title: title.into(),
                 description: None,
-                project_id: ProjectId::from_bytes(fixed_uuid_v7(project_tail)).expect("project id"),
-                workspace: WorkspaceRef::Main,
+                project_id: project.id,
+                workspace: WorkspaceRequest::confirmed_external(&project.root),
+                primary_provider: None,
+                defer_primary_provider_start: false,
                 assignment: TaskAssignment::LocalOwner,
                 created_at_ms: 1_725_000_000_000,
                 connectivity: TaskConnectivity::Connected,
@@ -330,13 +367,16 @@ fn create_task_named(
     )
 }
 
-fn create_task(client_id: ClientId) -> (CommandEnvelope, CommandId, TaskId) {
+fn create_task(
+    client_id: ClientId,
+    project: &LifecycleProject,
+) -> (CommandEnvelope, CommandId, TaskId) {
     create_task_named(
         client_id,
         0x71,
         0x72,
         0x73,
-        0x74,
+        project,
         "Foreground host reconnect",
     )
 }
@@ -346,6 +386,7 @@ async fn foreground_host_retains_lock_and_bus_across_client_reconnect() {
     let config_base = TempDir::new().expect("process-unique config base");
     let profile = unique_profile();
     let paths = isolated_paths(&config_base, &profile);
+    let project = configure_lifecycle_project(&paths);
     let lock_path = paths.root.join("host.lock");
 
     let mut host = ChildGuard::spawn(host_command(config_base.path(), &profile));
@@ -368,7 +409,7 @@ async fn foreground_host_retains_lock_and_bus_across_client_reconnect() {
     assert_eq!(client.host_boot_id(), Some(original_identity.boot_id));
     assert_eq!(client.granted_capabilities(), requested);
 
-    let (create, command_id, _task_id) = create_task(client_id);
+    let (create, command_id, _task_id) = create_task(client_id, &project);
     let receipt = client
         .execute_command(create)
         .await
@@ -722,6 +763,7 @@ async fn two_clients_attach_concurrently_and_share_one_command_bus() {
     let config_base = TempDir::new().expect("process-unique config base");
     let profile = unique_profile();
     let paths = isolated_paths(&config_base, &profile);
+    let project = configure_lifecycle_project(&paths);
     let lock_path = paths.root.join("host.lock");
 
     let mut host = ChildGuard::spawn(host_command(config_base.path(), &profile));
@@ -758,7 +800,7 @@ async fn two_clients_attach_concurrently_and_share_one_command_bus() {
     assert_eq!(client_b.host_boot_id(), Some(original_identity.boot_id));
     assert_ne!(client_a.connection_id(), client_b.connection_id());
 
-    let (create, _command_id, task_id) = create_task(client_a_id);
+    let (create, _command_id, task_id) = create_task(client_a_id, &project);
     let receipt = client_a
         .execute_command(create)
         .await
@@ -807,6 +849,7 @@ async fn paged_task_snapshot_is_immutable_tamper_evident_and_releasable() {
     let config_base = TempDir::new().expect("process-unique config base");
     let profile = unique_profile();
     let paths = isolated_paths(&config_base, &profile);
+    let project = configure_lifecycle_project(&paths);
     let lock_path = paths.root.join("host.lock");
 
     let mut host = ChildGuard::spawn(host_command(config_base.path(), &profile));
@@ -828,9 +871,9 @@ async fn paged_task_snapshot_is_immutable_tamper_evident_and_releasable() {
         .contains(Capability::PagedSnapshots));
 
     let (first_create, _, first_task_id) =
-        create_task_named(client_id, 0x91, 0x92, 0x93, 0x94, "First paged task");
+        create_task_named(client_id, 0x91, 0x92, 0x93, &project, "First paged task");
     let (second_create, _, second_task_id) =
-        create_task_named(client_id, 0x95, 0x96, 0x97, 0x98, "Second paged task");
+        create_task_named(client_id, 0x95, 0x96, 0x97, &project, "Second paged task");
     assert!(matches!(
         client
             .execute_command(first_create)
@@ -878,7 +921,7 @@ async fn paged_task_snapshot_is_immutable_tamper_evident_and_releasable() {
     );
 
     let (third_create, _, third_task_id) =
-        create_task_named(client_id, 0x99, 0x9a, 0x9b, 0x9c, "Post-snapshot task");
+        create_task_named(client_id, 0x99, 0x9a, 0x9b, &project, "Post-snapshot task");
     assert!(matches!(
         client
             .execute_command(third_create)
@@ -941,6 +984,7 @@ async fn durable_event_replay_is_ordered_frozen_tamper_evident_and_reconnectable
     let config_base = TempDir::new().expect("process-unique config base");
     let profile = unique_profile();
     let paths = isolated_paths(&config_base, &profile);
+    let project = configure_lifecycle_project(&paths);
     let lock_path = paths.root.join("host.lock");
 
     let mut host = ChildGuard::spawn(host_command(config_base.path(), &profile));
@@ -1005,9 +1049,9 @@ async fn durable_event_replay_is_ordered_frozen_tamper_evident_and_reconnectable
     drop(scoped_connection);
 
     let (first_create, _, _) =
-        create_task_named(writer_id, 0xa2, 0xa3, 0xa4, 0xa5, "First replay task");
+        create_task_named(writer_id, 0xa2, 0xa3, 0xa4, &project, "First replay task");
     let (second_create, _, _) =
-        create_task_named(writer_id, 0xa6, 0xa7, 0xa8, 0xa9, "Second replay task");
+        create_task_named(writer_id, 0xa6, 0xa7, 0xa8, &project, "Second replay task");
     assert!(matches!(
         writer
             .execute_command(first_create)
@@ -1059,7 +1103,7 @@ async fn durable_event_replay_is_ordered_frozen_tamper_evident_and_reconnectable
     );
 
     let (post_open_create, _, _) =
-        create_task_named(writer_id, 0xaa, 0xab, 0xac, 0xad, "Post-replay task");
+        create_task_named(writer_id, 0xaa, 0xab, 0xac, &project, "Post-replay task");
     assert!(matches!(
         writer
             .execute_command(post_open_create)
@@ -1153,6 +1197,7 @@ async fn durable_event_replay_transitions_to_live_without_gap_or_duplicate() {
     let config_base = TempDir::new().expect("process-unique config base");
     let profile = unique_profile();
     let paths = isolated_paths(&config_base, &profile);
+    let project = configure_lifecycle_project(&paths);
     let lock_path = paths.root.join("host.lock");
 
     let mut host = ChildGuard::spawn(host_command(config_base.path(), &profile));
@@ -1180,10 +1225,22 @@ async fn durable_event_replay_transitions_to_live_without_gap_or_duplicate() {
     let mut writer = connect_bounded(&writer_config, &mut host).await;
     let mut reader = connect_bounded(&reader_config, &mut host).await;
 
-    let (first_create, _, _) =
-        create_task_named(writer_id, 0xb2, 0xb3, 0xb4, 0xb5, "Live tail first task");
-    let (second_create, _, _) =
-        create_task_named(writer_id, 0xb6, 0xb7, 0xb8, 0xb9, "Live tail second task");
+    let (first_create, _, _) = create_task_named(
+        writer_id,
+        0xb2,
+        0xb3,
+        0xb4,
+        &project,
+        "Live tail first task",
+    );
+    let (second_create, _, _) = create_task_named(
+        writer_id,
+        0xb6,
+        0xb7,
+        0xb8,
+        &project,
+        "Live tail second task",
+    );
     assert!(matches!(
         writer
             .execute_command(first_create)
@@ -1223,7 +1280,7 @@ async fn durable_event_replay_transitions_to_live_without_gap_or_duplicate() {
         0xba,
         0xbb,
         0xbc,
-        0xbd,
+        &project,
         "After open before frozen complete",
     );
     let post_receipt = writer
@@ -1336,7 +1393,7 @@ async fn durable_event_replay_transitions_to_live_without_gap_or_duplicate() {
         .expect("release live subscription query");
 
     let (after_release_create, _, _) =
-        create_task_named(writer_id, 0xbe, 0xbf, 0xc0, 0xc1, "After release");
+        create_task_named(writer_id, 0xbe, 0xbf, 0xc0, &project, "After release");
     assert!(matches!(
         writer
             .execute_command(after_release_create)
@@ -1368,6 +1425,7 @@ async fn replacing_real_subscription_drains_only_retired_queued_frames() {
     let config_base = TempDir::new().expect("process-unique config base");
     let profile = unique_profile();
     let paths = isolated_paths(&config_base, &profile);
+    let project = configure_lifecycle_project(&paths);
     let lock_path = paths.root.join("host.lock");
 
     let mut host = ChildGuard::spawn(host_command(config_base.path(), &profile));
@@ -1393,7 +1451,7 @@ async fn replacing_real_subscription_drains_only_retired_queued_frames() {
         .expect("old subscription synchronize");
 
     let (first_create, _, first_task_id) =
-        create_task_named(writer_id, 0xc4, 0xc5, 0xc6, 0xc7, "Retired first");
+        create_task_named(writer_id, 0xc4, 0xc5, 0xc6, &project, "Retired first");
     assert!(matches!(
         writer
             .execute_command(first_create)
@@ -1414,7 +1472,7 @@ async fn replacing_real_subscription_drains_only_retired_queued_frames() {
     // add more old-generation events while the caller does not drain them.
     for (offset, title) in [(0xc8, "Retired second"), (0xcc, "Retired third")] {
         let (create, _, _) =
-            create_task_named(writer_id, offset, offset + 1, offset + 2, offset + 3, title);
+            create_task_named(writer_id, offset, offset + 1, offset + 2, &project, title);
         assert!(matches!(
             writer
                 .execute_command(create)
@@ -1435,7 +1493,7 @@ async fn replacing_real_subscription_drains_only_retired_queued_frames() {
         .expect("replacement subscription synchronize");
 
     let (replacement_create, _, replacement_task_id) =
-        create_task_named(writer_id, 0xd0, 0xd1, 0xd2, 0xd3, "Replacement event");
+        create_task_named(writer_id, 0xd0, 0xd1, 0xd2, &project, "Replacement event");
     assert!(matches!(
         writer
             .execute_command(replacement_create)
@@ -1477,6 +1535,7 @@ async fn pinned_snapshot_retains_id_across_section_restart_without_cursor() {
     let config_base = TempDir::new().expect("process-unique config base");
     let profile = unique_profile();
     let paths = isolated_paths(&config_base, &profile);
+    let project = configure_lifecycle_project(&paths);
     let lock_path = paths.root.join("host.lock");
 
     let mut host = ChildGuard::spawn(host_command(config_base.path(), &profile));
@@ -1495,9 +1554,9 @@ async fn pinned_snapshot_retains_id_across_section_restart_without_cursor() {
     let mut client = connect_bounded(&config, &mut host).await;
 
     let (first_create, _, first_task_id) =
-        create_task_named(client_id, 0xd1, 0xd2, 0xd3, 0xd4, "Retain first");
+        create_task_named(client_id, 0xd1, 0xd2, 0xd3, &project, "Retain first");
     let (second_create, _, second_task_id) =
-        create_task_named(client_id, 0xd5, 0xd6, 0xd7, 0xd8, "Retain second");
+        create_task_named(client_id, 0xd5, 0xd6, 0xd7, &project, "Retain second");
     assert!(matches!(
         client
             .execute_command(first_create)
@@ -1594,6 +1653,7 @@ async fn two_clients_assemble_same_initial_model_and_converge_live() {
     let config_base = TempDir::new().expect("process-unique config base");
     let profile = unique_profile();
     let paths = isolated_paths(&config_base, &profile);
+    let project = configure_lifecycle_project(&paths);
     let lock_path = paths.root.join("host.lock");
 
     let mut host = ChildGuard::spawn(host_command(config_base.path(), &profile));
@@ -1637,7 +1697,7 @@ async fn two_clients_assemble_same_initial_model_and_converge_live() {
     {
         let tail = 0xe3 + (idx as u8) * 4;
         let (create, _, _) =
-            create_task_named(writer_id, tail, tail + 1, tail + 2, tail + 3, title);
+            create_task_named(writer_id, tail, tail + 1, tail + 2, &project, title);
         assert!(matches!(
             writer.execute_command(create).await.expect("seed create"),
             CommandReceipt::Accepted { .. }
@@ -1668,7 +1728,7 @@ async fn two_clients_assemble_same_initial_model_and_converge_live() {
     let sync_sequence = model_a.last_applied_sequence();
 
     let (live_create, live_command_id, live_task_id) =
-        create_task_named(writer_id, 0xf0, 0xf1, 0xf2, 0xf3, "Live converge task");
+        create_task_named(writer_id, 0xf0, 0xf1, 0xf2, &project, "Live converge task");
     assert!(matches!(
         writer
             .execute_command(live_create.clone())
@@ -1777,6 +1837,7 @@ async fn artifact_content_pages_are_scoped_resumable_and_side_effect_free() {
     let config_base = TempDir::new().expect("process-unique config base");
     let profile = unique_profile();
     let paths = isolated_paths(&config_base, &profile);
+    let project = configure_lifecycle_project(&paths);
     let lock_path = paths.root.join("host.lock");
 
     let mut host = ChildGuard::spawn(host_command(config_base.path(), &profile));
@@ -1815,8 +1876,14 @@ async fn artifact_content_pages_are_scoped_resumable_and_side_effect_free() {
         .granted_capabilities()
         .contains(Capability::ChunkResume));
 
-    let (create, _, task_id) =
-        create_task_named(owner_id, 0xa2, 0xa3, 0xa4, 0xa5, "Artifact content task");
+    let (create, _, task_id) = create_task_named(
+        owner_id,
+        0xa2,
+        0xa3,
+        0xa4,
+        &project,
+        "Artifact content task",
+    );
     assert!(matches!(
         owner
             .execute_command(create)
@@ -2068,6 +2135,7 @@ async fn artifact_content_retry_same_cursor_after_connection_replacement_is_byte
     let config_base = TempDir::new().expect("process-unique config base");
     let profile = unique_profile();
     let paths = isolated_paths(&config_base, &profile);
+    let project = configure_lifecycle_project(&paths);
     let lock_path = paths.root.join("host.lock");
 
     let mut host = ChildGuard::spawn(host_command(config_base.path(), &profile));
@@ -2108,7 +2176,7 @@ async fn artifact_content_retry_same_cursor_after_connection_replacement_is_byte
         0xc1,
         0xc2,
         0xc3,
-        0xc4,
+        &project,
         "Artifact content retry task",
     );
     assert!(matches!(
@@ -2297,6 +2365,7 @@ async fn slow_durable_reader_does_not_delay_other_client_command_receipt() {
     let config_base = TempDir::new().expect("process-unique config base");
     let profile = unique_profile();
     let paths = isolated_paths(&config_base, &profile);
+    let project = configure_lifecycle_project(&paths);
     let lock_path = paths.root.join("host.lock");
 
     let healthy_id = ClientId::from_bytes(fixed_uuid_v7(0xc0)).expect("healthy client id");
@@ -2383,8 +2452,14 @@ async fn slow_durable_reader_does_not_delay_other_client_command_receipt() {
         }
     }
 
-    let (first_create, _first_command_id, first_task_id) =
-        create_task_named(healthy_id, 0xc2, 0xc3, 0xc4, 0xc5, "Slow-reader first task");
+    let (first_create, _first_command_id, first_task_id) = create_task_named(
+        healthy_id,
+        0xc2,
+        0xc3,
+        0xc4,
+        &project,
+        "Slow-reader first task",
+    );
     let first_receipt = healthy
         .execute_command(first_create)
         .await
@@ -2422,7 +2497,7 @@ async fn slow_durable_reader_does_not_delay_other_client_command_receipt() {
         0xc6,
         0xc7,
         0xc8,
-        0xc9,
+        &project,
         "Slow-reader second task",
     );
     let second_receipt = timeout(
@@ -2526,6 +2601,7 @@ async fn begin_close_rejects_new_runtime_registration_with_closing_before_drain(
     let config_base = TempDir::new().expect("process-unique config base");
     let profile = unique_profile();
     let paths = isolated_paths(&config_base, &profile);
+    let project = configure_lifecycle_project(&paths);
     let lock_path = paths.root.join("host.lock");
 
     let mut host = ChildGuard::spawn(host_command(config_base.path(), &profile));
@@ -2563,7 +2639,7 @@ async fn begin_close_rejects_new_runtime_registration_with_closing_before_drain(
         0xe2,
         0xe3,
         0xe4,
-        0xe5,
+        &project,
         "Closing admission barrier",
     );
     assert!(matches!(
@@ -2753,6 +2829,7 @@ async fn empty_begin_close_settles_and_archives_via_host_maintenance() {
     let config_base = TempDir::new().expect("process-unique config base");
     let profile = unique_profile();
     let paths = isolated_paths(&config_base, &profile);
+    let project = configure_lifecycle_project(&paths);
     let lock_path = paths.root.join("host.lock");
 
     let mut host = ChildGuard::spawn(host_command(config_base.path(), &profile));
@@ -2778,7 +2855,7 @@ async fn empty_begin_close_settles_and_archives_via_host_maintenance() {
         0xf1,
         0xf2,
         0xf3,
-        0xf4,
+        &project,
         "Empty close maintenance settle",
     );
     assert!(matches!(
@@ -2885,6 +2962,7 @@ async fn inspect_host_quit_reports_durable_blockers_without_mutation_or_exit() {
     let config_base = TempDir::new().expect("process-unique config base");
     let profile = unique_profile();
     let paths = isolated_paths(&config_base, &profile);
+    let project = configure_lifecycle_project(&paths);
     let lock_path = paths.root.join("host.lock");
 
     let mut host = ChildGuard::spawn(host_command(config_base.path(), &profile));
@@ -2912,7 +2990,7 @@ async fn inspect_host_quit_reports_durable_blockers_without_mutation_or_exit() {
     );
     assert_eq!(client.host_boot_id(), Some(original_identity.boot_id));
 
-    let (create, _, task_id) = create_task_named(client_id, 0x21, 0x22, 0x23, 0x24, TASK_TITLE);
+    let (create, _, task_id) = create_task_named(client_id, 0x21, 0x22, 0x23, &project, TASK_TITLE);
     assert!(matches!(
         client.execute_command(create).await.expect("create task"),
         CommandReceipt::Accepted { .. }
@@ -3402,6 +3480,7 @@ async fn confirmed_quit_with_residue_terminalizes_cleanup_failed_live_and_keeps_
     let config_base = TempDir::new().expect("process-unique config base");
     let profile = unique_profile();
     let paths = isolated_paths(&config_base, &profile);
+    let project = configure_lifecycle_project(&paths);
     let lock_path = paths.root.join("host.lock");
 
     let mut host = ChildGuard::spawn(host_command(config_base.path(), &profile));
@@ -3424,8 +3503,14 @@ async fn confirmed_quit_with_residue_terminalizes_cleanup_failed_live_and_keeps_
     let mut client = connect_bounded(&config, &mut host).await;
     assert_eq!(client.host_boot_id(), Some(original_identity.boot_id));
 
-    let (create, _, task_id) =
-        create_task_named(client_id, 0x51, 0x52, 0x53, 0x54, "cleanup-failed residue");
+    let (create, _, task_id) = create_task_named(
+        client_id,
+        0x51,
+        0x52,
+        0x53,
+        &project,
+        "cleanup-failed residue",
+    );
     assert!(matches!(
         client.execute_command(create).await.expect("create task"),
         CommandReceipt::Accepted { .. }
@@ -3649,8 +3734,14 @@ async fn confirmed_quit_with_residue_terminalizes_cleanup_failed_live_and_keeps_
         &mut host,
     )
     .await;
-    let (create_b, _, _) =
-        create_task_named(client_id_b, 0x5a, 0x5b, 0x5c, 0x5d, "after cleanup failed");
+    let (create_b, _, _) = create_task_named(
+        client_id_b,
+        0x5a,
+        0x5b,
+        0x5c,
+        &project,
+        "after cleanup failed",
+    );
     let closing = client_b
         .execute_command(create_b)
         .await
