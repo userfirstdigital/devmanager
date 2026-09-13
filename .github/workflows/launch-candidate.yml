@@ -118,6 +118,7 @@ jobs:
             '--target-dir', $env:CARGO_TARGET_DIR, '-j', '2', '--', '--test-threads=1',
             '--skip', 'quality_preview_cli_and_pixel_readback_hold_without_canonical_shell'
           )
+          Remove-Item Env:GCM_INTERACTIVE -ErrorAction SilentlyContinue
           Write-Output 'Retired preview tooling and hosted-runner desktop capture remain compile-only.'
           & cargo @cargoArgs 2>&1 | Tee-Object launch-evidence/tests.log
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
