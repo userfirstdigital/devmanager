@@ -2492,6 +2492,7 @@ const MACOS_SIGCONT: i32 = 19;
 
 #[cfg(target_os = "macos")]
 unsafe extern "C" {
+    #[link_name = "kill"]
     fn macos_kill(pid: i32, signal: i32) -> i32;
 }
 
