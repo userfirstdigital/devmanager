@@ -68,11 +68,15 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cargo metadata --format-version 1 --locked >/tmp/cargo-metadata-locked.json
-          python - <<'PY'
+          metadata_path="$RUNNER_TEMP/cargo-metadata-locked.json"
+          cargo metadata --format-version 1 --locked >"$metadata_path"
+          CARGO_METADATA_PATH="$metadata_path" python - <<'PY'
+          import os
           import json
           import pathlib
-          meta = json.loads(pathlib.Path("/tmp/cargo-metadata-locked.json").read_text(encoding="utf-8"))
+          meta = json.loads(
+              pathlib.Path(os.environ["CARGO_METADATA_PATH"]).read_text(encoding="utf-8")
+          )
           packages = {pkg["name"]: pkg["version"] for pkg in meta["packages"]}
           if packages.get("devmanager") is None:
               raise SystemExit("cargo metadata --locked did not resolve the root devmanager package")

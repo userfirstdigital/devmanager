@@ -100,6 +100,8 @@ fn release_verify_installs_rustfmt_before_running_cargo_fmt() {
 
     assert!(verify_job.contains("cargo fmt --all -- --check"));
     assert!(verify_job.contains("inputs.publish != true"));
+    assert!(verify_job.contains("$RUNNER_TEMP/cargo-metadata-locked.json"));
+    assert!(!verify_job.contains("/tmp/cargo-metadata-locked.json"));
     assert!(verify_job.contains("target-native-next/debug/devmanager-process-test-helper.exe"));
     assert!(
         rust_install.contains("components: rustfmt"),
