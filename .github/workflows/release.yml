@@ -136,6 +136,7 @@ jobs:
           for test_target in "${test_targets[@]}"; do
             cargo_args+=(--test "$test_target")
           done
+          unset GCM_INTERACTIVE
           echo "Retired preview tooling and hosted-runner desktop capture remain compile-only."
           cargo "${cargo_args[@]}" -- --test-threads=1 \
             --skip quality_preview_cli_and_pixel_readback_hold_without_canonical_shell
