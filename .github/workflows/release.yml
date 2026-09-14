@@ -115,9 +115,13 @@ jobs:
           cargo fmt --all -- --check
           cargo check --locked --lib --bins --tests
           cargo build --locked --bin devmanager-process-test-helper
+          cargo test --locked --test process_soak_infrastructure --no-run
           mkdir -p target-native-next/debug
+          mkdir -p target-native-next/debug/deps
           cp "$CARGO_TARGET_DIR/debug/devmanager-process-test-helper.exe" \
             target-native-next/debug/devmanager-process-test-helper.exe
+          cp "$CARGO_TARGET_DIR"/debug/deps/process_soak_infrastructure-*.exe \
+            target-native-next/debug/deps/
           cargo test --locked --all-targets -- --test-threads=1
 
   # Packaging (prepare/build) is independent from publication and never auto-publishes public.

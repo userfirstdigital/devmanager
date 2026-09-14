@@ -103,6 +103,9 @@ fn release_verify_installs_rustfmt_before_running_cargo_fmt() {
     assert!(verify_job.contains("$RUNNER_TEMP/cargo-metadata-locked.json"));
     assert!(!verify_job.contains("/tmp/cargo-metadata-locked.json"));
     assert!(verify_job.contains("target-native-next/debug/devmanager-process-test-helper.exe"));
+    assert!(verify_job.contains("cargo test --locked --test process_soak_infrastructure --no-run"));
+    assert!(verify_job.contains("mkdir -p target-native-next/debug/deps"));
+    assert!(verify_job.contains("debug/deps/process_soak_infrastructure-*.exe"));
     assert!(
         rust_install.contains("components: rustfmt"),
         "the minimal Rust toolchain must install cargo-fmt before verification"
