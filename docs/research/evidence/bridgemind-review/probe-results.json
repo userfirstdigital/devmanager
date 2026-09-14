@@ -1,0 +1,200 @@
+{
+  "recordedAtUtc": "2026-09-11T02:22:35.287533+00:00",
+  "platform": "Linux-7.2.3-1-cachyos-x86_64-with-glibc2.44",
+  "tools": {
+    "bash": "GNU bash, version 5.3.15(1)-release (x86_64-pc-linux-gnu)",
+    "grep": "grep (GNU grep) 3.12-modified",
+    "perl": "This is perl 5, version 42, subversion 2 (v5.42.2*) built for x86_64-linux-thread-multi",
+    "find": "find (GNU findutils) 4.11.0-modified"
+  },
+  "scope": "Pinned upstream offline scripts; disposable synthetic fixtures only; observed defects are not scanner passes.",
+  "sourceHashes": {
+    "ward": "39804c7ffb88329d60f488697f0c46b0c38411c315d935d7c0d992c4b5a125ef",
+    "security": "a8c62579674fc00b0dd1c9bdd183dd1f330fc4670a71cb91a0869c0e5833ab7b"
+  },
+  "sourcesUnchanged": true,
+  "observations": [
+    {
+      "id": "W01",
+      "scanner": "ward",
+      "observation": "clean control",
+      "syntheticFixtureSha256": "9b228e0499d35825fb0470c866ce0212432f9b1694635f2e459bf85238f1e013",
+      "directoryTarget": false,
+      "exitCode": 0,
+      "stdout": "BridgeWard quick-scan\nTarget: <fixtures>/W01/input.md\nFiles:  1\n---\n---\nNo findings.\n",
+      "stderr": "",
+      "fixtureUnchanged": true,
+      "observationConfirmed": true
+    },
+    {
+      "id": "W02",
+      "scanner": "ward",
+      "observation": "visible phrase detected",
+      "syntheticFixtureSha256": "18b372a6f04251375033406696729410694386381962bb0729a7bd3e52994cdb",
+      "directoryTarget": false,
+      "exitCode": 1,
+      "stdout": "BridgeWard quick-scan\nTarget: <fixtures>/W02/input.md\nFiles:  1\n---\n[MED] <fixtures>/W02/input.md: imperative-override phrase\n---\nTotal findings: 1\n\nRun the full /injection-audit slash-command for a deeper review,\nor invoke the injection-auditor subagent for line-by-line analysis.\n",
+      "stderr": "",
+      "fixtureUnchanged": true,
+      "observationConfirmed": true
+    },
+    {
+      "id": "W03",
+      "scanner": "ward",
+      "observation": "zero-width check misses its stated target",
+      "syntheticFixtureSha256": "2c1ad05ac51990f108690ee5cd8bb3bba13fdbe7035238cb4788d08fad4a007e",
+      "directoryTarget": false,
+      "exitCode": 0,
+      "stdout": "BridgeWard quick-scan\nTarget: <fixtures>/W03/input.md\nFiles:  1\n---\n---\nNo findings.\n",
+      "stderr": "",
+      "fixtureUnchanged": true,
+      "observationConfirmed": true
+    },
+    {
+      "id": "W04",
+      "scanner": "ward",
+      "observation": "Unicode tag check misses its stated target",
+      "syntheticFixtureSha256": "d8145edd5e1e3e44654e51fbd34660bf33958c70c2a28c3b03edf8b21e25951d",
+      "directoryTarget": false,
+      "exitCode": 0,
+      "stdout": "BridgeWard quick-scan\nTarget: <fixtures>/W04/input.md\nFiles:  1\n---\n---\nNo findings.\n",
+      "stderr": "",
+      "fixtureUnchanged": true,
+      "observationConfirmed": true
+    },
+    {
+      "id": "W05",
+      "scanner": "ward",
+      "observation": "directory allowlist omits TypeScript",
+      "syntheticFixtureSha256": "18b372a6f04251375033406696729410694386381962bb0729a7bd3e52994cdb",
+      "directoryTarget": true,
+      "exitCode": 0,
+      "stdout": "BridgeWard quick-scan\nTarget: <fixtures>/W05\nFiles:  0\n---\n---\nNo findings.\n",
+      "stderr": "",
+      "fixtureUnchanged": true,
+      "observationConfirmed": true
+    },
+    {
+      "id": "W06",
+      "scanner": "ward",
+      "observation": "same TypeScript file scanned directly is detected",
+      "syntheticFixtureSha256": "18b372a6f04251375033406696729410694386381962bb0729a7bd3e52994cdb",
+      "directoryTarget": false,
+      "exitCode": 1,
+      "stdout": "BridgeWard quick-scan\nTarget: <fixtures>/W06/input.ts\nFiles:  1\n---\n[MED] <fixtures>/W06/input.ts: imperative-override phrase\n---\nTotal findings: 1\n\nRun the full /injection-audit slash-command for a deeper review,\nor invoke the injection-auditor subagent for line-by-line analysis.\n",
+      "stderr": "",
+      "fixtureUnchanged": true,
+      "observationConfirmed": true
+    },
+    {
+      "id": "W07",
+      "scanner": "ward",
+      "observation": "benign quoted example also triggers heuristic",
+      "syntheticFixtureSha256": "99d1a5c0146cddb802706f6df8b14992653871079be4d1aa9c584fd126ef404b",
+      "directoryTarget": false,
+      "exitCode": 1,
+      "stdout": "BridgeWard quick-scan\nTarget: <fixtures>/W07/input.md\nFiles:  1\n---\n[MED] <fixtures>/W07/input.md: imperative-override phrase\n---\nTotal findings: 1\n\nRun the full /injection-audit slash-command for a deeper review,\nor invoke the injection-auditor subagent for line-by-line analysis.\n",
+      "stderr": "",
+      "fixtureUnchanged": true,
+      "observationConfirmed": true
+    },
+    {
+      "id": "S01",
+      "scanner": "security",
+      "observation": "clean control",
+      "syntheticFixtureSha256": "8de5c07db8deb3b75dedd9b5bc999669936cea181ae0033c27c4e2071a6e434d",
+      "directoryTarget": false,
+      "exitCode": 0,
+      "stdout": "BridgeSecurity quick-scan\nTarget: <fixtures>/S01/input.ts\nFiles:  1\n---\n---\nFindings: 0 critical, 0 high, 0 medium\nNo findings.\n",
+      "stderr": "",
+      "fixtureUnchanged": true,
+      "observationConfirmed": true
+    },
+    {
+      "id": "S02",
+      "scanner": "security",
+      "observation": "synthetic GitHub-shaped positive control",
+      "syntheticFixtureSha256": "2baeda4cd6fba3edccb063c13f2fce6ef1402c9f3d4898ed895d1358e12d4c4a",
+      "directoryTarget": false,
+      "exitCode": 1,
+      "stdout": "BridgeSecurity quick-scan\nTarget: <fixtures>/S02/input.ts\nFiles:  1\n---\n[CRIT] <fixtures>/S02/input.ts:1 \u2014 hardcoded secret (GitHub PAT)\n---\nFindings: 1 critical, 0 high, 0 medium\n\nRun /security-audit for a deeper review with severity calibration,\nexploit scenarios, and patched code. For a full SAST pass, run:\n  semgrep --config p/owasp-top-ten --config p/secrets .\n  trivy fs .\n  gitleaks detect --source . --redact\n",
+      "stderr": "",
+      "fixtureUnchanged": true,
+      "observationConfirmed": true
+    },
+    {
+      "id": "S03",
+      "scanner": "security",
+      "observation": "first AWS alternative detected",
+      "syntheticFixtureSha256": "8dc2384e231245279db5030b4d4c5135c52dc962ba8c50e49060b4bc8b69d14b",
+      "directoryTarget": false,
+      "exitCode": 1,
+      "stdout": "BridgeSecurity quick-scan\nTarget: <fixtures>/S03/input.ts\nFiles:  1\n---\n[CRIT] <fixtures>/S03/input.ts:1 \u2014 hardcoded secret (AWS access key)\n---\nFindings: 1 critical, 0 high, 0 medium\n\nRun /security-audit for a deeper review with severity calibration,\nexploit scenarios, and patched code. For a full SAST pass, run:\n  semgrep --config p/owasp-top-ten --config p/secrets .\n  trivy fs .\n  gitleaks detect --source . --redact\n",
+      "stderr": "",
+      "fixtureUnchanged": true,
+      "observationConfirmed": true
+    },
+    {
+      "id": "S04",
+      "scanner": "security",
+      "observation": "second AWS alternative lost during pattern splitting",
+      "syntheticFixtureSha256": "64179347dbd05cc1a53715f0c7e57582569411efec0185df6f374eb4ad583ca8",
+      "directoryTarget": false,
+      "exitCode": 0,
+      "stdout": "BridgeSecurity quick-scan\nTarget: <fixtures>/S04/input.ts\nFiles:  1\n---\n---\nFindings: 0 critical, 0 high, 0 medium\nNo findings.\n",
+      "stderr": "",
+      "fixtureUnchanged": true,
+      "observationConfirmed": true
+    },
+    {
+      "id": "S05",
+      "scanner": "security",
+      "observation": "split Anthropic regex is invalid and error is hidden",
+      "syntheticFixtureSha256": "7e9be2370bc02c5ec0c1987d3bdcbc45b5d40a17182e213b9e37ea95b8b028d1",
+      "directoryTarget": false,
+      "exitCode": 0,
+      "stdout": "BridgeSecurity quick-scan\nTarget: <fixtures>/S05/input.ts\nFiles:  1\n---\n---\nFindings: 0 critical, 0 high, 0 medium\nNo findings.\n",
+      "stderr": "",
+      "fixtureUnchanged": true,
+      "observationConfirmed": true
+    },
+    {
+      "id": "S06",
+      "scanner": "security",
+      "observation": "leading hyphens become grep options without an option terminator",
+      "syntheticFixtureSha256": "7ba879c4b1496ebeac4c6883b7fd6c27527c0fe184a3c6b52c954cd38b51769f",
+      "directoryTarget": false,
+      "exitCode": 0,
+      "stdout": "BridgeSecurity quick-scan\nTarget: <fixtures>/S06/input.ts\nFiles:  1\n---\n---\nFindings: 0 critical, 0 high, 0 medium\nNo findings.\n",
+      "stderr": "",
+      "fixtureUnchanged": true,
+      "observationConfirmed": true
+    },
+    {
+      "id": "S07",
+      "scanner": "security",
+      "observation": "zero covered files still exits zero",
+      "syntheticFixtureSha256": "2baeda4cd6fba3edccb063c13f2fce6ef1402c9f3d4898ed895d1358e12d4c4a",
+      "directoryTarget": true,
+      "exitCode": 0,
+      "stdout": "BridgeSecurity quick-scan\nTarget: <fixtures>/S07\nFiles:  0\n---\nNo scannable files found (filtered by extension allowlist).\n",
+      "stderr": "",
+      "fixtureUnchanged": true,
+      "observationConfirmed": true
+    }
+  ],
+  "grepDiagnostics": [
+    {
+      "case": "split regex",
+      "exitCode": 2,
+      "stderr": "/usr/bin/grep: Unmatched ( or \\(\n"
+    },
+    {
+      "case": "leading option",
+      "exitCode": 2,
+      "stderr": "/usr/bin/grep: unrecognized option '-----BEGIN.*PRIVATE KEY'\nUsage: grep [OPTION]... PATTERNS [FILE]...\nTry 'grep --help' for more information.\n"
+    }
+  ],
+  "confirmed": 14,
+  "total": 14
+}

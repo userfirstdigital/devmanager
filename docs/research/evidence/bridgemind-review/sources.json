@@ -1,0 +1,296 @@
+{
+  "reviewDateLocal": "2026-09-10",
+  "timezone": "America/Vancouver",
+  "recordedAtUtc": "2026-09-11T02:24:24.202957+00:00",
+  "publicPages": [
+    {
+      "url": "https://www.bridgemind.ai/",
+      "finalUrl": "https://www.bridgemind.ai/",
+      "status": 200,
+      "fetchedAt": "2026-09-11T02:14:27.548550+00:00",
+      "sha256": "df131c61d2b2787d7bd2c69f557898d2889d45858a1e28648563815258530970"
+    },
+    {
+      "url": "https://www.bridgemind.ai/changelog",
+      "finalUrl": "https://www.bridgemind.ai/changelog",
+      "status": 200,
+      "fetchedAt": "2026-09-11T02:14:27.711983+00:00",
+      "sha256": "bb5b76c5b9aa4b31c5578048a2c9079b770f2a2ea59bd3c62603aae14166c8eb"
+    },
+    {
+      "url": "https://www.bridgemind.ai/developers",
+      "finalUrl": "https://www.bridgemind.ai/developers",
+      "status": 200,
+      "fetchedAt": "2026-09-11T02:14:27.401412+00:00",
+      "sha256": "a7d78b16903ea660dea9761a9adbc7ec5b97fa571bf8aac0cdcb3d39d772f2da"
+    },
+    {
+      "url": "https://www.bridgemind.ai/api/v1/site-info",
+      "finalUrl": "https://www.bridgemind.ai/api/v1/site-info",
+      "status": 200,
+      "fetchedAt": "2026-09-11T02:14:27.337234+00:00",
+      "sha256": "11ebe462c7a020071b62e0a5879b1339130c6bffd280c3feae2140a174145dd6"
+    },
+    {
+      "url": "https://www.bridgemind.ai/llms.txt",
+      "finalUrl": "https://www.bridgemind.ai/llms.txt",
+      "status": 200,
+      "fetchedAt": "2026-09-11T02:14:27.548315+00:00",
+      "sha256": "5ee3b305c9cc63800ce97302688a93eddd32b8cd1f5e76b1a6cea79309d0b8c9"
+    },
+    {
+      "url": "https://www.bridgemind.ai/llms-full.txt",
+      "finalUrl": "https://www.bridgemind.ai/llms-full.txt",
+      "status": 200,
+      "fetchedAt": "2026-09-11T02:14:27.588117+00:00",
+      "sha256": "ceef446608579378bc81c2ca058a2e7b8bf6fb2134b06ed3d53951cdb6a29cf8"
+    },
+    {
+      "url": "https://www.bridgemind.ai/bridgevoice",
+      "finalUrl": "https://www.bridgemind.ai/bridgevoice",
+      "status": 200,
+      "fetchedAt": "2026-09-11T02:14:27.895284+00:00",
+      "sha256": "9405ee6851d79ff5addaabc3d2d09c95a63e02f5d798382a3dd9331d5f10830d"
+    },
+    {
+      "url": "https://docs.bridgemind.ai/docs",
+      "finalUrl": "https://docs.bridgemind.ai/docs",
+      "status": 200,
+      "fetchedAt": "2026-09-11T02:14:27.814010+00:00",
+      "sha256": "cd51c3a57f07fb5bf1ec446d884b655464096dd0e3705cad2189913f1d1d550b"
+    },
+    {
+      "url": "https://docs.bridgemind.ai/docs/agent-mode",
+      "finalUrl": "https://docs.bridgemind.ai/docs/agent-mode",
+      "status": 200,
+      "fetchedAt": "2026-09-11T02:14:29.821335+00:00",
+      "sha256": "6f37f6fe6040f2d6d8dbb76811f966a5fee09ddf6e8a4ce97c67ad7567e19aa5"
+    },
+    {
+      "url": "https://docs.bridgemind.ai/docs/code-mode",
+      "finalUrl": "https://docs.bridgemind.ai/docs/code-mode",
+      "status": 200,
+      "fetchedAt": "2026-09-11T02:14:29.546481+00:00",
+      "sha256": "e4669868616192f3c759d1dcbfaec728f3eca2008ff42581d123c770a89b11f3"
+    },
+    {
+      "url": "https://docs.bridgemind.ai/docs/chat-mode",
+      "finalUrl": "https://docs.bridgemind.ai/docs/chat-mode",
+      "status": 200,
+      "fetchedAt": "2026-09-11T02:14:29.624998+00:00",
+      "sha256": "f93a45213ad570617f851735e759364648d0eaea05ca0e28d04922ffaa8b3589"
+    },
+    {
+      "url": "https://docs.bridgemind.ai/docs/routines",
+      "finalUrl": "https://docs.bridgemind.ai/docs/routines",
+      "status": 200,
+      "fetchedAt": "2026-09-11T02:14:29.798665+00:00",
+      "sha256": "d92c3b45190632d378262ddc3b525aafc0a7592d5d255fffe66cae5d5202fef9"
+    },
+    {
+      "url": "https://docs.bridgemind.ai/docs/skills-and-plugins",
+      "finalUrl": "https://docs.bridgemind.ai/docs/skills-and-plugins",
+      "status": 200,
+      "fetchedAt": "2026-09-11T02:14:29.707908+00:00",
+      "sha256": "ec2fd4c724d543ca31cac63f0a14d62c6322ab12d83bddb27509601fdb70e297"
+    },
+    {
+      "url": "https://docs.bridgemind.ai/docs/dictation",
+      "finalUrl": "https://docs.bridgemind.ai/docs/dictation",
+      "status": 200,
+      "fetchedAt": "2026-09-11T02:14:29.803527+00:00",
+      "sha256": "feb93fe4c0c7f9f283536227f423f07f04bd427d3c3b7f859308e64d0eda7598"
+    },
+    {
+      "url": "https://www.bridgemind.ai/openapi.json",
+      "finalUrl": "https://www.bridgemind.ai/openapi.json",
+      "status": 200,
+      "fetchedAt": "2026-09-11T02:23:22.929401+00:00",
+      "sha256": "26261b5f65ada87fe29cc2b717dde61d18de7b148e9c7cacae6e751e494402ba"
+    },
+    {
+      "url": "https://www.bridgemind.ai/changelog/bridgemind-one/v0-1-38",
+      "finalUrl": "https://www.bridgemind.ai/changelog/bridgemind-one/v0-1-38",
+      "status": 200,
+      "fetchedAt": "2026-09-11T02:23:23.055428+00:00",
+      "sha256": "8e8027b041e6539126ee8cbbf85323d1b922ac9a55a141efb172d9ebc820f19b"
+    },
+    {
+      "url": "https://www.bridgemind.ai/changelog/bridgemind-one/v0-1-40",
+      "finalUrl": "https://www.bridgemind.ai/changelog/bridgemind-one/v0-1-40",
+      "status": 200,
+      "fetchedAt": "2026-09-11T02:23:22.760391+00:00",
+      "sha256": "91626611e93a1a8e08b03e771e7511487b0b111faa61a460268c75f77c0c6458"
+    }
+  ],
+  "repositories": [
+    {
+      "repository": "bridge-mind/BridgeWard",
+      "commit": "77756767a646d34faf5b782f1df4ac4632d286d3",
+      "commitDate": "2026-04-30T13:39:13Z",
+      "archiveUrl": "https://codeload.github.com/bridge-mind/BridgeWard/tar.gz/77756767a646d34faf5b782f1df4ac4632d286d3",
+      "archiveSha256": "294f9874bd23c47dd9f9a0531b1588ff845f2eb25949808329168e80de665931",
+      "archiveBytes": 43239,
+      "licenseObserved": "MIT, Copyright (c) 2026 BridgeMind; retain the notice and license for any applicable copies.",
+      "selectedFiles": [
+        {
+          "path": "LICENSE",
+          "inspectionScope": "full text",
+          "bytes": 1067,
+          "sha256": "49965a4d83a2412eb7cd2ec46fb1d42b0a4b9bce92d9ab6cbbddcd023472eda6",
+          "url": "https://github.com/bridge-mind/BridgeWard/blob/77756767a646d34faf5b782f1df4ac4632d286d3/LICENSE"
+        },
+        {
+          "path": "README.md",
+          "inspectionScope": "overview and component claims",
+          "bytes": 11298,
+          "sha256": "52fc02849d8e41374a7fc67f46474cca596eb44069091bb8a537a35032a71abd",
+          "url": "https://github.com/bridge-mind/BridgeWard/blob/77756767a646d34faf5b782f1df4ac4632d286d3/README.md"
+        },
+        {
+          "path": ".claude-plugin/plugin.json",
+          "inspectionScope": "full registration",
+          "bytes": 575,
+          "sha256": "290e78fe3b79690151c6680a2452749494b8a7a02dace9c132c74fc64c8765a4",
+          "url": "https://github.com/bridge-mind/BridgeWard/blob/77756767a646d34faf5b782f1df4ac4632d286d3/.claude-plugin/plugin.json"
+        },
+        {
+          "path": "scripts/scan.sh",
+          "inspectionScope": "full script and synthetic execution",
+          "bytes": 4838,
+          "sha256": "39804c7ffb88329d60f488697f0c46b0c38411c315d935d7c0d992c4b5a125ef",
+          "url": "https://github.com/bridge-mind/BridgeWard/blob/77756767a646d34faf5b782f1df4ac4632d286d3/scripts/scan.sh"
+        },
+        {
+          "path": "agents/injection-auditor.md",
+          "inspectionScope": "full procedure, tool declaration and examples",
+          "bytes": 7292,
+          "sha256": "fb8f3df3cd19f2b9b51a10b94f3c758bef201168ab79ae005eb31984bf01ee19",
+          "url": "https://github.com/bridge-mind/BridgeWard/blob/77756767a646d34faf5b782f1df4ac4632d286d3/agents/injection-auditor.md"
+        },
+        {
+          "path": "skills/bridgeward/references/trust-labels.md",
+          "inspectionScope": "source labels, transformation inheritance, authority and tool-change rules",
+          "bytes": 8175,
+          "sha256": "2d06659bf920454961f8409d272bcca3bf7418898326d35d35e77f0e86fed724",
+          "url": "https://github.com/bridge-mind/BridgeWard/blob/77756767a646d34faf5b782f1df4ac4632d286d3/skills/bridgeward/references/trust-labels.md"
+        }
+      ]
+    },
+    {
+      "repository": "bridge-mind/BridgeSecurity",
+      "commit": "99f88eb2f89def9134d2e539b2144b2e58609a97",
+      "commitDate": "2026-04-30T17:05:53Z",
+      "archiveUrl": "https://codeload.github.com/bridge-mind/BridgeSecurity/tar.gz/99f88eb2f89def9134d2e539b2144b2e58609a97",
+      "archiveSha256": "9ee4ec88a35f7f954705619c8d70ec5e6c4df2b045c760ae2a6341b0a9d075f9",
+      "archiveBytes": 58974,
+      "licenseObserved": "MIT, Copyright (c) 2026 BridgeMind; retain the notice and license for any applicable copies.",
+      "selectedFiles": [
+        {
+          "path": "LICENSE",
+          "inspectionScope": "full text",
+          "bytes": 1067,
+          "sha256": "49965a4d83a2412eb7cd2ec46fb1d42b0a4b9bce92d9ab6cbbddcd023472eda6",
+          "url": "https://github.com/bridge-mind/BridgeSecurity/blob/99f88eb2f89def9134d2e539b2144b2e58609a97/LICENSE"
+        },
+        {
+          "path": "README.md",
+          "inspectionScope": "overview and component claims",
+          "bytes": 12494,
+          "sha256": "96bb4b56e1815f786b782a5344134570ca8b4bf79897f9cc872f2831e8268c97",
+          "url": "https://github.com/bridge-mind/BridgeSecurity/blob/99f88eb2f89def9134d2e539b2144b2e58609a97/README.md"
+        },
+        {
+          "path": ".claude-plugin/plugin.json",
+          "inspectionScope": "full registration",
+          "bytes": 611,
+          "sha256": "e379617e0c415e58687643ee5fd7d73cdbfcdbb3a098f7868be4b6002de9ad14",
+          "url": "https://github.com/bridge-mind/BridgeSecurity/blob/99f88eb2f89def9134d2e539b2144b2e58609a97/.claude-plugin/plugin.json"
+        },
+        {
+          "path": "scripts/scan.sh",
+          "inspectionScope": "full script and synthetic execution",
+          "bytes": 10178,
+          "sha256": "a8c62579674fc00b0dd1c9bdd183dd1f330fc4670a71cb91a0869c0e5833ab7b",
+          "url": "https://github.com/bridge-mind/BridgeSecurity/blob/99f88eb2f89def9134d2e539b2144b2e58609a97/scripts/scan.sh"
+        },
+        {
+          "path": "agents/security-auditor.md",
+          "inspectionScope": "tool declaration, method, scope and finding requirements (first 105 lines)",
+          "bytes": 9673,
+          "sha256": "8dba112ae92f1ddf02d09e3da74da0819e095f20d4848d49b9851f14a4c70d74",
+          "url": "https://github.com/bridge-mind/BridgeSecurity/blob/99f88eb2f89def9134d2e539b2144b2e58609a97/agents/security-auditor.md"
+        }
+      ]
+    },
+    {
+      "repository": "bridge-mind/BridgeSpeak",
+      "commit": "9b434b331b40752b74e815f7ce7301159ffee18e",
+      "commitDate": "2026-05-10T13:13:06Z",
+      "archiveUrl": "https://codeload.github.com/bridge-mind/BridgeSpeak/tar.gz/9b434b331b40752b74e815f7ce7301159ffee18e",
+      "archiveSha256": "8a37ee9479ba3582f2d2044d4cccc942622dce15c6527eb9fa9da1adb99d8a09",
+      "archiveBytes": 22343,
+      "licenseObserved": "MIT, Copyright (c) 2026 BridgeMind; retain the notice and license for any applicable copies.",
+      "selectedFiles": [
+        {
+          "path": "LICENSE",
+          "inspectionScope": "full text",
+          "bytes": 1067,
+          "sha256": "49965a4d83a2412eb7cd2ec46fb1d42b0a4b9bce92d9ab6cbbddcd023472eda6",
+          "url": "https://github.com/bridge-mind/BridgeSpeak/blob/9b434b331b40752b74e815f7ce7301159ffee18e/LICENSE"
+        },
+        {
+          "path": "README.md",
+          "inspectionScope": "overview and component claims",
+          "bytes": 13228,
+          "sha256": "ab0030b49af04570ddba5dc57e8ea7088af696e10f1a610223890a813ab38985",
+          "url": "https://github.com/bridge-mind/BridgeSpeak/blob/9b434b331b40752b74e815f7ce7301159ffee18e/README.md"
+        },
+        {
+          "path": ".claude-plugin/plugin.json",
+          "inspectionScope": "full registration",
+          "bytes": 533,
+          "sha256": "71e061120910f7488280fd0f81ae6485fe702816285329f0693cd6dd0acfab6d",
+          "url": "https://github.com/bridge-mind/BridgeSpeak/blob/9b434b331b40752b74e815f7ce7301159ffee18e/.claude-plugin/plugin.json"
+        },
+        {
+          "path": "scripts/speak.py",
+          "inspectionScope": "transport, credential lookup and function inventory; not executed",
+          "bytes": 12731,
+          "sha256": "6995495a7d4abb86f6b8172f614d4e4bb7b7edc686fc5dc888f144788100a451",
+          "url": "https://github.com/bridge-mind/BridgeSpeak/blob/9b434b331b40752b74e815f7ce7301159ffee18e/scripts/speak.py"
+        }
+      ]
+    }
+  ],
+  "publicOrganizationInventory": {
+    "url": "https://api.github.com/orgs/bridge-mind/repos?per_page=100",
+    "count": 10,
+    "repositories": [
+      "bridge-mind/BridgeWard",
+      "bridge-mind/BridgeSecurity",
+      "bridge-mind/BridgeSpeak",
+      "bridge-mind/tideline",
+      "bridge-mind/bridge-horror-house",
+      "bridge-mind/opus-5-minecraft-one-shot",
+      "bridge-mind/voxelcraft",
+      "bridge-mind/turbo-kart-rush",
+      "bridge-mind/apex-formula",
+      "bridge-mind/leonida"
+    ],
+    "responseSha256": "57d4d1694fd060773b8e957d3dc731086353f1c4b138806d96dca9f2784aefbc"
+  },
+  "unavailable": [
+    {
+      "repository": "bridge-mind/bridgebench",
+      "error": "HTTP Error 404: Not Found"
+    }
+  ],
+  "scopeLimits": [
+    "Public docs, release notes, API discovery and selected pinned source only.",
+    "No installed BridgeMind/BridgeVoice desktop trial, provider/account/plugin connection, microphone or audio execution.",
+    "No public main desktop orchestrator source was located in this inventory; a cached BridgeBench search hit was not accepted as fetchable code.",
+    "Synthetic scanner observations establish neither security coverage nor DevManager runtime/UX acceptance."
+  ],
+  "probeRunnerNote": "The first runner comparison expected one space before the Ward file count; the source prints two. Whitespace normalization corrected the observation matcher; scanner inputs, source, exit codes and observed limitations were unchanged."
+}

@@ -1,0 +1,38 @@
+{
+  "checkedAtUtc": "2026-09-11T02:33:05.924118+00:00",
+  "scope": "Document/source/reference integrity only; no DevManager implementation, Rust, installed-app or provider test.",
+  "markdownFiles": 18,
+  "localLinks": 300,
+  "markdownTables": 47,
+  "scenarios": 197,
+  "all192PriorScenarioRowsUnchanged": true,
+  "reviewRecords": 64,
+  "all59PriorReviewRowsUnchanged": true,
+  "addedScenarioIds": [
+    "E13",
+    "E14",
+    "Q06",
+    "R14",
+    "U20"
+  ],
+  "sourcePages": 17,
+  "pinnedRepositories": 3,
+  "selectedSourceFileHashes": 15,
+  "syntheticObservationsConfirmed": 14,
+  "referenceImagesUnchanged": 11,
+  "referenceSourceHash": "467d2add17bb9381d40ad88e464e211c93352943794a3cf708474a455716904e",
+  "noBuildDirectory": true,
+  "errors": [],
+  "verifiedPageHashes": 17,
+  "verifiedArchiveHashes": 3,
+  "documentHashes": {
+    "spec/README.md": "7d61c734f2f8424c06e0170a9ec17f7f715281d473731b1e3ed81e627711a5af",
+    "spec/CONTEXT-PACK.md": "c6c4a99bc777faa50413e5a7fa391374706950678bbc9b2ba900a82cc0e0eb32",
+    "spec/ai-orchestration/SPEC.md": "3e40d45f5ed5b89ac5fe7a4e074e58001783115a0fac2b2a7fd724ec041c7413",
+    "spec/ai-orchestration/UX-SPEC.md": "76701a6e32e274aea3ab0be676b499cce5372952d78c09d9ee490b6c83da9992",
+    "spec/ai-orchestration/AUTONOMY-REVIEW.md": "5f7ce9bc9e61befb539de6d8edd92d845adbcd0db53846bac86f55278bf571f1",
+    "spec/ai-orchestration/visuals/README.md": "2b34379e409bd653a7ccee792cdb9c6db256229c7bf1703f0f195b6277ed482a",
+    "docs/research/2026-09-10-bridgemind-review.md": "05d8af6b5013d812ee1d80be75b7f09afaacfa8e7ffd96c7c715e31752e8a770"
+  },
+  "probeRunnerSha256": "d0ce215aafdcc59bcf9ad5c1db2b05a93cb26541515bd03678f148b0e46ff491"
+}

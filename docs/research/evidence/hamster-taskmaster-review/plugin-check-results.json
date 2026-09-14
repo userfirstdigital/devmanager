@@ -1,0 +1,28 @@
+{
+  "checkedAt": "2026-09-11T00:58:40.612749+00:00",
+  "scope": "two upstream read-only package checks, not live host/provider acceptance",
+  "filesUnchanged": true,
+  "checks": [
+    {
+      "command": [
+        "node",
+        "scripts/sync-adapters.mjs",
+        "--check"
+      ],
+      "cwd": "/tmp/devmanager-taskmaster-_m8l6f3l/hamster-cli/plugin-6f5862edb06c5606c00609eb7dfc938dd75047f2",
+      "exitCode": 0,
+      "stdout": "Adapter check passed.\n",
+      "stderr": ""
+    },
+    {
+      "command": [
+        "node",
+        "scripts/validate-plugin.mjs"
+      ],
+      "cwd": "/tmp/devmanager-taskmaster-_m8l6f3l/hamster-cli/plugin-6f5862edb06c5606c00609eb7dfc938dd75047f2",
+      "exitCode": 0,
+      "stdout": "Validation passed.\n",
+      "stderr": ""
+    }
+  ]
+}

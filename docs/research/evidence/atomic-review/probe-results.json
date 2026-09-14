@@ -1,0 +1,44 @@
+{
+  "reviewedAt": "2026-09-10T21:30:31.029Z",
+  "node": "v24.20.0",
+  "sourceManifestSha256": "cf4aef20c8949d93cdf77c213ff45966c3044d52b8a527301b6bdf561ef76440",
+  "scope": "Synthetic pure-helper and process-local identity probes. No Atomic runtime, broker, model, DBOS/Postgres, full suite, native DevManager, or external effect executed.",
+  "checks": [
+    "Required work blocks even at minor priority",
+    "Optional minor work does not inflate closure scope",
+    "Unclassified findings remain blocking",
+    "Missing requirement remains unproven in traceability helper",
+    "Observed limitation: approval flag accepts contradictory evidence",
+    "Explicit reviewer execution error still refuses approval",
+    "Observed limitation: two complete votes close despite unresolved evidence",
+    "Canonical object key ordering gives a stable hash",
+    "Changed child input changes invocation fingerprint",
+    "Observed boundary: child fingerprint alone does not bind implementation code",
+    "Identical fresh asks keep distinct intent identities",
+    "Disconnect retry receives an explicit retained token",
+    "Retained token refuses changed text or recipient",
+    "Retry preserves the original message identity",
+    "Concurrent retry cannot claim the same operation",
+    "Settled operation cannot be reused",
+    "Expired retry authority remains expired"
+  ],
+  "observations": {
+    "quorum": {
+      "status": "complete",
+      "decision": {
+        "parsed": true,
+        "approved": true,
+        "stopReviewLoop": true,
+        "nextAction": "finish",
+        "finalActionRemaining": false,
+        "diagnostics": [],
+        "turn": 1,
+        "decision": "complete",
+        "reason": "Reviewer quorum met: 2/2 reviewers independently reported stop_review_loop=true with no reviewer execution errors.",
+        "complete_votes": 2,
+        "review_quorum": 2
+      }
+    }
+  },
+  "errors": []
+}

@@ -1,0 +1,141 @@
+Before anything else, read spec/CONTEXT-PACK.md — it defines the commands, conventions, and constraints this doc assumes.
+
+# Build: Prove complete orchestration in the native app and real projects
+
+Phase 17 of 17 · Repository: DevManager · Implementation status: NOT STARTED BY THIS PACK.
+
+## Why
+
+This phase validates the integrated product that earlier slices already expose. Four real workloads, both configured lead modes and concurrent recovery demonstrate the intended hands-off process. Command and DevManager exercise actual project differences. Release acceptance includes the complete native journey and a fair standard-agent comparison.
+
+## Preconditions
+
+- [01 — Start one durable goal in the native Task](01-intake.md) exposes **CONTRACT-G01**. Run `cargo test --locked --test goal_intake -- --test-threads=1`; expect a completed nonzero test inventory, zero failures and exit 0. This target is created by that earlier phase; do not pretend it exists or passed before implementation.
+- [02 — Run a qualified lead and continue its work](02-lead-bridge.md) exposes **CONTRACT-G02**. Run `cargo test --locked --test goal_lead_bridge -- --test-threads=1`; expect a completed nonzero test inventory, zero failures and exit 0. This target is created by that earlier phase; do not pretend it exists or passed before implementation.
+- [03 — Generate complete plans and repair technical dependencies](03-plans.md) exposes **CONTRACT-G03**. Run `cargo test --locked --test goal_plans -- --test-threads=1`; expect a completed nonzero test inventory, zero failures and exit 0. This target is created by that earlier phase; do not pretend it exists or passed before implementation.
+- [04 — Build and integrate across owned repository workspaces](04-workspaces.md) exposes **CONTRACT-G04**. Run `cargo test --locked --test goal_workspaces -- --test-threads=1`; expect a completed nonzero test inventory, zero failures and exit 0. This target is created by that earlier phase; do not pretend it exists or passed before implementation.
+- [05 — Resolve questions and apply current scoped steering](05-decisions.md) exposes **CONTRACT-G05**. Run `cargo test --locked --test goal_decisions -- --test-threads=1`; expect a completed nonzero test inventory, zero failures and exit 0. This target is created by that earlier phase; do not pretend it exists or passed before implementation.
+- [06 — Independently verify outcomes and preserve real evidence](06-evidence.md) exposes **CONTRACT-G06**. Run `cargo test --locked --test goal_evidence -- --test-threads=1`; expect a completed nonzero test inventory, zero failures and exit 0. This target is created by that earlier phase; do not pretend it exists or passed before implementation.
+- [07 — Close audit gaps with bounded independent diagnosis](07-repairs.md) exposes **CONTRACT-G07**. Run `cargo test --locked --test goal_repairs -- --test-threads=1`; expect a completed nonzero test inventory, zero failures and exit 0. This target is created by that earlier phase; do not pretend it exists or passed before implementation.
+- [08 — Verify real user and operator journeys in owned environments](08-journeys.md) exposes **CONTRACT-G08**. Run `cargo test --locked --test goal_journeys -- --test-threads=1`; expect a completed nonzero test inventory, zero failures and exit 0. This target is created by that earlier phase; do not pretend it exists or passed before implementation.
+- [09 — Diagnose and repair measured performance outcomes](09-performance.md) exposes **CONTRACT-G09**. Run `cargo test --locked --test goal_performance -- --test-threads=1`; expect a completed nonzero test inventory, zero failures and exit 0. This target is created by that earlier phase; do not pretend it exists or passed before implementation.
+- [10 — Repair the full requested failing-test inventory](10-test-campaigns.md) exposes **CONTRACT-G10**. Run `cargo test --locked --test goal_test_campaigns -- --test-threads=1`; expect a completed nonzero test inventory, zero failures and exit 0. This target is created by that earlier phase; do not pretend it exists or passed before implementation.
+- [11 — Use canonical project and universal memory with scoped context](11-memory.md) exposes **CONTRACT-G11**. Run `cargo test --locked --test goal_memory -- --test-threads=1`; expect a completed nonzero test inventory, zero failures and exit 0. This target is created by that earlier phase; do not pretend it exists or passed before implementation.
+- [12 — Sharpen rules through coherent evidence-based revisions](12-learning.md) exposes **CONTRACT-G12**. Run `cargo test --locked --test goal_learning -- --test-threads=1`; expect a completed nonzero test inventory, zero failures and exit 0. This target is created by that earlier phase; do not pretend it exists or passed before implementation.
+- [13 — Run multiple task leads under fair shared ownership](13-scheduling.md) exposes **CONTRACT-G13**. Run `cargo test --locked --test goal_scheduling -- --test-threads=1`; expect a completed nonzero test inventory, zero failures and exit 0. This target is created by that earlier phase; do not pretend it exists or passed before implementation.
+- [14 — Recover from profile limits without changing authority](14-availability.md) exposes **CONTRACT-G14**. Run `cargo test --locked --test goal_availability -- --test-threads=1`; expect a completed nonzero test inventory, zero failures and exit 0. This target is created by that earlier phase; do not pretend it exists or passed before implementation.
+- [15 — Resume exact work after interruption and reconcile effects](15-recovery.md) exposes **CONTRACT-G15**. Run `cargo test --locked --test goal_recovery -- --test-threads=1`; expect a completed nonzero test inventory, zero failures and exit 0. This target is created by that earlier phase; do not pretend it exists or passed before implementation.
+- [16 — Finish reviewed delivery with current outcomes and evidence](16-delivery.md) exposes **CONTRACT-G16**. Run `cargo test --locked --test goal_delivery -- --test-threads=1`; expect a completed nonzero test inventory, zero failures and exit 0. This target is created by that earlier phase; do not pretend it exists or passed before implementation.
+
+On a fresh/resumed implementation, also verify the overview contracts and the exact current source/permission versions. Preconditions from this pack are to be run later against actual code. During continuous implementation, reuse current earlier-phase results until inputs change. An unsatisfied precondition blocks only dependent work; record its actual evidence in TRACKING/AUDIT.
+
+## Implementation and native behavior
+
+1. Implement CONTRACT-G17's repeatable acceptance fixtures, evidence capture and release checks. Run a finished multislice spec, a project brief including an empty project, a measured slow-page repair and a large red-test campaign. Repeat the applicable execution path with configured Claude and Codex leads, a real cross-provider assignment and a genuinely fresh verifier. Preserve all failed attempts and unavailable prerequisites; fixture-only success cannot substitute for live qualified transports.
+2. Exercise real authorized Command maintenance and a feature across its relevant surfaces using its current root/API/web/portal/agent/service/updater/extension rules as applicable. Run DevManager self-work in an isolated checkout; the running manager/host is not replaced until its own verified activation boundary. Do not make a production mutation merely to obtain acceptance evidence. Include three concurrent goals, overlap/fair admission, memory correction and holistic learning used by a later lead/project, and the exact disruption corpus from phase 15.
+3. Drive New goal → preparation → build documents → implementation → real decision → worker steering → fresh audit → E2E → fix/re-audit → delivery through the rebuilt GPUI shell. Open Plan/Agents/Checks/Knowledge and existing Files/Changes/Browser/Terminal, test manual Tasks, narrow focus/drafts, query recovery and both startup intervals. Capture complete canonical native scenes against all applicable targets and use an independent reviewer for composition/state/interaction discrepancies. Every earlier phase must already have its own native acceptance; this phase cannot absorb unfinished panels as polish.
+4. Compare against standard Claude/Codex sessions with equivalent inputs, tools, canonical memory/rules, budgets, stopping boundary and workload conditions. Record human coordination interventions, elapsed time, usage coverage, false completions, duplicate effects, retained failed trials and verified outcomes. Require no observed false completion, duplicate effect or avoidable human orchestration in the acceptance corpus, without claiming universal superiority from limited trials. Run the existing quiet isolated compiler/library/integration/platform/native gates and current build chain before release qualification.
+
+Implement the phase-17 `report` command in `scripts/goal-acceptance.py`, with the exact run-summary schema and nonzero missing-proof behavior in TEST-PLAN. Reuse the earlier owned fixture/process utility and extend its evidence reconciliation to the full real-project/provider/native/baseline corpus. Do not implement a missing earlier product panel in this test utility.
+
+## Behavior
+
+The following stable SPEC scenarios are reproduced as Given/When/Then acceptance. Scenario text retains the agreed behavior; the implementation steps above settle how it is built.
+
+| ID | Given | When | Then |
+| --- | --- | --- | --- |
+| J02 | A Command feature needs changes across API, staff web, and device/service behavior | The lead plans and executes it | All required repositories/contracts and user/operator surfaces participate in the goal, appropriate per-repo gates run, and combined behavior is independently verified. |
+| J04 | Command and DevManager goals are active, with different stacks and execution restrictions | Both leads receive context and request actions | Each gets its own applicable guidance; Command-specific provider/DB procedures cannot waive DevManager host identity or isolation, and other-project orchestration does not depend on Command's production AI-memory feature. |
+| V09 | DevManager is improving its own source or guidance while supervising another project | The new work is prepared and verified | The running supervisor's code/authority is not patched or relaxed in place; activation follows its actual boundary and unrelated goals retain valid ownership and state. |
+| U01 | No run is active, then a spec, project brief, or problem handoff starts work | The native cockpit is viewed | It shows the resolved target/outcome and actual stage without a workflow wizard; project milestones, performance measurements, or failure/cause progress appear when relevant, with unknown progress kept honest. |
+| U03 | A transient status query fails while work continues | The client recovers | The existing bounded reconnect/replay contract restores canonical progress; it does not create a second run or leave a permanent empty projection. |
+| U05 | A DevManager orchestration UI slice has no settled target for one of its required states | The implementation team prepares its phase | It uses UX-SPEC.md’s reference and coverage map, completes any missing state design within the established native direction, and supplies the target and shared component contracts before coding. Building a generic target-generation service does not deliver this slice. |
+| U06 | A DevManager feature borrows behavior/code from another product or needs a missing control | Its native UI is implemented | It uses DevManager’s canonical tokens, components, terminology, and interaction patterns. A missing shared pattern is added once with representative states/consumers; unrelated source-product styling and a new screen-local control kit are not adopted silently. |
+| U09 | The native default screenshot matches but a required narrow/long-text/error state clips controls or keyboard activation/focus recovery fails | The real DevManager journey and affected state matrix run | The usability defect prevents delivery and is repaired and freshly verified. Static appearance, token tests, or an API success cannot waive required native interaction, accessibility, state, or performance checks. |
+| U11 | Two DevManager implementation slices share a component or target and one changes its font/theme/layout contract | Their work integrates or resumes | The team reconciles actual current versions, exercises affected representative consumers, and invalidates stale dependent visual proof before delivery. Unaffected valid work remains usable; two isolated screenshot passes cannot hide a native integration regression. |
+| U12 | The implementation team draws on Command or another product for a new DevManager capability | Its native UI and knowledge presentation are reviewed | The capability fits DevManager’s own language and components, while the Knowledge surface keeps remembered project-specific facts/preferences explicitly scoped. Reusing an idea does not silently replace the native design or promote another project’s rules into universal knowledge. |
+| U14 | A capability’s backend exists but a feature-to-surface row has a placeholder, dead control, missing state, or no reachable native entry | Phase/release coverage is checked | That capability remains undelivered. Its real native wiring, owned actions/receipts, bounded current projection, error/recovery states, and observable result must be implemented and independently verified. |
+| U16 | Step 4 decomposes the orchestration program | A phase claims delivery of a user-visible capability | It names the UX-SPEC coverage rows and targets and includes backend proof, the native user journey, and current appearance proof. An infrastructure prerequisite has an explicit dependent UI slice; an optional final polish phase cannot carry missing required surfaces. |
+| U17 | Individual native panels and backend checks pass | Final acceptance runs from New goal through decision, recovery, checks, knowledge inspection and delivery | The integrated native journey actually operates the new orchestration, shows current host-backed facts, and meets the reference/state contract. Manual Tasks and existing viewers still work; the HTML reference gallery or a workflow performed only in CLI cannot satisfy this result. |
+
+## Acceptance checks
+
+Create the behavioral integration target **`tests/goal_acceptance.rs`** as this phase’s test deliverable. It does not exist merely because this document names it. Tests must drive production command, store/outbox, adapter or client handlers at the relevant boundary, using owned disposable resources and hostile/negative inputs. They must not substitute a handcrafted successful projection for the production result.
+
+- [ ] **P17-J02** — `cargo test --locked --test goal_acceptance p17_j02 -- --exact --test-threads=1`: implement the Given/When/Then above in top-level test `p17_j02`; expect exactly one selected test, its full completion summary, no failure and exit 0. Retain actual output/receipt and input versions. Assertions cover the stated outcome and forbidden false-success path.
+- [ ] **P17-J04** — `cargo test --locked --test goal_acceptance p17_j04 -- --exact --test-threads=1`: implement the Given/When/Then above in top-level test `p17_j04`; expect exactly one selected test, its full completion summary, no failure and exit 0. Retain actual output/receipt and input versions. Assertions cover the stated outcome and forbidden false-success path.
+- [ ] **P17-V09** — `cargo test --locked --test goal_acceptance p17_v09 -- --exact --test-threads=1`: implement the Given/When/Then above in top-level test `p17_v09`; expect exactly one selected test, its full completion summary, no failure and exit 0. Retain actual output/receipt and input versions. Assertions cover the stated outcome and forbidden false-success path.
+- [ ] **P17-U01** — `cargo test --locked --test goal_acceptance p17_u01 -- --exact --test-threads=1`: implement the Given/When/Then above in top-level test `p17_u01`; expect exactly one selected test, its full completion summary, no failure and exit 0. Retain actual output/receipt and input versions. Assertions cover the stated outcome and forbidden false-success path.
+- [ ] **P17-U03** — `cargo test --locked --test goal_acceptance p17_u03 -- --exact --test-threads=1`: implement the Given/When/Then above in top-level test `p17_u03`; expect exactly one selected test, its full completion summary, no failure and exit 0. Retain actual output/receipt and input versions. Assertions cover the stated outcome and forbidden false-success path.
+- [ ] **P17-U05** — `cargo test --locked --test goal_acceptance p17_u05 -- --exact --test-threads=1`: implement the Given/When/Then above in top-level test `p17_u05`; expect exactly one selected test, its full completion summary, no failure and exit 0. Retain actual output/receipt and input versions. Assertions cover the stated outcome and forbidden false-success path.
+- [ ] **P17-U06** — `cargo test --locked --test goal_acceptance p17_u06 -- --exact --test-threads=1`: implement the Given/When/Then above in top-level test `p17_u06`; expect exactly one selected test, its full completion summary, no failure and exit 0. Retain actual output/receipt and input versions. Assertions cover the stated outcome and forbidden false-success path.
+- [ ] **P17-U09** — `cargo test --locked --test goal_acceptance p17_u09 -- --exact --test-threads=1`: implement the Given/When/Then above in top-level test `p17_u09`; expect exactly one selected test, its full completion summary, no failure and exit 0. Retain actual output/receipt and input versions. Assertions cover the stated outcome and forbidden false-success path.
+- [ ] **P17-U11** — `cargo test --locked --test goal_acceptance p17_u11 -- --exact --test-threads=1`: implement the Given/When/Then above in top-level test `p17_u11`; expect exactly one selected test, its full completion summary, no failure and exit 0. Retain actual output/receipt and input versions. Assertions cover the stated outcome and forbidden false-success path.
+- [ ] **P17-U12** — `cargo test --locked --test goal_acceptance p17_u12 -- --exact --test-threads=1`: implement the Given/When/Then above in top-level test `p17_u12`; expect exactly one selected test, its full completion summary, no failure and exit 0. Retain actual output/receipt and input versions. Assertions cover the stated outcome and forbidden false-success path.
+- [ ] **P17-U14** — `cargo test --locked --test goal_acceptance p17_u14 -- --exact --test-threads=1`: implement the Given/When/Then above in top-level test `p17_u14`; expect exactly one selected test, its full completion summary, no failure and exit 0. Retain actual output/receipt and input versions. Assertions cover the stated outcome and forbidden false-success path.
+- [ ] **P17-U16** — `cargo test --locked --test goal_acceptance p17_u16 -- --exact --test-threads=1`: implement the Given/When/Then above in top-level test `p17_u16`; expect exactly one selected test, its full completion summary, no failure and exit 0. Retain actual output/receipt and input versions. Assertions cover the stated outcome and forbidden false-success path.
+- [ ] **P17-U17** — `cargo test --locked --test goal_acceptance p17_u17 -- --exact --test-threads=1`: implement the Given/When/Then above in top-level test `p17_u17`; expect exactly one selected test, its full completion summary, no failure and exit 0. Retain actual output/receipt and input versions. Assertions cover the stated outcome and forbidden false-success path.
+
+The one-test name is a stable acceptance entry point, not permission to mirror implementation internals. Where the scenario requires a real configured provider, browser, native capture or real project, the deterministic test covers the host boundary and **the corresponding live/native check below is additionally mandatory**. An unavailable live prerequisite leaves that scenario Not verified; a fixture pass cannot replace it.
+
+- [ ] **P17-J1 — Complete native journey:** Run every journey in TEST-PLAN against the current rebuilt shell, including actual rendered provider input, control-key edit, drag/copy, wheel scroll and recovery. Require functional, native action and independent current appearance evidence; HTML captures do not pass this check. Record actual actions, observations, current input versions and resulting artifact/receipt IDs.
+- [ ] **P17-J2 — Four workloads and project scope:** Deliver the four named workloads with real qualified lead/worker/verifier processes. Include Command multisurface maintenance/feature, DevManager self-work, three-goal concurrency and a later lead applying validated scoped knowledge. Missing live tooling/data is Not verified. Record actual actions, observations, current input versions and resulting artifact/receipt IDs.
+- [ ] **P17-J3 — Baseline and release:** Run equivalent standard-agent comparisons retaining all trials and constraints. Verify no observed false completion, duplicate effect or avoidable human coordination in this corpus. Complete the required compiler/build, serial suites and applicable Windows/Linux/native lanes with exact owned-process cleanup. Record actual actions, observations, current input versions and resulting artifact/receipt IDs.
+- [ ] **P17-UI:** Open the actual rebuilt native entry described above and compare full-shell current captures against `REF-START`, `REF-RUN`, `REF-PLAN`, `REF-AGENTS`, `REF-DECISION`, `REF-RECOVERY`, `REF-TESTS`, `REF-SPEED`, `REF-KNOWLEDGE`, `REF-DONE`, `REF-NARROW`, `REF-STEERING`, `REF-LINEAGE`, `REF-SOURCE-MISSING`, `REF-EFFECTIVE-ACCESS`, `REF-CHECK-COVERAGE`, `REF-CONTEXT-DRIFT`, `REF-KNOWLEDGE-STATES`, `REF-UNCERTAIN-EFFECT`, `REF-DELIVERY-PENDING`, `REF-ACCESS-NARROW`. Use the overview’s exact loading/empty/failure/recovery variants, shared components and manifest productRegion/geometry. Independently adjudicate material differences; also test long text, keyboard/focus, wrong-task/late-result protection and the preserved composer. Do not count the reference HTML or a preview-only snapshot as native acceptance.
+- [ ] **P17-GATES:** Complete the applicable shared verification/landing gates below; current results are linked to all scenarios they cover.
+
+### Shared verification and landing
+
+Run commands only from the active isolated DevManager worktree with the Context Pack’s owned target/process preparation. These are checks to run during implementation, **not results of document generation**. Before the first Rust invocation print and validate `CARGO_TARGET_DIR`; restore the ignored WASM inputs, build the process-test helper and use one quiet Rust verification owner. A wrapper yield/timeout does not end Cargo ownership.
+
+- `cargo fmt --all -- --check` — Rust formatting clean (this repository’s formatting/lint gate).
+- `cargo check --locked --lib --bins --tests` — compiler/type gate succeeds in the isolated target.
+- `cargo build --locked --bin devmanager-process-test-helper` — exact sibling helper exists before the complete suite.
+- `cargo test --locked --lib -- --test-threads=1` — complete serial existing library suite; retain exact failing identities and completion summary.
+- `cargo test --locked --tests -- --test-threads=1` — complete integration lane, including this phase’s new target.
+- `cargo build --locked --bin devmanager --bin devmanager-host` — actual application/host build succeeds.
+
+Run the phase’s focused checks while iterating and the shared global gates once at its required landing/integration boundary; reuse a still-current result across phases instead of rerunning global suites per scenario. Resolve introduced failures. Report exact pre-existing failures and incomplete environment runs; neither can certify a missing required behavior. If this phase changes web/Connect assets, also run `npm --prefix web test`, `npm --prefix web run typecheck`, and `npm --prefix web run build`. The web package has no lint script; do not invent one. Required Windows/Linux/native CI lanes in the Context Pack remain additional platform acceptance.
+
+
+Each actual landing uses explicit scoped pathspecs and the current applicable review/commit policy. Commit only the phase/feature files owned by this work in every repo actually touched; this pack changes one app repository. Do not force a per-phase commit when the actual policy requires feature-level landing. Before ending, record built versus verified checks, current evidence and the exact resume point in the existing TRACKING format; an implementer never self-certifies an independent audit closure.
+
+## Exposes
+
+**CONTRACT-G17.** Integrated acceptance corpus and release evidence covering every scenario/native surface, four workloads, configured Claude/Codex modes, cross-provider/fresh verification, real Command/DevManager, concurrency/recovery/learning and equivalent standard-agent trials. No fixture-only or HTML-only completion claim.
+
+This paragraph is identical to the overview contract register. All payloads, limits, errors, identity and evidence rules are defined there; this phase must not reshape them. A required contract change is reconciled with the overview and every dependent doc before code builds on it.
+
+## Context
+
+Feature-specific integration points, verified during generation:
+
+- [tests/ui_native_shell.rs](../../../tests/ui_native_shell.rs)
+- [.github/workflows/launch-candidate.yml](../../../.github/workflows/launch-candidate.yml)
+- [docs/final-release-verification-matrix.md](../../../docs/final-release-verification-matrix.md)
+- [docs/native-ui-system.md](../../../docs/native-ui-system.md)
+- [src/ui/preview_capture.rs](../../../src/ui/preview_capture.rs)
+- [src/ui/quality.rs](../../../src/ui/quality.rs)
+- [src/ui/native_shell.rs](../../../src/ui/native_shell.rs)
+- [spec/ai-orchestration/visuals/manifest.json](../../../spec/ai-orchestration/visuals/manifest.json)
+- [spec/ai-orchestration/visuals/step4-manifest.json](../../../spec/ai-orchestration/visuals/step4-manifest.json)
+
+All code lands in DevManager; target-project repositories are exercised through the existing workspace boundary, not committed as part of this application phase. Current module boundaries are examples to extend; do not relocate unrelated code to match a speculative architecture.
+
+## Constraints
+
+Four workload classes; both configured lead modes; at least one real cross-provider assignment and fresh verifier; at least three concurrent goals. Reference desktop 1440×900 and narrow 960×720 at device scale 1, using the manifest productRegion; platform allowances are explicit, not blanket pixel tolerances.
+
+## Out of scope
+
+Do not defer a missing feature UI to this phase, certify a platform never exercised, cherry-pick baseline trials or change acceptance rules to make a demonstration pass.
+
+## Risks & watch-fors
+
+- **Mocks prove only the scheduler model:** Separate deterministic host boundary fixtures from actual provider/browser/native and real-project evidence; both are required.
+- **Self-improvement replaces its own host mid-run:** Keep the active installation and production profile isolated; use the existing reviewed activation/handoff boundary only after all required current evidence passes.
+- **A current dirty checkout is mistaken for the inspected source:** Record base plus all changed inputs for each proof run; unrelated edits remain outside the implementation's landing and acceptance claim.
+
+## Reconciliation and close-out
+
+Checked doc-to-doc against CONTRACT-G01, CONTRACT-G02, CONTRACT-G03, CONTRACT-G04, CONTRACT-G05, CONTRACT-G06, CONTRACT-G07, CONTRACT-G08, CONTRACT-G09, CONTRACT-G10, CONTRACT-G11, CONTRACT-G12, CONTRACT-G13, CONTRACT-G14, CONTRACT-G15, CONTRACT-G16 and the locked SPEC/UX chapter. No earlier implementation or successful future precondition is assumed. No project tracker item was silently added to product scope. All technical calls and mitigations raised for this phase are recorded here or in the overview. There are no unresolved product questions or BLOCKERS in this phase document.

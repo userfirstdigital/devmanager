@@ -1,0 +1,232 @@
+{
+  "schema": 1,
+  "amendment": "A10",
+  "kind": "proposed-design-reference",
+  "nativeAcceptance": false,
+  "approval": "Assistant-prepared within the existing native direction; no new user approval inferred",
+  "renderedAt": "2026-09-08T22:41:19.099Z",
+  "renderer": "152.0.7977.82",
+  "platform": "linux",
+  "fontContract": "Segoe UI, system-ui, sans-serif; actual font rasterization is platform-specific",
+  "source": {
+    "file": "reference.html",
+    "sha256": "467d2add17bb9381d40ad88e464e211c93352943794a3cf708474a455716904e"
+  },
+  "comparison": "Use productRegion; exclude the gallery control bar. Compare native composition and state with documented renderer/font allowances.",
+  "captures": [
+    {
+      "id": "REF-START",
+      "scene": "start",
+      "file": "01-start.png",
+      "width": 1440,
+      "height": 900,
+      "deviceScaleFactor": 1,
+      "productRegion": {
+        "x": 0,
+        "y": 38,
+        "width": 1440,
+        "height": 862
+      },
+      "sha256": "5851b4ebee87f19bc49c0b377b41de1ce180b2421d48436f51b43945added02a",
+      "captureScope": "HTML design target; not native execution evidence"
+    },
+    {
+      "id": "REF-RUN",
+      "scene": "working",
+      "file": "02-working.png",
+      "width": 1440,
+      "height": 900,
+      "deviceScaleFactor": 1,
+      "productRegion": {
+        "x": 0,
+        "y": 38,
+        "width": 1440,
+        "height": 862
+      },
+      "sha256": "1e8a98f5836147bc5b36492e6520806d9d0f19584612b3c9dd54eb70bf123f74",
+      "captureScope": "HTML design target; not native execution evidence"
+    },
+    {
+      "id": "REF-PLAN",
+      "scene": "plan",
+      "file": "03-plan.png",
+      "width": 1440,
+      "height": 900,
+      "deviceScaleFactor": 1,
+      "productRegion": {
+        "x": 0,
+        "y": 38,
+        "width": 1440,
+        "height": 862
+      },
+      "sha256": "26588dce8004d638a523e56294a558ce17a25c614973637a2e75cd14b81561ed",
+      "captureScope": "HTML design target; not native execution evidence"
+    },
+    {
+      "id": "REF-AGENTS",
+      "scene": "agents",
+      "file": "04-agents.png",
+      "width": 1440,
+      "height": 900,
+      "deviceScaleFactor": 1,
+      "productRegion": {
+        "x": 0,
+        "y": 38,
+        "width": 1440,
+        "height": 862
+      },
+      "sha256": "96ccea328037e8d8bda5ddb8869d1997925b526645f938887e5d0bcff0b6ea89",
+      "captureScope": "HTML design target; not native execution evidence"
+    },
+    {
+      "id": "REF-DECISION",
+      "scene": "decision",
+      "file": "05-decision.png",
+      "width": 1440,
+      "height": 900,
+      "deviceScaleFactor": 1,
+      "productRegion": {
+        "x": 0,
+        "y": 38,
+        "width": 1440,
+        "height": 862
+      },
+      "sha256": "533d7b2359255f91c6dd073dd00dbb778e33140ff9f2e9ef220cce1de5511dd0",
+      "captureScope": "HTML design target; not native execution evidence"
+    },
+    {
+      "id": "REF-RECOVERY",
+      "scene": "recovery",
+      "file": "06-recovery.png",
+      "width": 1440,
+      "height": 900,
+      "deviceScaleFactor": 1,
+      "productRegion": {
+        "x": 0,
+        "y": 38,
+        "width": 1440,
+        "height": 862
+      },
+      "sha256": "94c472126627dbbc37332856fdf3eac91a5fdf2191ae2320313067e377913fc8",
+      "captureScope": "HTML design target; not native execution evidence"
+    },
+    {
+      "id": "REF-TESTS",
+      "scene": "tests",
+      "file": "07-tests.png",
+      "width": 1440,
+      "height": 900,
+      "deviceScaleFactor": 1,
+      "productRegion": {
+        "x": 0,
+        "y": 38,
+        "width": 1440,
+        "height": 862
+      },
+      "sha256": "5b31a765dbdcf5ec4844b06b7fc1aa56e7d4d37d164c31039306d6886e9a00bb",
+      "captureScope": "HTML design target; not native execution evidence"
+    },
+    {
+      "id": "REF-SPEED",
+      "scene": "performance",
+      "file": "08-performance.png",
+      "width": 1440,
+      "height": 900,
+      "deviceScaleFactor": 1,
+      "productRegion": {
+        "x": 0,
+        "y": 38,
+        "width": 1440,
+        "height": 862
+      },
+      "sha256": "ded2def9df0eab7dc8e3a88cb879ab01fcb95dc7cc120fdad38d0256928dad19",
+      "captureScope": "HTML design target; not native execution evidence"
+    },
+    {
+      "id": "REF-KNOWLEDGE",
+      "scene": "knowledge",
+      "file": "09-knowledge.png",
+      "width": 1440,
+      "height": 900,
+      "deviceScaleFactor": 1,
+      "productRegion": {
+        "x": 0,
+        "y": 38,
+        "width": 1440,
+        "height": 862
+      },
+      "sha256": "2186ba12e874bdd32fd507ea29093dfe38f4e2cf9211f2b4917fa78ded53ab5d",
+      "captureScope": "HTML design target; not native execution evidence"
+    },
+    {
+      "id": "REF-DONE",
+      "scene": "delivery",
+      "file": "10-delivery.png",
+      "width": 1440,
+      "height": 900,
+      "deviceScaleFactor": 1,
+      "productRegion": {
+        "x": 0,
+        "y": 38,
+        "width": 1440,
+        "height": 862
+      },
+      "sha256": "7f0c0874d5f25e8fcf33410ca435c4427aa8d9743dc78b99773862c3718e175d",
+      "captureScope": "HTML design target; not native execution evidence"
+    },
+    {
+      "id": "REF-NARROW",
+      "scene": "decision",
+      "file": "11-narrow.png",
+      "width": 960,
+      "height": 720,
+      "deviceScaleFactor": 1,
+      "productRegion": {
+        "x": 0,
+        "y": 38,
+        "width": 960,
+        "height": 682
+      },
+      "sha256": "ec889db5e0d417b1d0d8a4181d3b6bfc1d740ec61f838c841906f95f0a612565",
+      "captureScope": "HTML design target; not native execution evidence"
+    }
+  ],
+  "prototypeChecks": [
+    "Isolated browser process ownership identified",
+    "REF-START: no horizontal document overflow at 1440×900",
+    "REF-RUN: no horizontal document overflow at 1440×900",
+    "REF-PLAN: no horizontal document overflow at 1440×900",
+    "REF-AGENTS: no horizontal document overflow at 1440×900",
+    "REF-DECISION: no horizontal document overflow at 1440×900",
+    "REF-RECOVERY: no horizontal document overflow at 1440×900",
+    "REF-TESTS: no horizontal document overflow at 1440×900",
+    "REF-SPEED: no horizontal document overflow at 1440×900",
+    "REF-KNOWLEDGE: no horizontal document overflow at 1440×900",
+    "REF-DONE: no horizontal document overflow at 1440×900",
+    "REF-NARROW: no horizontal document overflow at 960×720",
+    "Empty goal does not submit",
+    "Start navigates to the same goal experience in the prototype",
+    "Draft survives details open and close",
+    "Another goal does not inherit the first goal draft",
+    "Returning to a goal restores its scoped draft",
+    "A displayed recommendation does not submit a decision",
+    "Choosing an answer enables explicit submission",
+    "Submitted answer remains in the prototype conversation",
+    "Pause first displays unsettled Pausing state",
+    "Resume returns to working in the simulation",
+    "Knowledge revision opens an inspectable diff",
+    "Escape dismisses the diff dialog",
+    "Narrow details uses the task overlay",
+    "Escape closes narrow details",
+    "Closing narrow details restores focus",
+    "No prototype JavaScript errors",
+    "No external HTTP requests"
+  ],
+  "errors": [],
+  "externalRequests": 0,
+  "cleanup": {
+    "ownedBrowserProcesses": 9,
+    "remaining": 0,
+    "temporaryProfileRemoved": true
+  }
+}

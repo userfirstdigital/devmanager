@@ -1,0 +1,245 @@
+{
+  "schema": 1,
+  "amendment": "A11–A13 implementation state preparation",
+  "kind": "proposed-design-reference",
+  "nativeAcceptance": false,
+  "approval": "Assistant-prepared within the existing native direction; no new user approval inferred",
+  "renderedAt": "2026-09-12T18:13:25.436Z",
+  "renderer": "152.0.7977.82",
+  "platform": "linux",
+  "fontContract": "Segoe UI, system-ui, sans-serif; actual font rasterization is platform-specific",
+  "source": {
+    "file": "step4-reference.html",
+    "sha256": "f3d9716367b08271d1c91acfba84f882e0cde46c0d20d9fa3c51357e2758be18"
+  },
+  "comparison": "Use productRegion; exclude the gallery control bar. Compare native composition and state with documented renderer/font allowances.",
+  "captures": [
+    {
+      "id": "REF-STEERING",
+      "scene": "steering",
+      "file": "step4-steering.png",
+      "width": 1440,
+      "height": 900,
+      "deviceScaleFactor": 1,
+      "productRegion": {
+        "x": 0,
+        "y": 38,
+        "width": 1440,
+        "height": 862
+      },
+      "sha256": "cc685097bb43c7cfceb84dbcf768430a8a3f96a6d5df66d84782d44bfe9bfd0d",
+      "captureScope": "HTML design target; not native execution evidence"
+    },
+    {
+      "id": "REF-LINEAGE",
+      "scene": "lineage",
+      "file": "step4-lineage.png",
+      "width": 1440,
+      "height": 900,
+      "deviceScaleFactor": 1,
+      "productRegion": {
+        "x": 0,
+        "y": 38,
+        "width": 1440,
+        "height": 862
+      },
+      "sha256": "f03c63b1f5f4868942fdfd108f00a3a81757464432178564e34cfa596b456807",
+      "captureScope": "HTML design target; not native execution evidence"
+    },
+    {
+      "id": "REF-SOURCE-MISSING",
+      "scene": "source-missing",
+      "file": "step4-source-missing.png",
+      "width": 1440,
+      "height": 900,
+      "deviceScaleFactor": 1,
+      "productRegion": {
+        "x": 0,
+        "y": 38,
+        "width": 1440,
+        "height": 862
+      },
+      "sha256": "1d2d61c16ca0b8f45f754bcd4879c9eaf64dccad8de97526b55d3c58e86751a3",
+      "captureScope": "HTML design target; not native execution evidence"
+    },
+    {
+      "id": "REF-EFFECTIVE-ACCESS",
+      "scene": "effective-access",
+      "file": "step4-effective-access.png",
+      "width": 1440,
+      "height": 900,
+      "deviceScaleFactor": 1,
+      "productRegion": {
+        "x": 0,
+        "y": 38,
+        "width": 1440,
+        "height": 862
+      },
+      "sha256": "206b4e4fb4facfcb31c441dce03e9af4956c7cd088b3825acea45b81f34bb21b",
+      "captureScope": "HTML design target; not native execution evidence"
+    },
+    {
+      "id": "REF-CHECK-COVERAGE",
+      "scene": "check-coverage",
+      "file": "step4-check-coverage.png",
+      "width": 1440,
+      "height": 900,
+      "deviceScaleFactor": 1,
+      "productRegion": {
+        "x": 0,
+        "y": 38,
+        "width": 1440,
+        "height": 862
+      },
+      "sha256": "07e91148217783f4d0ea8a237e01e7864979a429711b06476994af1fb64b9a5c",
+      "captureScope": "HTML design target; not native execution evidence"
+    },
+    {
+      "id": "REF-CONTEXT-DRIFT",
+      "scene": "context-drift",
+      "file": "step4-context-drift.png",
+      "width": 1440,
+      "height": 900,
+      "deviceScaleFactor": 1,
+      "productRegion": {
+        "x": 0,
+        "y": 38,
+        "width": 1440,
+        "height": 862
+      },
+      "sha256": "bb7da080c3acf7fd4c54d40eedceaca1620d340dfff1a6e2c869c6ce24df524d",
+      "captureScope": "HTML design target; not native execution evidence"
+    },
+    {
+      "id": "REF-KNOWLEDGE-STATES",
+      "scene": "knowledge-states",
+      "file": "step4-knowledge-states.png",
+      "width": 1440,
+      "height": 900,
+      "deviceScaleFactor": 1,
+      "productRegion": {
+        "x": 0,
+        "y": 38,
+        "width": 1440,
+        "height": 862
+      },
+      "sha256": "578cc936ca9195411715af9e38510f0d620e4e6a7f766e35a3d37d1be4df28f7",
+      "captureScope": "HTML design target; not native execution evidence"
+    },
+    {
+      "id": "REF-UNCERTAIN-EFFECT",
+      "scene": "uncertain-effect",
+      "file": "step4-uncertain-effect.png",
+      "width": 1440,
+      "height": 900,
+      "deviceScaleFactor": 1,
+      "productRegion": {
+        "x": 0,
+        "y": 38,
+        "width": 1440,
+        "height": 862
+      },
+      "sha256": "4eba027d33f8c075cdd9bb3524bb87b13302d035a4e1ffffc97a6f8235c0cd6a",
+      "captureScope": "HTML design target; not native execution evidence"
+    },
+    {
+      "id": "REF-DELIVERY-PENDING",
+      "scene": "delivery-pending",
+      "file": "step4-delivery-pending.png",
+      "width": 1440,
+      "height": 900,
+      "deviceScaleFactor": 1,
+      "productRegion": {
+        "x": 0,
+        "y": 38,
+        "width": 1440,
+        "height": 862
+      },
+      "sha256": "d6f37fe43841fd4c69fa0391db7d5d791e9329d22b197d339af42776699c17ba",
+      "captureScope": "HTML design target; not native execution evidence"
+    },
+    {
+      "id": "REF-ACCESS-NARROW",
+      "scene": "effective-access",
+      "file": "step4-access-narrow.png",
+      "width": 960,
+      "height": 720,
+      "deviceScaleFactor": 1,
+      "productRegion": {
+        "x": 0,
+        "y": 38,
+        "width": 960,
+        "height": 682
+      },
+      "sha256": "88a92ba19c60daadfa6e9d9fbab4b3e0680c856b78e86005d48a3fb42c3403ef",
+      "captureScope": "HTML design target; not native execution evidence"
+    }
+  ],
+  "prototypeChecks": [
+    "Isolated browser process ownership identified",
+    "REF-STEERING: requested state rendered",
+    "REF-STEERING: board selection matches the displayed goal",
+    "REF-STEERING: explicit state detail rendered",
+    "REF-STEERING: no horizontal document overflow at 1440×900",
+    "REF-LINEAGE: requested state rendered",
+    "REF-LINEAGE: board selection matches the displayed goal",
+    "REF-LINEAGE: explicit state detail rendered",
+    "REF-LINEAGE: no horizontal document overflow at 1440×900",
+    "REF-SOURCE-MISSING: requested state rendered",
+    "REF-SOURCE-MISSING: board selection matches the displayed goal",
+    "REF-SOURCE-MISSING: explicit state detail rendered",
+    "REF-SOURCE-MISSING: no horizontal document overflow at 1440×900",
+    "REF-EFFECTIVE-ACCESS: requested state rendered",
+    "REF-EFFECTIVE-ACCESS: board selection matches the displayed goal",
+    "REF-EFFECTIVE-ACCESS: explicit state detail rendered",
+    "REF-EFFECTIVE-ACCESS: no horizontal document overflow at 1440×900",
+    "REF-CHECK-COVERAGE: requested state rendered",
+    "REF-CHECK-COVERAGE: board selection matches the displayed goal",
+    "REF-CHECK-COVERAGE: explicit state detail rendered",
+    "REF-CHECK-COVERAGE: no horizontal document overflow at 1440×900",
+    "REF-CONTEXT-DRIFT: requested state rendered",
+    "REF-CONTEXT-DRIFT: board selection matches the displayed goal",
+    "REF-CONTEXT-DRIFT: explicit state detail rendered",
+    "REF-CONTEXT-DRIFT: no horizontal document overflow at 1440×900",
+    "REF-KNOWLEDGE-STATES: requested state rendered",
+    "REF-KNOWLEDGE-STATES: board selection matches the displayed goal",
+    "REF-KNOWLEDGE-STATES: explicit state detail rendered",
+    "REF-KNOWLEDGE-STATES: no horizontal document overflow at 1440×900",
+    "REF-UNCERTAIN-EFFECT: requested state rendered",
+    "REF-UNCERTAIN-EFFECT: board selection matches the displayed goal",
+    "REF-UNCERTAIN-EFFECT: explicit state detail rendered",
+    "REF-UNCERTAIN-EFFECT: no horizontal document overflow at 1440×900",
+    "REF-DELIVERY-PENDING: requested state rendered",
+    "REF-DELIVERY-PENDING: board selection matches the displayed goal",
+    "REF-DELIVERY-PENDING: explicit state detail rendered",
+    "REF-DELIVERY-PENDING: no horizontal document overflow at 1440×900",
+    "REF-ACCESS-NARROW: requested state rendered",
+    "REF-ACCESS-NARROW: board selection matches the displayed goal",
+    "REF-ACCESS-NARROW: explicit state detail rendered",
+    "REF-ACCESS-NARROW: no horizontal document overflow at 960×720",
+    "Empty goal does not submit",
+    "Start navigates to the same goal experience in the prototype",
+    "Draft survives details open and close",
+    "Another goal does not inherit the first goal draft",
+    "Returning to a goal restores its scoped draft",
+    "A displayed recommendation does not submit a decision",
+    "Choosing an answer enables explicit submission",
+    "Submitted answer remains in the prototype conversation",
+    "Pause first displays unsettled Pausing state",
+    "Resume returns to working in the simulation",
+    "Knowledge revision opens an inspectable diff",
+    "Escape dismisses the diff dialog",
+    "Narrow details uses the task overlay",
+    "Escape closes narrow details",
+    "Closing narrow details restores focus",
+    "No prototype JavaScript errors: []",
+    "No external HTTP requests"
+  ],
+  "errors": [],
+  "externalRequests": 0,
+  "cleanup": {
+    "ownedBrowserProcesses": 9,
+    "remaining": 0,
+    "temporaryProfileRemoved": true
+  }
+}

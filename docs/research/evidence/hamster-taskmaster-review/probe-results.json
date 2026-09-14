@@ -1,0 +1,103 @@
+{
+  "checkedAt": "2026-09-11T01:00:02.931Z",
+  "node": "v24.20.0",
+  "sourceRoot": "/tmp/devmanager-taskmaster-_m8l6f3l/source/claude-task-master-c0c98d367c55296bfe69e65680625b6db437af02",
+  "scope": "Twelve synthetic helper probes. Import bindings are removed; registration callbacks are inert. No model, CLI, schema pipeline, persistence, process runner, or application is exercised. PASS confirms the described observation, including limitations.",
+  "sources": [
+    {
+      "path": "scripts/modules/task-manager/find-next-task.js",
+      "sha256": "c1713f8b52b95064742ec2a95565a4a5dbcf4d214b6c1729de392065115514df"
+    },
+    {
+      "path": "packages/tm-core/src/modules/loop/services/loop.service.ts",
+      "sha256": "e560b9f39bd14269c06be860ed0d6a5d023c7c3e882ca5c7f289a0c41f20631f"
+    },
+    {
+      "path": "mcp-server/src/tools/tool-registry.js",
+      "sha256": "1ce22b53d1af481865c9a86d28c1609048cdaa403e5bc77b0dda63b592a6a88d"
+    },
+    {
+      "path": "scripts/modules/task-manager/expand-task.js",
+      "sha256": "3a6787c001a129e0e4f5687dd74ba9dcbd7c52479ddf715f50c392352fa2ae73"
+    }
+  ],
+  "passed": 12,
+  "cases": [
+    {
+      "id": "TM01",
+      "description": "A completed predecessor permits its pending dependent",
+      "observed": 2,
+      "status": "PASS"
+    },
+    {
+      "id": "TM02",
+      "description": "A cancelled predecessor does not satisfy the dependent",
+      "observed": null,
+      "status": "PASS"
+    },
+    {
+      "id": "TM03",
+      "description": "The helper selects a child without rechecking the in-progress parent prerequisite",
+      "observed": "1.1",
+      "status": "PASS"
+    },
+    {
+      "id": "TM04",
+      "description": "A done parent label satisfies a dependent despite an unfinished child",
+      "observed": 2,
+      "status": "PASS"
+    },
+    {
+      "id": "TM05",
+      "description": "A cycle produces no eligible item, not a completion result",
+      "observed": null,
+      "status": "PASS"
+    },
+    {
+      "id": "TM06",
+      "description": "Nonzero exit without markers is an error",
+      "observed": "error",
+      "status": "PASS"
+    },
+    {
+      "id": "TM07",
+      "description": "Completion marker is evaluated before a nonzero exit",
+      "observed": "complete",
+      "status": "PASS"
+    },
+    {
+      "id": "TM08",
+      "description": "A quoted marker in ordinary output is still matched",
+      "observed": "complete",
+      "status": "PASS"
+    },
+    {
+      "id": "TM09",
+      "description": "Completion wins when both complete and blocked markers occur",
+      "observed": "complete",
+      "status": "PASS"
+    },
+    {
+      "id": "TM10",
+      "description": "Actual registry categories; registration callbacks are inert stubs",
+      "observed": {
+        "core": 7,
+        "standard": 14,
+        "total": 44
+      },
+      "status": "PASS"
+    },
+    {
+      "id": "TM11",
+      "description": "Name predicate also admits an inherited Object property",
+      "observed": true,
+      "status": "PASS"
+    },
+    {
+      "id": "TM12",
+      "description": "Expansion candidate uses array length and can name an existing sparse ID",
+      "observed": 3,
+      "status": "PASS"
+    }
+  ]
+}

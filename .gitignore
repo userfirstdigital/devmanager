@@ -44,7 +44,10 @@ serviceAccountKey.json
 /target-test-*
 /tests/targets/
 /.worktrees/
+/.claude/
+/.devmanager/
 /.superpowers/
+/target-*/
 /target-live-dev
 /.devmanager-next/
 /target-native-next/

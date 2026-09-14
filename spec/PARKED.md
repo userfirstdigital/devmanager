@@ -1,0 +1,20 @@
+# Parked ideas
+
+## ai-orchestration — parked 2026-09-12
+
+- [ ] General business operations outside software development — why parked: the current scope includes software briefs, new projects, problems, and test campaigns, with or without a spec directory. — SPEC: [spec/ai-orchestration/SPEC.md](ai-orchestration/SPEC.md)
+- [ ] A learned model-ranking service or broad agent marketplace — why parked: collect comparable profile evidence before adding one. — SPEC: [spec/ai-orchestration/SPEC.md](ai-orchestration/SPEC.md)
+- [ ] A general model-request gateway, account-rotation pool, or ensemble/fusion service — why parked: 9router research informs qualified assignment routing; this workflow does not require a separate proxy or direct-API billing mode. — SPEC: [spec/ai-orchestration/SPEC.md](ai-orchestration/SPEC.md)
+- [ ] A visual workflow/DAG editor and arbitrary workflow programming language — why parked: the lead can plan software work without making the user program its process. — SPEC: [spec/ai-orchestration/SPEC.md](ai-orchestration/SPEC.md)
+- [ ] Cloud workers, execution while the local machine is off, and cross-machine scheduling — why parked: separate execution and credential boundaries. — SPEC: [spec/ai-orchestration/SPEC.md](ai-orchestration/SPEC.md)
+- [ ] Scheduled or externally triggered maintenance campaigns — why parked: current runs have durable continuation events, but saving a skill does not create a recurring job or a broad notification listener. — SPEC: [spec/ai-orchestration/SPEC.md](ai-orchestration/SPEC.md)
+- [ ] A new demonstration recorder, bot roster/marketplace, or free-form agent group-chat system — why parked: reuse existing browser recipes, project procedures, task leads, and scoped assignment handoffs. — SPEC: [spec/ai-orchestration/SPEC.md](ai-orchestration/SPEC.md)
+- [ ] Unrestricted recursive cross-provider delegation and opaque global budget enforcement — why parked: current ownership/capability limits must remain explicit. — SPEC: [spec/ai-orchestration/SPEC.md](ai-orchestration/SPEC.md)
+- [ ] Unbounded parallel execution — why parked: bounded concurrent goals are in scope; unlimited lead copies, workers, or background learning jobs are not. — SPEC: [spec/ai-orchestration/SPEC.md](ai-orchestration/SPEC.md)
+- [ ] A new vector/graph memory platform or model self-training — why parked: canonical files, scoped retrieval, and validated process consolidation must prove the need before extra infrastructure. — SPEC: [spec/ai-orchestration/SPEC.md](ai-orchestration/SPEC.md)
+- [ ] Automated stakeholder transcript approval or autonomous changes to product scope — why parked: the human agreement remains the authority. — SPEC: [spec/ai-orchestration/SPEC.md](ai-orchestration/SPEC.md)
+- [ ] A separate Connect orchestration redesign — why parked: preserve compatibility and prove the native workflow first. — SPEC: [spec/ai-orchestration/SPEC.md](ai-orchestration/SPEC.md)
+- [ ] Provider integrations that require a different identity/authentication policy — why parked: the research does not waive the current contract. — SPEC: [spec/ai-orchestration/SPEC.md](ai-orchestration/SPEC.md)
+- [ ] Organizational goal frameworks, weighted portfolios and a business-metrics service — why parked: measure the requested software outcome without adding a strategy-management product. — SPEC: [spec/ai-orchestration/SPEC.md](ai-orchestration/SPEC.md)
+- [ ] Multiplayer document editing/voting, a second floating chat system, Slack posting/bots, voice and meeting participation — why parked: useful Hamster collaboration surfaces, but separate identity, communication and UI scope. Supplied files/transcripts remain supported context. — SPEC: [spec/ai-orchestration/SPEC.md](ai-orchestration/SPEC.md)
+- [ ] A new connector catalogue or bidirectional issue-tracker sync engine — why parked: use already-authorized qualified tools and source links; external status cannot replace internal verification and execution ownership. — SPEC: [spec/ai-orchestration/SPEC.md](ai-orchestration/SPEC.md)

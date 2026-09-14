@@ -1,0 +1,27 @@
+{
+  "checkedAt": "2026-09-11T01:11:19.686833+00:00",
+  "scope": "Documents and reference integrity only; no runtime acceptance.",
+  "markdownFiles": 17,
+  "localLinks": 285,
+  "scenarios": 192,
+  "priorScenarioIdsRetained": 184,
+  "addedScenarios": [
+    "C10",
+    "G09",
+    "G10",
+    "L11",
+    "M10",
+    "N13",
+    "R13",
+    "U19"
+  ],
+  "reviewEntries": 59,
+  "selectedUpstreamFilesUnchanged": 29,
+  "taskmasterHelperProbesPassed": 12,
+  "pluginReadOnlyChecksPassed": 2,
+  "visualSourceHashMatches": true,
+  "unchangedVisualCaptures": 11,
+  "noBuildDirectory": true,
+  "trackedDiffWhitespaceExitCode": 0,
+  "errors": []
+}

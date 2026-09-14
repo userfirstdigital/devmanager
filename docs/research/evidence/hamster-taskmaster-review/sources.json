@@ -1,0 +1,386 @@
+{
+  "reviewedAt": "2026-09-11T01:04:22.606218+00:00",
+  "scope": "Pinned inputs, not a claim of line-by-line audit. Selected helpers/protocols inspected; source/probe boundaries in report. No source imported into DevManager runtime.",
+  "repositories": [
+    {
+      "name": "Taskmaster",
+      "root": "/tmp/devmanager-taskmaster-_m8l6f3l",
+      "checkout": "/tmp/devmanager-taskmaster-_m8l6f3l/source/claude-task-master-c0c98d367c55296bfe69e65680625b6db437af02",
+      "commit": "c0c98d367c55296bfe69e65680625b6db437af02",
+      "commitDate": "2026-04-23T12:07:23Z",
+      "archiveUrl": "https://codeload.github.com/eyaltoledano/claude-task-master/tar.gz/c0c98d367c55296bfe69e65680625b6db437af02",
+      "archiveSha256": "0a8b6d923cefa8ddba89d4df0629cdab5fd5920e4e0a87facd1805ea2d407e56",
+      "archiveBytes": 3874481,
+      "extraction": "Regular files/directories only; no install, hooks or source execution",
+      "files": [
+        {
+          "path": "LICENSE",
+          "sha256": "406748f876bdb5dd39c565089685ff532c4b3a41bb6163b0cfcd0b1927017d45",
+          "bytes": 2191
+        },
+        {
+          "path": "docs/licensing.md",
+          "sha256": "f29d04a61dc1e123ac4b6a60dc548aae2ad42fe7c86a822eea63c6692807bb55",
+          "bytes": 478
+        },
+        {
+          "path": "README.md",
+          "sha256": "5a159c3bb7739bc8b7df10e3b181ea59e44cce635fc7bc05f2a80dd740345ea3",
+          "bytes": 17421
+        },
+        {
+          "path": "package.json",
+          "sha256": "cd24d4def17538addc83cf812d503a37cb18cdf439083f9358f1614639f29478",
+          "bytes": 5710
+        },
+        {
+          "path": "scripts/modules/task-manager/find-next-task.js",
+          "sha256": "c1713f8b52b95064742ec2a95565a4a5dbcf4d214b6c1729de392065115514df",
+          "bytes": 4635
+        },
+        {
+          "path": "scripts/modules/task-manager/expand-task.js",
+          "sha256": "3a6787c001a129e0e4f5687dd74ba9dcbd7c52479ddf715f50c392352fa2ae73",
+          "bytes": 13228
+        },
+        {
+          "path": "scripts/modules/task-manager/analyze-task-complexity.js",
+          "sha256": "7d515129ebaf36bddb3ecbac8d737ed227bb6f715b944511b26c794f310c057f",
+          "bytes": 20367
+        },
+        {
+          "path": "scripts/modules/dependency-manager.js",
+          "sha256": "db88829c6eec5c9aab7f425b3af70823518f05701de0d8eaec15c1ebe773513b",
+          "bytes": 53694
+        },
+        {
+          "path": "scripts/modules/utils/contextGatherer.js",
+          "sha256": "c299f059e2e8adb81c7dc75d86a5e05d1504de009e7480eed3733c8f39013bc5",
+          "bytes": 27407
+        },
+        {
+          "path": "src/schemas/parse-prd.js",
+          "sha256": "0c3b5ae49e60558496030b0a11d96fbfd800939d0e0cf908933cdbd59c427bf4",
+          "bytes": 656
+        },
+        {
+          "path": "src/schemas/expand-task.js",
+          "sha256": "ea585d132247d68ae1bc8a0a7b2ec339b7b9d531ae87c6d9676987d21be1707d",
+          "bytes": 181
+        },
+        {
+          "path": "mcp-server/src/tools/tool-registry.js",
+          "sha256": "1ce22b53d1af481865c9a86d28c1609048cdaa403e5bc77b0dda63b592a6a88d",
+          "bytes": 6291
+        },
+        {
+          "path": "mcp-server/src/core/context-manager.js",
+          "sha256": "97d751fb1067f73047416933cc0f09091518caa65d7398b06fba64530d1ef3c1",
+          "bytes": 4416
+        },
+        {
+          "path": "packages/tm-core/src/modules/loop/services/loop.service.ts",
+          "sha256": "e560b9f39bd14269c06be860ed0d6a5d023c7c3e882ca5c7f289a0c41f20631f",
+          "bytes": 17031
+        },
+        {
+          "path": "packages/tm-core/src/modules/loop/presets/default.ts",
+          "sha256": "cd22f4e1188a2be705afadc01495e533baa089bad131b5626268cf4b6e74715e",
+          "bytes": 1110
+        },
+        {
+          "path": "packages/tm-core/src/modules/workflow/services/test-result-validator.ts",
+          "sha256": "513e67556359c4487238e62a0801043650353b049ff0be0b3155e960d667f35f",
+          "bytes": 6628
+        },
+        {
+          "path": "packages/tm-core/src/modules/workflow/orchestrators/workflow-orchestrator.ts",
+          "sha256": "6eaa5026f53e392e1eec7327cf1dafbca3f2708cbbc8abc69c02f17967564aec",
+          "bytes": 16763
+        }
+      ]
+    },
+    {
+      "name": "Hamster plugin",
+      "root": "/tmp/devmanager-taskmaster-_m8l6f3l",
+      "checkout": "/tmp/devmanager-taskmaster-_m8l6f3l/hamster-cli/plugin-6f5862edb06c5606c00609eb7dfc938dd75047f2",
+      "commit": "6f5862edb06c5606c00609eb7dfc938dd75047f2",
+      "commitDate": "2026-09-09T20:09:37Z",
+      "archiveUrl": "https://codeload.github.com/gethamster/cli/tar.gz/6f5862edb06c5606c00609eb7dfc938dd75047f2",
+      "archiveSha256": "b19f6cb767cc2de0e1ed923131dabb4c92ce4f2d08e5509aadc5c06e65bc5a43",
+      "archiveBytes": 119796,
+      "extraction": "regular files/directories only, filter=data; no installs or hooks",
+      "files": [
+        {
+          "path": "LICENSE",
+          "sha256": "c88da1c376c6bdbdc597c8476ad7d07e4b8bb2aac9147add684ad524b936603b",
+          "bytes": 1071
+        },
+        {
+          "path": "README.md",
+          "sha256": "01880ba071d6e9daf04a94114715060115c594146d6b95430eb05f3eca4e112b",
+          "bytes": 14057
+        },
+        {
+          "path": "plugin.json",
+          "sha256": "e4891e7c641066080677a513c862e48b4c1474ba842e3e0b3bbd06f8aa7dd2df",
+          "bytes": 656
+        },
+        {
+          "path": "scripts/sync-adapters.mjs",
+          "sha256": "a49986aaa91a2eb7affeda78fbaf3db1e29e4bc436c9f57260e730a17140fb45",
+          "bytes": 5386
+        },
+        {
+          "path": "scripts/validate-plugin.mjs",
+          "sha256": "584740ce40f82adc4ff62a3faa01939c8f0175599f6e5cf6eef7d137546b8f56",
+          "bytes": 29237
+        },
+        {
+          "path": "scripts/test-plugin.mjs",
+          "sha256": "fdc1653f671cacc4724e60c83a94f6bdf7cfabd1a38e6bc2532b17f1a44d6c11",
+          "bytes": 9744
+        },
+        {
+          "path": "skills/ship/references/brief-selection.md",
+          "sha256": "9def1033974bcf594185c20de10ba68f6bef9f92d817b87bc2c9cbb7e208a16d",
+          "bytes": 7789
+        },
+        {
+          "path": "skills/ship/references/execution-loop.md",
+          "sha256": "fa0fc1bf25e8b7ca0dcf98b5b38b729f66fe9e5ee402b7ea7dcecd4f0002710b",
+          "bytes": 7502
+        },
+        {
+          "path": "skills/ship/references/agents/task-executor.md",
+          "sha256": "7daf07e0c38af81a44174f07a1863ab7fa4ba68f621c5c2b1cb90e2892b774b4",
+          "bytes": 9017
+        },
+        {
+          "path": "skills/ship/references/agents/wave-reviewer.md",
+          "sha256": "dcfdfd601c07293207345f0b21e744f5ed96ea5514318979fda41eced814a02b",
+          "bytes": 5377
+        },
+        {
+          "path": "skills/resume-hamster/SKILL.md",
+          "sha256": "b50bbe88845ec162747c71c74016f900f639136c87cd458551bcc676364ca06c",
+          "bytes": 6434
+        },
+        {
+          "path": "skills/retro/references/analysis.md",
+          "sha256": "902913fb105e3a38740863bfbcc2fb2b7147ecfb18ca97361d037c83e2de1feb",
+          "bytes": 3948
+        }
+      ]
+    }
+  ],
+  "pages": [
+    {
+      "url": "https://tryhamster.com/product/studio",
+      "finalUrl": "https://tryhamster.com/product/studio",
+      "status": 200,
+      "fetchedAt": "2026-09-11T00:50:49.392411+00:00",
+      "sha256": "591dee8ca80af493f1776676b300170af7c4499d96deac0a255e1d35c3c459e1"
+    },
+    {
+      "url": "https://tryhamster.com/product/studio/goals",
+      "finalUrl": "https://tryhamster.com/product/studio/goals",
+      "status": 200,
+      "fetchedAt": "2026-09-11T00:50:49.288178+00:00",
+      "sha256": "2ed602e913099d6fa02aeb6062de149ce7aef6a3a9101f0ebd3f6f8d9f006d90"
+    },
+    {
+      "url": "https://tryhamster.com/product/studio/research",
+      "error": "HTTP Error 404: Not Found"
+    },
+    {
+      "url": "https://tryhamster.com/product/studio/briefs",
+      "finalUrl": "https://tryhamster.com/product/studio/briefs",
+      "status": 200,
+      "fetchedAt": "2026-09-11T00:50:49.439933+00:00",
+      "sha256": "c4453ec657db3848a5ec0d823415c593a9ec2fb024ce7a05835af27d0a948df2"
+    },
+    {
+      "url": "https://tryhamster.com/product/studio/plans",
+      "finalUrl": "https://tryhamster.com/product/studio/plans",
+      "status": 200,
+      "fetchedAt": "2026-09-11T00:50:49.218110+00:00",
+      "sha256": "c0b9ae6d08d925d831ee7384cc7cc0f4188efd548b4ffb31baffe541fa62d634"
+    },
+    {
+      "url": "https://tryhamster.com/product/studio/agents",
+      "finalUrl": "https://tryhamster.com/product/studio/agents",
+      "status": 200,
+      "fetchedAt": "2026-09-11T00:50:49.686442+00:00",
+      "sha256": "a82893326152ec5e53144d8c9e5b91a80f525774aca7afcce75ea46ba7c094cc"
+    },
+    {
+      "url": "https://tryhamster.com/product/studio/cli",
+      "finalUrl": "https://tryhamster.com/product/studio/cli",
+      "status": 200,
+      "fetchedAt": "2026-09-11T00:50:49.587245+00:00",
+      "sha256": "71864c0b969fc57f0354a69545558e8ab6bdc822e7f9367087c213ce40e7be37"
+    },
+    {
+      "url": "https://tryhamster.com/product/studio/collaboration",
+      "finalUrl": "https://tryhamster.com/product/studio/collaboration",
+      "status": 200,
+      "fetchedAt": "2026-09-11T00:50:49.608279+00:00",
+      "sha256": "f32400ca25da604dde95e99efdfcc03a3ee99f5add2da926921567ee1602c5f5"
+    },
+    {
+      "url": "https://tryhamster.com/product/studio/sync",
+      "finalUrl": "https://tryhamster.com/product/studio/sync",
+      "status": 200,
+      "fetchedAt": "2026-09-11T00:50:49.709042+00:00",
+      "sha256": "3bc706d4076525b8fc6b6c83ce828c6a30f6079453fda5da468110d505c6c009"
+    },
+    {
+      "url": "https://tryhamster.com/product/studio/context-graph",
+      "finalUrl": "https://tryhamster.com/product/studio/context-graph",
+      "status": 200,
+      "fetchedAt": "2026-09-11T00:50:49.880705+00:00",
+      "sha256": "3f2a5b4c8b17ab8d5ae1d0f9d79ca2003b3eefdb355e0b855588ffd1470bfb99"
+    },
+    {
+      "url": "https://tryhamster.com/product/studio/blueprints",
+      "finalUrl": "https://tryhamster.com/product/studio/blueprints",
+      "status": 200,
+      "fetchedAt": "2026-09-11T00:50:49.788903+00:00",
+      "sha256": "d4a5b8d1566b661920001a6769efad9d1672a8a25f21005ce624aab4b9153a92"
+    },
+    {
+      "url": "https://tryhamster.com/product/studio/skills-methods",
+      "finalUrl": "https://tryhamster.com/product/studio/skills-methods",
+      "status": 200,
+      "fetchedAt": "2026-09-11T00:50:50.076704+00:00",
+      "sha256": "c8935fb1398104755e885ec02ba4c1ca6c3f0d17b91a3c608030ea45b98c7697"
+    },
+    {
+      "url": "https://tryhamster.com/product/studio/routines",
+      "finalUrl": "https://tryhamster.com/product/studio/routines",
+      "status": 200,
+      "fetchedAt": "2026-09-11T00:50:50.098286+00:00",
+      "sha256": "6a93176e33032ad1fd6ae03a47cca5ddb86d2fc0ae245f60c826a6a49438257a"
+    },
+    {
+      "url": "https://tryhamster.com/product/studio/connections",
+      "finalUrl": "https://tryhamster.com/product/studio/connections",
+      "status": 200,
+      "fetchedAt": "2026-09-11T00:50:50.267385+00:00",
+      "sha256": "9d273c1b929bd96dbff4c8830a78082a5287a9e75c2c21ce18443bdea4c25d46"
+    },
+    {
+      "url": "https://tryhamster.com/product/studio/research-agents",
+      "error": "HTTP Error 403: Forbidden"
+    },
+    {
+      "url": "https://tryhamster.com/docs/concepts/discovery",
+      "error": "HTTP Error 403: Forbidden"
+    },
+    {
+      "url": "https://tryhamster.com/docs/concepts/direction",
+      "error": "HTTP Error 403: Forbidden"
+    },
+    {
+      "url": "https://tryhamster.com/docs/concepts/knowledge",
+      "error": "HTTP Error 403: Forbidden"
+    },
+    {
+      "url": "https://tryhamster.com/docs/hamster-studio/chat",
+      "error": "HTTP Error 403: Forbidden"
+    },
+    {
+      "url": "https://tryhamster.com/docs/hamster-studio/connections/slack",
+      "error": "HTTP Error 403: Forbidden"
+    },
+    {
+      "url": "https://tryhamster.com/docs/hamster-studio/cli",
+      "error": "HTTP Error 403: Forbidden"
+    },
+    {
+      "url": "https://tryhamster.com/research/taskmaster",
+      "access": "web browsing tool",
+      "checkedDate": "2026-09-10",
+      "scope": "Official public page/documentation; no signed-in product execution; no raw-page hash from this tool"
+    },
+    {
+      "url": "https://tryhamster.com/research/taskmaster/parse-prd",
+      "access": "web browsing tool",
+      "checkedDate": "2026-09-10",
+      "scope": "Official public page/documentation; no signed-in product execution; no raw-page hash from this tool"
+    },
+    {
+      "url": "https://tryhamster.com/research/taskmaster/complexity",
+      "access": "web browsing tool",
+      "checkedDate": "2026-09-10",
+      "scope": "Official public page/documentation; no signed-in product execution; no raw-page hash from this tool"
+    },
+    {
+      "url": "https://tryhamster.com/research/taskmaster/mcp-server",
+      "access": "web browsing tool",
+      "checkedDate": "2026-09-10",
+      "scope": "Official public page/documentation; no signed-in product execution; no raw-page hash from this tool"
+    },
+    {
+      "url": "https://tryhamster.com/research/taskmaster/expand",
+      "access": "web browsing tool",
+      "checkedDate": "2026-09-10",
+      "scope": "Official public page/documentation; no signed-in product execution; no raw-page hash from this tool"
+    },
+    {
+      "url": "https://tryhamster.com/docs/taskmaster/automation/loop",
+      "access": "web browsing tool",
+      "checkedDate": "2026-09-10",
+      "scope": "Official public page/documentation; no signed-in product execution; no raw-page hash from this tool"
+    },
+    {
+      "url": "https://tryhamster.com/docs/concepts/direction",
+      "access": "web browsing tool",
+      "checkedDate": "2026-09-10",
+      "scope": "Official public page/documentation; no signed-in product execution; no raw-page hash from this tool"
+    },
+    {
+      "url": "https://tryhamster.com/docs/concepts/discovery",
+      "access": "web browsing tool",
+      "checkedDate": "2026-09-10",
+      "scope": "Official public page/documentation; no signed-in product execution; no raw-page hash from this tool"
+    },
+    {
+      "url": "https://tryhamster.com/docs/concepts/delivery",
+      "access": "web browsing tool",
+      "checkedDate": "2026-09-10",
+      "scope": "Official public page/documentation; no signed-in product execution; no raw-page hash from this tool"
+    },
+    {
+      "url": "https://tryhamster.com/docs/hamster-studio/research-agents",
+      "access": "web browsing tool",
+      "checkedDate": "2026-09-10",
+      "scope": "Official public page/documentation; no signed-in product execution; no raw-page hash from this tool"
+    },
+    {
+      "url": "https://tryhamster.com/docs/hamster-studio/chat",
+      "access": "web browsing tool",
+      "checkedDate": "2026-09-10",
+      "scope": "Official public page/documentation; no signed-in product execution; no raw-page hash from this tool"
+    },
+    {
+      "url": "https://tryhamster.com/docs/hamster-studio/chat/voice",
+      "access": "web browsing tool",
+      "checkedDate": "2026-09-10",
+      "scope": "Official public page/documentation; no signed-in product execution; no raw-page hash from this tool"
+    },
+    {
+      "url": "https://tryhamster.com/docs/hamster-studio/connections/slack",
+      "access": "web browsing tool",
+      "checkedDate": "2026-09-10",
+      "scope": "Official public page/documentation; no signed-in product execution; no raw-page hash from this tool"
+    },
+    {
+      "url": "https://tryhamster.com/docs/hamster-studio/cli/setup",
+      "access": "web browsing tool",
+      "checkedDate": "2026-09-10",
+      "scope": "Official public page/documentation; no signed-in product execution; no raw-page hash from this tool"
+    }
+  ]
+}

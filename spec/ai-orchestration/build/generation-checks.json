@@ -1,0 +1,1434 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-09-12T18:13:51.131903+00:00",
+  "kind": "build-document-and-design-integrity",
+  "application_tests_run": false,
+  "native_application_acceptance": false,
+  "implementation_started": false,
+  "source_head_observed": "b788b14307890e0a986d8f11aae4bfb7d340eb64",
+  "source_checkout_clean": false,
+  "counts": {
+    "phases": 17,
+    "build_markdown_documents": 19,
+    "scenarios": 197,
+    "ux_rows": 19,
+    "autonomy_review_records": 64,
+    "parked_items": 16,
+    "e2e_journeys": 20,
+    "base_references": 11,
+    "additional_references": 10
+  },
+  "checks": [
+    {
+      "check": "SPEC is explicitly LOCKED",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "Locked SPEC body unchanged",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "Normative UX chapter unchanged",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "197 unique SPEC scenario IDs",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "64 autonomy review records retained",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "17 phase documents",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "Overview + 17 phases + TEST-PLAN",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "01-intake.md: required Context Pack instruction",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "01-intake.md: required sections",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "01-intake.md: assigned scenario set",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "01-intake.md: Given/When/Then text retained",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "01-intake.md: every scenario has exact acceptance entry",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "01-intake.md: exact Exposes matches overview",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "01-intake.md: only earlier phase preconditions",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "01-intake.md: native proof + global gates required",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "02-lead-bridge.md: required Context Pack instruction",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "02-lead-bridge.md: required sections",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "02-lead-bridge.md: assigned scenario set",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "02-lead-bridge.md: Given/When/Then text retained",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "02-lead-bridge.md: every scenario has exact acceptance entry",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "02-lead-bridge.md: exact Exposes matches overview",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "02-lead-bridge.md: only earlier phase preconditions",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "02-lead-bridge.md: native proof + global gates required",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "03-plans.md: required Context Pack instruction",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "03-plans.md: required sections",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "03-plans.md: assigned scenario set",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "03-plans.md: Given/When/Then text retained",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "03-plans.md: every scenario has exact acceptance entry",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "03-plans.md: exact Exposes matches overview",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "03-plans.md: only earlier phase preconditions",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "03-plans.md: native proof + global gates required",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "04-workspaces.md: required Context Pack instruction",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "04-workspaces.md: required sections",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "04-workspaces.md: assigned scenario set",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "04-workspaces.md: Given/When/Then text retained",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "04-workspaces.md: every scenario has exact acceptance entry",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "04-workspaces.md: exact Exposes matches overview",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "04-workspaces.md: only earlier phase preconditions",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "04-workspaces.md: native proof + global gates required",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "05-decisions.md: required Context Pack instruction",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "05-decisions.md: required sections",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "05-decisions.md: assigned scenario set",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "05-decisions.md: Given/When/Then text retained",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "05-decisions.md: every scenario has exact acceptance entry",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "05-decisions.md: exact Exposes matches overview",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "05-decisions.md: only earlier phase preconditions",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "05-decisions.md: native proof + global gates required",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "06-evidence.md: required Context Pack instruction",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "06-evidence.md: required sections",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "06-evidence.md: assigned scenario set",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "06-evidence.md: Given/When/Then text retained",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "06-evidence.md: every scenario has exact acceptance entry",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "06-evidence.md: exact Exposes matches overview",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "06-evidence.md: only earlier phase preconditions",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "06-evidence.md: native proof + global gates required",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "07-repairs.md: required Context Pack instruction",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "07-repairs.md: required sections",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "07-repairs.md: assigned scenario set",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "07-repairs.md: Given/When/Then text retained",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "07-repairs.md: every scenario has exact acceptance entry",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "07-repairs.md: exact Exposes matches overview",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "07-repairs.md: only earlier phase preconditions",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "07-repairs.md: native proof + global gates required",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "08-journeys.md: required Context Pack instruction",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "08-journeys.md: required sections",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "08-journeys.md: assigned scenario set",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "08-journeys.md: Given/When/Then text retained",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "08-journeys.md: every scenario has exact acceptance entry",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "08-journeys.md: exact Exposes matches overview",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "08-journeys.md: only earlier phase preconditions",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "08-journeys.md: native proof + global gates required",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "09-performance.md: required Context Pack instruction",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "09-performance.md: required sections",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "09-performance.md: assigned scenario set",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "09-performance.md: Given/When/Then text retained",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "09-performance.md: every scenario has exact acceptance entry",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "09-performance.md: exact Exposes matches overview",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "09-performance.md: only earlier phase preconditions",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "09-performance.md: native proof + global gates required",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "10-test-campaigns.md: required Context Pack instruction",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "10-test-campaigns.md: required sections",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "10-test-campaigns.md: assigned scenario set",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "10-test-campaigns.md: Given/When/Then text retained",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "10-test-campaigns.md: every scenario has exact acceptance entry",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "10-test-campaigns.md: exact Exposes matches overview",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "10-test-campaigns.md: only earlier phase preconditions",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "10-test-campaigns.md: native proof + global gates required",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "11-memory.md: required Context Pack instruction",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "11-memory.md: required sections",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "11-memory.md: assigned scenario set",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "11-memory.md: Given/When/Then text retained",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "11-memory.md: every scenario has exact acceptance entry",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "11-memory.md: exact Exposes matches overview",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "11-memory.md: only earlier phase preconditions",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "11-memory.md: native proof + global gates required",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "12-learning.md: required Context Pack instruction",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "12-learning.md: required sections",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "12-learning.md: assigned scenario set",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "12-learning.md: Given/When/Then text retained",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "12-learning.md: every scenario has exact acceptance entry",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "12-learning.md: exact Exposes matches overview",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "12-learning.md: only earlier phase preconditions",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "12-learning.md: native proof + global gates required",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "13-scheduling.md: required Context Pack instruction",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "13-scheduling.md: required sections",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "13-scheduling.md: assigned scenario set",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "13-scheduling.md: Given/When/Then text retained",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "13-scheduling.md: every scenario has exact acceptance entry",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "13-scheduling.md: exact Exposes matches overview",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "13-scheduling.md: only earlier phase preconditions",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "13-scheduling.md: native proof + global gates required",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "14-availability.md: required Context Pack instruction",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "14-availability.md: required sections",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "14-availability.md: assigned scenario set",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "14-availability.md: Given/When/Then text retained",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "14-availability.md: every scenario has exact acceptance entry",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "14-availability.md: exact Exposes matches overview",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "14-availability.md: only earlier phase preconditions",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "14-availability.md: native proof + global gates required",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "15-recovery.md: required Context Pack instruction",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "15-recovery.md: required sections",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "15-recovery.md: assigned scenario set",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "15-recovery.md: Given/When/Then text retained",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "15-recovery.md: every scenario has exact acceptance entry",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "15-recovery.md: exact Exposes matches overview",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "15-recovery.md: only earlier phase preconditions",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "15-recovery.md: native proof + global gates required",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "16-delivery.md: required Context Pack instruction",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "16-delivery.md: required sections",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "16-delivery.md: assigned scenario set",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "16-delivery.md: Given/When/Then text retained",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "16-delivery.md: every scenario has exact acceptance entry",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "16-delivery.md: exact Exposes matches overview",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "16-delivery.md: only earlier phase preconditions",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "16-delivery.md: native proof + global gates required",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "17-acceptance.md: required Context Pack instruction",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "17-acceptance.md: required sections",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "17-acceptance.md: assigned scenario set",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "17-acceptance.md: Given/When/Then text retained",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "17-acceptance.md: every scenario has exact acceptance entry",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "17-acceptance.md: exact Exposes matches overview",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "17-acceptance.md: only earlier phase preconditions",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "17-acceptance.md: native proof + global gates required",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "Every SPEC scenario assigned exactly once",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "Overview scenario traceability complete",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "19 normative UX capability rows",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "UX row mapped: Goal/problem/spec intake",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "UX row mapped: Complete generation/build/audit/E2E/fix workflow",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "UX row mapped: Whole-project steering and technical plan repair",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "UX row mapped: Multiple goals and shared scheduling",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "UX row mapped: Worker choice, delegation, provider fallback",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "UX row mapped: Decisions, access, and browser control",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "UX row mapped: Process ownership, pause/stop/restart",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "UX row mapped: Multi-repo implementation and integration",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "UX row mapped: Audits, fixes, evidence, and test campaigns",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "UX row mapped: Performance outcomes",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "UX row mapped: Memory and reusable procedures",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "UX row mapped: Holistic sharpening",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "UX row mapped: Context reduction and durable resumption",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "UX row mapped: Safe independent delivery",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "UX row mapped: Source-backed research and work lineage",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "UX row mapped: Outcome measurement and delivery boundary",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "UX row mapped: Canonical harness context and delivery knowledge reconciliation",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "UX row mapped: Effective access and current effect authority",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "UX row mapped: Transformed evidence and check coverage",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "16 unique parked entries",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "Deferred backlog not copied into phase deliverables",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "Local documentation links resolve",
+      "passed": true,
+      "details": {
+        "count": 628,
+        "broken": []
+      }
+    },
+    {
+      "check": "No trailing whitespace in generated/refreshed Markdown",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "Markdown fences balanced",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "Declared migration DDL parses in disposable in-memory SQLite",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "TEST-PLAN.md: Bash example syntax 1",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "TEST-PLAN.md: Bash example syntax 2",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "TEST-PLAN.md: Bash example syntax 3",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "TEST-PLAN.md: Bash example syntax 4",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "TEST-PLAN.md: Bash example syntax 5",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "TEST-PLAN.md: Bash example syntax 6",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "manifest.json: design scope explicit",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "manifest.json: HTML source hash current",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "REF-START: PNG matches retained manifest",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "REF-RUN: PNG matches retained manifest",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "REF-PLAN: PNG matches retained manifest",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "REF-AGENTS: PNG matches retained manifest",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "REF-DECISION: PNG matches retained manifest",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "REF-RECOVERY: PNG matches retained manifest",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "REF-TESTS: PNG matches retained manifest",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "REF-SPEED: PNG matches retained manifest",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "REF-KNOWLEDGE: PNG matches retained manifest",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "REF-DONE: PNG matches retained manifest",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "REF-NARROW: PNG matches retained manifest",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "manifest.json: owned renderer cleanup complete",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "step4-manifest.json: design scope explicit",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "step4-manifest.json: HTML source hash current",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "REF-STEERING: PNG matches retained manifest",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "REF-LINEAGE: PNG matches retained manifest",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "REF-SOURCE-MISSING: PNG matches retained manifest",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "REF-EFFECTIVE-ACCESS: PNG matches retained manifest",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "REF-CHECK-COVERAGE: PNG matches retained manifest",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "REF-CONTEXT-DRIFT: PNG matches retained manifest",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "REF-KNOWLEDGE-STATES: PNG matches retained manifest",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "REF-UNCERTAIN-EFFECT: PNG matches retained manifest",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "REF-DELIVERY-PENDING: PNG matches retained manifest",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "REF-ACCESS-NARROW: PNG matches retained manifest",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "step4-manifest.json: owned renderer cleanup complete",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "Ten additional state references",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "Every phase reference ID resolves to a captured target",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "Twenty cross-phase E2E journeys",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "TEST-PLAN includes setup/logs/nonvisual/sweeps/budgets/limits/cleanup",
+      "passed": true,
+      "details": null
+    },
+    {
+      "check": "Tracked git diff whitespace check",
+      "passed": true,
+      "details": null
+    }
+  ],
+  "source_manifest": [
+    {
+      "path": "packaging/prepare-ci-checkout.py",
+      "sha256": "759ccf676be9eb00b4f1156533db31e99d37af667bbc34874073a80b4e703ce5"
+    },
+    {
+      "path": "src/bin/devmanager-process-test-helper.rs",
+      "sha256": "371e0be4d3c52e8e619e4179c8b18ff3a1e32ff1cce356b3b5098796b60f263e"
+    },
+    {
+      "path": "src/browser/gateway.rs",
+      "sha256": "f717de1b5e9874a3f44c6114425673d58e42f1e71e280d7c8b8e549d7f208b18"
+    },
+    {
+      "path": "src/browser/pane.rs",
+      "sha256": "57b4cc6cbd8cb1afcf7162dddf19162cb0f342e024e1424deac143d4ad13820a"
+    },
+    {
+      "path": "src/browser/provider.rs",
+      "sha256": "578deb9c9c2e26f604cb01f94615b561d970c26f52a6d0dd60d548ec2ed244ff"
+    },
+    {
+      "path": "src/browser/replay.rs",
+      "sha256": "3c588bf91d82940029fa93bc0f3969f4745cf8437550fed20277e7736485f0df"
+    },
+    {
+      "path": "src/browser/workflow_mcp.rs",
+      "sha256": "4fbc59e9896fb5cad563084fd386aae403262915620dd4428d717ab979ec09d2"
+    },
+    {
+      "path": "src/client/action.rs",
+      "sha256": "49e0d48afc0f902bd8568caa67384a3e253281c439eeb0dd4eaba76ec6da8a61"
+    },
+    {
+      "path": "src/client/cli.rs",
+      "sha256": "74da98de8700e3adae1a855fb1efccc078a2d0b5b2af5533cc066f58a0b21def"
+    },
+    {
+      "path": "src/config/paths.rs",
+      "sha256": "9900a6bbf4a7844565a7430583e3ca549492d0deed396cc6562105eeb252001c"
+    },
+    {
+      "path": "src/connect/AGENTS.md",
+      "sha256": "150e4b66d1928ccedfc10edbe23df76974fc45b416d5bcdcee6237bd38313853"
+    },
+    {
+      "path": "src/domain/artifact.rs",
+      "sha256": "ce62c5b10d05d9b9280c580c9be2a502275ac072bd230ff49385e44129c5e79f"
+    },
+    {
+      "path": "src/domain/command.rs",
+      "sha256": "4011753f6b9061123da7e1504b412d47877466022baba174c3710ca4e4138419"
+    },
+    {
+      "path": "src/domain/event.rs",
+      "sha256": "42580157782748dc36efc541eee562d061761072470dcfc3175759788365199a"
+    },
+    {
+      "path": "src/domain/id.rs",
+      "sha256": "3bdcba006c9830681ba0f71bc2a699454122e727be85c3a947f43c875330ea13"
+    },
+    {
+      "path": "src/domain/operation.rs",
+      "sha256": "f66ba52337cbabf33d4fde3a16263d30a736c0050eafba0222ad9a8c79f7464f"
+    },
+    {
+      "path": "src/domain/provider_input.rs",
+      "sha256": "e2616a731543d660e0e7ad7154d6a0d82db30dc0b7ade1db3ab32889314738bb"
+    },
+    {
+      "path": "src/domain/query.rs",
+      "sha256": "092106bfaf52a6ab8b33a1bf97a0b13df163291f99195b295ae061101e50208c"
+    },
+    {
+      "path": "src/domain/resource.rs",
+      "sha256": "fbab1781a0d2b9d49a5db25ae430bc64e548fe7cb52bf01d94aa27bdc338246f"
+    },
+    {
+      "path": "src/domain/task.rs",
+      "sha256": "d53ed4120e72069c1df91c674d5690c9c20e4fcff65f2a750b22c72c3fef8753"
+    },
+    {
+      "path": "src/git/git_service.rs",
+      "sha256": "f02947a97869549e3a090fa6e0a2ef43e4e1b62fa101df5afaad8dff8c927e31"
+    },
+    {
+      "path": "src/host/connection.rs",
+      "sha256": "985c1b6e0af972ab2f98250638958e3da1fba4611bc4ee95fc2b8daa138f886c"
+    },
+    {
+      "path": "src/host/diag.rs",
+      "sha256": "611095dc859e545b58827e8b1bf667a1394e41bab105b24d2444c4a6639f71c8"
+    },
+    {
+      "path": "src/kernel/command_bus.rs",
+      "sha256": "a7af7f2835db76e69920bbc8acca53c112f91c1252bda3c09033f4ea7aaa527c"
+    },
+    {
+      "path": "src/kernel/outbox.rs",
+      "sha256": "719895a785a1d453259f7a3717f0acf9b9643a27f4f332625cf6dfa9c0936ca9"
+    },
+    {
+      "path": "src/kernel/replay.rs",
+      "sha256": "392aab7b8da27aa64398374dba92aae875f08e5c0ef2da7b8fbafd828c2be509"
+    },
+    {
+      "path": "src/kernel/schema.rs",
+      "sha256": "f8ad332f54519925198f44eb63ae13d60ee71f4a6532cff96cc45607bdb87c7e"
+    },
+    {
+      "path": "src/kernel/store.rs",
+      "sha256": "dceefb284d4e65feccbe60f5d3aaeaf48fb02d14d0ece450123b34dc120c25eb"
+    },
+    {
+      "path": "src/protocol/capabilities.rs",
+      "sha256": "f9d1b43d5f3c89ca6aea57242cccd11fdec99d46f23bd6d76fa05ec90a1b8c98"
+    },
+    {
+      "path": "src/providers/adapter.rs",
+      "sha256": "9876607ed74f7de17eed4bbcfc22ada06e28c288f535d47beccc5eb728547e06"
+    },
+    {
+      "path": "src/providers/capabilities.rs",
+      "sha256": "18e7a16132e261c13d8ddbbfb76c82ed1c8da6108368db36ce35fa3da6b9ac56"
+    },
+    {
+      "path": "src/providers/codex.rs",
+      "sha256": "7c8b93abc1170d7fc7ec784fef827fcb4637271429007350a637e8e1d303f87b"
+    },
+    {
+      "path": "src/providers/input.rs",
+      "sha256": "37c3ebb7d0981d87a4dfc6e518d34857f8628339ecc10c2a056306a18508d4b5"
+    },
+    {
+      "path": "src/providers/journal.rs",
+      "sha256": "d98106c5326b328384a3547168b0d902e93ae7ff63e722a089433fd65f05d971"
+    },
+    {
+      "path": "src/providers/orchestrator.rs",
+      "sha256": "74c8d8151cd8f16c1957b4929a8e8a70a2b9fdfe4f8e57ab0d59b733c0c7f746"
+    },
+    {
+      "path": "src/services/process_manager.rs",
+      "sha256": "341310235433e06cd825189318804c099daa8cb8fb923ddc62311d92cf2cf185"
+    },
+    {
+      "path": "src/theme/mod.rs",
+      "sha256": "f01f439370dbc5c3edc3325e0bf11f4ff56482760071fde4a30af18eeaeba2b8"
+    },
+    {
+      "path": "src/ui/AGENTS.md",
+      "sha256": "796ffc8764e92157d6ddf25b68d82b5b67e0ecb4abba38c5ad30d89fc11cc027"
+    },
+    {
+      "path": "src/ui/components/mod.rs",
+      "sha256": "a96b4b744c39cf65cb5d6d78eb3ae4a798edc130d6f4e21c11b7e53d51490e94"
+    },
+    {
+      "path": "src/ui/native_shell.rs",
+      "sha256": "3fb4523e7780bf0698dc8f3545b01a08793872b248fa3e24f11346125fa8cf98"
+    },
+    {
+      "path": "src/ui/preview_capture.rs",
+      "sha256": "74704b727c58ebb3b8e1a92f061ada35866d9d1d4eef81b8f1bc7e98b0432223"
+    },
+    {
+      "path": "src/ui/provider_settings.rs",
+      "sha256": "fc109cf2f157f126e3cd530e7df575d8396de8c0c314c65ed49dd208feb815e6"
+    },
+    {
+      "path": "src/ui/quality.rs",
+      "sha256": "cee575e728b990c255fff56f61bea982234a003be7acd26987eeadb2f0082c78"
+    },
+    {
+      "path": "src/ui/task_cockpit/cockpit_projection.rs",
+      "sha256": "d25793cf38aa901048e48479c11a07d01c7045facf031b8592e817dd1125090f"
+    },
+    {
+      "path": "src/ui/task_cockpit/composer.rs",
+      "sha256": "7b3dbd1ddfc3d79542e38f7eadf2889e8dd493c3db4cf64b0875ed7f1bec1486"
+    },
+    {
+      "path": "src/ui/task_cockpit/config_sidebar.rs",
+      "sha256": "aff23f1b3a4d35af1eb99783afa0c889376e36b975818bb8f7ebbacf58cdfc0f"
+    },
+    {
+      "path": "src/ui/task_cockpit/dock.rs",
+      "sha256": "1fd979c884a9ef14d2e5d3a4f5db5af4f2ebf5f2b4016fa82540ae9b8f0da8ce"
+    },
+    {
+      "path": "src/ui/task_cockpit/timeline.rs",
+      "sha256": "f044c604ae60c6715c5edd73ab2f6906ce0e8fee459bede92f7f8786f3e71b7f"
+    },
+    {
+      "path": "src/ui/task_workspace/view.rs",
+      "sha256": "831197aba4b0e62692f771525cd3716999cae7b32c50f2a70206f77ceb239f75"
+    },
+    {
+      "path": "src/ui/theme_system.rs",
+      "sha256": "3b2592c7000051e1d9f79d1d42fe725e70ba7c28ed52b7131811776fe9a98aeb"
+    },
+    {
+      "path": "src/ui/tokens.rs",
+      "sha256": "b3c57129b5eec6416df2e7acc132f59c4dcfadc6b01d974725c7bb57123286c4"
+    },
+    {
+      "path": "src/ui/workspace_layout.rs",
+      "sha256": "b2e257f6def2810441faede0a37f2fa7cc335b49b88346331d316f5d7a213c23"
+    },
+    {
+      "path": "src/workspace/model.rs",
+      "sha256": "ede3ec15892c4985fd790b9fdc152d669ff856c8c10b1151bca2a06a28db1b35"
+    },
+    {
+      "path": "src/workspace/repository_targets.rs",
+      "sha256": "56de336dff266bf5fc055dda55957f91b257c14b8e19d14ba7e9e52e71ce62f8"
+    },
+    {
+      "path": "src/workspace/service.rs",
+      "sha256": "becb573991257e980aadd0e1e5e35d99eac9e86b39134b45276237c5dc026c55"
+    },
+    {
+      "path": "src/workspace/worktree.rs",
+      "sha256": "30838541b7fa1f5675327f54b8a79efd7814acd48347aff4de0e705623d79db8"
+    },
+    {
+      "path": "tests/provider_journal.rs",
+      "sha256": "6280491343b1830f70cc486424c675c7919cf759336186015895288a3f6ba043"
+    },
+    {
+      "path": "tests/ui_native_shell.rs",
+      "sha256": "81167563e499bcc3a8de7642528985b57e44a15f64b15884665a868cb5b79bf4"
+    },
+    {
+      "path": "tests/workspace_conformance.rs",
+      "sha256": "3af17784f54b95b35b7b78b81377a3d5cef0aaecf68431c2fd1287d7197a8f59"
+    },
+    {
+      "path": "tests/workspace_service.rs",
+      "sha256": "c1c39586428f1a510a9e37193811960f175f1823b2a2574e9859e584dcc76d78"
+    }
+  ],
+  "document_manifest": [
+    {
+      "path": "spec/CONTEXT-PACK.md",
+      "sha256": "a636c83b1b6943944e9b002f0a64c02e61b34876d6b2936b8f5d0ca112e3f09c"
+    },
+    {
+      "path": "spec/PARKED.md",
+      "sha256": "f695d92f14bd2226515f6a730afea8e28139ff8c230d768428079c454bdf5fa3"
+    },
+    {
+      "path": "spec/README.md",
+      "sha256": "a37d35f42c7d9e496c8dea1c7f6165e0b78ef406a76662a2fc48166999ff228a"
+    },
+    {
+      "path": "spec/ai-orchestration/AUTONOMY-REVIEW.md",
+      "sha256": "db04ea29423faf53509b5cb4b1c27344e4fbb7b232472b0dca7f6d104fcfda24"
+    },
+    {
+      "path": "spec/ai-orchestration/build/00-overview.md",
+      "sha256": "f1b395804e0d321eddd25dd887bed46cbd2413478444ac840dc4ac7d1d145c92"
+    },
+    {
+      "path": "spec/ai-orchestration/build/01-intake.md",
+      "sha256": "5f6c7d269ba41568496607d8f761753f7fcbce3d3723c01715f8fb09063f7d2f"
+    },
+    {
+      "path": "spec/ai-orchestration/build/02-lead-bridge.md",
+      "sha256": "7f964891ce66ae6d0034cbaf7414f42c767022774bd335def4a8b6cbc0eecec1"
+    },
+    {
+      "path": "spec/ai-orchestration/build/03-plans.md",
+      "sha256": "30c02d8df4ae8f6522e2c186303aaf8907294ac3babc825dd52a304ab736c100"
+    },
+    {
+      "path": "spec/ai-orchestration/build/04-workspaces.md",
+      "sha256": "9cf6b8bf324704cebfce8329c361d7c41bfe0da8ae3fc455c4c7843bb8cbef7b"
+    },
+    {
+      "path": "spec/ai-orchestration/build/05-decisions.md",
+      "sha256": "c33e524721fb73a88e6662ffddffc5ba61c41713549f70f958ee850abe41f2bb"
+    },
+    {
+      "path": "spec/ai-orchestration/build/06-evidence.md",
+      "sha256": "c6705b4af9a7caa9e6a9ff7c9c6cddcf467314b0bdf186a222768eef965d5e2b"
+    },
+    {
+      "path": "spec/ai-orchestration/build/07-repairs.md",
+      "sha256": "fd28772725ad874f7d7a196426120c232d9968d1bb36579ea22866eaedc2e53c"
+    },
+    {
+      "path": "spec/ai-orchestration/build/08-journeys.md",
+      "sha256": "2dc45bf220917c16887af75955621d42b70c19fa92d420fb97bfb2df1e70dd3a"
+    },
+    {
+      "path": "spec/ai-orchestration/build/09-performance.md",
+      "sha256": "f6283bc1f30e0272a4c4b55e8b6c47d0819568d9f3a73a9f3740c83b0d9f0ba4"
+    },
+    {
+      "path": "spec/ai-orchestration/build/10-test-campaigns.md",
+      "sha256": "a0ade76bbb370e5ca6374b8c894dd61fa07a04391c17924a3bfac04927fd6bc3"
+    },
+    {
+      "path": "spec/ai-orchestration/build/11-memory.md",
+      "sha256": "4fb2cfc3f09df8d5f1507608b3ff02d842189700d1d2a477f93cf1ea195b0572"
+    },
+    {
+      "path": "spec/ai-orchestration/build/12-learning.md",
+      "sha256": "2111a3bad121a153ac2ee1d6836b9267e22a4f069e404819a64f998c87258634"
+    },
+    {
+      "path": "spec/ai-orchestration/build/13-scheduling.md",
+      "sha256": "d2448550de18f2ecdaa59f4da262d1fc4ad64e764338a200f42c559a0f68c435"
+    },
+    {
+      "path": "spec/ai-orchestration/build/14-availability.md",
+      "sha256": "609363f707b48d4a576721a37a1ff36259576889b0368da0d5ae6808eaf0b8c0"
+    },
+    {
+      "path": "spec/ai-orchestration/build/15-recovery.md",
+      "sha256": "1dcd1c6db79b80d07fc2c27b2dd2111a2d06a60efe2170d19f38be9bdcaac792"
+    },
+    {
+      "path": "spec/ai-orchestration/build/16-delivery.md",
+      "sha256": "28340145908cfeaa8b1e0a002da4219b40c021d2dc7d1527cf94e05e17a049e9"
+    },
+    {
+      "path": "spec/ai-orchestration/build/17-acceptance.md",
+      "sha256": "36d444f1a4785cbbc5e3f5cff7eaa27aaba146f855bdc6e396d013d4312fa7b1"
+    },
+    {
+      "path": "spec/ai-orchestration/build/TEST-PLAN.md",
+      "sha256": "13a2931e8776468c77254bc2799f2671fd066e4af6d6b05d45de4e14c6632dc9"
+    },
+    {
+      "path": "spec/ai-orchestration/visuals/README.md",
+      "sha256": "911404e33957c418b01c9dc794acc76f1fe5ba6e45ccf4f2c39ce19741149b53"
+    },
+    {
+      "path": "spec/ai-orchestration/SPEC.md",
+      "sha256": "11e9bf7a820cd54a9fc9eba0cc9589ffaf59b9146ad1c9e911d7ba84b7c6ea20"
+    },
+    {
+      "path": "spec/ai-orchestration/UX-SPEC.md",
+      "sha256": "76701a6e32e274aea3ab0be676b499cce5372952d78c09d9ee490b6c83da9992"
+    },
+    {
+      "path": "spec/ai-orchestration/visuals/manifest.json",
+      "sha256": "d6fdd7c0f0c759f7fb37f452f1d250734b365c070b9176e0afc4b7fc3634ac3a"
+    },
+    {
+      "path": "spec/ai-orchestration/visuals/step4-manifest.json",
+      "sha256": "5a875cc49da35cd8cf39553fc0dac2d20e7fe95e1a350686211411eba026ad8d"
+    }
+  ],
+  "prototype_manifest": "spec/ai-orchestration/visuals/step4-manifest.json",
+  "limits": [
+    "No Cargo/application/provider/Command/database or native Computer Use verification was run during document generation.",
+    "No independent application audit is claimed.",
+    "Source files already had unrelated edits and can advance independently; hashes record inspected integration points.",
+    "HTML captures are versioned design references; native runtime and appearance qualification remain implementation acceptance."
+  ]
+}

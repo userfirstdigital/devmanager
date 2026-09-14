@@ -1,0 +1,295 @@
+{
+  "reviewDate": "2026-09-10",
+  "localRoot": "/run/media/robin/D8B2E10CB2E0F044/Code/userfirst/atomic-main",
+  "upstream": "https://github.com/bastani-inc/atomic",
+  "gitCommit": null,
+  "provenance": "Downloaded directory without .git; upstream commit and archive creation time not established. This pins only the selected source set, not the entire repository or a release. Inclusion records review inputs; it does not imply every line was audited or its tests run.",
+  "selectedSourceFingerprint": "b94e43438801f3277c216a0f6b68e1572142b97f12cea11384094cb6f4bf2d5f",
+  "files": [
+    {
+      "path": "AGENTS.md",
+      "bytes": 27466,
+      "sha256": "56c240b3fa0e4ed97c8eded49de8c6b007e9ca0bdff287701935003db54c82cf"
+    },
+    {
+      "path": "DESIGN.md",
+      "bytes": 18110,
+      "sha256": "703d3ae1e2c7c19f9b1919ea5f12e3daf05bc2c723978fa3e05a2e1e198080e1"
+    },
+    {
+      "path": "LICENSE",
+      "bytes": 1263,
+      "sha256": "a1a5bc156dbcb71d4f572e6ca7f6cea546f14769719d7afbbaa8fc0c64c34302"
+    },
+    {
+      "path": "PRODUCT.md",
+      "bytes": 4115,
+      "sha256": "9de0aa0762fa9db3b2af890c1903b22a920ae36ab6745f6bd5b50fcf07ebde4d"
+    },
+    {
+      "path": "README.md",
+      "bytes": 64921,
+      "sha256": "d4e5a7aa3f12a440bdef29c86e0610ea846015d5f6fce4d17d6ae30af8a34b47"
+    },
+    {
+      "path": "package-lock.json",
+      "bytes": 382481,
+      "sha256": "3f7a39e498ebe311b33ac6429365071d559d2451764997c3366edd316914e5da"
+    },
+    {
+      "path": "package.json",
+      "bytes": 2491,
+      "sha256": "862f22402d94f741feb77966c87eaf9dd59c30b19f1a93c1f6463820fc357abc"
+    },
+    {
+      "path": "packages/ai/LICENSE",
+      "bytes": 1103,
+      "sha256": "954df9157d71aa99c0e66fb3ebdc5ee7a8677d4de24786d49ecb059d905e3a58"
+    },
+    {
+      "path": "packages/coding-agent/package.json",
+      "bytes": 7240,
+      "sha256": "8b4fa0ee65124042311e217edbace41d2786024084850cd68eae647c431c84ad"
+    },
+    {
+      "path": "packages/coding-agent/src/modes/interactive-engine/activity-watchdog.ts",
+      "bytes": 3959,
+      "sha256": "7345767192c20fdc280fd903537ae38af755bb3a31854a8d66befa43f9502de6"
+    },
+    {
+      "path": "packages/intercom/LICENSE",
+      "bytes": 1068,
+      "sha256": "2d20dfacd9742706e564470dc77438608a1e54b0ed46959f080709389209093c"
+    },
+    {
+      "path": "packages/intercom/README.md",
+      "bytes": 45121,
+      "sha256": "05bdc4d8c514045130304091d9e25bf502d85d4dd7a7d57b114160db595bd88a"
+    },
+    {
+      "path": "packages/intercom/broker/delivered-message-cache.ts",
+      "bytes": 17856,
+      "sha256": "314db0fc042604cc8fe0e697744b4033aabc525f7cd4ca311dcb7ef408d58c64"
+    },
+    {
+      "path": "packages/intercom/broker/send-signature.ts",
+      "bytes": 1791,
+      "sha256": "ec7efe4112a6f1990cc8cd4104a28805981a8c4dd2bf7a7b80d7209b3019d625"
+    },
+    {
+      "path": "packages/intercom/inbound-message-admission.ts",
+      "bytes": 4506,
+      "sha256": "f66bedee4d792cc007d4f3e3cb08649554f44706a57bf535ff76537ebb0abf2f"
+    },
+    {
+      "path": "packages/intercom/retry-identity.ts",
+      "bytes": 12370,
+      "sha256": "bedfeb564bf99849e3ac86a917d6abd83418e0410d6ca8a79643454992ae4033"
+    },
+    {
+      "path": "packages/intercom/retry-policy.ts",
+      "bytes": 776,
+      "sha256": "a50141a49f8c1cc857864283f057a9ed2d23b3d025bdcbe41e27d8f5489808ce"
+    },
+    {
+      "path": "packages/intercom/subagent-reply-capability.ts",
+      "bytes": 1264,
+      "sha256": "b186d999fc53bc1c5ccdeed64ca1862011673c0a0cfb334d3847565c9370a294"
+    },
+    {
+      "path": "packages/intercom/terminal-ordering-barrier.ts",
+      "bytes": 10706,
+      "sha256": "d05331199343adfe03dbf8a35d17b5a69ef21d038627aca63b7e57718d494978"
+    },
+    {
+      "path": "packages/subagents/README.md",
+      "bytes": 52267,
+      "sha256": "d2d748c84901a37d87e839a7295a4da2df12066218f42a874d69a53923f46f2f"
+    },
+    {
+      "path": "packages/workflows/LICENSE",
+      "bytes": 1263,
+      "sha256": "a1a5bc156dbcb71d4f572e6ca7f6cea546f14769719d7afbbaa8fc0c64c34302"
+    },
+    {
+      "path": "packages/workflows/README.md",
+      "bytes": 101474,
+      "sha256": "4dce33c604ea19d9ce2fe623ce56b8cf459b22441033c124470dec004dacbe8c"
+    },
+    {
+      "path": "packages/workflows/builtin/goal-convergence.ts",
+      "bytes": 3353,
+      "sha256": "b43886db2bfbbe8fcc13c6d76c1f560d6e5fd615f802247836e9d217ff6fcaf3"
+    },
+    {
+      "path": "packages/workflows/builtin/goal-reducer.ts",
+      "bytes": 6123,
+      "sha256": "93a02fbb0ce5444f2d18a5efff0dce1d0a95248586e2d9b512a6757b696844ba"
+    },
+    {
+      "path": "packages/workflows/builtin/goal-reverify.ts",
+      "bytes": 9731,
+      "sha256": "c7d08cd4ee735d1e50ee8b37c32ce3b8e97742c7d29b6c64b6818b85a6f911e9"
+    },
+    {
+      "path": "packages/workflows/builtin/goal-review.ts",
+      "bytes": 5228,
+      "sha256": "30511974192f5ff67a6f9808914179ec944cc4621f011a14f0109faa116b28fa"
+    },
+    {
+      "path": "packages/workflows/builtin/goal-runner.ts",
+      "bytes": 23094,
+      "sha256": "c687d68052b15a79ecac70b2a08fbcc4d0e50934dc317747668335aca12abf16"
+    },
+    {
+      "path": "packages/workflows/builtin/goal-schemas.ts",
+      "bytes": 2578,
+      "sha256": "977db6b028c1b227f4e4e7c4a0e3686ecc9ec4d41a89a58841728d568b6b8df7"
+    },
+    {
+      "path": "packages/workflows/builtin/goal-types.ts",
+      "bytes": 5000,
+      "sha256": "a451fac8bfa84909575b145cb359b7a665f42527f29780214cdc9607cea19b4b"
+    },
+    {
+      "path": "packages/workflows/builtin/goal.ts",
+      "bytes": 5587,
+      "sha256": "9de59756d375ffd216f8bdd665c9e3e4b20fee75e60a1dfafb670cb3f17bd1df"
+    },
+    {
+      "path": "packages/workflows/builtin/open-claude-design-runner.ts",
+      "bytes": 15836,
+      "sha256": "a4c0098268ec999b0412e2c49eca5123f16767695d6a06ae20ae624194540615"
+    },
+    {
+      "path": "packages/workflows/builtin/progress-scoring.ts",
+      "bytes": 8647,
+      "sha256": "8f6f1bf77382ebe014844c1b049ea3eadbc0f3b8c58a5fd8b11173c4c89b33cf"
+    },
+    {
+      "path": "packages/workflows/builtin/review-convergence.ts",
+      "bytes": 8001,
+      "sha256": "3657da39478d7b2e38d603e34a5e8634acbeda5b9d699ee6d216732cbc54f915"
+    },
+    {
+      "path": "packages/workflows/builtin/steering-context.ts",
+      "bytes": 2151,
+      "sha256": "7db28abf3faceadcef1af874abc64bc6adda73a5c0fe9971447acb53092f8eb9"
+    },
+    {
+      "path": "packages/workflows/builtin/verification-criteria.ts",
+      "bytes": 10599,
+      "sha256": "f8aef0adf217db9b70adb0da42d5719d353ed180ba265b0b486bb32064d06d83"
+    },
+    {
+      "path": "packages/workflows/package.json",
+      "bytes": 2123,
+      "sha256": "e187f3efafce6077b3a4e69f0ac0f6548b8b3a83a8b6dbda5068544a62a773c3"
+    },
+    {
+      "path": "packages/workflows/skills/impeccable/SKILL.md",
+      "bytes": 10662,
+      "sha256": "9d124382509eb15da0862f145bca0e53be00aaddb05272e4efc9a0832de048a9"
+    },
+    {
+      "path": "packages/workflows/skills/impeccable/scripts/live-accept.mjs",
+      "bytes": 36821,
+      "sha256": "02708b64afc86a9df27ee1e38238b5f942306b46c05796f6963640046346bcac"
+    },
+    {
+      "path": "packages/workflows/skills/impeccable/scripts/live-manual-edit-evidence.mjs",
+      "bytes": 12049,
+      "sha256": "8a507e60391bbdca906f92a88e9999269663774c35a9321a1a9856ab62eec642"
+    },
+    {
+      "path": "packages/workflows/skills/impeccable/scripts/live/source-lock.mjs",
+      "bytes": 3707,
+      "sha256": "2919dd7641a5ff2320a01a1bf9f9adcff6e7e2f2b3ccb1b48cdf0b5c091b3803"
+    },
+    {
+      "path": "packages/workflows/src/authoring/workflow.ts",
+      "bytes": 7624,
+      "sha256": "3314bbaab27fdbb1cd98fc9f262197dd893ed31d12c4b9b169a5a586bf5833a8"
+    },
+    {
+      "path": "packages/workflows/src/durable/boundary-topology.ts",
+      "bytes": 17872,
+      "sha256": "73a71ae49eaf6a9e8d1cda10602c1a8c8db92c0793848c01a47315c3fefa7041"
+    },
+    {
+      "path": "packages/workflows/src/durable/child-invocation.ts",
+      "bytes": 618,
+      "sha256": "c1dd82cbf885f35b2687d826f3a9176f7f1a29987bb58cdb2b3f5b5f543858e2"
+    },
+    {
+      "path": "packages/workflows/src/durable/durable-hash.ts",
+      "bytes": 935,
+      "sha256": "dd429319fc4f00a696c225453842aa4a05210a271cdafa67ef707c14c44c2339"
+    },
+    {
+      "path": "packages/workflows/src/durable/resume-runtime.ts",
+      "bytes": 14674,
+      "sha256": "c7a50c32959f4cc7c5b5bc5e98e725698ff2d3321428a1261cd7b3ae846d1fa4"
+    },
+    {
+      "path": "packages/workflows/src/durable/scoped-backend.ts",
+      "bytes": 10684,
+      "sha256": "be3baf4be915fa9f9e077121524d684e85561011aa45d5fd37c3f0d689748fe1"
+    },
+    {
+      "path": "packages/workflows/src/durable/tool-outcome.ts",
+      "bytes": 4419,
+      "sha256": "76f1a61234ccab136d38693dccdd9f92eb623db5f57f00a610bd991ce00171a4"
+    },
+    {
+      "path": "packages/workflows/src/durable/tool-primitive.ts",
+      "bytes": 35363,
+      "sha256": "849a751fe463657403eaf472f393b0beec1ad82894640962e660d754c646ac29"
+    },
+    {
+      "path": "packages/workflows/src/durable/tool-resume-frontier.ts",
+      "bytes": 4022,
+      "sha256": "fc5c60da1139605109020ec156bd6a63c1f93727642c6e43512073ad5d1cbe0b"
+    },
+    {
+      "path": "test/unit/builtin-workflow-steering-propagation.test.ts",
+      "bytes": 3631,
+      "sha256": "f19f6b9a23b9a827994ffc35f33d974a0062571f7a07aa808a3b5c29201a68aa"
+    },
+    {
+      "path": "test/unit/durable-nested-resume-hydration.test.ts",
+      "bytes": 19573,
+      "sha256": "4897a87df98f9bc280e535f25b47a48d545886a8780662ed8d692631747d3406"
+    },
+    {
+      "path": "test/unit/durable-repeated-child-replay.test.ts",
+      "bytes": 7170,
+      "sha256": "723ce2dec13f7d92ca4f8f7cc50a5cc61bf04fe52cfdd282667933b05c69aa7a"
+    },
+    {
+      "path": "test/unit/goal-reverify.test.ts",
+      "bytes": 13102,
+      "sha256": "da6de8bbb34066f356bcf76340513f8c04a47c4838e9f91770f4620cc044a506"
+    },
+    {
+      "path": "test/unit/goal-review-objective-drift.test.ts",
+      "bytes": 3039,
+      "sha256": "2953eb66ec91d91b196b32e43a1c08a30a72e10653f83ff7a2746d51dc7e5742"
+    },
+    {
+      "path": "test/unit/intercom-retry-identity.test.ts",
+      "bytes": 11797,
+      "sha256": "971bc4c82056a423f708a794fcb16b287f06d65b27752ea3e0087a494e49c0e3"
+    },
+    {
+      "path": "test/unit/review-convergence-closure.test.ts",
+      "bytes": 4599,
+      "sha256": "00c39833d1f04dd7c74ac5f20f5150bf7d4fa85b8ca211c54b9ce34f7bedf989"
+    },
+    {
+      "path": "test/unit/workflow-tool-durable-replay.test.ts",
+      "bytes": 18813,
+      "sha256": "007f92da5aecfc016d7b8f393e05db7fecb6d48d040ce072f2ff6be9f4729548"
+    }
+  ]
+}
