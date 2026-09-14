@@ -125,7 +125,8 @@ jobs:
           cargo test --locked --lib -- --test-threads=1
           mapfile -t test_targets < <(
             cargo metadata --locked --no-deps --format-version 1 |
-              python -c 'import json,sys; package=next(p for p in json.load(sys.stdin)["packages"] if p["name"] == "devmanager"); print("\n".join(sorted(t["name"] for t in package["targets"] if "test" in t["kind"] and t["name"] != "ui_preview_capture")))'
+              python -c 'import json,sys; package=next(p for p in json.load(sys.stdin)["packages"] if p["name"] == "devmanager"); print("\n".join(sorted(t["name"] for t in package["targets"] if "test" in t["kind"] and t["name"] != "ui_preview_capture")))' |
+              tr -d '\r'
           )
           if [ "${#test_targets[@]}" -eq 0 ]; then
             echo "No Windows integration test targets were discovered." >&2

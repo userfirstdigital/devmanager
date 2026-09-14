@@ -108,6 +108,7 @@ fn release_verify_installs_rustfmt_before_running_cargo_fmt() {
     assert!(verify_job.contains("debug/deps/process_soak_infrastructure-*.exe"));
     assert!(verify_job.contains("cargo test --locked --lib -- --test-threads=1"));
     assert!(verify_job.contains("t[\"name\"] != \"ui_preview_capture\""));
+    assert!(verify_job.contains("tr -d '\\r'"));
     assert!(verify_job.contains(
         "Retired preview tooling and hosted-runner desktop capture remain compile-only."
     ));
