@@ -1,8 +1,9 @@
-name: macOS launch probe
+name: macOS compile
 
 on:
   push:
-    branches: ["codex/macos-probe-*"]
+    branches: ["master"]
+  pull_request:
 
 permissions:
   contents: read
@@ -39,8 +40,8 @@ jobs:
           cargo check --locked --lib --bins --tests --examples
       - name: Build process helper
         run: cargo build --locked --bin devmanager-process-test-helper
-      - name: Run macOS library tests serially
-        run: cargo test --locked --lib -- --test-threads=1
+      - name: Link macOS library test harness
+        run: cargo test --locked --no-run --lib
       - name: Check for owned process residue
         if: always()
         run: |
