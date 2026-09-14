@@ -115,14 +115,29 @@ jobs:
           cargo fmt --all -- --check
           cargo check --locked --lib --bins --tests
           cargo build --locked --bin devmanager-process-test-helper
-          cargo test --locked --test process_soak_infrastructure --no-run
+          cargo test --locked --all-targets --no-run
           mkdir -p target-native-next/debug
           mkdir -p target-native-next/debug/deps
           cp "$CARGO_TARGET_DIR/debug/devmanager-process-test-helper.exe" \
             target-native-next/debug/devmanager-process-test-helper.exe
           cp "$CARGO_TARGET_DIR"/debug/deps/process_soak_infrastructure-*.exe \
             target-native-next/debug/deps/
-          cargo test --locked --all-targets -- --test-threads=1
+          cargo test --locked --lib -- --test-threads=1
+          mapfile -t test_targets < <(
+            cargo metadata --locked --no-deps --format-version 1 |
+              python -c 'import json,sys; package=next(p for p in json.load(sys.stdin)["packages"] if p["name"] == "devmanager"); print("\n".join(sorted(t["name"] for t in package["targets"] if "test" in t["kind"] and t["name"] != "ui_preview_capture")))'
+          )
+          if [ "${#test_targets[@]}" -eq 0 ]; then
+            echo "No Windows integration test targets were discovered." >&2
+            exit 1
+          fi
+          cargo_args=(test --locked --bins --examples)
+          for test_target in "${test_targets[@]}"; do
+            cargo_args+=(--test "$test_target")
+          done
+          echo "Retired preview tooling and hosted-runner desktop capture remain compile-only."
+          cargo "${cargo_args[@]}" -- --test-threads=1 \
+            --skip quality_preview_cli_and_pixel_readback_hold_without_canonical_shell
 
   # Packaging (prepare/build) is independent from publication and never auto-publishes public.
   prepare:
