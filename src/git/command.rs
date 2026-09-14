@@ -142,6 +142,12 @@ const HARD_MAX_TIMEOUT: Duration = Duration::from_secs(30);
 const HOST_AUTHORITY_LIFETIME: Duration = Duration::from_secs(120);
 const CLEANUP_RESERVE: Duration = Duration::from_secs(1);
 const READER_DROP_TIMEOUT: Duration = Duration::from_millis(250);
+// Git removes lock files before its process tree is considered settled, but
+// Windows can briefly keep the directory entry visible after the final handle
+// closes. Never adopt a newly-created lock into the durable graph baseline;
+// give that exact post-operation artifact a short, bounded chance to vanish.
+const POST_TRANSITION_LOCK_SETTLE_TIMEOUT: Duration = Duration::from_millis(500);
+const POST_TRANSITION_LOCK_PENDING: &str = "repository Git lock is still settling: ";
 const HARD_MAX_READER_REAPERS: usize = 16;
 
 #[derive(Clone, Debug)]
@@ -3995,7 +4001,29 @@ impl RepositoryGraph {
         transition: GraphTransition,
         deadline: Option<OperationDeadline>,
     ) -> Result<(), String> {
-        self.revalidate_nodes(transition, deadline, true, false)
+        let settle_deadline = deadline.map(|deadline| {
+            let now = Instant::now();
+            OperationDeadline::from_absolute(
+                now.checked_add(
+                    deadline
+                        .remaining()
+                        .min(POST_TRANSITION_LOCK_SETTLE_TIMEOUT),
+                )
+                .unwrap_or(now),
+                deadline.timeout,
+            )
+        });
+        loop {
+            match self.revalidate_nodes(transition, deadline, true, false) {
+                Err(reason)
+                    if reason.starts_with(POST_TRANSITION_LOCK_PENDING)
+                        && settle_deadline.is_some_and(|deadline| !deadline.is_expired()) =>
+                {
+                    settle_deadline.expect("checked above").sleep();
+                }
+                result => return result,
+            }
+        }
     }
 
     fn revalidate_during_transition_with_deadline(
@@ -4172,6 +4200,7 @@ impl RepositoryGraph {
                         &node.path,
                         &expected_entries,
                         &current_entries,
+                        update_baseline,
                     )?;
                     current_mutable_entries.push((node.path.clone(), current_entries));
                 }
@@ -4355,6 +4384,7 @@ impl RepositoryGraph {
                         &input.path,
                         &expected_entries,
                         &actual_entries,
+                        update_baseline,
                     )?;
                     current_entries.push((input.path.clone(), actual_entries));
                 }
@@ -4443,6 +4473,7 @@ fn validate_mutable_directory_snapshot(
     directory: &Path,
     expected: &MutableDirectorySnapshot,
     actual: &MutableDirectorySnapshot,
+    reject_new_lock_files: bool,
 ) -> Result<(), String> {
     let mut expected_index = 0;
     let mut actual_index = 0;
@@ -4489,6 +4520,26 @@ fn validate_mutable_directory_snapshot(
             continue;
         }
         let changed_path = directory.join(&relative);
+        if reject_new_lock_files
+            && expected_identity.is_none()
+            && actual_identity.is_some_and(|entry| entry.1)
+            && changed_path
+                .file_name()
+                .and_then(OsStr::to_str)
+                .is_some_and(|name| name.ends_with(".lock"))
+            && transition.allows_replacement(
+                root,
+                common_dir,
+                object_stores,
+                metadata_roots,
+                &changed_path,
+            )
+        {
+            return Err(format!(
+                "{POST_TRANSITION_LOCK_PENDING}{}",
+                changed_path.display()
+            ));
+        }
         let object_path = object_stores
             .iter()
             .find(|object_store| is_within(object_store, &changed_path));
@@ -12676,6 +12727,62 @@ mod tests {
             .graph
             .revalidate_after_transition(GraphTransition::Pull)
             .expect("a pull may leave Git's AUTO_MERGE behind");
+    }
+
+    #[test]
+    fn post_transition_waits_for_a_new_git_lock_without_adopting_it() {
+        let fixture = tempfile::tempdir().expect("create post-transition lock fixture");
+        let repository = test_repository(fixture.path(), GitLimits::default());
+        let lock = fixture.path().join(".git").join("AUTO_MERGE.lock");
+        fs::write(&lock, b"transient lock\n").expect("create transient Git lock");
+        let remove_lock = lock.clone();
+        let remover = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(20));
+            fs::remove_file(remove_lock).expect("remove transient Git lock");
+        });
+
+        repository
+            .root
+            .graph
+            .revalidate_after_transition_with_deadline(
+                GraphTransition::Commit,
+                Some(OperationDeadline::from_now(Duration::from_secs(1))),
+            )
+            .expect("the completed commit waits for its transient lock to disappear");
+        remover.join().expect("join lock remover");
+        repository
+            .root
+            .graph
+            .revalidate()
+            .expect("the transient lock was never adopted into the graph baseline");
+    }
+
+    #[test]
+    fn post_transition_refuses_to_adopt_a_persistent_git_lock() {
+        let fixture = tempfile::tempdir().expect("create persistent lock fixture");
+        let repository = test_repository(fixture.path(), GitLimits::default());
+        let lock = fixture.path().join(".git").join("AUTO_MERGE.lock");
+        fs::write(&lock, b"persistent lock\n").expect("create persistent Git lock");
+
+        let error = repository
+            .root
+            .graph
+            .revalidate_after_transition_with_deadline(
+                GraphTransition::Commit,
+                Some(OperationDeadline::from_now(Duration::from_millis(20))),
+            )
+            .expect_err("a persistent Git lock must fail closed");
+        assert!(
+            error.starts_with(POST_TRANSITION_LOCK_PENDING)
+                || error.contains("validation exceeded the operation deadline"),
+            "{error}"
+        );
+        fs::remove_file(lock).expect("remove persistent Git lock after refusal");
+        repository
+            .root
+            .graph
+            .revalidate()
+            .expect("a refused persistent lock was never adopted into the graph baseline");
     }
 
     #[test]
