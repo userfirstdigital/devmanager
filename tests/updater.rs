@@ -99,6 +99,8 @@ fn release_verify_installs_rustfmt_before_running_cargo_fmt() {
         .expect("verify job should install Rust");
 
     assert!(verify_job.contains("cargo fmt --all -- --check"));
+    assert!(verify_job.contains("inputs.publish != true"));
+    assert!(verify_job.contains("target-native-next/debug/devmanager-process-test-helper.exe"));
     assert!(
         rust_install.contains("components: rustfmt"),
         "the minimal Rust toolchain must install cargo-fmt before verification"
@@ -139,6 +141,10 @@ fn release_packaging_runs_independently_of_verify_but_stage_requires_verify() {
     assert!(
         !prepare_job.contains("needs: verify") && !prepare_job.contains("needs: [verify"),
         "prepare must not wait on verify so packaging still runs when verification fails"
+    );
+    assert!(
+        prepare_job.contains("inputs.publish != true"),
+        "publish-only dispatch must not compute and build a second release"
     );
     assert!(
         !build_job.contains("needs: verify") && !build_job.contains("needs: [verify"),
@@ -182,6 +188,10 @@ fn release_packaging_runs_independently_of_verify_but_stage_requires_verify() {
     assert!(
         !stage_job.contains("Expected exactly 11 non-empty staged release assets"),
         "draft asset verification must not keep the stale 11-asset count"
+    );
+    assert!(
+        !build_job.contains("platform: macos-aarch64") && !stage_job.contains("\"macos-aarch64\""),
+        "release jobs must exclude macOS until the native runtime is supported"
     );
 }
 

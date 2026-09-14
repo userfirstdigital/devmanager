@@ -84,15 +84,8 @@ $env:DEVMANAGER_UPDATE_PUBKEY = "<public key>"
 cargo packager --release --formats nsis
 ```
 
-Package a signed macOS build with both updater and end-user artifacts:
-
-```powershell
-$env:DEVMANAGER_UPDATE_ENDPOINTS = "https://github.com/<owner>/<repo>/releases/latest/download/latest.json"
-$env:DEVMANAGER_UPDATE_PUBKEY = "<public key>"
-$env:CARGO_PACKAGER_SIGN_PRIVATE_KEY = "<private key>"
-$env:CARGO_PACKAGER_SIGN_PRIVATE_KEY_PASSWORD = "<key password>"
-cargo packager --release --formats app,dmg
-```
+macOS currently has a compile-and-link CI gate, but it is not packaged or
+published until the native host and runtime pass macOS acceptance.
 
 Generated artifacts are written to `dist/packager`. Icons live in `packaging/icons`. cargo-packager reads release binaries from `binaries-dir = "target/release"` with an explicit `devmanager` + `devmanager-host` payload. The package contract is `packaging/package-contract.json`; validate a stage with:
 
@@ -154,7 +147,7 @@ The manifest shape matches the `cargo-packager-updater` multi-platform format an
 - The workflow uses `Cargo.toml` when it is newer than the latest stable `vX.Y.Z` tag; otherwise it selects the next patch version.
 - The prepare job writes the release version into `Cargo.toml` and `Cargo.lock`, then commits that bump back to `master` with `[skip ci]`.
 - Every platform checks out that exact prepared commit, and the release tag is explicitly pinned to the same commit rather than the moving branch head.
-- Windows builds publish updater-signed dual-binary ZIP payloads for staged replace, plus `nsis`/WiX installers for manual install on Windows. macOS builds publish updater-signed `app` bundles plus `dmg` artifacts.
+- Windows builds publish updater-signed dual-binary ZIP payloads for staged replace, plus `nsis`/WiX installers for manual install. Linux builds publish a signed AppImage. macOS remains compile-and-link only.
 - Draft staging requires the exact platform/signature/manifest contract (including signed dual-binary updater ZIPs) and verifies every uploaded size and SHA-256 digest before operators may approve publication.
 - `latest.json` includes identity/protocol compatibility fields and per-platform `hash` (`sha256:`), `sha256`, `client_build`, and `host_build` fields.
 
@@ -182,10 +175,10 @@ Use the generated private key for release signing and embed the public key into 
 
 After packaging on `master`, do not consider the release complete until all of these checks pass:
 
-- the `verify`, `prepare`, all three platform `build` jobs, and `stage` job succeed; the release remains a draft until protected manual approval publishes it
+- the `verify`, `prepare`, Windows `build`, Linux `build-linux`, and `stage` jobs succeed; the release remains a draft until protected manual approval publishes it
 - signatures verify with `DEVMANAGER_UPDATE_PUBKEY` before draft staging and again before publish
 - the new tag points to the workflow's reported prepared commit, not merely the latest `master` commit
-- the draft GitHub Release contains Windows x64/ARM64, macOS ARM64, matching updater `.sig` files, and `latest.json` with `identity` plus per-platform `sha256`
+- the draft GitHub Release contains Windows x64/ARM64 and Linux x64 artifacts, matching updater `.sig` files, and `latest.json` with `identity` plus per-platform `sha256`
 - every URL and platform key in `latest.json` resolves to the uploaded asset for the same version
 - a clean Windows install launches `devmanager.exe` beside `devmanager-host.exe`, and the existing app detects, verifies, downloads, and offers the update
 - the mobile web health endpoint, HTTPS app shell, pairing, WebSocket reconnect, and one real prompt all work through the production proxy
@@ -196,27 +189,7 @@ If packaging fails before draft creation, fix forward and push again; no release
 
 ## Platform Signing Status
 
-The `.sig` files authenticate updates to DevManager itself; they are not operating-system publisher signatures. Current Windows installers are not Authenticode-signed, so SmartScreen can warn. Current macOS artifacts have neither an Apple Developer ID signature nor notarization, so Gatekeeper can block them. Public low-friction distribution requires adding those platform credentials to the packaging workflow; until then, this repository's releases are suitable only for users who explicitly accept the warning/workaround.
-
-## macOS Installation
-
-The macOS build is not yet signed with an Apple Developer ID certificate or notarized, so macOS Gatekeeper may show **"DevManager is damaged and can't be opened"** when you try to open the app from the DMG.
-
-To work around this, open Terminal and remove the quarantine attribute:
-
-```bash
-xattr -cr /Applications/DevManager.app
-```
-
-If the DMG itself won't open, run this first:
-
-```bash
-xattr -cr ~/Downloads/DevManager*.dmg
-```
-
-Alternatively, you can right-click the app in Finder, choose **Open**, and click **Open** in the confirmation dialog. This bypasses Gatekeeper for that specific app.
-
-This workaround is needed until proper Apple code signing and notarization are added to the release workflow.
+The `.sig` files authenticate updates to DevManager itself; they are not operating-system publisher signatures. Current Windows installers are not Authenticode-signed, so SmartScreen can warn. Public low-friction Windows distribution requires adding those platform credentials to the packaging workflow; until then, users must explicitly accept the warning.
 
 ## Mobile Web App
 

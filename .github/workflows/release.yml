@@ -35,6 +35,7 @@ jobs:
   verify:
     if: >-
       github.ref == 'refs/heads/master' &&
+      (github.event_name != 'workflow_dispatch' || inputs.publish != true) &&
       (github.event_name != 'push' || !contains(github.event.head_commit.message, '[skip ci]'))
     runs-on: windows-latest
     permissions:
@@ -110,12 +111,16 @@ jobs:
           cargo fmt --all -- --check
           cargo check --locked --lib --bins --tests
           cargo build --locked --bin devmanager-process-test-helper
+          mkdir -p target-native-next/debug
+          cp "$CARGO_TARGET_DIR/debug/devmanager-process-test-helper.exe" \
+            target-native-next/debug/devmanager-process-test-helper.exe
           cargo test --locked --all-targets -- --test-threads=1
 
   # Packaging (prepare/build) is independent from publication and never auto-publishes public.
   prepare:
     if: >-
       github.ref == 'refs/heads/master' &&
+      (github.event_name != 'workflow_dispatch' || inputs.publish != true) &&
       (github.event_name != 'push' || !contains(github.event.head_commit.message, '[skip ci]'))
     runs-on: ubuntu-latest
     permissions:
@@ -269,9 +274,6 @@ jobs:
           - runner: windows-11-arm
             platform: windows-aarch64
             formats: nsis
-          - runner: macos-15
-            platform: macos-aarch64
-            formats: app,dmg
     runs-on: ${{ matrix.runner }}
 
     steps:
@@ -439,7 +441,7 @@ jobs:
           if names != {"devmanager.exe", "devmanager-host.exe"}:
               raise SystemExit(f"Dual updater ZIP must contain only product binaries, found {sorted(names)}")
 
-          # Sign with the same packager key used for NSIS/MSI/DMG artifacts.
+          # Sign with the same packager key used for NSIS/MSI artifacts.
           subprocess.run(
               ["cargo", "packager", "signer", "sign", str(zip_path)],
               check=True,
@@ -648,16 +650,10 @@ jobs:
                   ("Windows ARM64 dual-binary updater", "*_arm64-update.zip"),
                   ("Windows ARM64 dual-binary updater signature", "*_arm64-update.zip.sig"),
               ],
-              "macos-aarch64": [
-                  ("macOS updater archive", "*.app.tar.gz"),
-                  ("macOS updater signature", "*.app.tar.gz.sig"),
-                  ("macOS disk image", "*.dmg"),
-                  ("macOS disk image signature", "*.dmg.sig"),
-              ],
           }
           # latest.json points at dual-binary ZIP/DMUP1-compatible payloads for
-          # Windows staged replace. NSIS/MSI/DMG remain published for manual install.
-          # Format stays `nsis`/`app` so cargo-packager-updater can parse the
+          # Windows staged replace. NSIS/MSI remain published for manual install.
+          # Format stays `nsis` so cargo-packager-updater can parse the
           # manifest; DevManager materializes ZIP/DMUP1 bytes in-process and never
           # extracts installers.
           updater_assets = {
@@ -669,10 +665,6 @@ jobs:
               "windows-aarch64": {
                   "pattern": "*_arm64-update.zip",
                   "format": "nsis",
-              },
-              "macos-aarch64": {
-                  "pattern": "*.app.tar.gz",
-                  "format": "app",
               },
           }
 
@@ -717,9 +709,9 @@ jobs:
                       raise SystemExit(f"Forbidden packaged artifact path: {path}")
 
           names = [asset.name for asset in selected]
-          if len(selected) != 16 or len(names) != len(set(names)):
+          if len(selected) != 12 or len(names) != len(set(names)):
               raise SystemExit(
-                  f"Release contract requires 16 uniquely named platform files, found {sorted(names)}"
+                  f"Release contract requires 12 uniquely named platform files, found {sorted(names)}"
               )
           for asset in selected:
               shutil.copy2(asset, publish_dir / asset.name)
@@ -776,7 +768,7 @@ jobs:
           if manifest_path.stat().st_size <= 0:
               raise SystemExit("Generated latest.json is empty")
 
-          # Exact emitted publish set: the 16 selected platform artifacts plus latest.json.
+          # Exact emitted publish set: the 12 selected platform artifacts plus latest.json.
           emitted_paths = sorted(
               path for path in publish_dir.iterdir() if path.is_file()
           )
@@ -785,7 +777,7 @@ jobs:
               raise SystemExit("Staged publish-assets must include latest.json")
           if len(emitted_names) != len(selected) + 1 or len(emitted_names) != len(set(emitted_names)):
               raise SystemExit(
-                  "Staged publish-assets must be exactly the 16 uniquely named platform "
+                  "Staged publish-assets must be exactly the 12 uniquely named platform "
                   f"artifacts plus latest.json, found {emitted_names}"
               )
           if any(path.stat().st_size <= 0 for path in emitted_paths):
