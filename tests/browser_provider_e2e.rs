@@ -10,7 +10,7 @@ use devmanager::browser::{
     BrowserProviderArm, BrowserProviderE2EHold, BROWSER_E2E_VERIFICATION_TOKEN,
     BROWSER_FIXTURE_CASES,
 };
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -237,21 +237,24 @@ fn wait_ready_line(child: &mut std::process::Child, timeout: Duration) -> String
     );
 }
 
-fn http_get(url_path: &str, port: u16) -> (u16, String) {
-    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect fixture server");
-    stream
-        .set_read_timeout(Some(Duration::from_secs(2)))
-        .expect("read timeout");
-    write!(
-        stream,
-        "GET {url_path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
-    )
-    .expect("write request");
+fn http_get_once(url_path: &str, port: u16) -> io::Result<Vec<u8>> {
+    let mut stream = TcpStream::connect(("127.0.0.1", port))?;
+    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+    stream.write_all(
+        format!("GET {url_path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n")
+            .as_bytes(),
+    )?;
     let mut response = Vec::new();
     let mut chunk = [0u8; 4096];
     let complete_len = loop {
-        let read = stream.read(&mut chunk).expect("read response");
-        assert!(read > 0, "fixture server closed before a complete response");
+        let read = stream.read(&mut chunk)?;
+        if read == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "fixture server closed before a complete response",
+            ));
+        }
         response.extend_from_slice(&chunk[..read]);
         assert!(response.len() <= 1_048_576, "fixture response is unbounded");
         let Some(header_end) = response.windows(4).position(|window| window == b"\r\n\r\n") else {
@@ -272,6 +275,31 @@ fn http_get(url_path: &str, port: u16) -> (u16, String) {
         }
     };
     response.truncate(complete_len);
+    Ok(response)
+}
+
+fn is_retryable_fixture_transport(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::ConnectionRefused
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::TimedOut
+            | io::ErrorKind::UnexpectedEof
+    )
+}
+
+fn http_get(url_path: &str, port: u16) -> (u16, String) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let response = loop {
+        match http_get_once(url_path, port) {
+            Ok(response) => break response,
+            Err(error) if Instant::now() < deadline && is_retryable_fixture_transport(&error) => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(error) => panic!("fixture server request failed: {error}"),
+        }
+    };
     let response = String::from_utf8(response).expect("utf-8 fixture response");
     let status = response
         .split_whitespace()
@@ -279,6 +307,16 @@ fn http_get(url_path: &str, port: u16) -> (u16, String) {
         .and_then(|value| value.parse().ok())
         .unwrap_or(0);
     (status, response)
+}
+
+#[test]
+fn fixture_http_retries_windows_connection_abort_but_not_invalid_responses() {
+    assert!(is_retryable_fixture_transport(&io::Error::from(
+        io::ErrorKind::ConnectionAborted
+    )));
+    assert!(!is_retryable_fixture_transport(&io::Error::from(
+        io::ErrorKind::InvalidData
+    )));
 }
 
 fn stop_fixture_server(child: &mut Child) {
