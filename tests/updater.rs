@@ -214,6 +214,21 @@ fn release_build_reuses_the_tracked_fingerprinted_web_bundle() {
 }
 
 #[test]
+fn release_linux_full_suite_provides_a_display_for_real_window_children() {
+    let workflow = fs::read_to_string(release_workflow_path()).expect("read release workflow");
+    let linux_job = workflow
+        .split("\n  build-linux:")
+        .nth(1)
+        .and_then(|tail| tail.split("\n  stage:").next())
+        .expect("Linux build job should precede stage");
+
+    assert!(linux_job.contains(
+        "GDK_BACKEND=x11 xvfb-run -a cargo test --locked --lib -j 2 -- --test-threads=1"
+    ));
+    assert!(!linux_job.contains("\n          cargo test --locked --lib -j 2"));
+}
+
+#[test]
 fn release_windows_build_exports_the_installed_nsis_directory() {
     let workflow = fs::read_to_string(release_workflow_path()).expect("read release workflow");
     let build_job = workflow

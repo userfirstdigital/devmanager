@@ -509,7 +509,7 @@ jobs:
           cargo build --locked --bin devmanager-process-test-helper -j 2
           cargo test --locked --test cli_client -j 2 -- --test-threads=1
           cargo test --locked --lib exact_resume_mismatch -j 2 -- --test-threads=1
-          cargo test --locked --lib -j 2 -- --test-threads=1
+          GDK_BACKEND=x11 xvfb-run -a cargo test --locked --lib -j 2 -- --test-threads=1
           cargo test --locked --test updater --test update_contract --test package_contract -j 2 -- --test-threads=1
           GDK_BACKEND=x11 xvfb-run -a cargo test --locked --lib linux_webkit_native_lifecycle -j 2 -- --ignored --test-threads=1
 
