@@ -189,21 +189,18 @@ function Assert-PayloadResourcesAndIcons([string]$Root, $Contract) {
     }
 }
 
-function Invoke-HostCtlSmoke([string]$HostBinary, [string]$ProfileRoot, [string[]]$Args, [string]$ExpectedIdentity) {
+function Invoke-HostCtlSmoke([string]$HostBinary, [string]$ProfileRoot, [string[]]$HostArgs, [string]$ExpectedIdentity) {
     if (-not (Test-Path -LiteralPath $HostBinary -PathType Leaf)) {
         Write-Failure "Host binary missing for ctl smoke: $HostBinary"
     }
     New-Item -ItemType Directory -Force -Path $ProfileRoot | Out-Null
-    $profileName = 'package-contract-disposable'
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = $HostBinary
-    $psi.Arguments = ($Args -join ' ')
+    $psi.Arguments = ($HostArgs -join ' ')
     $psi.UseShellExecute = $false
     $psi.RedirectStandardOutput = $true
     $psi.RedirectStandardError = $true
     $psi.CreateNoWindow = $true
-    $psi.EnvironmentVariables['DEVMANAGER_PROFILE'] = $profileName
-    $psi.EnvironmentVariables['DEVMANAGER_CONFIG_DIR'] = $ProfileRoot
     if ($psi.EnvironmentVariables.ContainsKey('APPDATA')) {
         $psi.EnvironmentVariables['APPDATA'] = $ProfileRoot
     }
@@ -365,7 +362,7 @@ function Invoke-PayloadInspection([string]$PayloadRoot, $Contract, [string]$Vers
         Invoke-HostCtlSmoke `
             -HostBinary $hostMatch[0].FullName `
             -ProfileRoot $script:DisposableProfileRoot `
-            -Args @([string[]]$Contract.hostCtlSmoke) `
+            -HostArgs @([string[]]$Contract.hostCtlSmoke) `
             -ExpectedIdentity $ShippingIdentity
     }
 }

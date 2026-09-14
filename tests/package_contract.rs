@@ -549,3 +549,14 @@ fn stale_reference_scan_keeps_forbidden_patterns_and_exact_path_token_safety_con
         "stale scanner must self-check that intentional contracts stay path+token narrow"
     );
 }
+
+#[test]
+fn packaged_host_ctl_smoke_preserves_arguments_without_forbidden_profile_overrides() {
+    let script = read(&repo_root().join("packaging/Assert-PackageContract.ps1"));
+
+    assert!(script.contains("[string[]]$HostArgs"));
+    assert!(script.contains("$psi.Arguments = ($HostArgs -join ' ')"));
+    assert!(script.contains("-HostArgs @([string[]]$Contract.hostCtlSmoke)"));
+    assert!(!script.contains("EnvironmentVariables['DEVMANAGER_PROFILE']"));
+    assert!(!script.contains("EnvironmentVariables['DEVMANAGER_CONFIG_DIR']"));
+}
