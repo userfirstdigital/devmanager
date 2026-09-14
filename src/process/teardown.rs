@@ -3484,6 +3484,7 @@ impl From<TeardownAdmissionError> for TeardownReject {
 #[derive(Debug)]
 struct CleanupCell {
     result: Mutex<Option<TeardownReport>>,
+    settlement_claimed: AtomicBool,
     done: watch::Sender<bool>,
     blocking_done: Condvar,
     fallback: TeardownReport,
@@ -3495,6 +3496,7 @@ impl CleanupCell {
         let (done, _receiver) = watch::channel(false);
         Self {
             result: Mutex::new(None),
+            settlement_claimed: AtomicBool::new(false),
             done,
             blocking_done: Condvar::new(),
             fallback: waiter_failure_report(ticket.clone(), "teardown waiter channel closed"),
@@ -3503,13 +3505,15 @@ impl CleanupCell {
     }
 
     fn finish(&self, report: TeardownReport) {
+        if self.settlement_claimed.swap(true, Ordering::SeqCst) {
+            return;
+        }
         let Ok(mut result) = self.lock_result_for_finish() else {
             std::process::abort();
         };
-        if result.is_none() {
-            *result = Some(report);
-            self.done.send_replace(true);
-        }
+        debug_assert!(result.is_none());
+        *result = Some(report);
+        self.done.send_replace(true);
         self.blocking_done.notify_all();
     }
 
@@ -6441,6 +6445,30 @@ mod tests {
         assert!(error.contains("deadline"));
         drop(held);
         worker.join().expect("settlement lock worker");
+    }
+
+    #[test]
+    fn duplicate_cleanup_settlement_does_not_reenter_an_expired_result_lock() {
+        let key = completion_key_for_test(
+            13,
+            std::env::current_exe().expect("current test executable"),
+        );
+        let ticket = super::TeardownTicket::new(
+            crate::domain::id::OperationId::new(),
+            super::TeardownScope::Host,
+            key.action_epoch,
+            key.fence.clone(),
+        )
+        .expect("exact waiter ticket");
+        let cell = super::CleanupCell::new(&ticket, Instant::now() + Duration::from_millis(5));
+        let held = cell.result.lock().expect("hold claimed settlement slot");
+        cell.settlement_claimed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(10));
+
+        cell.finish(cell.fallback.clone());
+
+        assert!(held.is_none());
     }
 
     #[test]
